@@ -14,7 +14,7 @@ CXXFLAGS = -std=c++17 -Wall $(INCLUDES)
 OBJ = $(SRC:./src/%.cpp=./bin/%.o)
 
 # Output executable
-TARGET = myprogram
+TARGET = tcpipstack
 
 $(TARGET) : $(OBJ)
 	$(CXX) $(CXXFLAGS) -o $(TARGET) $^
