@@ -10,6 +10,8 @@
 #include <fcntl.h>
 #include <stdint.h>
 
+#include "interface_bridge.h"
+
 static int tun_alloc(char *dev)
 {
     struct ifreq ifr = {0};
@@ -80,19 +82,21 @@ int bridge_interfaces(const char* bridge_name, const char* interface1, const cha
 
 int main() 
 {
+    InterfaceBridge bridge("br0", {"ens33"});
+
     uint8_t example[] = {
         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 
         0x00, 0x0c, 0x29, 0x08, 0x5b, 0x73,
         0x08, 0x00
     };
-
     char tap_interface[10] = {0};
     int fd = tun_alloc(tap_interface);
     set_interface_up(tap_interface);
     printf("Opened TAP: %s\n", tap_interface);
+    bridge.add_interface(tap_interface);
 
     printf("Creating bridge br0\n");
-    bridge_interfaces("br0", "ens33", tap_interface);
+    bridge.start();
 
     getchar();
 
