@@ -11,7 +11,7 @@
 #include <stdint.h>
 
 #include "interface_bridge.h"
-
+#include "tun_wrapper.h"
 
 
 
@@ -52,7 +52,10 @@ int main()
         0x08, 0x00
     };
     char tap_interface[10] = {0};
-    int fd = tun_alloc(tap_interface);
+    //! Code by Yuval
+    TunWrapper tun_object = TunWrapper();
+    tun_object.start();
+    //
     set_interface_up(tap_interface);
     printf("Opened TAP: %s\n", tap_interface);
     bridge.add_interface(tap_interface);
@@ -63,8 +66,9 @@ int main()
     getchar();
 
     printf("Writing raw packet to ens33\n");
-    tun_write(fd, (char*)example, sizeof example);
-    // tun_read(fd, (char*)example, sizeof example);
 
+    //
+    tun_object._write()
+    //
     return 0;
 }

@@ -4,6 +4,8 @@
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <unistd.h>
+#include <string.h>
+#include <vector>
 
 
 TunWrapper::TunWrapper(const std::string &device_path)
@@ -72,14 +74,32 @@ void TunWrapper::_set_interface_state(const std::string& interface, bool state_u
     system(command.c_str());
 }
 
-int tun_read(int fd, std::string &buffer, int len)
+int TunWrapper::_read(int fd, std::vector<char> &buffer)
 {
-    buffer.resize(len);
-    int n = read(fd, buffer.data(), len);
+    if (!this->_is_active)
+    {
+        // TODO: Throw exception
+        return -1; // don`t exit - just state thats not possible to read right now.
+    }
+    int buffer_length = buffer.size();
+    int n = read(fd, buffer.data(), buffer_length);
     return n;
 }
 
-int tun_write(int fd, std::string &buffer, int len)
+int TunWrapper::_write(int fd, std::vector<char> &buffer)
 {
-    return write(fd, buffer.data(), std::min(static_cast<int>(buffer.size()), len));
+    if (!this->_is_active)
+    {
+        // TODO: Throw exception
+        return -1; // don`t exit - just state thats not possible to read right now.
+    }
+    int buffer_length = buffer.size();
+    int bytes_written = write(fd, buffer.data(), buffer_length);
+
+    if (bytes_written < 0)
+    {
+        printf("Writing using the tun device has failed.\n");
+        return -1;
+    }
+    return bytes_written;
 }
