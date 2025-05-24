@@ -1,9 +1,11 @@
 #include "tun_wrapper.h"
+#include "custom_exception.h"
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <unistd.h>
+#include <iostream>
 #include <string.h>
 #include <vector>
 
@@ -38,12 +40,12 @@ std::string TunWrapper::_open_device(const std::string &device_path)
     int fd, err;
 
     fd = open(device_path.c_str(), O_RDWR);
+    
     if (fd < 0)
     {
-        // TODO throw exception
-        exit(1);
+        throw new CustomException("opening a device failed at: TunWrapper::_open_device");
     }
-
+    
     // flags: tun device, no packet info
     ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
 
@@ -51,11 +53,11 @@ std::string TunWrapper::_open_device(const std::string &device_path)
     // strncpy(ifr.ifr_name, interface_name, IFNAMSIZ);
 
     err = ioctl(fd, TUNSETIFF, (void*) &ifr);
+
     if (err < 0)
     {
-        // TODO: throw exception
         close(fd);
-        exit(1);
+        throw new CustomException("setting the tun device has failed at: TunWrapper::_open_device");
     }
 
     return std::string(ifr.ifr_name);
@@ -78,9 +80,9 @@ int TunWrapper::_read(int fd, std::vector<char> &buffer)
 {
     if (!this->_is_active)
     {
-        // TODO: Throw exception
-        return -1; // don`t exit - just state thats not possible to read right now.
+        throw new CustomException("tun device is not active at TunWrapper::_read");
     }
+
     int buffer_length = buffer.size();
     int n = read(fd, buffer.data(), buffer_length);
     return n;
@@ -90,9 +92,9 @@ int TunWrapper::_write(int fd, std::vector<char> &buffer)
 {
     if (!this->_is_active)
     {
-        // TODO: Throw exception
-        return -1; // don`t exit - just state thats not possible to read right now.
+        throw new CustomException("tun device is not active at TunWrapper::_write");
     }
+
     int buffer_length = buffer.size();
     int bytes_written = write(fd, buffer.data(), buffer_length);
 

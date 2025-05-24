@@ -68,7 +68,7 @@ int main()
     printf("Writing raw packet to ens33\n");
 
     //
-    tun_object._write()
+    //tun_object._write()
     //
     return 0;
 }
