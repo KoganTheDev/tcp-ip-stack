@@ -71,3 +71,15 @@ void TunWrapper::_set_interface_state(const std::string& interface, bool state_u
     command += state_up ? "up" : "down";
     system(command.c_str());
 }
+
+int tun_read(int fd, std::string &buffer, int len)
+{
+    buffer.resize(len);
+    int n = read(fd, buffer.data(), len);
+    return n;
+}
+
+int tun_write(int fd, std::string &buffer, int len)
+{
+    return write(fd, buffer.data(), std::min(static_cast<int>(buffer.size()), len));
+}

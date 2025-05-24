@@ -14,15 +14,7 @@
 
 
 
-int tun_read(int fd, char *buf, int len)
-{
-    return read(fd, buf, len);
-}
 
-int tun_write(int fd, char *buf, int len)
-{
-    return write(fd, buf, len);
-}
 
 int set_interface_up(const char* interface)
 {
