@@ -3,6 +3,7 @@
 #include <exception>
 #include <string>
 
+#define POSITIONED_EXCEPTION(message) CustomException(message, __FILE__, __LINE__, __func__)
 class CustomException : public std::exception
 {
 public:

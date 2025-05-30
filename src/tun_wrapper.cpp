@@ -88,7 +88,7 @@ int TunWrapper::_read(int fd, std::vector<char> &buffer)
     return n;
 }
 
-int TunWrapper::_write(int fd, std::vector<char> &buffer)
+void TunWrapper::_write(int fd, std::vector<char> &buffer)
 {
     if (!this->_is_active)
     {
@@ -98,10 +98,12 @@ int TunWrapper::_write(int fd, std::vector<char> &buffer)
     int buffer_length = buffer.size();
     int bytes_written = write(fd, buffer.data(), buffer_length);
 
-    if (bytes_written < 0)
+    if (bytes_written == -1)
     {
-        printf("Writing using the tun device has failed.\n");
-        return -1;
+        throw new CustomException("Writing using the tun device has failed.\n");
     }
-    return bytes_written;
+    if (bytes_written != buffer.size())
+    {
+        throw new CustomException("Not all of the message was sent.\n");
+    }
 }

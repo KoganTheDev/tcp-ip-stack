@@ -11,13 +11,13 @@ public:
 
     void start();
     void stop();
+    int _read(int fd, std::vector<char> &buffer);
+    void _write(int fd, std::vector<char> &buffer);
 
 private:
     std::string _open_device(const std::string& device_path);
     void _close_device();
-    void _set_interface_state(const std::string& interface, bool state_up);  // copy from BridgeInterface class
-    int _read(int fd, std::vector<char> &buffer);
-    int _write(int fd, std::vector<char> &buffer);
+    void _set_interface_state(const std::string& interface, bool state_up);
 
 
     int _fd;
