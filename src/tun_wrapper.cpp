@@ -1,5 +1,5 @@
 #include "tun_wrapper.h"
-#include "custom_exception.h"
+#include "exceptions.h"
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <linux/if.h>
@@ -43,7 +43,7 @@ std::string TunWrapper::_open_device(const std::string &device_path)
     
     if (fd < 0)
     {
-        throw CustomException("opening a device failed at: TunWrapper::_open_device");
+        throw EXCEPTION(BaseException, "opening a device failed at: TunWrapper::_open_device");
     }
     
     // flags: tun device, no packet info
@@ -57,7 +57,7 @@ std::string TunWrapper::_open_device(const std::string &device_path)
     if (err < 0)
     {
         close(fd);
-        throw CustomException("setting the tun device has failed at: TunWrapper::_open_device");
+        throw EXCEPTION(BaseException, "setting the tun device has failed at: TunWrapper::_open_device");
     }
 
     this->_fd = fd;
@@ -82,14 +82,14 @@ Bytes TunWrapper::read(unsigned int max_size)
     Bytes buffer(max_size);
     if (!this->_is_active)
     {
-        throw CustomException("tun device is not active at TunWrapper::_read");
+        throw EXCEPTION(BaseException, "tun device is not active at TunWrapper::_read");
     }
 
     ssize_t bytes_read = ::read(this->_fd, buffer.data(), max_size);
 
     if (bytes_read < 0)
     {
-        throw CustomException("read has failed.");
+        throw EXCEPTION(BaseException, "read has failed.");
     }
     
     buffer.resize(bytes_read);
@@ -100,7 +100,7 @@ void TunWrapper::write(const Bytes& buffer)
 {
     if (!this->_is_active)
     {
-        throw CustomException("tun device is not active at TunWrapper::_write");
+        throw EXCEPTION(BaseException, "tun device is not active at TunWrapper::_write");
     }
 
     size_t buffer_length = buffer.size();
@@ -108,11 +108,11 @@ void TunWrapper::write(const Bytes& buffer)
 
     if (bytes_written < 0)
     {
-        throw CustomException("Writing using the tun device has failed.\n");
+        throw EXCEPTION(BaseException, "Writing using the tun device has failed");
     }
     else if ((size_t)bytes_written != buffer.size())
     {
-        throw CustomException("Not all of the message was sent.\n");
+        throw EXCEPTION(BaseException, "Not all of the message was sent");
     }
 }
 

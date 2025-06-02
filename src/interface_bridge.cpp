@@ -1,5 +1,5 @@
 #include "interface_bridge.h"
-#include "custom_exception.h"
+#include "exceptions.h"
 #include <stdlib.h>
 
 InterfaceBridge::InterfaceBridge(const std::string& bridge_name)
@@ -59,6 +59,6 @@ void InterfaceBridge::_system_wrapper(const std::string &command)
     int return_value = system(command.c_str()); 
     if (return_value != 0)
     {
-        throw CustomException("Error in command \"" + command + "\", return value " + std::to_string(return_value));
+        throw EXCEPTION(BaseException, "Error in command \"" + command + "\", return value " + std::to_string(return_value));
     }
 }
