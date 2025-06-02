@@ -1,7 +1,18 @@
 #pragma once
+
 #include <vector>
+#include <string>
 
-typedef std::vector<unsigned char> bytes;
+typedef unsigned char byte_t;
 
-bytes add_bytes(bytes &first, bytes &second);
-bytes substract_bytes(bytes &first, bytes &second);
+class Bytes : public std::vector<byte_t>
+{
+public:
+    Bytes();
+    Bytes(const std::string& buffer);
+    Bytes(unsigned int length);
+
+    Bytes operator|(const Bytes& other);
+    Bytes operator+(const Bytes& other);
+    Bytes operator-(const Bytes& other);
+};

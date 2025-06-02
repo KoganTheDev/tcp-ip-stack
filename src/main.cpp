@@ -1,74 +1,53 @@
 #include <iostream>
-
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
-#include <linux/if.h>
-#include <linux/if_tun.h>
-#include <sys/ioctl.h>
-#include <fcntl.h>
-#include <stdint.h>
+#include <memory>
 
 #include "interface_bridge.h"
 #include "tun_wrapper.h"
+#include "custom_exception.h"
 
 
+const bool USE_BRIDGE = false;
 
-
-int set_interface_up(const char* interface)
-{
-    char command[128] = {0};
-    snprintf(command, sizeof command, "sudo ip link set %s up", interface);
-    return system(command);
-}
-
-int bridge_interfaces(const char* bridge_name, const char* interface1, const char* interface2)
-{
-    char command[128] = {0};
-
-    // create bridge
-    snprintf(command, sizeof command, "sudo ip link add name %s type bridge", bridge_name);
-    system(command);
-    set_interface_up(bridge_name);
-
-    // add interfaces to bridge
-    snprintf(command, sizeof command, "sudo ip link set %s master %s", interface1, bridge_name);
-    system(command);
-    snprintf(command, sizeof command, "sudo ip link set %s master %s", interface2, bridge_name);
-    system(command);
-
-    // TODO return error properly
-    return 0;
-}
 
 int main() 
 {
-    InterfaceBridge bridge("br0", {"ens33"});
+    std::unique_ptr<InterfaceBridge> bridge;
+    try
+    {
+        TunWrapper tun = TunWrapper();
+        tun.start();
+        
+        if (USE_BRIDGE)
+        {
+            bridge = std::make_unique<InterfaceBridge>("br0");
+            bridge->add_interface(tun.get_interface_name());
+            bridge->add_interface("wlp1s0");
+            bridge->start();
+        }
 
-    uint8_t example[] = {
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 
-        0x00, 0x0c, 0x29, 0x08, 0x5b, 0x73,
-        0x08, 0x00
-    };
-    char tap_interface[10] = {0};
-    //! Code by Yuval
-    TunWrapper tun_object = TunWrapper();
-    tun_object.start();
-    //
-    set_interface_up(tap_interface);
-    printf("Opened TAP: %s\n", tap_interface);
-    bridge.add_interface(tap_interface);
+        std::cout << "Finished network setup" << std::endl;   
 
-    printf("Creating bridge br0\n");
-    bridge.start();
+        getchar();
+        Bytes ethernet_packet({
+            '\xff', '\xff', '\xff', '\xff', '\xff', '\xff',
+            '\x00', '\x0c', '\x29', '\x08', '\x5b', '\x73',
+            '\x08', '\x08'
+        });
+        std::cout << ethernet_packet.size() << std::endl;
+        tun.write(ethernet_packet);
+        std::cout << "Writing raw packet to interface" << std::endl;
+        getchar();
 
-    getchar();
-
-    printf("Writing raw packet to ens33\n");
-
-    //
-    //tun_object._write()
-    //
-    return 0;
+        return 0;
+    }
+    catch (const CustomException& e)
+    {
+        std::cerr << "ERROR: " << e.what() << std::endl;
+        return -1;
+    }
+    catch (...)
+    {
+        std::cerr << "UNEXPECTED ERROR" << std::endl;
+        return -1;
+    }
 }

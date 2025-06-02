@@ -43,7 +43,7 @@ std::string TunWrapper::_open_device(const std::string &device_path)
     
     if (fd < 0)
     {
-        throw new CustomException("opening a device failed at: TunWrapper::_open_device");
+        throw CustomException("opening a device failed at: TunWrapper::_open_device");
     }
     
     // flags: tun device, no packet info
@@ -57,9 +57,10 @@ std::string TunWrapper::_open_device(const std::string &device_path)
     if (err < 0)
     {
         close(fd);
-        throw new CustomException("setting the tun device has failed at: TunWrapper::_open_device");
+        throw CustomException("setting the tun device has failed at: TunWrapper::_open_device");
     }
 
+    this->_fd = fd;
     return std::string(ifr.ifr_name);
 }
 
@@ -76,34 +77,46 @@ void TunWrapper::_set_interface_state(const std::string& interface, bool state_u
     system(command.c_str());
 }
 
-int TunWrapper::_read(int fd, std::vector<char> &buffer)
+Bytes TunWrapper::read(unsigned int max_size)
 {
+    Bytes buffer(max_size);
     if (!this->_is_active)
     {
-        throw new CustomException("tun device is not active at TunWrapper::_read");
+        throw CustomException("tun device is not active at TunWrapper::_read");
     }
 
-    int buffer_length = buffer.size();
-    int n = read(fd, buffer.data(), buffer_length);
-    return n;
+    ssize_t bytes_read = ::read(this->_fd, buffer.data(), max_size);
+
+    if (bytes_read < 0)
+    {
+        throw CustomException("read has failed.");
+    }
+    
+    buffer.resize(bytes_read);
+    return buffer;
 }
 
-void TunWrapper::_write(int fd, std::vector<char> &buffer)
+void TunWrapper::write(const Bytes& buffer)
 {
     if (!this->_is_active)
     {
-        throw new CustomException("tun device is not active at TunWrapper::_write");
+        throw CustomException("tun device is not active at TunWrapper::_write");
     }
 
-    int buffer_length = buffer.size();
-    int bytes_written = write(fd, buffer.data(), buffer_length);
+    size_t buffer_length = buffer.size();
+    ssize_t bytes_written = ::write(this->_fd, buffer.data(), buffer_length);
 
-    if (bytes_written == -1)
+    if (bytes_written < 0)
     {
-        throw new CustomException("Writing using the tun device has failed.\n");
+        throw CustomException("Writing using the tun device has failed.\n");
     }
-    if (bytes_written != buffer.size())
+    else if ((size_t)bytes_written != buffer.size())
     {
-        throw new CustomException("Not all of the message was sent.\n");
+        throw CustomException("Not all of the message was sent.\n");
     }
+}
+
+std::string TunWrapper::get_interface_name()
+{
+    return this->_interface_name;
 }
