@@ -89,7 +89,7 @@ Bytes TunWrapper::read(unsigned int max_size)
 
     if (bytes_read < 0)
     {
-        throw EXCEPTION(BaseException, "read has failed.");
+        throw EXCEPTION(SystemException, "read has failed.");
     }
     
     buffer.resize(bytes_read);
@@ -108,11 +108,11 @@ void TunWrapper::write(const Bytes& buffer)
 
     if (bytes_written < 0)
     {
-        throw EXCEPTION(BaseException, "Writing using the tun device has failed");
+        throw EXCEPTION(SystemException, "Writing using the tun device has failed");
     }
     else if ((size_t)bytes_written != buffer.size())
     {
-        throw EXCEPTION(BaseException, "Not all of the message was sent");
+        throw EXCEPTION(SystemException, "Not all of the message was sent");
     }
 }
 

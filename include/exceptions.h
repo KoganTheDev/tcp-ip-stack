@@ -3,7 +3,7 @@
 #include <exception>
 #include <string>
 
-#define EXCEPTION(exception_class, message) exception_class(message, __FILE__, __func__, __LINE__)
+#define EXCEPTION(exception_class, message) exception_class((message), __FILE__, __func__, __LINE__)
 
 class BaseException : public std::exception
 {
@@ -17,4 +17,14 @@ private:
     std::string _file;
     std::string _function;
     unsigned int _line;
+};
+
+
+class SystemException : public BaseException
+{
+public:
+    SystemException(const std::string& message, const std::string& file="unknown_file", const std::string& func="unknown_func", unsigned int line=0);
+
+
+
 };
