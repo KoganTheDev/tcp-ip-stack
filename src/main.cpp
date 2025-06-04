@@ -1,104 +1,53 @@
 #include <iostream>
+#include <memory>
 
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
-#include <linux/if.h>
-#include <linux/if_tun.h>
-#include <sys/ioctl.h>
-#include <fcntl.h>
-#include <stdint.h>
+#include "interface_bridge.h"
+#include "tun_wrapper.h"
+#include "exceptions.h"
 
-static int tun_alloc(char *dev)
-{
-    struct ifreq ifr = {0};
-    int fd, err;
 
-    if( (fd = open("/dev/net/tun", O_RDWR)) < 0 ) {
-        perror("Cannot open TUN/TAP dev\n"
-                    "Make sure one exists with " 
-                    "'$ mknod /dev/net/tap c 10 200'");
-        exit(1);
-    }
+const bool USE_BRIDGE = false;
 
-    /* Flags: IFF_TUN   - TUN device (no Ethernet headers)
-     *        IFF_TAP   - TAP device
-     *
-     *        IFF_NO_PI - Do not provide packet information
-     */
-    ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
-    if( *dev ) {
-        strncpy(ifr.ifr_name, dev, IFNAMSIZ);
-    }
-
-    if( (err = ioctl(fd, TUNSETIFF, (void *) &ifr)) < 0 ){
-        perror("ERR: Could not ioctl tun");
-        close(fd);
-        return err;
-    }
-
-    strcpy(dev, ifr.ifr_name);
-    return fd;
-}
-
-int tun_read(int fd, char *buf, int len)
-{
-    return read(fd, buf, len);
-}
-
-int tun_write(int fd, char *buf, int len)
-{
-    return write(fd, buf, len);
-}
-
-int set_interface_up(const char* interface)
-{
-    char command[128] = {0};
-    snprintf(command, sizeof command, "sudo ip link set %s up", interface);
-    return system(command);
-}
-
-int bridge_interfaces(const char* bridge_name, const char* interface1, const char* interface2)
-{
-    char command[128] = {0};
-
-    // create bridge
-    snprintf(command, sizeof command, "sudo ip link add name %s type bridge", bridge_name);
-    system(command);
-    set_interface_up(bridge_name);
-
-    // add interfaces to bridge
-    snprintf(command, sizeof command, "sudo ip link set %s master %s", interface1, bridge_name);
-    system(command);
-    snprintf(command, sizeof command, "sudo ip link set %s master %s", interface2, bridge_name);
-    system(command);
-
-    // TODO return error properly
-    return 0;
-}
 
 int main() 
-{
-    uint8_t example[] = {
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 
-        0x00, 0x0c, 0x29, 0x08, 0x5b, 0x73,
-        0x08, 0x00
-    };
+{   
+    std::unique_ptr<InterfaceBridge> bridge;
+    try
+    {
+        TunWrapper tun = TunWrapper();
+        tun.start();
+        
+        if (USE_BRIDGE)
+        {
+            bridge = std::make_unique<InterfaceBridge>("br0");
+            bridge->add_interface(tun.get_interface_name());
+            bridge->add_interface("wlp1s0");
+            bridge->start();
+        }
 
-    char tap_interface[10] = {0};
-    int fd = tun_alloc(tap_interface);
-    set_interface_up(tap_interface);
-    printf("Opened TAP: %s\n", tap_interface);
+        std::cout << "Finished network setup" << std::endl;   
 
-    printf("Creating bridge br0\n");
-    bridge_interfaces("br0", "ens33", tap_interface);
+        getchar();
+        Bytes ethernet_packet({
+            '\xff', '\xff', '\xff', '\xff', '\xff', '\xff',
+            '\x00', '\x0c', '\x29', '\x08', '\x5b', '\x73',
+            '\x08', '\x08'
+        });
+        tun.write(ethernet_packet);
+        std::cout << "Writing raw packet to interface" << std::endl;
+        getchar();
 
-    getchar();
-
-    printf("Writing raw packet to ens33\n");
-    tun_write(fd, (char*)example, sizeof example);
-    // tun_read(fd, (char*)example, sizeof example);
-
-    return 0;
+        return 0;
+    }
+    catch (const BaseException& e)
+    {
+        std::cerr << "ERROR: " << e.what() << std::endl;
+        std::cerr << "Exception from " << e.position() << std::endl;
+        return -1;
+    }
+    catch (...)
+    {
+        std::cerr << "UNEXPECTED ERROR" << std::endl;
+        return -1;
+    }
 }
