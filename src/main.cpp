@@ -1,5 +1,6 @@
 #include <iostream>
 #include <memory>
+#include <unistd.h>
 
 #include "interface_bridge.h"
 #include "tun_wrapper.h"
@@ -11,6 +12,12 @@ const bool USE_BRIDGE = false;
 
 int main() 
 {   
+    if (geteuid() != 0)
+    {
+        std::cerr << "This program must be run as root. Exiting." << std::endl;
+        return 1;
+    }
+
     std::unique_ptr<InterfaceBridge> bridge;
     try
     {
