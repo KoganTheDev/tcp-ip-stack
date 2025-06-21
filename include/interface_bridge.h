@@ -4,8 +4,8 @@
 #include <string>
 #include <vector>
 
-
-class InterfaceBridge 
+#include "bridge_object.h"
+class InterfaceBridge : public BridgeObject
 {
 public:
     InterfaceBridge(const std::string& bridge_name);
@@ -18,7 +18,6 @@ public:
 private:
     void _create_bridge();
     void _delete_bridge();
-    void _set_interface_state(const std::string& interface, bool state_up);
 
     static void _system_wrapper(const std::string& command);
  

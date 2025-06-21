@@ -34,16 +34,17 @@ int main()
 
         std::cout << "Finished network setup" << std::endl;   
 
-        getchar();
         Bytes ethernet_packet({
             '\xff', '\xff', '\xff', '\xff', '\xff', '\xff',
             '\x00', '\x0c', '\x29', '\x08', '\x5b', '\x73',
             '\x08', '\x08'
         });
-        tun.write(ethernet_packet);
-        std::cout << "Writing raw packet to interface" << std::endl;
-        getchar();
 
+        while (getchar() != 'x') // x for exit.
+        {
+            tun.write(ethernet_packet);
+            std::cout << "Writing raw packet to interface" << std::endl;
+        }
         return 0;
     }
     catch (const BaseException& e)

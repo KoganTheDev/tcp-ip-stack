@@ -1,6 +1,6 @@
-#include "exceptions.h"
 #include <iostream>
 #include <cstring>
+#include "exceptions.h"
 
 BaseException::BaseException(const std::string &message, const std::string &file, const std::string &func, unsigned int line)
     : _message(message), _file(file), _function(func), _line(line)

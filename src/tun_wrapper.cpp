@@ -9,7 +9,6 @@
 #include <string.h>
 #include <vector>
 
-
 TunWrapper::TunWrapper(const std::string &device_path)
     : _fd(-1), _is_active(false)
 {
@@ -68,13 +67,6 @@ void TunWrapper::_close_device()
 {
     close(this->_fd);
     this->_fd = -1; 
-}
-
-void TunWrapper::_set_interface_state(const std::string& interface, bool state_up)
-{
-    std::string command = "sudo ip link set " + interface + " ";
-    command += state_up ? "up" : "down";
-    system(command.c_str());
 }
 
 Bytes TunWrapper::read(unsigned int max_size)
