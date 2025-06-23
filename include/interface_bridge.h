@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "bridge_object.h"
+
 class InterfaceBridge : public BridgeObject
 {
 public:

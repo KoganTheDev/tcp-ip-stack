@@ -1,7 +1,7 @@
 #pragma once
 
-#include "system_network_object.h"
 #include <string>
+#include "system_network_object.h"
 
 class BridgeObject : public SystemNetworkObject
 {

@@ -2,7 +2,7 @@
 
 #include "bridge_object.h"
 
-class ToBridge : public BridgeObject
+class TCBridge : public BridgeObject
 {
 
 };

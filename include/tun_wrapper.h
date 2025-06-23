@@ -11,8 +11,8 @@ public:
     TunWrapper(const std::string& device_path="/dev/net/tun");
     ~TunWrapper();
 
-    void start() override;
-    void stop() override;
+    virtual void start();
+    virtual void stop();
 
     Bytes read(unsigned int max_length);
     void write(const Bytes &buffer);

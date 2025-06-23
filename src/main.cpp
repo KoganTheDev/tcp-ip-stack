@@ -6,7 +6,6 @@
 #include "tun_wrapper.h"
 #include "exceptions.h"
 
-
 const bool USE_BRIDGE = false;
 
 
