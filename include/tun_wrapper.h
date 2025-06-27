@@ -3,14 +3,16 @@
 #include <string>
 #include <vector>
 #include "bytes.h"
-class TunWrapper
+#include "system_network_object.h"
+
+class TunWrapper : public SystemNetworkObject
 {
 public:
     TunWrapper(const std::string& device_path="/dev/net/tun");
     ~TunWrapper();
 
-    void start();
-    void stop();
+    virtual void start();
+    virtual void stop();
 
     Bytes read(unsigned int max_length);
     void write(const Bytes &buffer);
@@ -20,7 +22,6 @@ public:
 private:
     std::string _open_device(const std::string& device_path);
     void _close_device();
-    void _set_interface_state(const std::string& interface, bool state_up);
 
     int _fd;
     std::string _interface_name;
