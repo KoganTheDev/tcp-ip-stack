@@ -27,8 +27,6 @@ void InterfaceBridge::stop()
 
 void InterfaceBridge::_create_bridge()
 {
-    // TODO handle errors
-
     std::string command = "sudo ip link add name " + this->_bridge_name + " type bridge";
     _system_wrapper(command);
 }

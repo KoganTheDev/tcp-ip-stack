@@ -6,6 +6,9 @@
 #include "tun_wrapper.h"
 #include "exceptions.h"
 
+#include "ethernet.h"
+#include "arp.h"
+
 const bool USE_BRIDGE = false;
 
 
@@ -20,6 +23,7 @@ int main()
     std::unique_ptr<InterfaceBridge> bridge;
     try
     {
+        /*
         TunWrapper tun = TunWrapper();
         tun.start();
         
@@ -33,11 +37,7 @@ int main()
 
         std::cout << "Finished network setup" << std::endl;   
 
-        Bytes ethernet_packet({
-            '\xff', '\xff', '\xff', '\xff', '\xff', '\xff',
-            '\x00', '\x0c', '\x29', '\x08', '\x5b', '\x73',
-            '\x08', '\x08'
-        });
+        Bytes ethernet_packet = Bytes::from_hex("ffffffffffff") | Bytes::from_hex("000c29085b73") | Bytes::from_hex("0808");
 
         while (getchar() != 'x') // x for exit.
         {
@@ -45,6 +45,13 @@ int main()
             std::cout << "Writing raw packet to interface" << std::endl;
         }
         return 0;
+        */
+        Bytes my_mac = Bytes("123456123456");
+        Bytes dst_mac = Bytes("ABABABABABAB");
+        EtherType ether_protocol = ETHERTYPE_ARP;
+
+        Ethernet ether = Ethernet(my_mac, dst_mac, ether_protocol);
+        // TODO: Arp arp = Arp() ... Continue here with Alon, main problem, too many fields i don`t know what to do with in ARP constructor
     }
     catch (const BaseException& e)
     {

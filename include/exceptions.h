@@ -24,7 +24,4 @@ class SystemException : public BaseException
 {
 public:
     SystemException(const std::string& message, const std::string& file="unknown_file", const std::string& func="unknown_func", unsigned int line=0);
-
-
-
 };
