@@ -20,8 +20,6 @@ private:
     void _create_bridge();
     void _delete_bridge();
 
-    static void _system_wrapper(const std::string& command);
- 
     std::string _bridge_name;
     std::vector<std::string> _interfaces;
     bool _is_active;

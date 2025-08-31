@@ -8,7 +8,7 @@ SRC = $(wildcard ./src/*.cpp)
 
 # Compiler and flags
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall $(INCLUDES)
+CXXFLAGS = -std=c++17 -Wall $(INCLUDES) -g
 
 # Object files corresponding to the source files
 OBJ = $(SRC:./src/%.cpp=./bin/%.o)

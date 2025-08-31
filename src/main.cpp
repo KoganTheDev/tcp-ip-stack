@@ -2,15 +2,15 @@
 #include <memory>
 #include <unistd.h>
 
-#include "interface_bridge.h"
-#include "tun_wrapper.h"
 #include "exceptions.h"
 
 #include "ethernet.h"
 #include "arp.h"
 
-const bool USE_BRIDGE = false;
+#include "raw_socket.h"
 
+// Used for in communication between VM`s linux and my computer
+#define INTERFACE_NAME "vmnet8"
 
 int main() 
 {   
@@ -20,38 +20,51 @@ int main()
         return 1;
     }
 
-    std::unique_ptr<InterfaceBridge> bridge;
     try
     {
+        RawSocket socket(INTERFACE_NAME);
+
+        Ethernet packet(socket.get_mac_address(), MacAddress::BROADCAST, (EtherType)0xcafe);
+        for (int i = 0; i < 3; i++)
+            socket.send(packet.to_bytes());
+        for (int i = 0; i < 100; i ++)
+        {
+            
+            try
+            {
+                Bytes p = socket.recv();
+                // std::cout << p.to_hex() << std::endl;
+                Ethernet ether = Ethernet(p);
+                if (ether.get_dest() == MacAddress("00:50:56:c0:00:08") || ether.get_src() == MacAddress("00:50:56:c0:00:08"))
+                    std::cout << ether.to_string() << std::endl << std::endl;
+            }
+            catch(const BaseException& e)
+            {
+            }
+        }
+
         /*
-        TunWrapper tun = TunWrapper();
-        tun.start();
-        
-        if (USE_BRIDGE)
-        {
-            bridge = std::make_unique<InterfaceBridge>("br0");
-            bridge->add_interface(tun.get_interface_name());
-            bridge->add_interface("wlp1s0");
-            bridge->start();
-        }
+        MacAddress src("11:22:33:44:55:66");
+        MacAddress dst("AA:BB:CC:DD:EE:FF");
+        EtherType ether_protocol = EtherType::ARP;
 
-        std::cout << "Finished network setup" << std::endl;   
+        Ethernet ether = Ethernet(src, dst, ether_protocol);
 
-        Bytes ethernet_packet = Bytes::from_hex("ffffffffffff") | Bytes::from_hex("000c29085b73") | Bytes::from_hex("0808");
+        ether /= std::make_unique<Arp>(src, IPv4Address("1.2.3.4"), IPv4Address("8.8.8.8"));
+        std::cout << ether.to_string() << std::endl;
 
-        while (getchar() != 'x') // x for exit.
-        {
-            tun.write(ethernet_packet);
-            std::cout << "Writing raw packet to interface" << std::endl;
-        }
-        return 0;
+        Bytes packet = ether.to_bytes();
+        packet |= Bytes::from_hex("cafecafe0011223344556677cafecafe");
+        std::cout << packet.to_hex() << std::endl;
+
+        Ethernet new_ether;
+        new_ether.from_bytes(packet);
+
+        std::cout << new_ether.to_string() << std::endl;
+
+        std::cout << new_ether.to_bytes().to_hex() << std::endl;
         */
-        Bytes my_mac = Bytes("123456123456");
-        Bytes dst_mac = Bytes("ABABABABABAB");
-        EtherType ether_protocol = ETHERTYPE_ARP;
 
-        Ethernet ether = Ethernet(my_mac, dst_mac, ether_protocol);
-        // TODO: Arp arp = Arp() ... Continue here with Alon, main problem, too many fields i don`t know what to do with in ARP constructor
     }
     catch (const BaseException& e)
     {

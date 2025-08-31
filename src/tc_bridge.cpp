@@ -1,9 +1,8 @@
 #include "tc_bridge.h"
 #include "exceptions.h"
 #include "system_network_object.h"
-
 #include <assert.h>
-
+#include <utils.h>
 
 TCBridge::TCBridge()
 {
@@ -48,13 +47,13 @@ void TCBridge::_create_bridge()
 {
     assert(!this->_is_active);
 
-    SystemNetworkObject::_system_wrapper("sudo tc qdisc add dev tap0 clsact");
-    SystemNetworkObject::_system_wrapper("sudo tc filter add dev tap0 ingress matchall action mirred egress mirror dev wlp1s0");
+    system_wrapper("sudo tc qdisc add dev tap0 clsact");
+    system_wrapper("sudo tc filter add dev tap0 ingress matchall action mirred egress mirror dev wlp1s0");
 }
 
 void TCBridge::_delete_bridge()
 {
     assert(this->_is_active);
 
-    SystemNetworkObject::_system_wrapper("sudo tc qdisc del dev tap0 clsact");
+    system_wrapper("sudo tc qdisc del dev tap0 clsact");
 }

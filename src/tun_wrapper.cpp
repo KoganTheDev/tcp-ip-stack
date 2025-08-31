@@ -10,7 +10,8 @@
 #include <vector>
 
 TunWrapper::TunWrapper(const std::string &device_path)
-    : _fd(-1), _is_active(false)
+    : _fd(-1),
+      _is_active(false)
 {
     this->_interface_name = this->_open_device(device_path);
 }
@@ -42,7 +43,7 @@ std::string TunWrapper::_open_device(const std::string &device_path)
     
     if (fd < 0)
     {
-        throw EXCEPTION(BaseException, "opening a device failed at: TunWrapper::_open_device");
+        throw EXCEPTION(SystemException, "Failed opening the TUN device.");
     }
     
     // flags: tun device, no packet info
@@ -65,7 +66,12 @@ std::string TunWrapper::_open_device(const std::string &device_path)
 
 void TunWrapper::_close_device()
 {
-    close(this->_fd);
+    int returned_value = close(this->_fd);
+    // Log instead of throwing an error since this function is used in the destructor
+    if (returned_value < 0)
+    {
+        printf("Error closing TunWrapper, errno: %d", errno);
+    }
     this->_fd = -1; 
 }
 

@@ -10,5 +10,4 @@ class SystemNetworkObject
 
     protected:
         static void _set_interface_state(const std::string& name, bool state);
-        static void _system_wrapper(const std::string& command);
 };

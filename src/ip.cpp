@@ -4,22 +4,55 @@
 Ip::Ip(uint8_t version, uint8_t IHL, uint8_t TOS, uint16_t total_length, uint16_t identification,
      bool ip_flag_x, bool ip_flag_d, bool ip_flag_m, uint16_t fragment_offset, uint8_t TTL, uint8_t protocol,
      uint16_t header_checksum, const Bytes &src_address, const Bytes &dest_address)
-    : _version(4), _IHL(IHL), _TOS(TOS), _total_length(total_length), _identification(identification),
-    _ip_flag_x(0), _ip_flag_d(ip_flag_d), _ip_flag_m(ip_flag_m), _fragment_offset(fragment_offset), _TTL(TTL), _protocol(protocol),
-    _header_checksum(header_checksum), _src_address(src_address), _dest_address(dest_address)
+    : _version(4),
+      _IHL(IHL),
+      _TOS(TOS),
+      _total_length(total_length),
+      _identification(identification),
+      // TODO: maybe change the flags to be from a unified flag variable. check TCP.cpp for reference.  
+     _ip_flag_x(0),
+     _ip_flag_d(ip_flag_d),
+     _ip_flag_m(ip_flag_m),
+     _fragment_offset(fragment_offset),
+     _TTL(TTL), _protocol(protocol),
+     _header_checksum(header_checksum),
+     _src_address(src_address),
+     _dest_address(dest_address)
 {
 }
 
 void Ip::from_bytes(const Bytes& data)
 {
-    if (data.size() != 20) 
+    if (data.size() < 20) 
     // ip header minimum size when IHL = 5 and there`s no options field
     {
-        EXCEPTION(BaseException, "Invalid IPv4 header length");
+        throw EXCEPTION(BaseException, "Invalid IPv4 header length");
     }
 
     _version = (data[0] & 0xf0) >> 4; // Grab left nibble
     _IHL = data[0] & 0x0f; // Grab right nibble
+
+    if (this->_IHL < 5)
+    {
+        throw EXCEPTION(BaseException, "Invalid IHL (too small)");
+    }
+
+    if (this->_IHL > 15)
+    {
+        throw EXCEPTION(BaseException, "Invalid IHL (too big)");
+    }
+    
+    // ?? Ask Alon: i can use both data.size() and the field total length to check if the IHL field is correct, which one should i use?
+    size_t header_bytes = _IHL * 4; // IHL represents header length in words of 32-bits
+    if (data.size() < header_bytes)
+    {
+        throw EXCEPTION(BaseException, "Data shorter than IHL indicates");
+    }
+    if (data.size() > header_bytes)
+    {
+        throw EXCEPTION(BaseException, "Data larger than IHL indicates");
+    }
+
     _TOS = data[1];
     _total_length = data.slice_int<uint16_t>(2);
     _identification = data.slice_int<uint16_t>(4);
@@ -44,10 +77,10 @@ Bytes Ip::to_bytes()
     result |= int_to_bytes<uint16_t>(this->_total_length);
     result |= int_to_bytes<uint16_t>(this->_identification);
     uint16_t flags_and_offset = 
-    ((_ip_flag_x & 0x1) << 15) |  // Reserved
-    ((_ip_flag_d & 0x1) << 14) |  // DF
-    ((_ip_flag_m & 0x1) << 13) |  // MF
-    (_fragment_offset & 0x1FFF);  // 13-bit offset
+    ((this->_ip_flag_x & 0x1) << 15) |  // Reserved
+    ((this->_ip_flag_d & 0x1) << 14) |  // DF
+    ((this->_ip_flag_m & 0x1) << 13) |  // MF
+    (this->_fragment_offset & 0x1FFF);  // 13-bit offset
     result |= int_to_bytes<uint16_t>(flags_and_offset);
     result |= int_to_bytes<uint8_t>(this->_TTL);
     result |= int_to_bytes<uint8_t>(this->_protocol);

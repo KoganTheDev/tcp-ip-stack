@@ -1,7 +1,30 @@
 #pragma once
 
 #include <stdint.h>
+#include "exceptions.h"
 #include "bytes.h"
+
+// Throws a system exception
+// Prints the following: a message, the error number, file, func and the specific line
+void system_wrapper(const std::string &command);
+
+// In a string, replace each substring with another substring
+std::string string_replace_all(const std::string& str, const std::string& to_replace, const std::string& replace_with);
+
+// Turns a hexadecimal character to an integer
+uint8_t hex_char_to_int(char character);
+
+// Turn a decimal character to an integer
+uint8_t decimal_char_to_int(char character);
+
+// Turns a byte into a hexadecimal string representation
+std::string byte_to_hex(uint8_t byte);
+
+// Turns a byte into a decimal string representation
+std::string byte_to_decimal(uint8_t byte);
+
+// Turns a decimal string representation to an integer
+uint8_t decimal_to_byte(const std::string& decimal);
 
 // Converts a Big Endian byte sequence to unsigned int
 template <typename T>

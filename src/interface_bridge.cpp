@@ -1,6 +1,7 @@
-#include <stdlib.h>
 #include "interface_bridge.h"
 #include "exceptions.h"
+#include "utils.h"
+#include <stdlib.h>
 
 InterfaceBridge::InterfaceBridge(const std::string& bridge_name)
     : _bridge_name(bridge_name), _interfaces(), _is_active(false)
@@ -28,13 +29,13 @@ void InterfaceBridge::stop()
 void InterfaceBridge::_create_bridge()
 {
     std::string command = "sudo ip link add name " + this->_bridge_name + " type bridge";
-    _system_wrapper(command);
+    system_wrapper(command);
 }
 
 void InterfaceBridge::add_interface(const std::string& interface)
 {
     std::string command = "sudo ip link set " + interface + " master " + this->_bridge_name;
-    _system_wrapper(command);
+    system_wrapper(command);
 
     this->_interfaces.push_back(interface);
 }
@@ -42,14 +43,5 @@ void InterfaceBridge::add_interface(const std::string& interface)
 void InterfaceBridge::_delete_bridge()
 {
     std::string command = "sudo ip link delete " + this->_bridge_name;
-    _system_wrapper(command);
-}
-
-void InterfaceBridge::_system_wrapper(const std::string &command)
-{
-    int return_value = system(command.c_str()); 
-    if (return_value != 0)
-    {
-        throw EXCEPTION(BaseException, "Error in command \"" + command + "\", return value " + std::to_string(return_value));
-    }
+    system_wrapper(command);
 }
