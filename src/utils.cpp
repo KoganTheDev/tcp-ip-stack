@@ -66,6 +66,11 @@ std::string byte_to_hex(uint8_t byte)
 
 std::string byte_to_decimal(uint8_t byte)
 {
+    if (byte == 0)
+    {
+        return "0";
+    }
+
     const std::string digits = "0123456789";
     std::string result;
     while (byte > 0)

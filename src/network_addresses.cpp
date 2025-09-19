@@ -95,7 +95,13 @@ const Bytes& IPv4Address::get_address() const
     return this->_address;
 }
 
-bool IPv4Address::operator==(const IPv4Address& other) const
+std::size_t std::hash<IPv4Address>::operator()(const IPv4Address& ip_address) const noexcept
+{
+    return std::hash<uint32_t>{}(bytes_to_int<uint32_t>(ip_address.get_address()));
+}
+
+
+bool IPv4Address::operator==(const IPv4Address &other) const noexcept
 {
     return this->_address == other._address;
 }

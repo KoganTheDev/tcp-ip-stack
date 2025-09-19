@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <functional> // Used for hashing
 #include "bytes.h"
 
 class MacAddress
@@ -30,11 +31,17 @@ public:
 
     const Bytes& get_address() const;
     std::string to_string() const;
-    bool operator==(const IPv4Address& other) const;
+    bool operator==(const IPv4Address& other) const noexcept;
 
 private:
     Bytes _address;
 };
 
-
-
+namespace std
+{
+    template<>
+    struct hash<IPv4Address>
+    {
+        std::size_t operator()(const IPv4Address& ip_address) const noexcept; // Hash an IPv4 address for a hash map
+    };
+};

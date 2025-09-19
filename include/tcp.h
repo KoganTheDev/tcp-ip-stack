@@ -7,12 +7,14 @@
 class Tcp : ProtocolLayer
 {
 public:
-    // ? Ask Alon what about the options field?
     Tcp(uint16_t src_port, uint16_t dest_port, uint32_t sequence_number, uint32_t acknowledgement_number, uint8_t data_offset,
         uint8_t tcp_flags, uint16_t window, uint16_t checksum, uint16_t urgent_pointer);
+    Tcp(const Bytes& bytes); // Constructor that gets a bytestream and serializes it directly into an TCP object
 
     void from_bytes(const Bytes& data);
     Bytes to_bytes();
+    virtual std::string to_string() const;
+
 
     // Accessors
     uint16_t get_src_port() const { return _src_port; }

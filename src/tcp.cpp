@@ -23,6 +23,10 @@ Tcp::Tcp(uint16_t src_port, uint16_t dest_port, uint32_t sequence_number, uint32
 {
 }
 
+Tcp::Tcp(const Bytes &bytes)
+{
+	this->from_bytes(bytes);
+}
 
 void Tcp::from_bytes(const Bytes& data)
 {
@@ -88,4 +92,40 @@ Bytes Tcp::to_bytes()
 	result |= int_to_bytes<uint16_t>(this->_window);
 	result |= int_to_bytes<uint16_t>(this->_checksum);
 	result |= int_to_bytes<uint16_t>(this->_urgent_ptr);
+}
+
+std::string Tcp::to_string() const
+{
+	    std::string result;
+
+    result = this->_protocol_header_to_string("Tcp");
+    result += this->_field_to_string("source port", int_to_bytes<uint16_t>(this->_src_port).to_hex());
+    result += this->_field_to_string("destination port", int_to_bytes<uint16_t>(this->_dest_port).to_hex());
+    result += this->_field_to_string("sequence number", int_to_bytes<uint32_t>(this->_sequence_number).to_hex());
+	result += this->_field_to_string("sequence number", int_to_bytes<uint32_t>(this->_acknowledgement_number).to_hex());
+	result += this->_field_to_string("data offset", byte_to_hex(this->_data_offset));
+
+	uint8_t flags = 
+	(this->_cwr & 0x01) << 7 |
+	(this->_ece & 0x01) << 6 | 
+	(this->_urg & 0x01) << 5 | 
+	(this->_ack & 0x01) << 4 |
+	(this->_psh & 0x01) << 3 |
+	(this->_rst & 0x01) << 2 |
+	(this->_syn & 0x01) << 1 |
+	(this->_fin & 0x01);
+
+
+    result += this->_field_to_string("tcp flags", "0x" + byte_to_hex(flags));
+	result += this->_field_to_string("window", int_to_bytes<uint16_t>(this->_window).to_hex());
+    result += this->_field_to_string("checksum", int_to_bytes<uint16_t>(this->_checksum).to_hex());
+    result += this->_field_to_string("urgent pointer", int_to_bytes<uint16_t>(this->_urgent_ptr).to_hex());
+
+
+    if (this->_next_layer)
+    {
+        result += this->_next_layer->to_string();
+    }
+    
+    return result;
 }

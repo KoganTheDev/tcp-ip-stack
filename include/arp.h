@@ -28,9 +28,8 @@ public:
         ArpOperation operation, const MacAddress& sender_hardware_address, const IPv4Address& sender_protocol_address, 
         const MacAddress& target_hardware_address, const IPv4Address& target_protocol_address
     );
-    // Constructor for arp request
     Arp(const MacAddress& sender_hardware_address, const IPv4Address& sender_protocol_address, const IPv4Address& target_protocol_address);
-    Arp(const Bytes& bytes);
+    Arp(const Bytes& bytes); // Constructor that gets a bytestream and serializes it directly into an ARP object
     
     void from_bytes(const Bytes& data);
     Bytes to_bytes();

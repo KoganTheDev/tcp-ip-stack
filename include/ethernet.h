@@ -6,6 +6,7 @@
 
 enum EtherType 
 {
+    IPv4 = 0x0800,
     ARP = 0x0806,
 };
 
@@ -14,7 +15,7 @@ class Ethernet : public ProtocolLayer
 {
 public:
     Ethernet() = default;
-    Ethernet(const Bytes& data);
+    Ethernet(const Bytes& data); // Constructor that gets a bytestream and serializes it directly into an Ethernet object
     Ethernet(const MacAddress& src, const MacAddress& dest, EtherType ethernet_protocol);
 
     // Implement protocol layer interface

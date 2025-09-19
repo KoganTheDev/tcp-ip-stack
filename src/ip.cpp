@@ -1,5 +1,6 @@
 #include "ip.h"
 #include "utils.h"
+#include "network_addresses.h"
 
 Ip::Ip(uint8_t version, uint8_t IHL, uint8_t TOS, uint16_t total_length, uint16_t identification,
      bool ip_flag_x, bool ip_flag_d, bool ip_flag_m, uint16_t fragment_offset, uint8_t TTL, uint8_t protocol,
@@ -19,6 +20,11 @@ Ip::Ip(uint8_t version, uint8_t IHL, uint8_t TOS, uint16_t total_length, uint16_
      _src_address(src_address),
      _dest_address(dest_address)
 {
+}
+
+Ip::Ip(const Bytes &bytes)
+{
+    this->from_bytes(bytes);
 }
 
 void Ip::from_bytes(const Bytes& data)
@@ -48,10 +54,11 @@ void Ip::from_bytes(const Bytes& data)
     {
         throw EXCEPTION(BaseException, "Data shorter than IHL indicates");
     }
-    if (data.size() > header_bytes)
-    {
-        throw EXCEPTION(BaseException, "Data larger than IHL indicates");
-    }
+    //* Note, causes exceptions, probably wrong one when slicing from a full packet to an ARP frame
+    // if (data.size() > header_bytes)
+    // {
+    //     throw EXCEPTION(BaseException, "Data larger than IHL indicates");
+    // }
 
     _TOS = data[1];
     _total_length = data.slice_int<uint16_t>(2);
@@ -88,3 +95,30 @@ Bytes Ip::to_bytes()
     result |= this->_src_address;
     result |= this->_dest_address;
 }
+
+std::string Ip::to_string() const
+{
+    std::string result;
+    result = this->_protocol_header_to_string("IPv4");
+    result += this->_field_to_string("verstion", byte_to_hex(this->_version));
+    result += this->_field_to_string("IHL", byte_to_hex(this->_IHL));
+    result += this->_field_to_string("TOS", byte_to_hex(this->_TOS));
+    result += this->_field_to_string("total length", int_to_bytes<uint16_t>(this->_total_length).to_hex());
+    result += this->_field_to_string("idendtification", int_to_bytes<uint16_t>(this->_identification).to_hex());
+
+    // IP flags
+    uint16_t flags_and_offset = 
+    ((this->_ip_flag_x & 0x1) << 15) |  // Reserved
+    ((this->_ip_flag_d & 0x1) << 14) |  // DF
+    ((this->_ip_flag_m & 0x1) << 13) |  // MF
+    (this->_fragment_offset & 0x1FFF);  // 13-bit offset
+    result += this->_field_to_string("IP flags and offset", byte_to_hex(flags_and_offset));
+
+    result += this->_field_to_string("TTL", byte_to_hex(this->_version));
+    result += this->_field_to_string("header checksum", int_to_bytes<uint16_t>(this->_header_checksum).to_hex());
+    result += this->_field_to_string("src address", IPv4Address(this->_src_address).to_string());
+    result += this->_field_to_string("dest address", IPv4Address(this->_dest_address).to_string());
+
+    return result;
+}
+

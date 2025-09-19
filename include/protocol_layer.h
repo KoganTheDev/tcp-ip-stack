@@ -15,6 +15,8 @@ public:
     // concat layers
     ProtocolLayer& operator/=(std::unique_ptr<ProtocolLayer>);
 
+    const ProtocolLayer& get_next_layer() const { return *this->_next_layer; }
+    
 protected:
     void encapsulate(std::unique_ptr<ProtocolLayer> next_layer);
     template <typename T>
@@ -25,6 +27,7 @@ protected:
     // Returns a formatted string of the protocol name
     static std::string _protocol_header_to_string(const std::string& protocol_name);
     
+
     std::unique_ptr<ProtocolLayer> _next_layer;
 };
 

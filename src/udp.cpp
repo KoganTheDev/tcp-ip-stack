@@ -1,13 +1,18 @@
 #include "udp.h"
 #include "utils.h"
+#include "raw.h"
 
 Udp::Udp(uint16_t src_port, uint16_t dest_port, uint16_t length, uint16_t checksum, const Bytes& data)
     : _src_port(src_port),
       _dest_port(dest_port),
       _length(length),
-      _checksum(checksum),
-      _data(data)
+      _checksum(checksum)
 {
+}
+
+Udp::Udp(const Bytes &bytes)
+{
+    this->from_bytes(bytes);
 }
 
 void Udp::from_bytes(const Bytes& data)
@@ -16,11 +21,11 @@ void Udp::from_bytes(const Bytes& data)
     this->_dest_port = data.slice_int<uint16_t>(2);
     this->_length = data.slice_int<uint16_t>(4);
     this->_checksum = data.slice_int<uint16_t>(6);
-    this->_data = data.slice(8, data.size() - 8);
+    this->_next_layer = std::make_unique<Raw>(data.slice(8));
 
-    if (this->_length * 8 != bytes_to_int<uint16_t>(this->_data)) // length field is represented in octets
+    if (this->_length * 8 != data.size())
     {
-        throw EXCEPTION(BaseException, "Invalid UDP header");
+        throw EXCEPTION(BaseException, "Invalid UDP header size");
     }
 }
 
@@ -31,6 +36,11 @@ Bytes Udp::to_bytes()
     result |= int_to_bytes<uint16_t>(this->_dest_port);
     result |= int_to_bytes<uint16_t>(this->_length);
     result |= int_to_bytes<uint16_t>(this->_checksum);
-    result |= _data;
+
+    if (this->_next_layer)
+    {
+        result |= this->_next_layer->to_bytes();
+    }
+
     return result;
 }

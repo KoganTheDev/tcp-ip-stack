@@ -1,15 +1,15 @@
 #include "raw_socket.h"
 #include <string>
-#include <net/if.h>
 #include <string.h>
+#include <net/if.h>
 #include <sys/ioctl.h>
 #include <linux/if_packet.h>
 #include <netinet/ether.h>
 #include <netinet/in.h>
 #include <unistd.h>
-#include "exceptions.h"
-
 #include <iostream>
+
+#include "exceptions.h"
 #include "utils.h"
 
 RawSocket::RawSocket(const std::string& interface_name)
@@ -33,7 +33,7 @@ RawSocket::~RawSocket()
     this->_close_socket();
 }
 
-ssize_t RawSocket::send(const Bytes& data, MacAddress target)
+ssize_t RawSocket::send(const Bytes& data, MacAddress target) const
 {
     struct sockaddr_ll socket_address = {0};
     socket_address.sll_ifindex = this->_interface_index;
@@ -50,12 +50,12 @@ ssize_t RawSocket::send(const Bytes& data, MacAddress target)
     return bytes_sent;
 }
 
-ssize_t RawSocket::send(const Bytes &data)
+ssize_t RawSocket::send(const Bytes &data) const
 {
     return this->send(data, MacAddress::BROADCAST);
 }
 
-Bytes RawSocket::recv(size_t size)
+Bytes RawSocket::recv(size_t size) const
 {
     Bytes buffer(size);
     ssize_t bytes_received = recvfrom(this->_fd, buffer.data(), size, 0, NULL, NULL);
@@ -69,14 +69,14 @@ Bytes RawSocket::recv(size_t size)
     return buffer;
 }
 
-const MacAddress &RawSocket::get_mac_address()
+const MacAddress &RawSocket::get_mac_address() const
 {
     return this->_interface_mac;
 }
 
 void RawSocket::_create_socket()
 {
-    int sockfd = socket(AF_PACKET, SOCK_RAW, htons(0x0800));
+    int sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (sockfd < 0)
     {
         throw EXCEPTION(SystemException, "Failed to create a socket");

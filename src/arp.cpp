@@ -18,11 +18,10 @@ Arp::Arp(ArpOperation operation, const MacAddress& sender_hardware_address, cons
 }
 
 Arp::Arp(const MacAddress &sender_hardware_address, const IPv4Address &sender_protocol_address, const IPv4Address &target_protocol_address) 
- : Arp(ArpOperation::REQUEST, sender_hardware_address, sender_protocol_address, MacAddress("00:00:00:00:00:00"), sender_protocol_address)
+ : Arp(ArpOperation::REQUEST, sender_hardware_address, sender_protocol_address, MacAddress("00:00:00:00:00:00"), target_protocol_address)
 {
 }
 
-//TODO: implement this kind of function to all of the protocols
 Arp::Arp(const Bytes& bytes)
 {
     this->from_bytes(bytes);

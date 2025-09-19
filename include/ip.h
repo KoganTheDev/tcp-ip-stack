@@ -11,9 +11,11 @@ public:
     Ip(uint8_t version, uint8_t _IHL, uint8_t TOS, uint16_t total_length, uint16_t identification,
         bool ip_flag_x, bool _ip_flag_d, bool _ip_flag_m, uint16_t fragment_offset, uint8_t TTL, uint8_t protocol,
         uint16_t header_checksum, const Bytes& src_address, const Bytes& dest_address);
+    Ip(const Bytes& bytes); // Constructor that gets a bytestream and serializes it directly into an IP object
 
     void from_bytes(const Bytes& data);
     Bytes to_bytes();
+    virtual std::string to_string() const;
 
     uint8_t get_version() const { return _version; }
     uint8_t get_IHL() const { return _IHL; }

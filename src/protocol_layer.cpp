@@ -2,7 +2,7 @@
 #include "exceptions.h"
 
 
-ProtocolLayer &ProtocolLayer::operator/=(std::unique_ptr<ProtocolLayer> other)
+ProtocolLayer& ProtocolLayer::operator/=(std::unique_ptr<ProtocolLayer> other)
 {
     this->encapsulate(std::move(other));
     return *this;

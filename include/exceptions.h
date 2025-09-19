@@ -5,6 +5,8 @@
 
 #define EXCEPTION(exception_class, message) exception_class((message), __FILE__, __func__, __LINE__)
 
+#define DEFAULT_EXCEPTION_PARAMS const std::string& file="unknown_file", const std::string& func="unknown_func", unsigned int line=0
+
 class BaseException : public std::exception
 {
 public:
