@@ -123,9 +123,10 @@ void TcpConnection::_handle_fin()
     {
         _transition(TcpState::CLOSE_WAIT);
         _send_pure_ack();
-        // this stack has no deferred-write model - there's nothing to wait
-        // for, so half-close our side back immediately
-        close();
+        // CLOSE_WAIT means exactly this: the peer is done sending, but we
+        // may still have a response in flight (e.g. queued on a worker
+        // thread via a completion queue) - the application calls close()
+        // once it actually has nothing left to send, not automatically here
         return;
     }
 

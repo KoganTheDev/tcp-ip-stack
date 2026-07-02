@@ -95,6 +95,15 @@ void Server::_handle_new_connections()
                 this->_completion_queue.push([connection, response]()
                 {
                     connection->send(response);
+
+                    // the peer already sent its FIN (CLOSE_WAIT) and we've
+                    // now sent everything we had for it - safe to close our
+                    // side. TcpConnection defers this itself if this send is
+                    // still in flight, so this is never premature.
+                    if (connection->get_state() == TcpState::CLOSE_WAIT)
+                    {
+                        connection->close();
+                    }
                 });
             });
         });
