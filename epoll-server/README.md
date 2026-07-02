@@ -1,28 +1,51 @@
 # epoll-server
 
-A multithreaded TCP echo server on Linux, built directly on `epoll` - no framework.
+A multithreaded TCP echo server on Linux - built on `epoll`, but talking TCP through
+this repo's own from-scratch Ethernet/ARP/IP/TCP stack (`../include/network_stack.h`)
+over a TAP device, not kernel sockets. No framework, no kernel TCP/IP involved at all
+for the connections this server serves.
 
 ## Architecture
 
-- `SocketWrapper` - non-blocking listening socket (`socket`/`bind`/`listen`/`accept`)
+- `NetworkStack` (root project) - owns the TAP device, ARP table, and TCP connection
+  table; this is what actually accepts connections and moves bytes
+- `TcpConnection` (root project) - one connection's TCP state machine (handshake,
+  sequencing, retransmission, teardown)
 - `EpollWrapper` - thin wrapper over `epoll_create1`/`epoll_ctl`/`epoll_wait`
 - `ThreadPool` - fixed-size worker pool with a task queue
-- `Server` - one thread runs the `epoll_wait` loop and accepts connections; each ready
-  client fd is handed to the thread pool as a task. Client fds are registered
-  `EPOLLIN | EPOLLET | EPOLLONESHOT`, so a fd is only ever in one worker's hands at a
-  time - it gets re-armed after that worker finishes reading, instead of being locked.
+- `CompletionQueue` - an `eventfd`-backed handoff from worker threads back to the
+  reactor thread
+- `Server` - runs the `epoll_wait` loop
+
+### Why this looks different from a kernel-socket epoll server
+
+A kernel-socket version has one fd per connection, so epoll can fan connections out
+across worker threads directly - each fd is independent. Here there is exactly one
+real fd: the TAP device. Every "connection" is a userspace abstraction demultiplexed
+from frames arriving on that one fd, and `NetworkStack`/`TcpConnection` are not
+thread-safe - only the reactor thread (the one running the `epoll_wait` loop) may
+touch them.
+
+So the thread pool's role shifts: a worker computes a connection's response (the
+"work" - a plain echo here, but this is the seam where real per-connection processing
+would go) off the reactor thread, then hands the result back through
+`CompletionQueue`, which the reactor drains and applies (calling
+`TcpConnection::send()`) itself. `EPOLLONESHOT` isn't used or needed here, since
+connections are never registered as separate epoll fds in the first place.
+
+**Known limitation**: the completion handoff holds a raw `TcpConnection*`. If a peer
+resets/closes and `NetworkStack` reaps that connection before the worker's result
+comes back, the pointer dangles - not guarded against. Low risk for a quick
+request/response workload; unsafe for a sustained one under real load.
 
 ## Build & run
 
 ```sh
 make
-./epoll-server
+sudo ./epoll-server
 ```
 
-Listens on port 8080, echoes back whatever it reads. `Ctrl+C` shuts it down cleanly.
-
-## Status
-
-Scaffold stage - single-`epoll`-instance-shared-across-threads architecture, not yet
-load-tested. See the effort/project pages in the LLM wiki for the open decisions
-(e.g. `SO_REUSEPORT` sharding as an alternative to the shared-instance model here).
+Requires root (opens `/dev/net/tun`). Brings up a TAP interface at `10.0.0.2` and
+listens on TCP port 8080 - see the project page in the LLM wiki for how to reach it
+from a real kernel TCP client on the same machine. `Ctrl+C`/`SIGTERM` shut it down
+cleanly.

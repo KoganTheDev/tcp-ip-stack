@@ -1,23 +1,45 @@
 #include "server.h"
 #include "exceptions.h"
 
+#include <sys/timerfd.h>
 #include <unistd.h>
-#include <array>
-#include <cerrno>
 #include <iostream>
 
 namespace
 {
-    // EPOLLONESHOT means a ready fd fires exactly once and must be re-armed
-    // after processing - that's what lets multiple worker threads share one
-    // epoll instance without two threads ever touching the same connection.
-    constexpr uint32_t CLIENT_EVENTS = EPOLLIN | EPOLLET | EPOLLONESHOT;
+    constexpr long RETRANSMIT_TICK_MS = 500;
 }
 
 Server::Server(uint16_t port, size_t worker_count)
-    : _listen_socket(port), _epoll(), _thread_pool(worker_count)
+    : _port(port),
+      _network_stack("/dev/net/tun", MacAddress("02:00:00:00:00:01"), IPv4Address("10.0.0.2")),
+      _epoll(), _thread_pool(worker_count), _completion_queue(), _timer_fd(-1)
 {
-    this->_epoll.add(this->_listen_socket.get_fd(), EPOLLIN);
+    this->_network_stack.listen(port);
+    this->_epoll.add(this->_network_stack.get_fd(), EPOLLIN | EPOLLET);
+    this->_epoll.add(this->_completion_queue.get_fd(), EPOLLIN | EPOLLET);
+    this->_create_retransmit_timer();
+}
+
+void Server::_create_retransmit_timer()
+{
+    this->_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    if (this->_timer_fd < 0)
+    {
+        throw EXCEPTION(SystemException, "timerfd_create() failed");
+    }
+
+    itimerspec interval = {};
+    interval.it_value.tv_sec = RETRANSMIT_TICK_MS / 1000;
+    interval.it_value.tv_nsec = (RETRANSMIT_TICK_MS % 1000) * 1000000L;
+    interval.it_interval = interval.it_value;
+
+    if (timerfd_settime(this->_timer_fd, 0, &interval, nullptr) < 0)
+    {
+        throw EXCEPTION(SystemException, "timerfd_settime() failed");
+    }
+
+    this->_epoll.add(this->_timer_fd, EPOLLIN);
 }
 
 void Server::run(const volatile std::sig_atomic_t& stop_flag)
@@ -28,88 +50,53 @@ void Server::run(const volatile std::sig_atomic_t& stop_flag)
 
         for (const epoll_event& event : events)
         {
-            if (event.data.fd == this->_listen_socket.get_fd())
+            if (event.data.fd == this->_network_stack.get_fd())
             {
+                this->_network_stack.poll();
                 this->_handle_new_connections();
-                continue;
             }
-
-            int client_fd = event.data.fd;
-            this->_thread_pool.submit([this, client_fd]
+            else if (event.data.fd == this->_timer_fd)
             {
-                this->_handle_client_event(client_fd);
-            });
+                uint64_t expirations = 0;
+                while (read(this->_timer_fd, &expirations, sizeof(expirations)) > 0)
+                {
+                    // just draining the expiration counter
+                }
+                this->_network_stack.on_timer_tick();
+            }
+            else if (event.data.fd == this->_completion_queue.get_fd())
+            {
+                this->_completion_queue.drain_and_run();
+            }
         }
     }
 }
 
 void Server::_handle_new_connections()
 {
-    // the listening socket is edge-triggered, so every pending connection
-    // must be drained now - epoll won't report it again until a new one arrives
-    while (true)
+    while (TcpConnection* connection = this->_network_stack.accept(this->_port))
     {
-        int client_fd = this->_listen_socket.accept_connection();
-        if (client_fd < 0)
+        connection->set_data_received_callback([this, connection](const Bytes& data)
         {
-            break;
-        }
-
-        try
-        {
-            this->_epoll.add(client_fd, CLIENT_EVENTS);
-        }
-        catch (const std::exception& e)
-        {
-            // registering this one connection failed - drop just this fd
-            // instead of leaking it or taking down the accept loop
-            std::cerr << "Server: epoll_ctl(ADD) failed for a new connection: " << e.what() << std::endl;
-            close(client_fd);
-        }
-    }
-}
-
-void Server::_handle_client_event(int client_fd)
-{
-    std::array<char, 4096> buffer;
-
-    while (true)
-    {
-        ssize_t bytes_read = ::read(client_fd, buffer.data(), buffer.size());
-
-        if (bytes_read > 0)
-        {
-            ssize_t bytes_written = ::write(client_fd, buffer.data(), bytes_read);
-            if (bytes_written < 0)
+            // The "work" (a plain echo here, but this is the seam where
+            // real per-connection processing would go) runs on a worker
+            // thread; the result is applied back on the reactor thread via
+            // the completion queue, since NetworkStack/TcpConnection are
+            // only safe to touch from there.
+            //
+            // Known limitation: `connection` is a raw pointer owned by
+            // NetworkStack. If the peer resets/closes and NetworkStack
+            // reaps this connection before the worker's result comes back,
+            // this dangles - not guarded against. Low risk for a quick
+            // request/response workload; unsafe for a sustained one.
+            this->_thread_pool.submit([this, connection, data]()
             {
-                // peer likely reset/closed the connection (EPIPE/ECONNRESET) -
-                // SIGPIPE is ignored in main(), so this is the only signal of it
-                this->_close_client(client_fd);
-                return;
-            }
-            continue;
-        }
-
-        if (bytes_read == 0)
-        {
-            this->_close_client(client_fd);
-            return;
-        }
-
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-        {
-            // drained everything available right now - re-arm for the next event
-            this->_epoll.modify(client_fd, CLIENT_EVENTS);
-            return;
-        }
-
-        this->_close_client(client_fd);
-        return;
+                Bytes response = data;
+                this->_completion_queue.push([connection, response]()
+                {
+                    connection->send(response);
+                });
+            });
+        });
     }
-}
-
-void Server::_close_client(int client_fd)
-{
-    this->_epoll.remove(client_fd);
-    close(client_fd);
 }

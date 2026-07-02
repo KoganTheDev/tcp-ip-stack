@@ -1,5 +1,6 @@
 #include <iostream>
 #include <csignal>
+#include <unistd.h>
 
 #include "server.h"
 #include "exceptions.h"
@@ -19,18 +20,21 @@ int main()
     const uint16_t PORT = 8080;
     const size_t WORKER_COUNT = 4;
 
+    if (geteuid() != 0)
+    {
+        std::cerr << "This program must be run as root (it opens /dev/net/tun). Exiting." << std::endl;
+        return 1;
+    }
+
     try
     {
         std::signal(SIGINT, handle_shutdown_signal);
         std::signal(SIGTERM, handle_shutdown_signal);
-
-        // write()/send() to a peer that already closed its end raises SIGPIPE,
-        // whose default action terminates the whole process over one dead
-        // connection - ignore it and handle the EPIPE/ECONNRESET return instead
-        std::signal(SIGPIPE, SIG_IGN);
+        std::signal(SIGPIPE, SIG_IGN); // defensive - nothing here writes to a raw kernel socket anymore
 
         Server server(PORT, WORKER_COUNT);
-        std::cout << "epoll-server listening on port " << PORT << std::endl;
+        std::cout << "epoll-server listening on TCP port " << PORT
+                   << " (custom Ethernet/ARP/IP/TCP stack, no kernel sockets)" << std::endl;
 
         server.run(g_stop_flag);
 
