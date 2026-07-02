@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <array>
 #include <cerrno>
+#include <iostream>
 
 namespace
 {
@@ -54,7 +55,17 @@ void Server::_handle_new_connections()
             break;
         }
 
-        this->_epoll.add(client_fd, CLIENT_EVENTS);
+        try
+        {
+            this->_epoll.add(client_fd, CLIENT_EVENTS);
+        }
+        catch (const std::exception& e)
+        {
+            // registering this one connection failed - drop just this fd
+            // instead of leaking it or taking down the accept loop
+            std::cerr << "Server: epoll_ctl(ADD) failed for a new connection: " << e.what() << std::endl;
+            close(client_fd);
+        }
     }
 }
 
@@ -68,7 +79,14 @@ void Server::_handle_client_event(int client_fd)
 
         if (bytes_read > 0)
         {
-            ::write(client_fd, buffer.data(), bytes_read);
+            ssize_t bytes_written = ::write(client_fd, buffer.data(), bytes_read);
+            if (bytes_written < 0)
+            {
+                // peer likely reset/closed the connection (EPIPE/ECONNRESET) -
+                // SIGPIPE is ignored in main(), so this is the only signal of it
+                this->_close_client(client_fd);
+                return;
+            }
             continue;
         }
 
