@@ -22,6 +22,12 @@ int main()
     try
     {
         std::signal(SIGINT, handle_shutdown_signal);
+        std::signal(SIGTERM, handle_shutdown_signal);
+
+        // write()/send() to a peer that already closed its end raises SIGPIPE,
+        // whose default action terminates the whole process over one dead
+        // connection - ignore it and handle the EPIPE/ECONNRESET return instead
+        std::signal(SIGPIPE, SIG_IGN);
 
         Server server(PORT, WORKER_COUNT);
         std::cout << "epoll-server listening on port " << PORT << std::endl;

@@ -1,4 +1,5 @@
 #include "thread_pool.h"
+#include <iostream>
 
 ThreadPool::ThreadPool(size_t worker_count)
     : _stopping(false)
@@ -54,6 +55,20 @@ void ThreadPool::_worker_loop()
             this->_tasks.pop();
         }
 
-        task();
+        // a task throwing must never escape a worker thread - an uncaught
+        // exception here calls std::terminate and takes the whole process down
+        // with it, over what should be at most one broken connection
+        try
+        {
+            task();
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "ThreadPool: task threw: " << e.what() << std::endl;
+        }
+        catch (...)
+        {
+            std::cerr << "ThreadPool: task threw a non-std::exception" << std::endl;
+        }
     }
 }
