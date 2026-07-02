@@ -5,6 +5,13 @@
 #include "exceptions.h"
 #include "vector"
 
+enum IpProtocol
+{
+    ICMP = 1,
+    TCP = 6,
+    UDP = 17,
+};
+
 class Ip : public ProtocolLayer
 {
 public:

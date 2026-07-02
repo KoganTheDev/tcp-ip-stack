@@ -1,14 +1,15 @@
 #include "tcp.h"
 #include "utils.h"
 #include "exceptions.h"
+#include "raw.h"
 
 
 Tcp::Tcp(uint16_t src_port, uint16_t dest_port, uint32_t sequence_number, uint32_t acknowledgement_number,
      uint8_t data_offset, uint8_t tcp_flags,uint16_t window, uint16_t checksum, uint16_t urgent_pointer)
     : _src_port(src_port),
 	  _dest_port(dest_port),
-	  _sequence_number(_sequence_number),
-	  _acknowledgement_number(_acknowledgement_number),
+	  _sequence_number(sequence_number),
+	  _acknowledgement_number(acknowledgement_number),
       _data_offset(data_offset),
 	  _cwr(tcp_flags & 0x80),
 	  _ece(tcp_flags & 0x40),
@@ -30,7 +31,7 @@ Tcp::Tcp(const Bytes &bytes)
 
 void Tcp::from_bytes(const Bytes& data)
 {
-	if (20 > data.size() || data.size() > 60)
+	if (data.size() < 20)
 	{
 		throw EXCEPTION(BaseException, "Invalid TCP header length");
 	}
@@ -56,12 +57,19 @@ void Tcp::from_bytes(const Bytes& data)
 	_ack = flags & 0x10;
 	_psh = flags & 0x08;
 	_rst = flags & 0x04;
-	_syn = flags & 0x01;
+	_syn = flags & 0x02;
 	_fin = flags & 0x01;
 
 	_window = data.slice_int<uint16_t>(14);
 	_checksum = data.slice_int<uint16_t>(16);
 	_urgent_ptr = data.slice_int<uint16_t>(18);
+
+	// options (if any) live between byte 20 and header_length are not parsed -
+	// this stack never sends them and skips over them on receive
+	if (data.size() > header_length)
+	{
+		this->_next_layer = std::make_unique<Raw>(data.slice(header_length));
+	}
 }
 
 
@@ -92,6 +100,13 @@ Bytes Tcp::to_bytes()
 	result |= int_to_bytes<uint16_t>(this->_window);
 	result |= int_to_bytes<uint16_t>(this->_checksum);
 	result |= int_to_bytes<uint16_t>(this->_urgent_ptr);
+
+	if (this->_next_layer)
+	{
+		result |= this->_next_layer->to_bytes();
+	}
+
+	return result;
 }
 
 std::string Tcp::to_string() const

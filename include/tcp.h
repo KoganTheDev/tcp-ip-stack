@@ -4,7 +4,7 @@
 #include "protocol_layer.h"
 #include <stdbool.h>
 
-class Tcp : ProtocolLayer
+class Tcp : public ProtocolLayer
 {
 public:
     Tcp(uint16_t src_port, uint16_t dest_port, uint32_t sequence_number, uint32_t acknowledgement_number, uint8_t data_offset,
@@ -20,7 +20,7 @@ public:
     uint16_t get_src_port() const { return _src_port; }
     uint16_t get_dest_port() const { return _dest_port; }
     uint32_t get_sequence_number() const { return _sequence_number; }
-    uint8_t get_acknowledgement_number() const { return _acknowledgement_number; }
+    uint32_t get_acknowledgement_number() const { return _acknowledgement_number; }
     uint8_t get_data_offset() const { return _data_offset; }
     bool get_cwr() const { return _cwr; }
     bool get_ece() const { return _ece; }

@@ -8,6 +8,10 @@ Udp::Udp(uint16_t src_port, uint16_t dest_port, uint16_t length, uint16_t checks
       _length(length),
       _checksum(checksum)
 {
+    if (!data.empty())
+    {
+        this->_next_layer = std::make_unique<Raw>(data);
+    }
 }
 
 Udp::Udp(const Bytes &bytes)
@@ -23,7 +27,7 @@ void Udp::from_bytes(const Bytes& data)
     this->_checksum = data.slice_int<uint16_t>(6);
     this->_next_layer = std::make_unique<Raw>(data.slice(8));
 
-    if (this->_length * 8 != data.size())
+    if (this->_length != data.size())
     {
         throw EXCEPTION(BaseException, "Invalid UDP header size");
     }
@@ -40,6 +44,24 @@ Bytes Udp::to_bytes()
     if (this->_next_layer)
     {
         result |= this->_next_layer->to_bytes();
+    }
+
+    return result;
+}
+
+std::string Udp::to_string() const
+{
+    std::string result;
+
+    result = this->_protocol_header_to_string("Udp");
+    result += this->_field_to_string("source port", int_to_bytes<uint16_t>(this->_src_port).to_hex());
+    result += this->_field_to_string("destination port", int_to_bytes<uint16_t>(this->_dest_port).to_hex());
+    result += this->_field_to_string("length", int_to_bytes<uint16_t>(this->_length).to_hex());
+    result += this->_field_to_string("checksum", int_to_bytes<uint16_t>(this->_checksum).to_hex());
+
+    if (this->_next_layer)
+    {
+        result += this->_next_layer->to_string();
     }
 
     return result;
