@@ -96,7 +96,7 @@ void Ip::from_bytes(const Bytes& data)
     }
 }
 
-Bytes Ip::to_bytes()
+Bytes Ip::_header_to_bytes() const
 {
     Bytes result;
     uint8_t version_and_IHL = (this->_version << 4) | this->_IHL;
@@ -104,7 +104,7 @@ Bytes Ip::to_bytes()
     result |= int_to_bytes<uint8_t>(this->_TOS);
     result |= int_to_bytes<uint16_t>(this->_total_length);
     result |= int_to_bytes<uint16_t>(this->_identification);
-    uint16_t flags_and_offset = 
+    uint16_t flags_and_offset =
     ((this->_ip_flag_x & 0x1) << 15) |  // Reserved
     ((this->_ip_flag_d & 0x1) << 14) |  // DF
     ((this->_ip_flag_m & 0x1) << 13) |  // MF
@@ -115,6 +115,12 @@ Bytes Ip::to_bytes()
     result |= int_to_bytes<uint16_t>(this->_header_checksum);
     result |= this->_src_address;
     result |= this->_dest_address;
+    return result;
+}
+
+Bytes Ip::to_bytes()
+{
+    Bytes result = this->_header_to_bytes();
 
     if (this->_next_layer)
     {
@@ -122,6 +128,12 @@ Bytes Ip::to_bytes()
     }
 
     return result;
+}
+
+void Ip::compute_checksum()
+{
+    this->_header_checksum = 0;
+    this->_header_checksum = internet_checksum(this->_header_to_bytes());
 }
 
 std::string Ip::to_string() const

@@ -17,6 +17,7 @@ public:
     uint16_t get_dest_port() const { return _dest_port; }
     uint16_t get_length() const { return _length; }
     uint16_t get_checksum() const { return _checksum; }
+    void set_checksum(uint16_t checksum) { _checksum = checksum; }
 
 private:
     uint16_t _src_port;

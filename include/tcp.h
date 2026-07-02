@@ -34,6 +34,11 @@ public:
     uint16_t get_checksum() const { return _checksum; }
     uint16_t get_urgent_ptr() const { return _urgent_ptr; }
 
+    // The TCP checksum needs the source/destination IP, which this class
+    // doesn't own - the caller computes it via transport_checksum() (using
+    // to_bytes() with this set to 0 first) and writes the result back here.
+    void set_checksum(uint16_t checksum) { _checksum = checksum; }
+
 
 private:
     uint16_t _src_port; // Identifies the sending port
