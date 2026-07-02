@@ -15,8 +15,12 @@ public:
     // concat layers
     ProtocolLayer& operator/=(std::unique_ptr<ProtocolLayer>);
 
+    // get_next_layer() dereferences unconditionally - check this first,
+    // since a segment with no payload (a pure ACK, for example) leaves
+    // _next_layer null.
+    bool has_next_layer() const { return this->_next_layer != nullptr; }
     const ProtocolLayer& get_next_layer() const { return *this->_next_layer; }
-    
+
 protected:
     void encapsulate(std::unique_ptr<ProtocolLayer> next_layer);
     template <typename T>
