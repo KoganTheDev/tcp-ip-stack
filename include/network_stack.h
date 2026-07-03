@@ -102,6 +102,15 @@ private:
     void _handle_ip(const Ip& ip);
     void _handle_tcp(const Ip& ip, const Tcp& tcp);
     void _reap_closed_connections();
+    // Wires a connection's state-change notification to push its id onto
+    // _pending_reap_ids the instant it reaches CLOSED - never erases
+    // directly here. This fires synchronously from inside the connection's
+    // own on_segment()/on_tick()/close(), which is still on the call stack;
+    // erasing (destroying) the object at that point would be a
+    // use-after-free the moment control returned to that still-running
+    // method. The actual erase happens later, safely, in
+    // _reap_closed_connections().
+    void _watch_for_close(TcpConnection& connection);
 
     void _send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol, const Bytes& payload);
     void _send_tcp_segment(const IPv4Address& dest_ip, const Tcp& header, const Bytes& payload);
@@ -120,7 +129,15 @@ private:
     std::unordered_map<uint16_t, bool> _listening_ports;
     std::unordered_map<uint16_t, std::deque<ConnectionKey>> _pending_accepts;
     std::unordered_map<ConnectionKey, std::unique_ptr<TcpConnection>, ConnectionKeyHash> _connections;
-    std::unordered_map<uint64_t, TcpConnection*> _connections_by_id;
+    // id -> key, not id -> TcpConnection* - find_connection() and reaping
+    // both need to reach the owning entry in _connections (keyed by
+    // ConnectionKey), and this is what makes that an O(1) hash lookup
+    // instead of a linear scan over every connection
+    std::unordered_map<uint64_t, ConnectionKey> _connections_by_id;
+    // ids that reached CLOSED since the last reap pass - see
+    // _watch_for_close()'s comment for why this exists instead of scanning
+    // every connection on every poll()/on_timer_tick()
+    std::deque<uint64_t> _pending_reap_ids;
 
     // outbound connect() calls waiting on ARP resolution for a given IP,
     // and the retry state of the ARP request itself
