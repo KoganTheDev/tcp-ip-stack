@@ -5,6 +5,13 @@
 
 #include <iostream>
 
+namespace
+{
+    constexpr uint16_t FIRST_EPHEMERAL_PORT = 49152; // IANA dynamic/private range starts here
+    constexpr int ARP_MAX_RETRIES = 3;
+    constexpr int ARP_RETRY_TICKS = 4; // with a 500ms NetworkStack tick, ~2s between retries
+}
+
 bool NetworkStack::ConnectionKey::operator==(const ConnectionKey& other) const
 {
     return this->remote_ip == other.remote_ip
@@ -21,7 +28,7 @@ size_t NetworkStack::ConnectionKeyHash::operator()(const ConnectionKey& key) con
 }
 
 NetworkStack::NetworkStack(const std::string& tap_device_path, const MacAddress& local_mac, const IPv4Address& local_ip)
-    : _tun(tap_device_path), _local_mac(local_mac), _local_ip(local_ip)
+    : _tun(tap_device_path), _local_mac(local_mac), _local_ip(local_ip), _next_ephemeral_port(FIRST_EPHEMERAL_PORT)
 {
     this->_tun.start();
     this->_tun.set_non_blocking();
@@ -50,6 +57,40 @@ TcpConnection* NetworkStack::accept(uint16_t port)
 
     auto connection_it = this->_connections.find(key);
     return connection_it != this->_connections.end() ? connection_it->second.get() : nullptr;
+}
+
+TcpConnection* NetworkStack::connect(const IPv4Address& remote_ip, uint16_t remote_port)
+{
+    uint16_t local_port = this->_allocate_ephemeral_port();
+    ConnectionKey key{remote_ip, remote_port, local_port};
+
+    auto connection = std::make_unique<TcpConnection>(
+        local_port, remote_ip, remote_port, generate_initial_sequence_number(),
+        [this, remote_ip](const Tcp& header, const Bytes& payload)
+        {
+            this->_send_tcp_segment(remote_ip, header, payload);
+        }
+    );
+
+    TcpConnection* connection_ptr = connection.get();
+    this->_connections_by_id[connection_ptr->get_id()] = connection_ptr;
+    this->_connections[key] = std::move(connection);
+
+    if (this->_arp_table.find(remote_ip) != this->_arp_table.end())
+    {
+        connection_ptr->initiate_connect(); // peer's MAC already known - send the SYN now
+    }
+    else
+    {
+        this->_pending_outbound_connects[remote_ip].push_back(key);
+        if (this->_arp_requests_in_flight.find(remote_ip) == this->_arp_requests_in_flight.end())
+        {
+            this->_send_arp_request(remote_ip);
+            this->_arp_requests_in_flight[remote_ip] = {ARP_MAX_RETRIES, ARP_RETRY_TICKS};
+        }
+    }
+
+    return connection_ptr;
 }
 
 TcpConnection* NetworkStack::find_connection(uint64_t id) const
@@ -88,6 +129,30 @@ void NetworkStack::on_timer_tick()
     }
 
     this->_reap_closed_connections();
+
+    for (auto it = this->_arp_requests_in_flight.begin(); it != this->_arp_requests_in_flight.end(); )
+    {
+        it->second.ticks_until_retry -= 1;
+        if (it->second.ticks_until_retry > 0)
+        {
+            ++it;
+            continue;
+        }
+
+        it->second.retries_remaining -= 1;
+        if (it->second.retries_remaining <= 0)
+        {
+            // never got a reply - give up and fail every connect() waiting on it
+            IPv4Address unresolved_ip = it->first;
+            it = this->_arp_requests_in_flight.erase(it);
+            this->_fail_pending_outbound_connects(unresolved_ip);
+            continue;
+        }
+
+        this->_send_arp_request(it->first);
+        it->second.ticks_until_retry = ARP_RETRY_TICKS;
+        ++it;
+    }
 }
 
 void NetworkStack::_reap_closed_connections()
@@ -137,10 +202,28 @@ void NetworkStack::_handle_frame(const Bytes& frame)
 void NetworkStack::_handle_arp(const Arp& arp)
 {
     // learn the sender's mapping regardless of whether the request is for
-    // us - this is how a passive-open-only stack ever learns a peer's MAC:
-    // from the ARP request the peer had to send to find us in the first
-    // place, never from a request we initiated ourselves
-    this->_arp_table[arp.get_sender_protocol_address()] = arp.get_sender_hardware_address();
+    // us - a passive-open connection never needs to send its own ARP
+    // request because of this (the peer's request for our IP already
+    // teaches us its mapping); an active-open connect() below is what
+    // actually needs to wait on this
+    IPv4Address sender_ip = arp.get_sender_protocol_address();
+    this->_arp_table[sender_ip] = arp.get_sender_hardware_address();
+
+    this->_arp_requests_in_flight.erase(sender_ip);
+
+    auto pending_it = this->_pending_outbound_connects.find(sender_ip);
+    if (pending_it != this->_pending_outbound_connects.end())
+    {
+        for (const ConnectionKey& key : pending_it->second)
+        {
+            auto connection_it = this->_connections.find(key);
+            if (connection_it != this->_connections.end())
+            {
+                connection_it->second->initiate_connect();
+            }
+        }
+        this->_pending_outbound_connects.erase(pending_it);
+    }
 
     bool is_request_for_us = arp.get_operation() == ArpOperation::REQUEST
         && arp.get_target_protocol_address() == this->_local_ip;
@@ -228,10 +311,56 @@ MacAddress NetworkStack::_resolve_mac(const IPv4Address& ip) const
     auto it = this->_arp_table.find(ip);
     if (it == this->_arp_table.end())
     {
-        throw EXCEPTION(BaseException, "No ARP entry for " + ip.to_string()
-            + " - this stack only replies to ARP, it never initiates a request");
+        // Reachable in principle for either open path, but genuinely
+        // shouldn't happen in practice: passive-open only ever replies to a
+        // connection whose peer already ARP'd for us, and active-open
+        // (connect()) only calls initiate_connect() - the thing that first
+        // triggers a send - after _handle_arp() has already cached the
+        // mapping. This is a safety net, not the normal resolution path.
+        throw EXCEPTION(BaseException, "No ARP entry for " + ip.to_string());
     }
     return it->second;
+}
+
+uint16_t NetworkStack::_allocate_ephemeral_port()
+{
+    // wraps back to FIRST_EPHEMERAL_PORT past uint16_t's range - no dedup
+    // against ports already in use, since a given local port only actually
+    // collides if it's reused against the exact same remote ip:port
+    // (ConnectionKey includes all three); fine for this stack's scale
+    uint16_t port = this->_next_ephemeral_port;
+    this->_next_ephemeral_port =
+        (this->_next_ephemeral_port == 65535) ? FIRST_EPHEMERAL_PORT : this->_next_ephemeral_port + 1;
+    return port;
+}
+
+void NetworkStack::_send_arp_request(const IPv4Address& target_ip)
+{
+    Ethernet request(this->_local_mac, MacAddress::BROADCAST, EtherType::ARP);
+    request /= std::make_unique<Arp>(this->_local_mac, this->_local_ip, target_ip);
+    this->_tun.write(request.to_bytes());
+}
+
+void NetworkStack::_fail_pending_outbound_connects(const IPv4Address& ip)
+{
+    auto pending_it = this->_pending_outbound_connects.find(ip);
+    if (pending_it == this->_pending_outbound_connects.end())
+    {
+        return;
+    }
+
+    for (const ConnectionKey& key : pending_it->second)
+    {
+        auto connection_it = this->_connections.find(key);
+        if (connection_it != this->_connections.end())
+        {
+            std::cerr << "NetworkStack: giving up on ARP resolution for " << ip.to_string()
+                       << " - connect() failed" << std::endl;
+            connection_it->second->fail();
+        }
+    }
+
+    this->_pending_outbound_connects.erase(pending_it);
 }
 
 void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol, const Bytes& payload)

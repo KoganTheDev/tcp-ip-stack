@@ -52,10 +52,11 @@ Tcp TcpConnection::_build_header(uint8_t flags, uint32_t seq) const
     return Tcp(_local_port, _remote_port, seq, _recv_next, 5, flags, RECEIVE_WINDOW, 0, 0);
 }
 
-void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload)
+void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool include_ack)
 {
     uint32_t seq = _send_next;
-    _send_segment(_build_header(flags | FLAG_ACK, seq), payload);
+    uint8_t full_flags = include_ack ? (flags | FLAG_ACK) : flags;
+    _send_segment(_build_header(full_flags, seq), payload);
 
     size_t consumed = payload.size();
     if (flags & FLAG_SYN) consumed += 1;
@@ -65,7 +66,7 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload)
     InFlightSegment entry;
     entry.seq = seq;
     entry.end_seq = _send_next;
-    entry.flags = flags;
+    entry.flags = full_flags;
     entry.payload = payload;
     entry.retransmit_ticks_remaining = RETRANSMIT_TIMEOUT_TICKS;
     entry.retransmit_attempts = 0;
@@ -84,6 +85,12 @@ void TcpConnection::accept_incoming_syn(uint32_t peer_isn)
     _recv_next = peer_isn + 1; // the SYN itself consumes one sequence number
     _transition(TcpState::SYN_RECEIVED);
     _send_flags(FLAG_SYN);
+}
+
+void TcpConnection::initiate_connect()
+{
+    _transition(TcpState::SYN_SENT);
+    _send_flags(FLAG_SYN, Bytes(), false); // active open: bare SYN, nothing to ack yet
 }
 
 void TcpConnection::_handle_ack(const Tcp& segment)
@@ -185,6 +192,19 @@ void TcpConnection::on_segment(const Tcp& segment)
     if (segment.get_rst())
     {
         _transition(TcpState::CLOSED);
+        return;
+    }
+
+    if (_state == TcpState::SYN_SENT)
+    {
+        // active open: expecting SYN-ACK for the bare SYN initiate_connect() sent
+        if (segment.get_syn() && segment.get_ack() && segment.get_acknowledgement_number() == _send_next)
+        {
+            _recv_next = segment.get_sequence_number() + 1; // the peer's SYN consumes one sequence number
+            _in_flight.clear(); // our SYN is now acked
+            _transition(TcpState::ESTABLISHED);
+            _send_pure_ack(); // completes the 3-way handshake
+        }
         return;
     }
 

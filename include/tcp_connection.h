@@ -11,6 +11,7 @@
 enum class TcpState
 {
     LISTEN,
+    SYN_SENT,
     SYN_RECEIVED,
     ESTABLISHED,
     FIN_WAIT_1,
@@ -85,6 +86,11 @@ public:
     TcpState get_state() const { return _state; }
     bool is_closed() const { return _state == TcpState::CLOSED; }
 
+    // Hard-closes without any teardown handshake - nothing has been
+    // transmitted yet, so there's nothing to tear down. NetworkStack calls
+    // this when an active open's ARP resolution exhausts its retries.
+    void fail() { _transition(TcpState::CLOSED); }
+
     // A stable identity that outlives any single TcpConnection* - safe to
     // hand across a thread boundary and look up again later via
     // NetworkStack::find_connection(), unlike the pointer itself, which
@@ -98,10 +104,17 @@ public:
     // a freshly-received SYN: sends the SYN-ACK and moves to SYN_RECEIVED.
     void accept_incoming_syn(uint32_t peer_isn);
 
+    // Active open: sends a bare SYN (no ACK - there's nothing to acknowledge
+    // yet) and moves to SYN_SENT. NetworkStack calls this once the peer's
+    // MAC is resolved (or immediately, if it already was).
+    void initiate_connect();
+
 private:
     void _transition(TcpState new_state);
     Tcp _build_header(uint8_t flags, uint32_t seq) const;
-    void _send_flags(uint8_t flags, const Bytes& payload = Bytes());
+    // include_ack is false only for the very first segment of an active
+    // open: every other segment this stack ever sends acks something.
+    void _send_flags(uint8_t flags, const Bytes& payload = Bytes(), bool include_ack = true);
     void _send_pure_ack();
     void _handle_ack(const Tcp& segment);
     void _handle_fin();

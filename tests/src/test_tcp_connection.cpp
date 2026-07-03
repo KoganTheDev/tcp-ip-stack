@@ -87,6 +87,35 @@ TEST(HandshakeSendsSynAckWithCorrectSeqAndAck)
     test_assert(connection.get_state() == TcpState::SYN_RECEIVED, "should move to SYN_RECEIVED after sending SYN-ACK");
 }
 
+// Active open (connect()'s side): initiate_connect() should send a bare
+// SYN - no ACK, since there's nothing to acknowledge yet - and the
+// SYN-ACK response should complete the handshake with our own final ACK.
+TEST(ActiveOpenSendsBareSynThenCompletesHandshake)
+{
+    std::vector<RecordedSegment> sent;
+    TcpConnection connection(54321, IPv4Address("10.0.0.2"), 8080, 2000,
+        [&sent](const Tcp& header, const Bytes& payload)
+        {
+            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload});
+        }
+    );
+
+    connection.initiate_connect();
+
+    test_assert(sent.size() == 1, "initiate_connect() should send exactly one segment");
+    test_assert(sent[0].flags == FLAG_SYN, "an active open's first SYN must not have ACK set - there's nothing to ack yet");
+    test_assert(sent[0].seq == 2000, "the SYN should use our chosen ISN");
+    test_assert(connection.get_state() == TcpState::SYN_SENT, "initiate_connect() should move to SYN_SENT");
+
+    // peer replies with SYN-ACK
+    connection.on_segment(*make_incoming_segment(9000, 2001, FLAG_SYN | FLAG_ACK));
+
+    test_assert(connection.get_state() == TcpState::ESTABLISHED, "a valid SYN-ACK in SYN_SENT should move to ESTABLISHED");
+    test_assert(sent.size() == 2, "completing the handshake should send our final ACK");
+    test_assert(sent[1].flags == FLAG_ACK, "the handshake-completing segment should be a pure ACK");
+    test_assert(sent[1].ack == 9001, "the final ACK should ack the peer's ISN + 1");
+}
+
 TEST(FinalHandshakeAckMovesToEstablished)
 {
     std::vector<RecordedSegment> sent;
