@@ -249,3 +249,60 @@ TEST(DuplicateFinDuringTimeWaitReAcksAndRestartsWait)
     connection->on_tick();
     test_assert(connection->get_state() == TcpState::TIME_WAIT, "the wait timer should have restarted, not continued from before the duplicate");
 }
+
+// MAX_IN_FLIGHT_SEGMENTS is 4 (see tcp_connection.h) - the sliding window
+// should let that many segments out before it starts queueing, unlike
+// stop-and-wait's exactly one.
+TEST(SendPipelinesUpToWindowLimitBeforeQueueing)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->send(Bytes::from_hex("01"));
+    connection->send(Bytes::from_hex("02"));
+    connection->send(Bytes::from_hex("03"));
+    connection->send(Bytes::from_hex("04"));
+    test_assert(sent.size() == 4, "all 4 sends should go out immediately - the window isn't full yet");
+
+    connection->send(Bytes::from_hex("05"));
+    test_assert(sent.size() == 4, "a 5th send with the window full should queue instead of going out immediately");
+
+    test_assert(sent[0].seq + 1 == sent[1].seq, "consecutive pipelined segments should have consecutive sequence numbers");
+    test_assert(sent[1].seq + 1 == sent[2].seq, "consecutive pipelined segments should have consecutive sequence numbers");
+}
+
+TEST(CumulativeAckDrainsQueueIntoWindow)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->send(Bytes::from_hex("01"));
+    connection->send(Bytes::from_hex("02"));
+    connection->send(Bytes::from_hex("03"));
+    connection->send(Bytes::from_hex("04"));
+    connection->send(Bytes::from_hex("05")); // queued - window is full
+
+    // cumulative ack covering all 4 in-flight segments at once
+    connection->on_segment(*make_incoming_segment(501, sent[3].seq + 1, FLAG_ACK));
+
+    test_assert(sent.size() == 5, "acking the whole window should let the queued 5th segment go out");
+    test_assert(sent[4].payload.to_hex() == "05", "the queued segment's payload should be exactly what was queued");
+}
+
+TEST(RetransmitOnlyRetransmitsOldestSegmentInWindow)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->send(Bytes::from_hex("01"));
+    connection->send(Bytes::from_hex("02"));
+    test_assert(sent.size() == 2, "both sends should go out - well within the window");
+
+    // RETRANSMIT_TIMEOUT_TICKS is 3 - tick past it with neither acked
+    connection->on_tick();
+    connection->on_tick();
+    connection->on_tick();
+
+    test_assert(sent.size() == 3, "only one retransmission should happen per timeout, not one per in-flight segment");
+    test_assert(sent[2].seq == sent[0].seq, "the retransmission must be of the oldest (first) unacked segment, not the newer one");
+}

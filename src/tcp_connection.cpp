@@ -32,9 +32,7 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
     : _id(g_next_connection_id.fetch_add(1)),
       _local_port(local_port), _remote_ip(remote_ip), _remote_port(remote_port),
       _state(TcpState::LISTEN),
-      _send_next(initial_seq), _send_unacked(initial_seq), _recv_next(0),
-      _unacked_flags(0), _awaiting_ack(false),
-      _retransmit_ticks_remaining(0), _retransmit_attempts(0),
+      _send_next(initial_seq), _recv_next(0),
       _fin_requested(false), _time_wait_ticks_remaining(0),
       _send_segment(std::move(send_segment))
 {
@@ -59,22 +57,25 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload)
     uint32_t seq = _send_next;
     _send_segment(_build_header(flags | FLAG_ACK, seq), payload);
 
-    _unacked_flags = flags;
-    _unacked_payload = payload;
-    _awaiting_ack = true;
-    _retransmit_ticks_remaining = RETRANSMIT_TIMEOUT_TICKS;
-    _retransmit_attempts = 0;
-
     size_t consumed = payload.size();
     if (flags & FLAG_SYN) consumed += 1;
     if (flags & FLAG_FIN) consumed += 1;
     _send_next = seq + static_cast<uint32_t>(consumed);
+
+    InFlightSegment entry;
+    entry.seq = seq;
+    entry.end_seq = _send_next;
+    entry.flags = flags;
+    entry.payload = payload;
+    entry.retransmit_ticks_remaining = RETRANSMIT_TIMEOUT_TICKS;
+    entry.retransmit_attempts = 0;
+    _in_flight.push_back(std::move(entry));
 }
 
 void TcpConnection::_send_pure_ack()
 {
     // an ACK with nothing new to say is never itself acknowledged - it isn't
-    // tracked for retransmission, unlike everything sent through _send_flags
+    // tracked in the window, unlike everything sent through _send_flags
     _send_segment(_build_header(FLAG_ACK, _send_next), Bytes());
 }
 
@@ -87,34 +88,50 @@ void TcpConnection::accept_incoming_syn(uint32_t peer_isn)
 
 void TcpConnection::_handle_ack(const Tcp& segment)
 {
-    if (!_awaiting_ack || segment.get_acknowledgement_number() != _send_next)
+    uint32_t ack = segment.get_acknowledgement_number();
+    bool fin_acked = false;
+    bool acked_anything = false;
+
+    // cumulative ack: everything whose end_seq it covers is done, oldest
+    // (front) first - this is what lets several segments be in flight at
+    // once instead of stop-and-wait's exactly one
+    while (!_in_flight.empty() && _in_flight.front().end_seq <= ack)
     {
-        return; // nothing in flight, or an ack that doesn't cover it yet
+        if (_in_flight.front().flags & FLAG_FIN)
+        {
+            fin_acked = true;
+        }
+        _in_flight.pop_front();
+        acked_anything = true;
     }
 
-    _awaiting_ack = false;
-    _send_unacked = _send_next;
-
-    if (_state == TcpState::FIN_WAIT_1)
+    if (!acked_anything)
     {
-        _transition(TcpState::FIN_WAIT_2);
-        return;
-    }
-    if (_state == TcpState::LAST_ACK)
-    {
-        _transition(TcpState::CLOSED);
-        return;
+        return; // nothing new acked yet
     }
 
-    if (!_send_queue.empty())
+    if (fin_acked)
+    {
+        if (_state == TcpState::FIN_WAIT_1)
+        {
+            _transition(TcpState::FIN_WAIT_2);
+            return;
+        }
+        if (_state == TcpState::LAST_ACK)
+        {
+            _transition(TcpState::CLOSED);
+            return;
+        }
+    }
+
+    while (_in_flight.size() < MAX_IN_FLIGHT_SEGMENTS && !_send_queue.empty())
     {
         Bytes next_chunk = std::move(_send_queue.front());
         _send_queue.pop_front();
         _send_flags(0, next_chunk);
-        return;
     }
 
-    if (_fin_requested)
+    if (_in_flight.empty() && _send_queue.empty() && _fin_requested)
     {
         _fin_requested = false;
         close();
@@ -175,8 +192,7 @@ void TcpConnection::on_segment(const Tcp& segment)
     {
         if (segment.get_ack() && segment.get_acknowledgement_number() == _send_next)
         {
-            _awaiting_ack = false;
-            _send_unacked = _send_next;
+            _in_flight.clear(); // only the SYN-ACK could have been in flight here
             _transition(TcpState::ESTABLISHED);
         }
         return;
@@ -237,26 +253,30 @@ void TcpConnection::on_tick()
         return;
     }
 
-    if (!_awaiting_ack)
+    if (_in_flight.empty())
     {
         return;
     }
 
-    _retransmit_ticks_remaining -= 1;
-    if (_retransmit_ticks_remaining > 0)
+    // simplified go-back-one: only the oldest unacked segment is ever
+    // retransmitted on timeout, not every unacked segment (real go-back-N)
+    InFlightSegment& oldest = _in_flight.front();
+
+    oldest.retransmit_ticks_remaining -= 1;
+    if (oldest.retransmit_ticks_remaining > 0)
     {
         return;
     }
 
-    _retransmit_attempts += 1;
-    if (_retransmit_attempts > MAX_RETRANSMIT_ATTEMPTS)
+    oldest.retransmit_attempts += 1;
+    if (oldest.retransmit_attempts > MAX_RETRANSMIT_ATTEMPTS)
     {
         _transition(TcpState::CLOSED);
         return;
     }
 
-    _send_segment(_build_header(_unacked_flags | FLAG_ACK, _send_unacked), _unacked_payload);
-    _retransmit_ticks_remaining = RETRANSMIT_TIMEOUT_TICKS;
+    _send_segment(_build_header(oldest.flags | FLAG_ACK, oldest.seq), oldest.payload);
+    oldest.retransmit_ticks_remaining = RETRANSMIT_TIMEOUT_TICKS;
 }
 
 void TcpConnection::send(const Bytes& data)
@@ -266,7 +286,7 @@ void TcpConnection::send(const Bytes& data)
         return;
     }
 
-    if (_awaiting_ack)
+    if (_in_flight.size() >= MAX_IN_FLIGHT_SEGMENTS)
     {
         _send_queue.push_back(data);
         return;
@@ -282,7 +302,7 @@ void TcpConnection::close()
         return;
     }
 
-    if (_awaiting_ack || !_send_queue.empty())
+    if (!_in_flight.empty() || !_send_queue.empty())
     {
         _fin_requested = true;
         return;

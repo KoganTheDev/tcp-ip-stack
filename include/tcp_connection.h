@@ -29,9 +29,14 @@ enum class TcpState
 // resolves the peer's MAC, and writes bytes to the TUN device.
 //
 // Deliberately out of scope (documented, not accidental):
-//  - only one segment is ever in flight (stop-and-wait), not a sliding
-//    window - real TCP pipelines many unacked segments for throughput
-//  - no congestion control (Reno/Cubic/...), no SACK, no window scaling
+//  - a fixed-size window (MAX_IN_FLIGHT_SEGMENTS) of segments in flight -
+//    real TCP sizes its window adaptively (the receiver's advertised
+//    window, further limited by congestion control); this stack just picks
+//    a constant and never grows or shrinks it
+//  - no congestion control (Reno/Cubic/...), no SACK, no window scaling -
+//    a retransmit timeout retransmits only the single oldest unacked
+//    segment (go-back-one), not every unacked segment (real go-back-N) or
+//    a per-segment timer
 //  - no out-of-order reassembly buffer - an out-of-order segment is just
 //    dropped and re-ACKed at the current RCV.NXT, same as real TCP's fallback
 //  - TIME_WAIT lasts a fixed, short number of timer ticks
@@ -101,27 +106,36 @@ private:
     void _handle_ack(const Tcp& segment);
     void _handle_fin();
 
+    // One segment this side sent and hasn't seen acked yet. end_seq is
+    // seq + however many sequence numbers it consumed (payload bytes, plus
+    // one each for SYN/FIN) - a cumulative ack covering end_seq clears it.
+    struct InFlightSegment
+    {
+        uint32_t seq;
+        uint32_t end_seq;
+        uint8_t flags;
+        Bytes payload;
+        int retransmit_ticks_remaining;
+        int retransmit_attempts;
+    };
+
     uint64_t _id;
     uint16_t _local_port;
     IPv4Address _remote_ip;
     uint16_t _remote_port;
 
     TcpState _state;
-    uint32_t _send_next;    // SND.NXT - next sequence number this side will send
-    uint32_t _send_unacked; // SND.UNA - oldest sequence number not yet acknowledged
-    uint32_t _recv_next;    // RCV.NXT - next sequence number expected from the peer
+    uint32_t _send_next; // SND.NXT - next sequence number this side will send
+    uint32_t _recv_next; // RCV.NXT - next sequence number expected from the peer
 
-    // stop-and-wait: at most one in-flight segment; anything else queues here.
-    // Its sequence number is always _send_unacked while _awaiting_ack is true.
-    uint8_t _unacked_flags;
-    Bytes _unacked_payload;
-    bool _awaiting_ack;
-    int _retransmit_ticks_remaining;
-    int _retransmit_attempts;
-    std::deque<Bytes> _send_queue;
-    // close() called while something was still in flight - deferred until
-    // the send queue drains instead of clobbering the in-flight segment's
-    // retransmission state
+    // the sliding window: ordered oldest-first, so the front is always
+    // SND.UNA (or _send_next if empty - nothing outstanding). A cumulative
+    // ack pops everything it covers from the front; a timeout retransmits
+    // only the front entry.
+    std::deque<InFlightSegment> _in_flight;
+    std::deque<Bytes> _send_queue; // data waiting for window room
+    // close() called while something was still in flight or queued -
+    // deferred until both drain, instead of clobbering in-flight state
     bool _fin_requested;
 
     // counts down while in TIME_WAIT; reset if a duplicate FIN arrives
@@ -133,6 +147,7 @@ private:
     StateChangedFn _on_state_changed;
 
     static constexpr uint16_t RECEIVE_WINDOW = 65535;
+    static constexpr size_t MAX_IN_FLIGHT_SEGMENTS = 4;
     static constexpr int RETRANSMIT_TIMEOUT_TICKS = 3;
     static constexpr int MAX_RETRANSMIT_ATTEMPTS = 5;
     static constexpr int TIME_WAIT_TICKS = 4;
