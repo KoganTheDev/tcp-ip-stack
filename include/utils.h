@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include "exceptions.h"
 #include "bytes.h"
+#include "network_addresses.h"
 
 // Throws a system exception
 // Prints the following: a message, the error number, file, func and the specific line
@@ -25,6 +26,19 @@ std::string byte_to_decimal(uint8_t byte);
 
 // Turns a decimal string representation to an integer
 uint8_t decimal_to_byte(const std::string& decimal);
+
+// RFC 1071 Internet checksum: ones'-complement sum of 16-bit big-endian words,
+// carries folded back in, then complemented. Used as-is for the IP header
+// checksum, and as the tail end of the TCP/UDP pseudo-header checksum below.
+uint16_t internet_checksum(const Bytes& data);
+
+// TCP/UDP checksum: internet_checksum() over an IPv4 pseudo-header
+// (src, dest, zero byte, protocol, segment length) followed by the segment
+// itself (header + payload, with the segment's own checksum field zeroed).
+// The pseudo-header isn't transmitted - it just makes the checksum also
+// cover the routing info a segment can't see for itself, so e.g. a segment
+// misdelivered to the wrong host or port fails the check.
+uint16_t transport_checksum(const IPv4Address& src, const IPv4Address& dest, uint8_t protocol, const Bytes& segment);
 
 // Converts a Big Endian byte sequence to unsigned int
 template <typename T>

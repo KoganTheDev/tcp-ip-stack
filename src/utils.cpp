@@ -101,3 +101,38 @@ uint8_t decimal_to_byte(const std::string &decimal)
 
     return static_cast<uint8_t>(result & 0xff);
 }
+
+uint16_t internet_checksum(const Bytes& data)
+{
+    uint32_t sum = 0;
+    size_t i = 0;
+
+    for (; i + 1 < data.size(); i += 2)
+    {
+        sum += (static_cast<uint16_t>(data[i]) << 8) | data[i + 1];
+    }
+    if (i < data.size())
+    {
+        sum += static_cast<uint16_t>(data[i]) << 8; // odd trailing byte, low half padded with zero
+    }
+
+    while (sum >> 16)
+    {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+
+    return static_cast<uint16_t>(~sum);
+}
+
+uint16_t transport_checksum(const IPv4Address& src, const IPv4Address& dest, uint8_t protocol, const Bytes& segment)
+{
+    Bytes pseudo_header;
+    pseudo_header |= src.get_address();
+    pseudo_header |= dest.get_address();
+    pseudo_header |= int_to_bytes<uint8_t>(0);
+    pseudo_header |= int_to_bytes<uint8_t>(protocol);
+    pseudo_header |= int_to_bytes<uint16_t>(static_cast<uint16_t>(segment.size()));
+    pseudo_header |= segment;
+
+    return internet_checksum(pseudo_header);
+}

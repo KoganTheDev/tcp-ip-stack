@@ -8,6 +8,7 @@
 #include <iostream>
 #include <string.h>
 #include <vector>
+#include <cerrno>
 
 TunWrapper::TunWrapper(const std::string &device_path)
     : _fd(-1),
@@ -87,11 +88,30 @@ Bytes TunWrapper::read(unsigned int max_size)
 
     if (bytes_read < 0)
     {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        {
+            // non-blocking fd, nothing available right now - not an error
+            return Bytes();
+        }
         throw EXCEPTION(SystemException, "read has failed.");
     }
-    
+
     buffer.resize(bytes_read);
     return buffer;
+}
+
+void TunWrapper::set_non_blocking()
+{
+    int flags = fcntl(this->_fd, F_GETFL, 0);
+    if (flags < 0)
+    {
+        throw EXCEPTION(SystemException, "fcntl(F_GETFL) failed on the TUN device");
+    }
+
+    if (fcntl(this->_fd, F_SETFL, flags | O_NONBLOCK) < 0)
+    {
+        throw EXCEPTION(SystemException, "fcntl(F_SETFL, O_NONBLOCK) failed on the TUN device");
+    }
 }
 
 void TunWrapper::write(const Bytes& buffer)

@@ -1,6 +1,9 @@
 #include "ip.h"
 #include "utils.h"
 #include "network_addresses.h"
+#include "tcp.h"
+#include "udp.h"
+#include "raw.h"
 
 Ip::Ip(uint8_t version, uint8_t IHL, uint8_t TOS, uint16_t total_length, uint16_t identification,
      bool ip_flag_x, bool ip_flag_d, bool ip_flag_m, uint16_t fragment_offset, uint8_t TTL, uint8_t protocol,
@@ -63,19 +66,37 @@ void Ip::from_bytes(const Bytes& data)
     _TOS = data[1];
     _total_length = data.slice_int<uint16_t>(2);
     _identification = data.slice_int<uint16_t>(4);
-    uint8_t flags = (data[6] & 0xf0) >> 5; // Only the flags will remain in this variable
-    _ip_flag_x = flags & 0x01;
-    _ip_flag_d = flags & 0x02;
-    _ip_flag_m = flags & 0x04;
-    _fragment_offset = data.slice_int<uint16_t>(6) & 0x1fff; 
+    // the 3 flag bits are the top 3 bits of byte 6 (reserved, DF, MF);
+    // the remaining 13 bits of bytes 6-7 are the fragment offset
+    _ip_flag_x = data[6] & 0x80;
+    _ip_flag_d = data[6] & 0x40;
+    _ip_flag_m = data[6] & 0x20;
+    _fragment_offset = data.slice_int<uint16_t>(6) & 0x1fff;
     _TTL = data[8];
     _protocol = data[9];
     _header_checksum = data.slice_int<uint16_t>(10);
     _src_address = Bytes(data.slice(12, 4));
     _dest_address = Bytes(data.slice(16, 4));
+
+    Bytes payload = data.slice(header_bytes);
+    switch (this->_protocol)
+    {
+    case IpProtocol::TCP:
+        this->_next_layer = std::make_unique<Tcp>(payload);
+        break;
+    case IpProtocol::UDP:
+        this->_next_layer = std::make_unique<Udp>(payload);
+        break;
+    default:
+        if (!payload.empty())
+        {
+            this->_next_layer = std::make_unique<Raw>(payload);
+        }
+        break;
+    }
 }
 
-Bytes Ip::to_bytes()
+Bytes Ip::_header_to_bytes() const
 {
     Bytes result;
     uint8_t version_and_IHL = (this->_version << 4) | this->_IHL;
@@ -83,7 +104,7 @@ Bytes Ip::to_bytes()
     result |= int_to_bytes<uint8_t>(this->_TOS);
     result |= int_to_bytes<uint16_t>(this->_total_length);
     result |= int_to_bytes<uint16_t>(this->_identification);
-    uint16_t flags_and_offset = 
+    uint16_t flags_and_offset =
     ((this->_ip_flag_x & 0x1) << 15) |  // Reserved
     ((this->_ip_flag_d & 0x1) << 14) |  // DF
     ((this->_ip_flag_m & 0x1) << 13) |  // MF
@@ -94,6 +115,25 @@ Bytes Ip::to_bytes()
     result |= int_to_bytes<uint16_t>(this->_header_checksum);
     result |= this->_src_address;
     result |= this->_dest_address;
+    return result;
+}
+
+Bytes Ip::to_bytes()
+{
+    Bytes result = this->_header_to_bytes();
+
+    if (this->_next_layer)
+    {
+        result |= this->_next_layer->to_bytes();
+    }
+
+    return result;
+}
+
+void Ip::compute_checksum()
+{
+    this->_header_checksum = 0;
+    this->_header_checksum = internet_checksum(this->_header_to_bytes());
 }
 
 std::string Ip::to_string() const
@@ -112,12 +152,17 @@ std::string Ip::to_string() const
     ((this->_ip_flag_d & 0x1) << 14) |  // DF
     ((this->_ip_flag_m & 0x1) << 13) |  // MF
     (this->_fragment_offset & 0x1FFF);  // 13-bit offset
-    result += this->_field_to_string("IP flags and offset", byte_to_hex(flags_and_offset));
+    result += this->_field_to_string("IP flags and offset", int_to_bytes<uint16_t>(flags_and_offset).to_hex());
 
-    result += this->_field_to_string("TTL", byte_to_hex(this->_version));
+    result += this->_field_to_string("TTL", byte_to_hex(this->_TTL));
     result += this->_field_to_string("header checksum", int_to_bytes<uint16_t>(this->_header_checksum).to_hex());
     result += this->_field_to_string("src address", IPv4Address(this->_src_address).to_string());
     result += this->_field_to_string("dest address", IPv4Address(this->_dest_address).to_string());
+
+    if (this->_next_layer)
+    {
+        result += this->_next_layer->to_string();
+    }
 
     return result;
 }

@@ -13,7 +13,7 @@ public:
 
     virtual std::string to_string() const;
 
-    Bytes get_data() { return this->_data; }
+    Bytes get_data() const { return this->_data; }
 
 private:
     Bytes _data;

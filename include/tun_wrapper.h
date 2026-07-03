@@ -16,8 +16,13 @@ public:
 
     Bytes read(unsigned int max_length);
     void write(const Bytes &buffer);
-    
+
     std::string get_interface_name();
+    int get_fd() const { return this->_fd; }
+
+    // Puts the underlying fd in non-blocking mode, so read() can be driven
+    // from an epoll loop instead of blocking the calling thread.
+    void set_non_blocking();
 
 private:
     std::string _open_device(const std::string& device_path);

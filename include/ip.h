@@ -5,6 +5,13 @@
 #include "exceptions.h"
 #include "vector"
 
+enum IpProtocol
+{
+    ICMP = 1,
+    TCP = 6,
+    UDP = 17,
+};
+
 class Ip : public ProtocolLayer
 {
 public:
@@ -16,6 +23,12 @@ public:
     void from_bytes(const Bytes& data);
     Bytes to_bytes();
     virtual std::string to_string() const;
+
+    // Zeroes the checksum field, serializes the header alone, and stores
+    // internet_checksum() of that back into _header_checksum. Must be called
+    // after every field is final and before to_bytes() is used to actually
+    // send the packet - the IP checksum covers only the header, not payload.
+    void compute_checksum();
 
     uint8_t get_version() const { return _version; }
     uint8_t get_IHL() const { return _IHL; }
@@ -33,6 +46,13 @@ public:
     const Bytes& get_dest_address() const { return _dest_address; }
 
 private:
+    // Serializes just the 20-byte header (this stack never emits IP options,
+    // so IHL is always 5) using whatever _header_checksum currently holds -
+    // shared by to_bytes() and compute_checksum(), which calls it twice: once
+    // with the checksum field zeroed to compute over, once implicitly via
+    // to_bytes() afterward with the real value in place.
+    Bytes _header_to_bytes() const;
+
     //* Note: Check if IP_option (variable length, optional, not common) is needed as part of the ip4 header
     uint8_t _version; // IPv4 = 4
     uint8_t _IHL; // Header length,if IHL = 5 there`s no field options

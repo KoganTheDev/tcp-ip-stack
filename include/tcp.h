@@ -4,7 +4,7 @@
 #include "protocol_layer.h"
 #include <stdbool.h>
 
-class Tcp : ProtocolLayer
+class Tcp : public ProtocolLayer
 {
 public:
     Tcp(uint16_t src_port, uint16_t dest_port, uint32_t sequence_number, uint32_t acknowledgement_number, uint8_t data_offset,
@@ -20,7 +20,7 @@ public:
     uint16_t get_src_port() const { return _src_port; }
     uint16_t get_dest_port() const { return _dest_port; }
     uint32_t get_sequence_number() const { return _sequence_number; }
-    uint8_t get_acknowledgement_number() const { return _acknowledgement_number; }
+    uint32_t get_acknowledgement_number() const { return _acknowledgement_number; }
     uint8_t get_data_offset() const { return _data_offset; }
     bool get_cwr() const { return _cwr; }
     bool get_ece() const { return _ece; }
@@ -33,6 +33,11 @@ public:
     uint16_t get_window() const { return _window; }
     uint16_t get_checksum() const { return _checksum; }
     uint16_t get_urgent_ptr() const { return _urgent_ptr; }
+
+    // The TCP checksum needs the source/destination IP, which this class
+    // doesn't own - the caller computes it via transport_checksum() (using
+    // to_bytes() with this set to 0 first) and writes the result back here.
+    void set_checksum(uint16_t checksum) { _checksum = checksum; }
 
 
 private:
