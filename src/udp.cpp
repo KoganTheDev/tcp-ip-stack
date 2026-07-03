@@ -36,10 +36,11 @@ void Udp::from_bytes(const Bytes& data)
 Bytes Udp::to_bytes()
 {
     Bytes result;
-    result |= int_to_bytes<uint16_t>(this->_src_port);
-    result |= int_to_bytes<uint16_t>(this->_dest_port);
-    result |= int_to_bytes<uint16_t>(this->_length);
-    result |= int_to_bytes<uint16_t>(this->_checksum);
+    result.reserve(8); // fixed UDP header size - avoids reallocating as fields are appended
+    result.append_int<uint16_t>(this->_src_port);
+    result.append_int<uint16_t>(this->_dest_port);
+    result.append_int<uint16_t>(this->_length);
+    result.append_int<uint16_t>(this->_checksum);
 
     if (this->_next_layer)
     {

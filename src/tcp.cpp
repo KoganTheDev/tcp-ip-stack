@@ -76,30 +76,31 @@ void Tcp::from_bytes(const Bytes& data)
 Bytes Tcp::to_bytes()
 {
 	Bytes result;
+	result.reserve(20); // fixed TCP header size (no options) - avoids reallocating as fields are appended
 
-	result |= int_to_bytes<uint16_t>(this->_src_port);
-	result |= int_to_bytes<uint16_t>(this->_dest_port);
-	result |= int_to_bytes<uint32_t>(this->_sequence_number);
-	result |= int_to_bytes<uint32_t>(this->_acknowledgement_number);
+	result.append_int<uint16_t>(this->_src_port);
+	result.append_int<uint16_t>(this->_dest_port);
+	result.append_int<uint32_t>(this->_sequence_number);
+	result.append_int<uint32_t>(this->_acknowledgement_number);
 
 	uint8_t data_offset_and_reserved = _data_offset << 4; // Using reserved = 0
-	result |= int_to_bytes<uint8_t>(data_offset_and_reserved);
+	result.append_int<uint8_t>(data_offset_and_reserved);
 
-	uint8_t flags = 
+	uint8_t flags =
 	(this->_cwr & 0x01) << 7 |
-	(this->_ece & 0x01) << 6 | 
-	(this->_urg & 0x01) << 5 | 
+	(this->_ece & 0x01) << 6 |
+	(this->_urg & 0x01) << 5 |
 	(this->_ack & 0x01) << 4 |
 	(this->_psh & 0x01) << 3 |
 	(this->_rst & 0x01) << 2 |
 	(this->_syn & 0x01) << 1 |
 	(this->_fin & 0x01);
 
-	result |= int_to_bytes<uint8_t>(flags);
+	result.append_int<uint8_t>(flags);
 
-	result |= int_to_bytes<uint16_t>(this->_window);
-	result |= int_to_bytes<uint16_t>(this->_checksum);
-	result |= int_to_bytes<uint16_t>(this->_urgent_ptr);
+	result.append_int<uint16_t>(this->_window);
+	result.append_int<uint16_t>(this->_checksum);
+	result.append_int<uint16_t>(this->_urgent_ptr);
 
 	if (this->_next_layer)
 	{

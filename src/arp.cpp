@@ -52,11 +52,12 @@ void Arp::from_bytes(const Bytes& data)
 Bytes Arp::to_bytes()
 {
     Bytes result;
-    result |= int_to_bytes<uint16_t>(this->_hardware_type);
-    result |=  int_to_bytes<uint16_t>(this->_protocol_type);
-    result |= int_to_bytes<uint8_t>(this->_hardware_address_length);
-    result |= int_to_bytes<uint8_t>(this->_protocol_address_length);
-    result |= int_to_bytes<uint16_t>(this->_operation);
+    result.reserve(28); // fixed ARP packet size - avoids reallocating as fields are appended
+    result.append_int<uint16_t>(this->_hardware_type);
+    result.append_int<uint16_t>(this->_protocol_type);
+    result.append_int<uint8_t>(this->_hardware_address_length);
+    result.append_int<uint8_t>(this->_protocol_address_length);
+    result.append_int<uint16_t>(this->_operation);
     result |= this->_sender_hardware_address.get_address();
     result |= this->_sender_protocol_address.get_address();
     result |= this->_target_hardware_address.get_address();

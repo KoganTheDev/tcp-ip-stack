@@ -34,4 +34,13 @@ public:
 
     template <typename T>
     T slice_int(size_t index) const;
+
+    // Appends an integer's big-endian bytes directly onto the end of this
+    // buffer - unlike `*this |= int_to_bytes<T>(value)`, this never
+    // allocates a separate Bytes object just to immediately copy its
+    // contents in and discard it. Every protocol header field written this
+    // way saves one heap allocation; profiling found this pattern
+    // (via operator|=/_M_range_insert) as a real cost under load.
+    template <typename T>
+    void append_int(T value);
 };
