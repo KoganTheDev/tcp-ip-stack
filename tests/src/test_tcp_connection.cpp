@@ -196,3 +196,56 @@ TEST(GivesUpAndClosesAfterMaxRetransmitAttempts)
 
     test_assert(connection->get_state() == TcpState::CLOSED, "should give up and close after exceeding max retransmit attempts");
 }
+
+TEST(OurCloseThenPeerFinMovesToTimeWaitThenCloses)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->close(); // our side initiates: sends FIN, -> FIN_WAIT_1
+    test_assert(connection->get_state() == TcpState::FIN_WAIT_1, "close() from ESTABLISHED should move to FIN_WAIT_1");
+
+    // peer acks our FIN -> FIN_WAIT_2
+    connection->on_segment(*make_incoming_segment(501, sent[0].seq + 1, FLAG_ACK));
+    test_assert(connection->get_state() == TcpState::FIN_WAIT_2, "peer acking our FIN should move to FIN_WAIT_2");
+
+    // peer sends its own FIN -> TIME_WAIT, not straight to CLOSED
+    connection->on_segment(*make_incoming_segment(501, sent[0].seq + 1, FLAG_ACK | FLAG_FIN));
+    test_assert(connection->get_state() == TcpState::TIME_WAIT, "peer's FIN in FIN_WAIT_2 should move to TIME_WAIT, not CLOSED directly");
+
+    // TIME_WAIT_TICKS is 4 (see tcp_connection.cpp) - stay open for that many ticks
+    connection->on_tick();
+    connection->on_tick();
+    connection->on_tick();
+    test_assert(connection->get_state() == TcpState::TIME_WAIT, "should remain in TIME_WAIT until its tick budget is exhausted");
+
+    connection->on_tick();
+    test_assert(connection->get_state() == TcpState::CLOSED, "should close once the TIME_WAIT tick budget is exhausted");
+}
+
+TEST(DuplicateFinDuringTimeWaitReAcksAndRestartsWait)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->close();
+    connection->on_segment(*make_incoming_segment(501, sent[0].seq + 1, FLAG_ACK));
+    connection->on_segment(*make_incoming_segment(501, sent[0].seq + 1, FLAG_ACK | FLAG_FIN));
+    test_assert(connection->get_state() == TcpState::TIME_WAIT, "should be in TIME_WAIT before the duplicate FIN test begins");
+
+    size_t sent_before_duplicate = sent.size();
+
+    // burn down most of the wait budget, then a duplicate FIN arrives -
+    // as if our ack for the first one was lost and the peer retransmitted
+    connection->on_tick();
+    connection->on_tick();
+    connection->on_tick();
+    connection->on_segment(*make_incoming_segment(501, sent[0].seq + 1, FLAG_ACK | FLAG_FIN));
+
+    test_assert(sent.size() == sent_before_duplicate + 1, "a duplicate FIN in TIME_WAIT should be re-acked");
+    test_assert(connection->get_state() == TcpState::TIME_WAIT, "a duplicate FIN should not itself close the connection");
+
+    // the wait should have restarted - one more tick should NOT be enough to close
+    connection->on_tick();
+    test_assert(connection->get_state() == TcpState::TIME_WAIT, "the wait timer should have restarted, not continued from before the duplicate");
+}

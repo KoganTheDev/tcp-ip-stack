@@ -17,6 +17,7 @@ enum class TcpState
     FIN_WAIT_2,
     CLOSE_WAIT,
     LAST_ACK,
+    TIME_WAIT,
     CLOSED,
 };
 
@@ -33,9 +34,10 @@ enum class TcpState
 //  - no congestion control (Reno/Cubic/...), no SACK, no window scaling
 //  - no out-of-order reassembly buffer - an out-of-order segment is just
 //    dropped and re-ACKed at the current RCV.NXT, same as real TCP's fallback
-//  - TIME_WAIT is skipped - a connection is reaped the instant its final ACK
-//    is seen, instead of waiting 2*MSL to catch a stray retransmitted
-//    duplicate segment from a now-closed connection with the same 4-tuple
+//  - TIME_WAIT lasts a fixed, short number of timer ticks
+//    (TIME_WAIT_TICKS), not the real 2*MSL - long enough to catch an
+//    immediately-retransmitted duplicate FIN, not long enough to guarantee
+//    catching one after a real network's worth of delay
 //  - simultaneous close (both sides FIN before seeing the other's ACK) is
 //    not modeled as its own CLOSING state - it degrades to the normal
 //    FIN_WAIT_2 path, which is not strictly correct as an isolated state,
@@ -122,6 +124,10 @@ private:
     // retransmission state
     bool _fin_requested;
 
+    // counts down while in TIME_WAIT; reset if a duplicate FIN arrives
+    // (meaning our ack for it was likely lost)
+    int _time_wait_ticks_remaining;
+
     SendSegmentFn _send_segment;
     DataReceivedFn _on_data_received;
     StateChangedFn _on_state_changed;
@@ -129,6 +135,7 @@ private:
     static constexpr uint16_t RECEIVE_WINDOW = 65535;
     static constexpr int RETRANSMIT_TIMEOUT_TICKS = 3;
     static constexpr int MAX_RETRANSMIT_ATTEMPTS = 5;
+    static constexpr int TIME_WAIT_TICKS = 4;
 };
 
 // Clock-driven ISN generator (RFC 793 style: not cryptographically

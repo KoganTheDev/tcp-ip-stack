@@ -35,7 +35,7 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
       _send_next(initial_seq), _send_unacked(initial_seq), _recv_next(0),
       _unacked_flags(0), _awaiting_ack(false),
       _retransmit_ticks_remaining(0), _retransmit_attempts(0),
-      _fin_requested(false),
+      _fin_requested(false), _time_wait_ticks_remaining(0),
       _send_segment(std::move(send_segment))
 {
 }
@@ -123,6 +123,16 @@ void TcpConnection::_handle_ack(const Tcp& segment)
 
 void TcpConnection::_handle_fin()
 {
+    if (_state == TcpState::TIME_WAIT)
+    {
+        // a duplicate FIN means our previous ack for it was likely lost -
+        // resend the ack and restart the wait, without touching sequence
+        // state again (it was already consumed by the first FIN)
+        _send_pure_ack();
+        _time_wait_ticks_remaining = TIME_WAIT_TICKS;
+        return;
+    }
+
     _recv_next += 1; // the FIN itself consumes one sequence number
 
     if (_state == TcpState::ESTABLISHED)
@@ -139,7 +149,8 @@ void TcpConnection::_handle_fin()
     if (_state == TcpState::FIN_WAIT_2)
     {
         _send_pure_ack();
-        _transition(TcpState::CLOSED);
+        _transition(TcpState::TIME_WAIT);
+        _time_wait_ticks_remaining = TIME_WAIT_TICKS;
         return;
     }
 
@@ -216,6 +227,16 @@ void TcpConnection::on_segment(const Tcp& segment)
 
 void TcpConnection::on_tick()
 {
+    if (_state == TcpState::TIME_WAIT)
+    {
+        _time_wait_ticks_remaining -= 1;
+        if (_time_wait_ticks_remaining <= 0)
+        {
+            _transition(TcpState::CLOSED);
+        }
+        return;
+    }
+
     if (!_awaiting_ack)
     {
         return;
