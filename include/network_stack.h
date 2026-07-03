@@ -23,10 +23,20 @@
 // protocol state machine; this owns identity, delivery, and the connection
 // table.
 //
-// Scope: TCP only (Ip already decodes UDP/ICMP payloads, but nothing here
-// dispatches them further), no IP fragmentation/reassembly, no routing -
-// every packet must be addressed to this stack's own IP and reachable on
-// the same L2 segment.
+// Scope:
+//  - TCP only - Ip already decodes UDP/ICMP payloads, but nothing here
+//    dispatches them further
+//  - no IP fragmentation/reassembly - a fragmented packet (MF set, or a
+//    nonzero fragment offset) is detected and dropped with a log line, not
+//    silently mishandled; this stack's own TCP never produces a payload
+//    that would need fragmenting, so the only way one could arrive is a
+//    peer doing it, which nothing this project talks to does
+//  - no routing/forwarding at all, not a partial or simplified version of
+//    it - this stack has exactly one interface (the TAP device) and one L2
+//    segment. Routing means choosing a next-hop across *multiple*
+//    interfaces; with only one, there's nothing to choose between. Every
+//    packet must already be addressed to this stack's own IP and directly
+//    reachable on that one segment.
 //
 // Passive-open (listen()/accept()) never needs to resolve a peer's MAC
 // itself - a peer's own ARP request for our IP already teaches us its

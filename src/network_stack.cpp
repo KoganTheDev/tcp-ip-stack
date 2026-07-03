@@ -248,6 +248,21 @@ void NetworkStack::_handle_ip(const Ip& ip)
         return; // not addressed to us - this stack doesn't route or forward
     }
 
+    // MF set, or a nonzero fragment offset, means this packet is one piece
+    // of a larger one - reassembly isn't implemented. This stack's own TCP
+    // never produces a payload that would need IP-layer fragmentation
+    // (segments stay well under a safe MTU), so the only way a fragment
+    // could arrive is a peer doing it - not exercised by anything this
+    // project talks to. Dropped deliberately and visibly, not silently
+    // mishandled as if it were a complete packet.
+    if (ip.get_ip_flag_m() || ip.get_fragment_offset() != 0)
+    {
+        std::cerr << "NetworkStack: dropping a fragmented IP packet from "
+                   << IPv4Address(ip.get_src_address()).to_string()
+                   << " - fragment reassembly is not implemented" << std::endl;
+        return;
+    }
+
     if (ip.get_protocol() != IpProtocol::TCP || !ip.has_next_layer())
     {
         return;
