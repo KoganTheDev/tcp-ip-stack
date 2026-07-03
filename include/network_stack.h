@@ -45,6 +45,12 @@ public:
     // reaches CLOSED and gets reaped by poll()/on_timer_tick().
     TcpConnection* accept(uint16_t port);
 
+    // Looks a connection up by the stable id from TcpConnection::get_id(),
+    // or nullptr if it's since been reaped. This is the safe way to hold
+    // onto a connection across an async boundary (e.g. a thread pool) -
+    // holding the TcpConnection* itself across that gap risks it dangling.
+    TcpConnection* find_connection(uint64_t id) const;
+
     // Reads and processes every frame currently available on the TAP fd -
     // it's edge-triggered under epoll, so this must drain it - then reaps
     // any connection that finished closing.
@@ -85,4 +91,5 @@ private:
     std::unordered_map<uint16_t, bool> _listening_ports;
     std::unordered_map<uint16_t, std::deque<ConnectionKey>> _pending_accepts;
     std::unordered_map<ConnectionKey, std::unique_ptr<TcpConnection>, ConnectionKeyHash> _connections;
+    std::unordered_map<uint64_t, TcpConnection*> _connections_by_id;
 };

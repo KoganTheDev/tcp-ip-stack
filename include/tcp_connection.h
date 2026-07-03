@@ -78,6 +78,12 @@ public:
     TcpState get_state() const { return _state; }
     bool is_closed() const { return _state == TcpState::CLOSED; }
 
+    // A stable identity that outlives any single TcpConnection* - safe to
+    // hand across a thread boundary and look up again later via
+    // NetworkStack::find_connection(), unlike the pointer itself, which
+    // dangles the instant NetworkStack reaps a CLOSED connection.
+    uint64_t get_id() const { return _id; }
+
     void set_data_received_callback(DataReceivedFn callback) { _on_data_received = std::move(callback); }
     void set_state_changed_callback(StateChangedFn callback) { _on_state_changed = std::move(callback); }
 
@@ -93,6 +99,7 @@ private:
     void _handle_ack(const Tcp& segment);
     void _handle_fin();
 
+    uint64_t _id;
     uint16_t _local_port;
     IPv4Address _remote_ip;
     uint16_t _remote_port;

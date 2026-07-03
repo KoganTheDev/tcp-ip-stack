@@ -76,36 +76,75 @@ void Server::_handle_new_connections()
 {
     while (TcpConnection* connection = this->_network_stack.accept(this->_port))
     {
-        connection->set_data_received_callback([this, connection](const Bytes& data)
+        uint64_t connection_id = connection->get_id();
+        connection->set_data_received_callback([this, connection_id](const Bytes& data)
         {
-            // The "work" (a plain echo here, but this is the seam where
-            // real per-connection processing would go) runs on a worker
-            // thread; the result is applied back on the reactor thread via
-            // the completion queue, since NetworkStack/TcpConnection are
-            // only safe to touch from there.
-            //
-            // Known limitation: `connection` is a raw pointer owned by
-            // NetworkStack. If the peer resets/closes and NetworkStack
-            // reaps this connection before the worker's result comes back,
-            // this dangles - not guarded against. Low risk for a quick
-            // request/response workload; unsafe for a sustained one.
-            this->_thread_pool.submit([this, connection, data]()
-            {
-                Bytes response = data;
-                this->_completion_queue.push([connection, response]()
-                {
-                    connection->send(response);
-
-                    // the peer already sent its FIN (CLOSE_WAIT) and we've
-                    // now sent everything we had for it - safe to close our
-                    // side. TcpConnection defers this itself if this send is
-                    // still in flight, so this is never premature.
-                    if (connection->get_state() == TcpState::CLOSE_WAIT)
-                    {
-                        connection->close();
-                    }
-                });
-            });
+            this->_enqueue_or_dispatch(connection_id, data);
         });
     }
+}
+
+void Server::_enqueue_or_dispatch(uint64_t connection_id, const Bytes& data)
+{
+    if (this->_connections_busy.count(connection_id) > 0)
+    {
+        // something for this connection is already in flight - queue this
+        // chunk instead of dispatching it now, so responses can never be
+        // applied out of the order their data arrived in
+        this->_pending_chunks[connection_id].push_back(data);
+        return;
+    }
+
+    this->_dispatch_chunk(connection_id, data);
+}
+
+void Server::_dispatch_chunk(uint64_t connection_id, const Bytes& data)
+{
+    this->_connections_busy.insert(connection_id);
+
+    // The "work" (a plain echo here, but this is the seam where real
+    // per-connection processing would go) runs on a worker thread; the
+    // result is applied back on the reactor thread via the completion
+    // queue, since NetworkStack/TcpConnection are only safe to touch there.
+    this->_thread_pool.submit([this, connection_id, data]()
+    {
+        Bytes response = data;
+        this->_completion_queue.push([this, connection_id, response]()
+        {
+            this->_apply_response(connection_id, response);
+        });
+    });
+}
+
+void Server::_apply_response(uint64_t connection_id, const Bytes& response)
+{
+    // Looked up by id, not held as a pointer across the async gap above -
+    // find_connection() safely returns nullptr if NetworkStack already
+    // reaped this connection (e.g. the peer sent RST) instead of dangling.
+    TcpConnection* connection = this->_network_stack.find_connection(connection_id);
+    if (connection != nullptr)
+    {
+        connection->send(response);
+
+        // the peer already sent its FIN (CLOSE_WAIT) and we've now sent
+        // everything we had for it - safe to close our side. TcpConnection
+        // defers this itself if this send is still in flight, so this is
+        // never premature.
+        if (connection->get_state() == TcpState::CLOSE_WAIT)
+        {
+            connection->close();
+        }
+    }
+
+    auto pending_it = this->_pending_chunks.find(connection_id);
+    if (pending_it != this->_pending_chunks.end() && !pending_it->second.empty())
+    {
+        Bytes next_chunk = std::move(pending_it->second.front());
+        pending_it->second.pop_front();
+        this->_dispatch_chunk(connection_id, next_chunk);
+        return;
+    }
+
+    this->_pending_chunks.erase(connection_id);
+    this->_connections_busy.erase(connection_id);
 }

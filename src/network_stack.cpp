@@ -52,6 +52,12 @@ TcpConnection* NetworkStack::accept(uint16_t port)
     return connection_it != this->_connections.end() ? connection_it->second.get() : nullptr;
 }
 
+TcpConnection* NetworkStack::find_connection(uint64_t id) const
+{
+    auto it = this->_connections_by_id.find(id);
+    return it != this->_connections_by_id.end() ? it->second : nullptr;
+}
+
 void NetworkStack::poll()
 {
     while (true)
@@ -88,7 +94,15 @@ void NetworkStack::_reap_closed_connections()
 {
     for (auto it = this->_connections.begin(); it != this->_connections.end(); )
     {
-        it = it->second->is_closed() ? this->_connections.erase(it) : std::next(it);
+        if (it->second->is_closed())
+        {
+            this->_connections_by_id.erase(it->second->get_id());
+            it = this->_connections.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
     }
 }
 
@@ -205,6 +219,7 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
         return;
     }
 
+    this->_connections_by_id[connection->get_id()] = connection.get();
     this->_connections[key] = std::move(connection);
 }
 

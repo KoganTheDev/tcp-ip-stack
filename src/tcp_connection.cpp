@@ -22,9 +22,15 @@ uint32_t generate_initial_sequence_number()
     return clock_component + counter.fetch_add(64000u);
 }
 
+namespace
+{
+    std::atomic<uint64_t> g_next_connection_id{1};
+}
+
 TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port,
                               uint32_t initial_seq, SendSegmentFn send_segment)
-    : _local_port(local_port), _remote_ip(remote_ip), _remote_port(remote_port),
+    : _id(g_next_connection_id.fetch_add(1)),
+      _local_port(local_port), _remote_ip(remote_ip), _remote_port(remote_port),
       _state(TcpState::LISTEN),
       _send_next(initial_seq), _send_unacked(initial_seq), _recv_next(0),
       _unacked_flags(0), _awaiting_ack(false),
