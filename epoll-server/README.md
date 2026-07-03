@@ -33,10 +33,12 @@ would go) off the reactor thread, then hands the result back through
 `TcpConnection::send()`) itself. `EPOLLONESHOT` isn't used or needed here, since
 connections are never registered as separate epoll fds in the first place.
 
-**Known limitation**: the completion handoff holds a raw `TcpConnection*`. If a peer
-resets/closes and `NetworkStack` reaps that connection before the worker's result
-comes back, the pointer dangles - not guarded against. Low risk for a quick
-request/response workload; unsafe for a sustained one under real load.
+Dispatch is tracked by `TcpConnection::get_id()`, not by raw pointer - a pointer held
+across the thread-pool/completion-queue gap could dangle if `NetworkStack` reaps the
+connection first; `find_connection(id)` safely returns `nullptr` instead. It's also
+serialized per connection: at most one chunk per connection is ever in flight in the
+thread pool at once, so two chunks from the same connection can't have their
+responses applied out of order.
 
 ## Build & run
 
@@ -49,3 +51,20 @@ Requires root (opens `/dev/net/tun`). Brings up a TAP interface at `10.0.0.2` an
 listens on TCP port 8080 - see the project page in the LLM wiki for how to reach it
 from a real kernel TCP client on the same machine. `Ctrl+C`/`SIGTERM` shut it down
 cleanly.
+
+## Load testing
+
+`load_test.py` drives N concurrent connections against a running server and asserts
+every echo matches exactly - run it in the same privileged container as the server,
+once it's up and `tap0` has an IP:
+
+```sh
+python3 load_test.py [connection_count] [payload_size]   # defaults: 30, 256
+```
+
+This is what caught a real bug: under a burst of connections, a connection's
+handshake-completing ACK and its first data segment could land in the same
+`NetworkStack::poll()` drain, arriving before `Server` had called `accept()` and
+registered a data-received callback - silently dropping that data. Fixed in
+`TcpConnection` by buffering any data received before a callback is registered and
+flushing it (in order) the moment one is - see the project's Bugs Found & Fixed.

@@ -123,6 +123,52 @@ TEST(FinalHandshakeAckMovesToEstablished)
     test_assert(connection->get_state() == TcpState::ESTABLISHED, "final handshake ACK should move to ESTABLISHED");
 }
 
+// Regression test for a load-testing find: under a burst of many
+// connections, a connection's handshake-completing ACK and its first data
+// segment can land in the same processing batch, before the application
+// (Server) has called accept() and wired up a data_received callback.
+// NetworkStack delivers data the instant a segment arrives, with no
+// buffering of its own - on_segment() must not silently drop data that
+// arrives before any callback is registered.
+TEST(DataArrivingBeforeCallbackRegisteredIsNotLost)
+{
+    std::vector<RecordedSegment> sent;
+
+    // build a connection to ESTABLISHED without ever registering a
+    // data_received callback, then feed data segments - as if Server hasn't
+    // called accept() for it yet
+    auto connection = std::make_unique<TcpConnection>(
+        8080, IPv4Address("10.0.0.1"), 12345, 1000,
+        [&sent](const Tcp& header, const Bytes& payload)
+        {
+            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload});
+        }
+    );
+    connection->accept_incoming_syn(500);
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK));
+
+    Bytes first_chunk = Bytes::from_hex("68656c6c6f");     // "hello"
+    Bytes second_chunk = Bytes::from_hex("776f726c64");    // "world"
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, first_chunk));
+    connection->on_segment(*make_incoming_segment(506, 1001, FLAG_ACK, second_chunk));
+
+    std::vector<Bytes> received;
+    connection->set_data_received_callback([&received](const Bytes& data)
+    {
+        received.push_back(data);
+    });
+
+    test_assert(received.size() == 2, "both segments received before the callback existed should be delivered once it's registered");
+    test_assert(received[0].to_hex() == first_chunk.to_hex(), "buffered data should be delivered in the order it arrived");
+    test_assert(received[1].to_hex() == second_chunk.to_hex(), "buffered data should be delivered in the order it arrived");
+
+    // data arriving after the callback is already set should still go
+    // straight through, not get buffered again
+    Bytes third_chunk = Bytes::from_hex("2131");           // "!1"
+    connection->on_segment(*make_incoming_segment(511, 1001, FLAG_ACK, third_chunk));
+    test_assert(received.size() == 3, "data arriving after the callback is set should be delivered immediately");
+}
+
 TEST(InboundDataTriggersCallbackAndAcksCorrectly)
 {
     std::vector<RecordedSegment> sent;

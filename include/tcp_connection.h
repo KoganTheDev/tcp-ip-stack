@@ -97,7 +97,15 @@ public:
     // dangles the instant NetworkStack reaps a CLOSED connection.
     uint64_t get_id() const { return _id; }
 
-    void set_data_received_callback(DataReceivedFn callback) { _on_data_received = std::move(callback); }
+    // Registers the callback and immediately flushes anything already
+    // received before this was called (in order) - a real gap otherwise:
+    // NetworkStack delivers data the instant a segment arrives, with no
+    // buffering of its own, but an application (like epoll-server) only
+    // wires this callback up after accept() returns. If a connection's
+    // data-carrying segment lands in the same poll() drain as the segment
+    // that completed its handshake, it arrives before accept() was even
+    // called - silently lost without this buffer.
+    void set_data_received_callback(DataReceivedFn callback);
     void set_state_changed_callback(StateChangedFn callback) { _on_state_changed = std::move(callback); }
 
     // Called by NetworkStack immediately after constructing this object for
@@ -158,6 +166,9 @@ private:
     SendSegmentFn _send_segment;
     DataReceivedFn _on_data_received;
     StateChangedFn _on_state_changed;
+    // received data waiting for a callback to be registered - see
+    // set_data_received_callback()'s comment
+    std::deque<Bytes> _received_before_callback;
 
     static constexpr uint16_t RECEIVE_WINDOW = 65535;
     static constexpr size_t MAX_IN_FLIGHT_SEGMENTS = 4;

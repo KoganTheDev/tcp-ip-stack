@@ -87,6 +87,18 @@ void TcpConnection::accept_incoming_syn(uint32_t peer_isn)
     _send_flags(FLAG_SYN);
 }
 
+void TcpConnection::set_data_received_callback(DataReceivedFn callback)
+{
+    _on_data_received = std::move(callback);
+
+    while (!_received_before_callback.empty())
+    {
+        Bytes buffered = std::move(_received_before_callback.front());
+        _received_before_callback.pop_front();
+        _on_data_received(buffered);
+    }
+}
+
 void TcpConnection::initiate_connect()
 {
     _transition(TcpState::SYN_SENT);
@@ -247,6 +259,14 @@ void TcpConnection::on_segment(const Tcp& segment)
                 if (_on_data_received)
                 {
                     _on_data_received(payload);
+                }
+                else
+                {
+                    // no application has registered a callback yet (this
+                    // segment landed in the same processing batch as the
+                    // one that completed the handshake, before accept()
+                    // could run) - hold onto it instead of dropping it
+                    _received_before_callback.push_back(payload);
                 }
             }
             // ack current RCV.NXT either way - a duplicate ack if this was
