@@ -76,3 +76,15 @@ T Bytes::slice_int(size_t index) const
 {
     return bytes_to_int<T>(this->slice(index, sizeof(T)));
 }
+
+template <typename T>
+void Bytes::append_int(T value)
+{
+    size_t offset = this->size();
+    this->resize(offset + sizeof(T));
+    for (size_t i = 0; i < sizeof(T); i++)
+    {
+        (*this)[offset + sizeof(T) - i - 1] = static_cast<byte_t>(value & 0xff);
+        value /= 0x100;
+    }
+}

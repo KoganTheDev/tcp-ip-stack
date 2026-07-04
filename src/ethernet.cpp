@@ -48,15 +48,16 @@ void Ethernet::from_bytes(const Bytes &data)
 Bytes Ethernet::to_bytes()
 {
     Bytes result;
+    result.reserve(14); // fixed Ethernet header size - avoids reallocating as fields are appended
     result |= this->_dest.get_address();
     result |= this->_src.get_address();
-    result |= int_to_bytes<uint16_t>(this->_ethernet_protocol);
+    result.append_int<uint16_t>(this->_ethernet_protocol);
 
     if (this->_next_layer)
     {
         result |= this->_next_layer->to_bytes();
     }
-    
+
     return result;
 }
 

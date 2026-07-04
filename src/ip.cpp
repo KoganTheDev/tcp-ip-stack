@@ -99,20 +99,21 @@ void Ip::from_bytes(const Bytes& data)
 Bytes Ip::_header_to_bytes() const
 {
     Bytes result;
+    result.reserve(20); // fixed IP header size (no options) - avoids reallocating as fields are appended
     uint8_t version_and_IHL = (this->_version << 4) | this->_IHL;
-    result |= int_to_bytes<uint8_t>(version_and_IHL);
-    result |= int_to_bytes<uint8_t>(this->_TOS);
-    result |= int_to_bytes<uint16_t>(this->_total_length);
-    result |= int_to_bytes<uint16_t>(this->_identification);
+    result.append_int<uint8_t>(version_and_IHL);
+    result.append_int<uint8_t>(this->_TOS);
+    result.append_int<uint16_t>(this->_total_length);
+    result.append_int<uint16_t>(this->_identification);
     uint16_t flags_and_offset =
     ((this->_ip_flag_x & 0x1) << 15) |  // Reserved
     ((this->_ip_flag_d & 0x1) << 14) |  // DF
     ((this->_ip_flag_m & 0x1) << 13) |  // MF
     (this->_fragment_offset & 0x1FFF);  // 13-bit offset
-    result |= int_to_bytes<uint16_t>(flags_and_offset);
-    result |= int_to_bytes<uint8_t>(this->_TTL);
-    result |= int_to_bytes<uint8_t>(this->_protocol);
-    result |= int_to_bytes<uint16_t>(this->_header_checksum);
+    result.append_int<uint16_t>(flags_and_offset);
+    result.append_int<uint8_t>(this->_TTL);
+    result.append_int<uint8_t>(this->_protocol);
+    result.append_int<uint16_t>(this->_header_checksum);
     result |= this->_src_address;
     result |= this->_dest_address;
     return result;
