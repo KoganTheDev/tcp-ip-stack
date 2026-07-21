@@ -39,8 +39,25 @@ public:
     // to_bytes() with this set to 0 first) and writes the result back here.
     void set_checksum(uint16_t checksum) { _checksum = checksum; }
 
+    // TCP options (RFC 793 SS3.1 / RFC 7323) - MSS and window scaling only;
+    // SACK/timestamps stay a deliberate scope cut. Both are meaningful only
+    // on a SYN (RFC 7323: window scaling is used at all only if *both*
+    // sides' SYNs carried it) but nothing here enforces that - it's on the
+    // caller (TcpConnection) to only set these before sending a SYN.
+    bool has_mss_option() const { return _has_mss_option; }
+    uint16_t get_mss_option() const { return _mss_option; }
+    void set_mss_option(uint16_t mss) { _has_mss_option = true; _mss_option = mss; }
+
+    bool has_window_scale_option() const { return _has_window_scale_option; }
+    uint8_t get_window_scale_option() const { return _window_scale_option; }
+    void set_window_scale_option(uint8_t shift) { _has_window_scale_option = true; _window_scale_option = shift; }
 
 private:
+    // Serializes whatever options are currently set (MSS/window-scale),
+    // NOP-padded to a 4-byte boundary, and updates _data_offset to match -
+    // shared by to_bytes() (needs the bytes) and anything that needs to
+    // know the resulting header length before serializing.
+    Bytes _options_to_bytes();
     uint16_t _src_port; // Identifies the sending port
 
     uint16_t _dest_port; // Identifies the receiving port
@@ -93,4 +110,12 @@ private:
     uint16_t _checksum;
 
     uint16_t _urgent_ptr; // If the URG flag is set, then this field is the offset from the sequence number indicating the last urgent data byte.
+
+    // Options (kind 2 = MSS, kind 3 = window scale) - absent unless
+    // explicitly set via set_mss_option()/set_window_scale_option(), or
+    // parsed from an incoming segment that carried them.
+    bool _has_mss_option = false;
+    uint16_t _mss_option = 0;
+    bool _has_window_scale_option = false;
+    uint8_t _window_scale_option = 0;
 };

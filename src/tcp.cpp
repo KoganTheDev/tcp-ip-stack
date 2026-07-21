@@ -64,19 +64,91 @@ void Tcp::from_bytes(const Bytes& data)
 	_checksum = data.slice_int<uint16_t>(16);
 	_urgent_ptr = data.slice_int<uint16_t>(18);
 
-	// options (if any) live between byte 20 and header_length are not parsed -
-	// this stack never sends them and skips over them on receive
+	// Options (RFC 793 SS3.1): a sequence of kind/[length/data] TLVs between
+	// byte 20 and header_length. Only MSS (kind 2) and window scale (kind 3)
+	// are understood - anything else is skipped via its own length byte,
+	// which is what makes this forward-compatible instead of a parse error.
+	_has_mss_option = false;
+	_has_window_scale_option = false;
+	size_t i = 20;
+	while (i < header_length)
+	{
+		uint8_t kind = data[i];
+		if (kind == 0) // End of Option List
+		{
+			break;
+		}
+		if (kind == 1) // No-Operation (padding) - no length byte
+		{
+			i += 1;
+			continue;
+		}
+
+		if (i + 1 >= header_length)
+		{
+			break; // truncated option with no length byte - stop, don't read out of bounds
+		}
+		uint8_t length = data[i + 1];
+		if (length < 2 || i + length > header_length)
+		{
+			break; // malformed length - stop rather than read past the header
+		}
+
+		if (kind == 2 && length == 4)
+		{
+			_has_mss_option = true;
+			_mss_option = data.slice_int<uint16_t>(i + 2);
+		}
+		else if (kind == 3 && length == 3)
+		{
+			_has_window_scale_option = true;
+			_window_scale_option = data[i + 2];
+		}
+
+		i += length;
+	}
+
 	if (data.size() > header_length)
 	{
 		this->_next_layer = std::make_unique<Raw>(data.slice(header_length));
 	}
 }
 
+Bytes Tcp::_options_to_bytes()
+{
+	Bytes options;
+	if (this->_has_mss_option)
+	{
+		options.append_int<uint8_t>(2); // kind: MSS
+		options.append_int<uint8_t>(4); // length (bytes, including kind+length)
+		options.append_int<uint16_t>(this->_mss_option);
+	}
+	if (this->_has_window_scale_option)
+	{
+		options.append_int<uint8_t>(3); // kind: window scale
+		options.append_int<uint8_t>(3);
+		options.append_int<uint8_t>(this->_window_scale_option);
+	}
+	while (options.size() % 4 != 0)
+	{
+		options.append_int<uint8_t>(1); // NOP padding - data_offset counts whole 32-bit words
+	}
+	return options;
+}
+
 
 Bytes Tcp::to_bytes()
 {
+	// data_offset depends on however many option bytes (if any) are set -
+	// recomputed here rather than trusted from construction, since options
+	// are attached after construction via set_mss_option()/
+	// set_window_scale_option() (mirrors how set_checksum() is also a
+	// post-construction mutator).
+	Bytes options = this->_options_to_bytes();
+	this->_data_offset = static_cast<uint8_t>(5 + options.size() / 4);
+
 	Bytes result;
-	result.reserve(20); // fixed TCP header size (no options) - avoids reallocating as fields are appended
+	result.reserve(20 + options.size()); // avoids reallocating as fields are appended
 
 	result.append_int<uint16_t>(this->_src_port);
 	result.append_int<uint16_t>(this->_dest_port);
@@ -101,6 +173,7 @@ Bytes Tcp::to_bytes()
 	result.append_int<uint16_t>(this->_window);
 	result.append_int<uint16_t>(this->_checksum);
 	result.append_int<uint16_t>(this->_urgent_ptr);
+	result |= options;
 
 	if (this->_next_layer)
 	{

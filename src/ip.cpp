@@ -137,6 +137,11 @@ void Ip::compute_checksum()
     this->_header_checksum = internet_checksum(this->_header_to_bytes());
 }
 
+bool Ip::verify_checksum() const
+{
+    return internet_checksum(this->_header_to_bytes()) == 0;
+}
+
 std::string Ip::to_string() const
 {
     std::string result;

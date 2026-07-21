@@ -114,6 +114,11 @@ private:
 
     void _send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol, const Bytes& payload);
     void _send_tcp_segment(const IPv4Address& dest_ip, const Tcp& header, const Bytes& payload);
+    // RFC 793 SS3.4's reset-generation rule for a segment that doesn't match
+    // any existing connection and isn't a SYN to a listening port: no
+    // TcpConnection exists to answer through, so this builds and sends the
+    // RST directly.
+    void _send_rst(const Ip& ip, const Tcp& tcp);
     MacAddress _resolve_mac(const IPv4Address& ip) const;
 
     uint16_t _allocate_ephemeral_port();

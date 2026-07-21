@@ -30,6 +30,13 @@ public:
     // send the packet - the IP checksum covers only the header, not payload.
     void compute_checksum();
 
+    // Recomputes internet_checksum() over the header exactly as received
+    // (checksum field left in place, not zeroed) - the standard Internet
+    // checksum self-verification identity: a header whose checksum is
+    // correct always sums to exactly 0. Called on receive, unlike
+    // compute_checksum() which is called before sending.
+    bool verify_checksum() const;
+
     uint8_t get_version() const { return _version; }
     uint8_t get_IHL() const { return _IHL; }
     uint8_t get_type_of_service() const { return _TOS; }

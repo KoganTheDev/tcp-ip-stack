@@ -10,6 +10,15 @@ namespace
     constexpr uint16_t FIRST_EPHEMERAL_PORT = 49152; // IANA dynamic/private range starts here
     constexpr int ARP_MAX_RETRIES = 3;
     constexpr int ARP_RETRY_TICKS = 4; // with a 500ms NetworkStack tick, ~2s between retries
+
+    constexpr uint8_t FLAG_ACK = 0x10;
+    constexpr uint8_t FLAG_RST = 0x04;
+    constexpr uint8_t FLAG_SYN = 0x02;
+    constexpr uint8_t FLAG_FIN = 0x01;
+
+    // 1500 (the TAP device's Ethernet MTU) minus 20 bytes of IP header and
+    // 20 of TCP header - what this stack advertises in its own MSS option.
+    constexpr uint16_t LOCAL_MSS = 1460;
 }
 
 bool NetworkStack::ConnectionKey::operator==(const ConnectionKey& other) const
@@ -69,7 +78,8 @@ TcpConnection* NetworkStack::connect(const IPv4Address& remote_ip, uint16_t remo
         [this, remote_ip](const Tcp& header, const Bytes& payload)
         {
             this->_send_tcp_segment(remote_ip, header, payload);
-        }
+        },
+        LOCAL_MSS
     );
 
     TcpConnection* connection_ptr = connection.get();
@@ -288,6 +298,17 @@ void NetworkStack::_handle_ip(const Ip& ip)
         return;
     }
 
+    if (!ip.verify_checksum())
+    {
+        // corrupted header (or genuinely not addressed to us and we
+        // misparsed it as if it were) - a real stack drops this silently,
+        // no RST, since it can't even trust the header enough to know who
+        // to send one to
+        std::cerr << "NetworkStack: dropping an IPv4 packet with a bad header checksum from "
+                   << IPv4Address(ip.get_src_address()).to_string() << std::endl;
+        return;
+    }
+
     if (ip.get_protocol() != IpProtocol::TCP || !ip.has_next_layer())
     {
         return;
@@ -301,7 +322,24 @@ void NetworkStack::_handle_ip(const Ip& ip)
 
 void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
 {
-    ConnectionKey key{IPv4Address(ip.get_src_address()), tcp.get_src_port(), tcp.get_dest_port()};
+    IPv4Address src_ip(ip.get_src_address());
+
+    // to_bytes() isn't declared const (ProtocolLayer's virtual signature
+    // isn't, and nothing else in the codebase needed to call it through a
+    // const reference before) but it only serializes already-parsed fields -
+    // no observable mutation - so a const_cast here is safe, not a hack
+    // around real constness.
+    Bytes segment_bytes = const_cast<Tcp&>(tcp).to_bytes();
+    if (transport_checksum(src_ip, this->_local_ip, IpProtocol::TCP, segment_bytes) != 0)
+    {
+        // corrupted segment - dropped silently, same as a real kernel stack;
+        // no RST, since we can't trust the header enough to safely answer it
+        std::cerr << "NetworkStack: dropping a TCP segment with a bad checksum from "
+                   << src_ip.to_string() << std::endl;
+        return;
+    }
+
+    ConnectionKey key{src_ip, tcp.get_src_port(), tcp.get_dest_port()};
 
     auto connection_it = this->_connections.find(key);
     if (connection_it != this->_connections.end())
@@ -320,7 +358,15 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
         && this->_listening_ports.find(tcp.get_dest_port()) != this->_listening_ports.end();
     if (!is_new_connection_request)
     {
-        return; // not a SYN to a port we're listening on - a real stack would RST here
+        if (!tcp.get_rst())
+        {
+            // no connection matches this 4-tuple, and it isn't a SYN to a
+            // listening port either - RFC 793 SS3.4's reset-generation rule
+            // for exactly this case. Never RST in response to an RST itself
+            // (that's how two stacks could RST each other forever).
+            this->_send_rst(ip, tcp);
+        }
+        return;
     }
 
     IPv4Address remote_ip = key.remote_ip;
@@ -329,12 +375,18 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
         [this, remote_ip](const Tcp& header, const Bytes& payload)
         {
             this->_send_tcp_segment(remote_ip, header, payload);
-        }
+        },
+        LOCAL_MSS
     );
 
     try
     {
-        connection->accept_incoming_syn(tcp.get_sequence_number());
+        connection->accept_incoming_syn(
+            tcp.get_sequence_number(),
+            tcp.has_mss_option() ? tcp.get_mss_option() : 0,
+            tcp.has_window_scale_option(),
+            tcp.has_window_scale_option() ? tcp.get_window_scale_option() : 0
+        );
     }
     catch (const std::exception& e)
     {
@@ -436,6 +488,18 @@ void NetworkStack::_send_tcp_segment(const IPv4Address& dest_ip, const Tcp& head
                 header.get_acknowledgement_number(), header.get_data_offset(), flags,
                 header.get_window(), 0, header.get_urgent_ptr());
 
+    // options aren't copied by the constructor above (rebuilt from getters,
+    // same reason as the flags) - carry them over explicitly so a SYN's
+    // MSS/window-scale options actually make it onto the wire
+    if (header.has_mss_option())
+    {
+        segment.set_mss_option(header.get_mss_option());
+    }
+    if (header.has_window_scale_option())
+    {
+        segment.set_window_scale_option(header.get_window_scale_option());
+    }
+
     if (!payload.empty())
     {
         segment /= std::make_unique<Raw>(payload);
@@ -445,4 +509,43 @@ void NetworkStack::_send_tcp_segment(const IPv4Address& dest_ip, const Tcp& head
     segment.set_checksum(checksum);
 
     this->_send_ip_packet(dest_ip, IpProtocol::TCP, segment.to_bytes());
+}
+
+void NetworkStack::_send_rst(const Ip& ip, const Tcp& tcp)
+{
+    IPv4Address remote_ip(ip.get_src_address());
+
+    // RFC 793 SS3.4: a reset's sequencing depends on whether the segment
+    // being answered carried an ACK.
+    uint32_t seq;
+    uint32_t ack = 0;
+    uint8_t flags = FLAG_RST;
+
+    if (tcp.get_ack())
+    {
+        // the RST just continues the sequence space the sender already
+        // told us they expect - no ACK of our own needed
+        seq = tcp.get_acknowledgement_number();
+    }
+    else
+    {
+        size_t payload_size = 0;
+        if (tcp.has_next_layer())
+        {
+            if (const Raw* raw = dynamic_cast<const Raw*>(&tcp.get_next_layer()))
+            {
+                payload_size = raw->get_data().size();
+            }
+        }
+        uint32_t consumed = static_cast<uint32_t>(payload_size);
+        if (tcp.get_syn()) consumed += 1;
+        if (tcp.get_fin()) consumed += 1;
+
+        seq = 0;
+        ack = tcp.get_sequence_number() + consumed;
+        flags |= FLAG_ACK;
+    }
+
+    Tcp rst(tcp.get_dest_port(), tcp.get_src_port(), seq, ack, 5, flags, 0, 0, 0);
+    this->_send_tcp_segment(remote_ip, rst, Bytes());
 }

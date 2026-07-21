@@ -61,6 +61,20 @@ TEST(TransportChecksumSelfVerifies)
     test_assert(verify == 0, "transport_checksum() should self-verify to 0 once the real checksum is filled in");
 }
 
+// Ip::verify_checksum() is the receive-side counterpart to compute_checksum() -
+// a correctly-checksummed header must self-verify, and a corrupted one must not.
+TEST(IpVerifyChecksumAcceptsCorrectHeaderAndRejectsCorruptedOne)
+{
+    Ip ip(4, 5, 0x00, 0x0028, 0x0001, false, false, false, 0, 64, IpProtocol::TCP, 0,
+          Bytes::from_hex("0a000001"), Bytes::from_hex("0a000002"));
+    ip.compute_checksum();
+    test_assert(ip.verify_checksum(), "a header with a correctly-computed checksum must verify");
+
+    Ip corrupted(4, 5, 0x01 /* TOS flipped after the checksum was computed */, 0x0028, 0x0001, false, false, false, 0, 64,
+                 IpProtocol::TCP, ip.get_header_checksum(), Bytes::from_hex("0a000001"), Bytes::from_hex("0a000002"));
+    test_assert(!corrupted.verify_checksum(), "a header whose fields changed after the checksum was computed must fail verification");
+}
+
 // Changing any field the pseudo-header covers - here, the destination IP -
 // without recomputing the checksum must break the self-verification. This
 // is the whole point of the pseudo-header: a segment misdelivered to a

@@ -8,6 +8,7 @@
 namespace
 {
     constexpr uint8_t FLAG_ACK = 0x10;
+    constexpr uint8_t FLAG_RST = 0x04;
     constexpr uint8_t FLAG_SYN = 0x02;
     constexpr uint8_t FLAG_FIN = 0x01;
 
@@ -325,25 +326,84 @@ TEST(DuplicateFinDuringTimeWaitReAcksAndRestartsWait)
     test_assert(connection->get_state() == TcpState::TIME_WAIT, "the wait timer should have restarted, not continued from before the duplicate");
 }
 
-// MAX_IN_FLIGHT_SEGMENTS is 4 (see tcp_connection.h) - the sliding window
-// should let that many segments out before it starts queueing, unlike
-// stop-and-wait's exactly one.
-TEST(SendPipelinesUpToWindowLimitBeforeQueueing)
+// The fixed-count window (MAX_IN_FLIGHT_SEGMENTS) is gone - flow control is
+// now min(cwnd, peer's advertised window), in bytes. make_established_connection's
+// peer segments never carry an MSS option, so both the effective MSS and
+// the initial congestion window fall back to DEFAULT_PEER_MSS (536).
+TEST(SendQueuesOnceBytesInFlightWouldExceedTheCongestionWindow)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
-    connection->send(Bytes::from_hex("01"));
-    connection->send(Bytes::from_hex("02"));
-    connection->send(Bytes::from_hex("03"));
-    connection->send(Bytes::from_hex("04"));
-    test_assert(sent.size() == 4, "all 4 sends should go out immediately - the window isn't full yet");
+    connection->send(Bytes(400)); // fits: 0 + 400 <= 536
+    test_assert(sent.size() == 1, "a send within the congestion window should go out immediately");
 
-    connection->send(Bytes::from_hex("05"));
-    test_assert(sent.size() == 4, "a 5th send with the window full should queue instead of going out immediately");
+    connection->send(Bytes(200)); // doesn't fit: 400 + 200 > 536
+    test_assert(sent.size() == 1, "a send that would exceed the congestion window should queue instead of going out");
 
-    test_assert(sent[0].seq + 1 == sent[1].seq, "consecutive pipelined segments should have consecutive sequence numbers");
-    test_assert(sent[1].seq + 1 == sent[2].seq, "consecutive pipelined segments should have consecutive sequence numbers");
+    // acking the whole first segment frees enough room for the queued one
+    connection->on_segment(*make_incoming_segment(501, sent[0].seq + 400, FLAG_ACK));
+    test_assert(sent.size() == 2, "acking enough of the window should let the queued send go out");
+}
+
+// Slow start (RFC 5681): the congestion window starts at one MSS and grows
+// by the full number of bytes acked each time - roughly doubling per RTT.
+TEST(SlowStartRoughlyDoublesCongestionWindowPerRtt)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->send(Bytes(536)); // exactly one MSS - the initial window
+    test_assert(sent.size() == 1, "the initial congestion window (1 MSS) should let exactly one full segment out");
+
+    // acking it grows cwnd by the 536 bytes just acked: 536 -> 1072
+    connection->on_segment(*make_incoming_segment(501, sent[0].seq + 536, FLAG_ACK));
+
+    connection->send(Bytes(536));
+    connection->send(Bytes(536));
+    test_assert(sent.size() == 3, "after slow start doubles the window, two more full-size segments should pipeline immediately");
+}
+
+// Classic Reno's fast retransmit: three acks that don't advance SND.UNA
+// (duplicate acks) trigger an immediate retransmit of the oldest unacked
+// segment, without waiting for RETRANSMIT_TIMEOUT_TICKS to elapse.
+TEST(ThreeDuplicateAcksTriggerImmediateFastRetransmit)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->send(Bytes::from_hex("6f6b")); // "ok" - one segment in flight
+    test_assert(sent.size() == 1, "send() should produce one segment");
+    uint32_t snd_una = sent[0].seq;
+
+    connection->on_segment(*make_incoming_segment(501, snd_una, FLAG_ACK));
+    connection->on_segment(*make_incoming_segment(501, snd_una, FLAG_ACK));
+    test_assert(sent.size() == 1, "fewer than 3 duplicate acks should not trigger a retransmit yet");
+
+    connection->on_segment(*make_incoming_segment(501, snd_una, FLAG_ACK));
+    test_assert(sent.size() == 2, "the 3rd duplicate ack should trigger an immediate retransmit, without waiting for a timeout");
+    test_assert(sent[1].seq == snd_una, "the fast retransmit must resend the oldest unacked segment at its original sequence number");
+}
+
+// Classic Reno's "slow start restart": a real timeout (unlike duplicate
+// acks, which mean something is still getting through) collapses the
+// congestion window all the way back to one MSS.
+TEST(RetransmitTimeoutCollapsesCongestionWindowToOneSegment)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->send(Bytes::from_hex("6f6b"));
+    connection->on_tick();
+    connection->on_tick();
+    connection->on_tick(); // RETRANSMIT_TIMEOUT_TICKS is 3
+    test_assert(sent.size() == 2, "the timeout should have triggered exactly one retransmission");
+
+    // with cwnd collapsed back to one MSS (536 bytes) and 2 bytes already
+    // outstanding from the retransmitted segment, a payload bigger than the
+    // remaining room should queue instead of pipelining straight out
+    connection->send(Bytes(600));
+    test_assert(sent.size() == 2, "with cwnd collapsed to one segment, a send this size should queue rather than pipeline");
 }
 
 TEST(CumulativeAckDrainsQueueIntoWindow)
@@ -380,4 +440,91 @@ TEST(RetransmitOnlyRetransmitsOldestSegmentInWindow)
 
     test_assert(sent.size() == 3, "only one retransmission should happen per timeout, not one per in-flight segment");
     test_assert(sent[2].seq == sent[0].seq, "the retransmission must be of the oldest (first) unacked segment, not the newer one");
+}
+
+// Out-of-order reassembly: a segment arriving ahead of RCV.NXT must be
+// buffered, not delivered or dropped, and only released once the gap in
+// front of it is filled.
+TEST(OutOfOrderSegmentIsBufferedThenDeliveredOnceGapFills)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    std::vector<Bytes> received;
+    connection->set_data_received_callback([&received](const Bytes& data) { received.push_back(data); });
+
+    Bytes first = Bytes::from_hex("68656c6c6f");  // "hello" - seq 501..505
+    Bytes second = Bytes::from_hex("776f726c64"); // "world" - seq 506..510
+
+    // "world" arrives first - out of order, since RCV.NXT is still 501
+    connection->on_segment(*make_incoming_segment(506, 1001, FLAG_ACK, second));
+    test_assert(received.empty(), "an out-of-order segment must not be delivered before the gap ahead of it is filled");
+
+    // the gap-filler arrives - both chunks should now deliver, in order
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, first));
+    test_assert(received.size() == 2, "the gap-filler should trigger delivery of both the new and the buffered chunk");
+    test_assert(received[0].to_hex() == first.to_hex(), "chunks must be delivered in sequence order, not arrival order");
+    test_assert(received[1].to_hex() == second.to_hex(), "chunks must be delivered in sequence order, not arrival order");
+}
+
+// Simultaneous close: both sides send FIN before seeing the other's ack.
+// This used to fold into the normal FIN_WAIT_2 path; it now passes through
+// its own CLOSING state instead.
+TEST(SimultaneousCloseGoesThroughClosingState)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->close(); // -> FIN_WAIT_1, sends our FIN
+    test_assert(connection->get_state() == TcpState::FIN_WAIT_1, "close() should move to FIN_WAIT_1");
+
+    // the peer's FIN arrives before it has acked ours
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK | FLAG_FIN));
+    test_assert(connection->get_state() == TcpState::CLOSING,
+        "a peer FIN in FIN_WAIT_1 (before our own FIN is acked) should move to CLOSING, not FIN_WAIT_2");
+
+    // now the peer acks our FIN
+    connection->on_segment(*make_incoming_segment(502, sent[0].seq + 1, FLAG_ACK));
+    test_assert(connection->get_state() == TcpState::TIME_WAIT, "CLOSING should move to TIME_WAIT once our own FIN is acked");
+}
+
+// RFC 793 SS3.9: a reset whose sequence number falls outside the receive
+// window must be ignored, not blindly trusted - a real segment couldn't
+// legitimately be that far from what's actually expected next.
+TEST(RstOutsideReceiveWindowIsIgnored)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->on_segment(*make_incoming_segment(999999, 1001, FLAG_ACK | FLAG_RST));
+    test_assert(connection->get_state() == TcpState::ESTABLISHED,
+        "an RST whose sequence number is outside the receive window must be ignored");
+
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK | FLAG_RST));
+    test_assert(connection->get_state() == TcpState::CLOSED, "an RST at the current RCV.NXT should still close the connection");
+}
+
+// MSS negotiation: a peer's SYN advertising a small MSS should cap every
+// segment this side sends to that size, splitting a larger payload instead
+// of ignoring the negotiated limit.
+TEST(NegotiatedMssCapsSentSegmentSize)
+{
+    std::vector<RecordedSegment> sent;
+    TcpConnection connection(8080, IPv4Address("10.0.0.1"), 12345, 1000,
+        [&sent](const Tcp& header, const Bytes& payload)
+        {
+            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload});
+        }
+    );
+
+    connection.accept_incoming_syn(500, 100); // peer's SYN advertises MSS=100
+    connection.on_segment(*make_incoming_segment(501, 1001, FLAG_ACK));
+    sent.clear();
+
+    // the initial congestion window is also one MSS (100 bytes here), so
+    // only the first chunk goes out immediately - the rest queues, which is
+    // exactly slow start's IW=1MSS behavior, not a segmentation bug
+    connection.send(Bytes(250));
+    test_assert(sent.size() == 1, "only the first MSS-sized chunk should go out under the initial (1 MSS) congestion window");
+    test_assert(sent[0].payload.size() == 100, "the sent chunk must be capped at the negotiated 100-byte MSS, not sent as one 250-byte segment");
 }

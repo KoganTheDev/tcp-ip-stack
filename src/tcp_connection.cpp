@@ -1,6 +1,7 @@
 #include "tcp_connection.h"
 #include "raw.h"
 
+#include <algorithm>
 #include <atomic>
 #include <ctime>
 
@@ -28,12 +29,16 @@ namespace
 }
 
 TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port,
-                              uint32_t initial_seq, SendSegmentFn send_segment)
+                              uint32_t initial_seq, SendSegmentFn send_segment, uint16_t local_mss)
     : _id(g_next_connection_id.fetch_add(1)),
       _local_port(local_port), _remote_ip(remote_ip), _remote_port(remote_port),
       _state(TcpState::LISTEN),
       _send_next(initial_seq), _recv_next(0),
       _fin_requested(false), _time_wait_ticks_remaining(0),
+      _local_mss(local_mss), _peer_mss(DEFAULT_PEER_MSS), _effective_mss(std::min(local_mss, DEFAULT_PEER_MSS)),
+      _window_scaling_negotiated(false), _peer_window_scale(0),
+      _peer_window(local_mss), // conservative placeholder until the handshake's real window arrives
+      _cwnd(local_mss), _ssthresh(INITIAL_SSTHRESH), _dup_ack_count(0), _in_fast_recovery(false),
       _send_segment(std::move(send_segment))
 {
 }
@@ -47,16 +52,70 @@ void TcpConnection::_transition(TcpState new_state)
     }
 }
 
+uint32_t TcpConnection::_bytes_in_flight() const
+{
+    // the window is always contiguous in sequence-number space (each entry
+    // starts exactly where the previous one ended), so the span from the
+    // first entry's start to the last entry's end covers every outstanding
+    // byte without needing to sum every entry individually
+    return _in_flight.empty() ? 0 : (_in_flight.back().end_seq - _in_flight.front().seq);
+}
+
+uint32_t TcpConnection::_receive_buffer_occupied() const
+{
+    uint32_t occupied = 0;
+    for (const auto& entry : _reorder_buffer)
+    {
+        occupied += static_cast<uint32_t>(entry.second.size());
+    }
+    for (const Bytes& buffered : _received_before_callback)
+    {
+        occupied += static_cast<uint32_t>(buffered.size());
+    }
+    return occupied;
+}
+
+bool TcpConnection::_seq_in_receive_window(uint32_t seq) const
+{
+    uint32_t occupied = _receive_buffer_occupied();
+    uint32_t window = occupied < RECEIVE_BUFFER_CAPACITY ? RECEIVE_BUFFER_CAPACITY - occupied : 0;
+    if (window == 0)
+    {
+        return seq == _recv_next;
+    }
+    // unsigned subtraction wraps modulo 2^32, which is exactly TCP's own
+    // sequence-number arithmetic - this correctly handles a sequence-number
+    // wraparound without any special-case code
+    return (seq - _recv_next) < window;
+}
+
 Tcp TcpConnection::_build_header(uint8_t flags, uint32_t seq) const
 {
-    return Tcp(_local_port, _remote_port, seq, _recv_next, 5, flags, RECEIVE_WINDOW, 0, 0);
+    uint32_t occupied = _receive_buffer_occupied();
+    uint32_t available = occupied < RECEIVE_BUFFER_CAPACITY ? RECEIVE_BUFFER_CAPACITY - occupied : 0;
+    // RFC 7323: if window scaling wasn't negotiated, this side must
+    // advertise its window unscaled too - the peer has no way to know our
+    // shift otherwise, since it's only exchanged on the SYN
+    uint8_t our_shift = _window_scaling_negotiated ? WINDOW_SCALE_SHIFT : 0;
+    uint32_t window_value = std::min<uint32_t>(available >> our_shift, 0xFFFFu);
+
+    return Tcp(_local_port, _remote_port, seq, _recv_next, 5, flags, static_cast<uint16_t>(window_value), 0, 0);
 }
 
 void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool include_ack)
 {
     uint32_t seq = _send_next;
     uint8_t full_flags = include_ack ? (flags | FLAG_ACK) : flags;
-    _send_segment(_build_header(full_flags, seq), payload);
+    Tcp header = _build_header(full_flags, seq);
+    if (flags & FLAG_SYN)
+    {
+        // options only ever go on a SYN - this stack always offers both,
+        // whether either ends up actually used depends on whether the peer
+        // offered them too (RFC 7323's negotiation rule)
+        header.set_mss_option(_local_mss);
+        header.set_window_scale_option(WINDOW_SCALE_SHIFT);
+    }
+    _send_segment(header, payload);
 
     size_t consumed = payload.size();
     if (flags & FLAG_SYN) consumed += 1;
@@ -80,9 +139,15 @@ void TcpConnection::_send_pure_ack()
     _send_segment(_build_header(FLAG_ACK, _send_next), Bytes());
 }
 
-void TcpConnection::accept_incoming_syn(uint32_t peer_isn)
+void TcpConnection::accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss,
+                                         bool peer_supports_window_scaling, uint8_t peer_window_scale)
 {
     _recv_next = peer_isn + 1; // the SYN itself consumes one sequence number
+    _peer_mss = peer_mss != 0 ? peer_mss : DEFAULT_PEER_MSS;
+    _effective_mss = std::min(_local_mss, _peer_mss);
+    _window_scaling_negotiated = peer_supports_window_scaling; // we always send our own option, so it comes down to the peer's
+    _peer_window_scale = peer_window_scale;
+
     _transition(TcpState::SYN_RECEIVED);
     _send_flags(FLAG_SYN);
 }
@@ -105,17 +170,88 @@ void TcpConnection::initiate_connect()
     _send_flags(FLAG_SYN, Bytes(), false); // active open: bare SYN, nothing to ack yet
 }
 
+void TcpConnection::_deliver(const Bytes& payload)
+{
+    _recv_next += static_cast<uint32_t>(payload.size());
+    if (_on_data_received)
+    {
+        _on_data_received(payload);
+    }
+    else
+    {
+        // no application has registered a callback yet (this segment landed
+        // in the same processing batch as the one that completed the
+        // handshake, before accept() could run) - hold onto it instead of
+        // dropping it
+        _received_before_callback.push_back(payload);
+    }
+}
+
+void TcpConnection::_send_queued_while_window_allows()
+{
+    while (!_send_queue.empty())
+    {
+        uint32_t effective_window = std::min(_cwnd, _peer_window);
+        if (_bytes_in_flight() + _send_queue.front().size() > effective_window)
+        {
+            break;
+        }
+        Bytes next_chunk = std::move(_send_queue.front());
+        _send_queue.pop_front();
+        _send_flags(0, next_chunk);
+    }
+}
+
 void TcpConnection::_handle_ack(const Tcp& segment)
 {
     uint32_t ack = segment.get_acknowledgement_number();
+
+    // the peer's advertised window is worth updating even on a duplicate
+    // ack - it's still telling us something current about its receive
+    // buffer
+    uint8_t peer_shift = _window_scaling_negotiated ? _peer_window_scale : 0;
+    _peer_window = static_cast<uint32_t>(segment.get_window()) << peer_shift;
+
+    uint32_t snd_una = _in_flight.empty() ? _send_next : _in_flight.front().seq;
+
+    if (!_in_flight.empty() && ack == snd_una)
+    {
+        // a duplicate ack: SND.UNA hasn't moved despite another ack for it
+        // arriving - classic Reno's signal that a segment probably got
+        // lost (one or two can just be reordering; three in a row is the
+        // threshold every real implementation uses before trusting it)
+        _dup_ack_count += 1;
+        if (_dup_ack_count == DUP_ACK_FAST_RETRANSMIT_THRESHOLD)
+        {
+            InFlightSegment& oldest = _in_flight.front();
+            _send_segment(_build_header(oldest.flags, oldest.seq), oldest.payload);
+            _ssthresh = std::max(_bytes_in_flight() / 2, static_cast<uint32_t>(2 * _effective_mss));
+            _cwnd = _ssthresh + DUP_ACK_FAST_RETRANSMIT_THRESHOLD * static_cast<uint32_t>(_effective_mss);
+            _in_fast_recovery = true;
+        }
+        else if (_in_fast_recovery)
+        {
+            // window inflation: each further duplicate ack means another
+            // segment left the network, so there's room for one more MSS
+            // in flight while waiting for the retransmit to be acked
+            _cwnd += _effective_mss;
+            _send_queued_while_window_allows();
+        }
+        return;
+    }
+
+    _dup_ack_count = 0;
+
     bool fin_acked = false;
     bool acked_anything = false;
+    uint32_t bytes_acked = 0;
 
     // cumulative ack: everything whose end_seq it covers is done, oldest
     // (front) first - this is what lets several segments be in flight at
     // once instead of stop-and-wait's exactly one
     while (!_in_flight.empty() && _in_flight.front().end_seq <= ack)
     {
+        bytes_acked += _in_flight.front().end_seq - _in_flight.front().seq;
         if (_in_flight.front().flags & FLAG_FIN)
         {
             fin_acked = true;
@@ -129,11 +265,38 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         return; // nothing new acked yet
     }
 
+    if (_in_fast_recovery)
+    {
+        // the retransmit that triggered fast recovery is now confirmed
+        // received - deflate back to ssthresh rather than keep the
+        // inflated window fast recovery was using
+        _cwnd = _ssthresh;
+        _in_fast_recovery = false;
+    }
+    else if (_cwnd < _ssthresh)
+    {
+        _cwnd += bytes_acked; // slow start: exponential growth, roughly doubles cwnd every RTT
+    }
+    else
+    {
+        // congestion avoidance: the standard approximation of "+1 MSS per
+        // RTT" without tracking RTTs directly - each ack grows cwnd by
+        // MSS * (bytes_acked / cwnd), which sums to about one MSS per
+        // window's worth of acks
+        _cwnd += std::max<uint32_t>(1, (static_cast<uint32_t>(_effective_mss) * bytes_acked) / _cwnd);
+    }
+
     if (fin_acked)
     {
         if (_state == TcpState::FIN_WAIT_1)
         {
             _transition(TcpState::FIN_WAIT_2);
+            return;
+        }
+        if (_state == TcpState::CLOSING)
+        {
+            _transition(TcpState::TIME_WAIT);
+            _time_wait_ticks_remaining = TIME_WAIT_TICKS;
             return;
         }
         if (_state == TcpState::LAST_ACK)
@@ -143,12 +306,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         }
     }
 
-    while (_in_flight.size() < MAX_IN_FLIGHT_SEGMENTS && !_send_queue.empty())
-    {
-        Bytes next_chunk = std::move(_send_queue.front());
-        _send_queue.pop_front();
-        _send_flags(0, next_chunk);
-    }
+    _send_queued_while_window_allows();
 
     if (_in_flight.empty() && _send_queue.empty() && _fin_requested)
     {
@@ -192,10 +350,12 @@ void TcpConnection::_handle_fin()
 
     if (_state == TcpState::FIN_WAIT_1)
     {
-        // simultaneous close (see the class-level scope note) - not modeled
-        // as its own CLOSING state; ack it and let the FIN_WAIT_2 path close
-        // things out once our own FIN is acked
+        // simultaneous close: both sides sent FIN before seeing the other's
+        // ack. This used to degrade into the FIN_WAIT_2 path; now it's
+        // CLOSING's own state, which _handle_ack()'s fin_acked branch
+        // moves to TIME_WAIT once our own FIN is acked
         _send_pure_ack();
+        _transition(TcpState::CLOSING);
     }
 }
 
@@ -203,6 +363,16 @@ void TcpConnection::on_segment(const Tcp& segment)
 {
     if (segment.get_rst())
     {
+        bool past_handshake = _state == TcpState::ESTABLISHED || _state == TcpState::FIN_WAIT_1
+            || _state == TcpState::FIN_WAIT_2 || _state == TcpState::CLOSE_WAIT
+            || _state == TcpState::CLOSING || _state == TcpState::LAST_ACK;
+        if (past_handshake && !_seq_in_receive_window(segment.get_sequence_number()))
+        {
+            // RFC 793 SS3.9: a reset outside the receive window is ignored -
+            // a segment with this sequence number couldn't legitimately be
+            // this far from what's actually expected next
+            return;
+        }
         _transition(TcpState::CLOSED);
         return;
     }
@@ -214,6 +384,15 @@ void TcpConnection::on_segment(const Tcp& segment)
         {
             _recv_next = segment.get_sequence_number() + 1; // the peer's SYN consumes one sequence number
             _in_flight.clear(); // our SYN is now acked
+
+            _peer_mss = segment.has_mss_option() ? segment.get_mss_option() : DEFAULT_PEER_MSS;
+            _effective_mss = std::min(_local_mss, _peer_mss);
+            _window_scaling_negotiated = segment.has_window_scale_option();
+            _peer_window_scale = _window_scaling_negotiated ? segment.get_window_scale_option() : 0;
+            _peer_window = static_cast<uint32_t>(segment.get_window()) << _peer_window_scale;
+            _cwnd = _effective_mss;
+            _ssthresh = INITIAL_SSTHRESH;
+
             _transition(TcpState::ESTABLISHED);
             _send_pure_ack(); // completes the 3-way handshake
         }
@@ -225,6 +404,10 @@ void TcpConnection::on_segment(const Tcp& segment)
         if (segment.get_ack() && segment.get_acknowledgement_number() == _send_next)
         {
             _in_flight.clear(); // only the SYN-ACK could have been in flight here
+            uint8_t peer_shift = _window_scaling_negotiated ? _peer_window_scale : 0;
+            _peer_window = static_cast<uint32_t>(segment.get_window()) << peer_shift;
+            _cwnd = _effective_mss;
+            _ssthresh = INITIAL_SSTHRESH;
             _transition(TcpState::ESTABLISHED);
         }
         return;
@@ -253,24 +436,66 @@ void TcpConnection::on_segment(const Tcp& segment)
 
         if (!payload.empty())
         {
-            if (segment.get_sequence_number() == _recv_next)
+            uint32_t seq = segment.get_sequence_number();
+
+            if (seq == _recv_next)
             {
-                _recv_next += static_cast<uint32_t>(payload.size());
-                if (_on_data_received)
+                _deliver(payload);
+
+                // drain any now-contiguous buffered segments the gap-filler
+                // just unblocked, in order
+                while (true)
                 {
-                    _on_data_received(payload);
-                }
-                else
-                {
-                    // no application has registered a callback yet (this
-                    // segment landed in the same processing batch as the
-                    // one that completed the handshake, before accept()
-                    // could run) - hold onto it instead of dropping it
-                    _received_before_callback.push_back(payload);
+                    auto next_it = _reorder_buffer.find(_recv_next);
+                    if (next_it == _reorder_buffer.end())
+                    {
+                        break;
+                    }
+                    Bytes buffered = std::move(next_it->second);
+                    _reorder_buffer.erase(next_it);
+                    _deliver(buffered);
                 }
             }
-            // ack current RCV.NXT either way - a duplicate ack if this was
-            // out-of-order, since there's no reassembly buffer to hold it in
+            else if (seq > _recv_next)
+            {
+                // out of order - buffer it if there's room and it isn't
+                // already there (a retransmit of an already-buffered
+                // segment), and either way tell the peer our current
+                // RCV.NXT again: that duplicate ack is the signal a sender's
+                // fast retransmit depends on
+                if (_reorder_buffer.find(seq) == _reorder_buffer.end()
+                    && _seq_in_receive_window(seq))
+                {
+                    _reorder_buffer[seq] = payload;
+                }
+            }
+            else
+            {
+                // seq < _recv_next: fully or partially already seen. A
+                // partial overlap's new tail is still worth delivering
+                uint32_t already_seen = _recv_next - seq;
+                if (already_seen < payload.size())
+                {
+                    Bytes new_part = payload.slice(static_cast<size_t>(already_seen));
+                    _deliver(new_part);
+
+                    while (true)
+                    {
+                        auto next_it = _reorder_buffer.find(_recv_next);
+                        if (next_it == _reorder_buffer.end())
+                        {
+                            break;
+                        }
+                        Bytes buffered = std::move(next_it->second);
+                        _reorder_buffer.erase(next_it);
+                        _deliver(buffered);
+                    }
+                }
+            }
+
+            // ack current RCV.NXT either way - a duplicate ack if this
+            // wasn't the in-order case, exactly the RFC 793 SS3.3
+            // "unacceptable/out-of-order segment" response
             _send_pure_ack();
         }
     }
@@ -315,7 +540,16 @@ void TcpConnection::on_tick()
         return;
     }
 
-    _send_segment(_build_header(oldest.flags | FLAG_ACK, oldest.seq), oldest.payload);
+    // classic Reno's "slow start restart": a timeout means no acks at all
+    // got through (unlike fast retransmit's duplicate acks, which mean
+    // *something* is still arriving) - a harsher signal, so cwnd collapses
+    // all the way back to one segment instead of just deflating to ssthresh
+    _ssthresh = std::max(_bytes_in_flight() / 2, static_cast<uint32_t>(2 * _effective_mss));
+    _cwnd = _effective_mss;
+    _in_fast_recovery = false;
+    _dup_ack_count = 0;
+
+    _send_segment(_build_header(oldest.flags, oldest.seq), oldest.payload);
     oldest.retransmit_ticks_remaining = RETRANSMIT_TIMEOUT_TICKS;
 }
 
@@ -326,13 +560,28 @@ void TcpConnection::send(const Bytes& data)
         return;
     }
 
-    if (_in_flight.size() >= MAX_IN_FLIGHT_SEGMENTS)
+    // split anything larger than the negotiated effective MSS - the
+    // application shouldn't have to know what that negotiated value is
+    size_t offset = 0;
+    while (offset < data.size())
     {
-        _send_queue.push_back(data);
-        return;
-    }
+        size_t chunk_size = std::min<size_t>(_effective_mss, data.size() - offset);
+        Bytes chunk = data.slice(offset, chunk_size);
 
-    _send_flags(0, data);
+        // once anything is queued, everything after it must queue too -
+        // otherwise a later, smaller chunk could jump ahead of an earlier
+        // one still waiting on window room and arrive out of order
+        if (!_send_queue.empty() || _bytes_in_flight() + chunk.size() > std::min(_cwnd, _peer_window))
+        {
+            _send_queue.push_back(std::move(chunk));
+        }
+        else
+        {
+            _send_flags(0, chunk);
+        }
+
+        offset += chunk_size;
+    }
 }
 
 void TcpConnection::close()
