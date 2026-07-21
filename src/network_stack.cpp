@@ -200,6 +200,7 @@ void NetworkStack::_reap_closed_connections()
             continue; // already reaped - e.g. a duplicate CLOSED transition
         }
 
+        LOG_DEBUG("NetworkStack: reaping closed connection id=" << connection_id);
         this->_connections.erase(id_it->second);
         this->_connections_by_id.erase(id_it);
     }
@@ -362,12 +363,16 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
             // listening port either - RFC 793 SS3.4's reset-generation rule
             // for exactly this case. Never RST in response to an RST itself
             // (that's how two stacks could RST each other forever).
+            LOG_DEBUG("NetworkStack: sending RST to " << key.remote_ip.to_string() << ":" << key.remote_port
+                      << " (no matching connection, not a SYN to a listening port)");
             this->_send_rst(ip, tcp);
         }
         return;
     }
 
     IPv4Address remote_ip = key.remote_ip;
+    LOG_DEBUG("NetworkStack: accepting new connection from " << remote_ip.to_string() << ":" << key.remote_port
+              << " on port " << key.local_port);
     auto connection = std::make_unique<TcpConnection>(
         key.local_port, remote_ip, key.remote_port, generate_initial_sequence_number(),
         [this, remote_ip](const Tcp& header, const Bytes& payload)

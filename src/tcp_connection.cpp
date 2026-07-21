@@ -1,5 +1,6 @@
 #include "tcp_connection.h"
 #include "raw.h"
+#include "logger.h"
 
 #include <algorithm>
 #include <atomic>
@@ -11,6 +12,25 @@ namespace
     constexpr uint8_t FLAG_RST = 0x04;
     constexpr uint8_t FLAG_SYN = 0x02;
     constexpr uint8_t FLAG_FIN = 0x01;
+
+    const char* state_name(TcpState state)
+    {
+        switch (state)
+        {
+        case TcpState::LISTEN:        return "LISTEN";
+        case TcpState::SYN_SENT:      return "SYN_SENT";
+        case TcpState::SYN_RECEIVED:  return "SYN_RECEIVED";
+        case TcpState::ESTABLISHED:   return "ESTABLISHED";
+        case TcpState::FIN_WAIT_1:    return "FIN_WAIT_1";
+        case TcpState::FIN_WAIT_2:    return "FIN_WAIT_2";
+        case TcpState::CLOSE_WAIT:    return "CLOSE_WAIT";
+        case TcpState::CLOSING:       return "CLOSING";
+        case TcpState::LAST_ACK:      return "LAST_ACK";
+        case TcpState::TIME_WAIT:     return "TIME_WAIT";
+        case TcpState::CLOSED:        return "CLOSED";
+        }
+        return "UNKNOWN";
+    }
 }
 
 uint32_t generate_initial_sequence_number()
@@ -45,6 +65,7 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
 
 void TcpConnection::_transition(TcpState new_state)
 {
+    LOG_DEBUG("TcpConnection[" << _id << "] " << state_name(_state) << " -> " << state_name(new_state));
     _state = new_state;
     if (_on_state_changed)
     {
@@ -224,10 +245,13 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         if (_dup_ack_count == DUP_ACK_FAST_RETRANSMIT_THRESHOLD)
         {
             InFlightSegment& oldest = _in_flight.front();
+            uint32_t cwnd_before = _cwnd;
             _send_segment(_build_header(oldest.flags, oldest.seq), oldest.payload);
             _ssthresh = std::max(_bytes_in_flight() / 2, static_cast<uint32_t>(2 * _effective_mss));
             _cwnd = _ssthresh + DUP_ACK_FAST_RETRANSMIT_THRESHOLD * static_cast<uint32_t>(_effective_mss);
             _in_fast_recovery = true;
+            LOG_DEBUG("TcpConnection[" << _id << "] fast retransmit at seq=" << oldest.seq
+                      << " (3 duplicate acks), cwnd " << cwnd_before << " -> " << _cwnd);
         }
         else if (_in_fast_recovery)
         {
@@ -536,6 +560,8 @@ void TcpConnection::on_tick()
     oldest.retransmit_attempts += 1;
     if (oldest.retransmit_attempts > MAX_RETRANSMIT_ATTEMPTS)
     {
+        LOG_WARNING("TcpConnection[" << _id << "] giving up after " << (oldest.retransmit_attempts - 1)
+                    << " retransmit attempts at seq=" << oldest.seq << " - closing");
         _transition(TcpState::CLOSED);
         return;
     }
@@ -544,10 +570,15 @@ void TcpConnection::on_tick()
     // got through (unlike fast retransmit's duplicate acks, which mean
     // *something* is still arriving) - a harsher signal, so cwnd collapses
     // all the way back to one segment instead of just deflating to ssthresh
+    uint32_t cwnd_before = _cwnd;
     _ssthresh = std::max(_bytes_in_flight() / 2, static_cast<uint32_t>(2 * _effective_mss));
     _cwnd = _effective_mss;
     _in_fast_recovery = false;
     _dup_ack_count = 0;
+
+    LOG_DEBUG("TcpConnection[" << _id << "] retransmit timeout at seq=" << oldest.seq
+              << " (attempt " << oldest.retransmit_attempts << "/" << MAX_RETRANSMIT_ATTEMPTS
+              << "), cwnd " << cwnd_before << " -> " << _cwnd);
 
     _send_segment(_build_header(oldest.flags, oldest.seq), oldest.payload);
     oldest.retransmit_ticks_remaining = RETRANSMIT_TIMEOUT_TICKS;
