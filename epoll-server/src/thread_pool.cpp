@@ -1,5 +1,5 @@
 #include "thread_pool.h"
-#include <iostream>
+#include "logger.h"
 
 ThreadPool::ThreadPool(size_t worker_count)
     : _stopping(false)
@@ -64,11 +64,11 @@ void ThreadPool::_worker_loop()
         }
         catch (const std::exception& e)
         {
-            std::cerr << "ThreadPool: task threw: " << e.what() << std::endl;
+            LOG_ERROR("ThreadPool: task threw: " << e.what());
         }
         catch (...)
         {
-            std::cerr << "ThreadPool: task threw a non-std::exception" << std::endl;
+            LOG_ERROR("ThreadPool: task threw a non-std::exception");
         }
     }
 }

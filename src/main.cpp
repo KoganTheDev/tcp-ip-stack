@@ -7,15 +7,16 @@
 #include "arp.h"
 #include "raw_socket.h"
 #include "arp_cache.h"
+#include "logger.h"
 
 // Used for in communication between VM`s linux and my computer
 #define INTERFACE_NAME "vmnet8"
 
-int main() 
-{   
+int main()
+{
     if (geteuid() != 0)
     {
-        std::cerr << "This program must be run as root. Exiting." << std::endl;
+        LOG_ERROR("This program must be run as root. Exiting.");
         return 1;
     }
 
@@ -32,13 +33,13 @@ int main()
     }
     catch (const BaseException& e)
     {
-        std::cerr << "ERROR: " << e.what() << std::endl;
-        std::cerr << "Exception from " << e.position() << std::endl;
+        LOG_ERROR(e.what());
+        LOG_ERROR("Exception from " << e.position());
         return -1;
     }
     catch (...)
     {
-        std::cerr << "UNEXPECTED ERROR" << std::endl;
+        LOG_ERROR("UNEXPECTED ERROR");
         return -1;
     }
 }

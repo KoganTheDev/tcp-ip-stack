@@ -1,9 +1,9 @@
 #include "completion_queue.h"
 #include "exceptions.h"
+#include "logger.h"
 
 #include <sys/eventfd.h>
 #include <unistd.h>
-#include <iostream>
 
 CompletionQueue::CompletionQueue()
 {
@@ -31,7 +31,7 @@ void CompletionQueue::push(std::function<void()> task)
     {
         // the reactor will still find this task next time it drains the
         // queue for any other reason - losing the wakeup isn't losing the work
-        std::cerr << "CompletionQueue: failed to signal eventfd" << std::endl;
+        LOG_WARNING("CompletionQueue: failed to signal eventfd");
     }
 }
 
@@ -57,7 +57,7 @@ void CompletionQueue::drain_and_run()
         }
         catch (const std::exception& e)
         {
-            std::cerr << "CompletionQueue: task threw: " << e.what() << std::endl;
+            LOG_ERROR("CompletionQueue: task threw: " << e.what());
         }
     }
 }

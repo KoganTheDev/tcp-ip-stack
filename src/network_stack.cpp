@@ -2,8 +2,7 @@
 #include "raw.h"
 #include "exceptions.h"
 #include "utils.h"
-
-#include <iostream>
+#include "logger.h"
 
 namespace
 {
@@ -153,7 +152,7 @@ void NetworkStack::on_timer_tick()
         }
         catch (const std::exception& e)
         {
-            std::cerr << "NetworkStack: on_tick failed for a connection: " << e.what() << std::endl;
+            LOG_ERROR("NetworkStack: on_tick failed for a connection: " << e.what());
         }
     }
 
@@ -230,7 +229,7 @@ void NetworkStack::_handle_frame(const Bytes& frame)
     catch (const BaseException& e)
     {
         // malformed frame - drop it, same as a real NIC/driver would
-        std::cerr << "NetworkStack: dropping unparseable frame: " << e.what() << std::endl;
+        LOG_WARNING("NetworkStack: dropping unparseable frame: " << e.what());
     }
 }
 
@@ -292,9 +291,9 @@ void NetworkStack::_handle_ip(const Ip& ip)
     // mishandled as if it were a complete packet.
     if (ip.get_ip_flag_m() || ip.get_fragment_offset() != 0)
     {
-        std::cerr << "NetworkStack: dropping a fragmented IP packet from "
-                   << IPv4Address(ip.get_src_address()).to_string()
-                   << " - fragment reassembly is not implemented" << std::endl;
+        LOG_WARNING("NetworkStack: dropping a fragmented IP packet from "
+                     << IPv4Address(ip.get_src_address()).to_string()
+                     << " - fragment reassembly is not implemented");
         return;
     }
 
@@ -304,8 +303,8 @@ void NetworkStack::_handle_ip(const Ip& ip)
         // misparsed it as if it were) - a real stack drops this silently,
         // no RST, since it can't even trust the header enough to know who
         // to send one to
-        std::cerr << "NetworkStack: dropping an IPv4 packet with a bad header checksum from "
-                   << IPv4Address(ip.get_src_address()).to_string() << std::endl;
+        LOG_WARNING("NetworkStack: dropping an IPv4 packet with a bad header checksum from "
+                     << IPv4Address(ip.get_src_address()).to_string());
         return;
     }
 
@@ -334,8 +333,7 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
     {
         // corrupted segment - dropped silently, same as a real kernel stack;
         // no RST, since we can't trust the header enough to safely answer it
-        std::cerr << "NetworkStack: dropping a TCP segment with a bad checksum from "
-                   << src_ip.to_string() << std::endl;
+        LOG_WARNING("NetworkStack: dropping a TCP segment with a bad checksum from " << src_ip.to_string());
         return;
     }
 
@@ -390,7 +388,7 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
     }
     catch (const std::exception& e)
     {
-        std::cerr << "NetworkStack: failed to accept incoming connection: " << e.what() << std::endl;
+        LOG_ERROR("NetworkStack: failed to accept incoming connection: " << e.what());
         return;
     }
 
@@ -447,8 +445,7 @@ void NetworkStack::_fail_pending_outbound_connects(const IPv4Address& ip)
         auto connection_it = this->_connections.find(key);
         if (connection_it != this->_connections.end())
         {
-            std::cerr << "NetworkStack: giving up on ARP resolution for " << ip.to_string()
-                       << " - connect() failed" << std::endl;
+            LOG_ERROR("NetworkStack: giving up on ARP resolution for " << ip.to_string() << " - connect() failed");
             connection_it->second->fail();
         }
     }
