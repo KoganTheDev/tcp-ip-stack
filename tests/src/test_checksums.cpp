@@ -2,6 +2,7 @@
 #include "utils.h"
 #include "ip.h"
 #include "tcp.h"
+#include "udp.h"
 #include "raw.h"
 #include "bytes.h"
 #include "network_addresses.h"
@@ -91,4 +92,20 @@ TEST(TransportChecksumCatchesWrongDestination)
 
     uint16_t verify_wrong_dest = transport_checksum(src_ip, wrong_dst_ip, IpProtocol::TCP, segment.to_bytes());
     test_assert(verify_wrong_dest != 0, "checksum should not self-verify against a different destination IP");
+}
+
+// UDP uses the same pseudo-header + internet_checksum() machinery as TCP -
+// transport_checksum() is already protocol-agnostic, so no separate
+// algorithm is needed, just a different IpProtocol value.
+TEST(UdpTransportChecksumSelfVerifies)
+{
+    IPv4Address src_ip("10.0.0.1");
+    IPv4Address dst_ip("10.0.0.2");
+
+    Udp datagram(12345, 80, 13, 0, Bytes::from_hex("68656c6c6f")); // 8-byte header + "hello"
+    uint16_t checksum = transport_checksum(src_ip, dst_ip, IpProtocol::UDP, datagram.to_bytes());
+    datagram.set_checksum(checksum);
+
+    uint16_t verify = transport_checksum(src_ip, dst_ip, IpProtocol::UDP, datagram.to_bytes());
+    test_assert(verify == 0, "transport_checksum() should self-verify to 0 for a UDP datagram, same as for TCP");
 }

@@ -14,6 +14,8 @@
 #include "ip.h"
 #include "tcp.h"
 #include "tcp_connection.h"
+#include "udp.h"
+#include "udp_socket.h"
 
 // Ties Ethernet/Arp/Ip/Tcp together over a TAP device into something an
 // application can listen()/accept()/connect() on - the same shape as a
@@ -24,8 +26,15 @@
 // table.
 //
 // Scope:
-//  - TCP only - Ip already decodes UDP/ICMP payloads, but nothing here
+//  - TCP and UDP - Ip already decodes ICMP payloads too, but nothing here
 //    dispatches them further
+//  - UDP sends only ever answer a peer this stack has already heard from
+//    (same reply-and-learn ARP pattern TCP's passive-open used before
+//    active-open/connect() was added) - bind_udp()'s socket can send_to()
+//    any peer whose MAC is already known, but there's no outbound ARP
+//    request/retry for a UDP send to a peer never heard from, the way
+//    connect() has for TCP; a send to an unresolved peer is dropped and
+//    logged rather than queued
 //  - no IP fragmentation/reassembly - a fragmented packet (MF set, or a
 //    nonzero fragment offset) is detected and dropped with a log line, not
 //    silently mishandled; this stack's own TCP never produces a payload
@@ -75,6 +84,14 @@ public:
     // holding the TcpConnection* itself across that gap risks it dangling.
     TcpConnection* find_connection(uint64_t id) const;
 
+    // Binds a UdpSocket to a local port and returns it, owned by
+    // NetworkStack for the rest of this object's lifetime (unlike a
+    // TcpConnection, a UDP socket never gets reaped - there's no CLOSED
+    // state, since there's no connection to close). Calling this twice for
+    // the same port returns the same socket rather than creating a second
+    // one bound to the same port.
+    UdpSocket* bind_udp(uint16_t port);
+
     // Reads and processes every frame currently available on the TAP fd -
     // it's edge-triggered under epoll, so this must drain it - then reaps
     // any connection that finished closing.
@@ -101,6 +118,7 @@ private:
     void _handle_arp(const Arp& arp);
     void _handle_ip(const Ip& ip);
     void _handle_tcp(const Ip& ip, const Tcp& tcp);
+    void _handle_udp(const Ip& ip, const Udp& udp);
     void _reap_closed_connections();
     // Wires a connection's state-change notification to push its id onto
     // _pending_reap_ids the instant it reaches CLOSED - never erases
@@ -119,6 +137,7 @@ private:
     // TcpConnection exists to answer through, so this builds and sends the
     // RST directly.
     void _send_rst(const Ip& ip, const Tcp& tcp);
+    void _send_udp_datagram(const IPv4Address& dest_ip, const Udp& header, const Bytes& payload);
     MacAddress _resolve_mac(const IPv4Address& ip) const;
 
     uint16_t _allocate_ephemeral_port();
@@ -133,6 +152,7 @@ private:
     std::unordered_map<IPv4Address, MacAddress> _arp_table;
     std::unordered_map<uint16_t, bool> _listening_ports;
     std::unordered_map<uint16_t, std::deque<ConnectionKey>> _pending_accepts;
+    std::unordered_map<uint16_t, std::unique_ptr<UdpSocket>> _udp_sockets;
     std::unordered_map<ConnectionKey, std::unique_ptr<TcpConnection>, ConnectionKeyHash> _connections;
     // id -> key, not id -> TcpConnection* - find_connection() and reaping
     // both need to reach the owning entry in _connections (keyed by

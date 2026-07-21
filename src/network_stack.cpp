@@ -115,6 +115,27 @@ TcpConnection* NetworkStack::find_connection(uint64_t id) const
     return connection_it != this->_connections.end() ? connection_it->second.get() : nullptr;
 }
 
+UdpSocket* NetworkStack::bind_udp(uint16_t port)
+{
+    auto existing_it = this->_udp_sockets.find(port);
+    if (existing_it != this->_udp_sockets.end())
+    {
+        return existing_it->second.get();
+    }
+
+    auto socket = std::make_unique<UdpSocket>(
+        port,
+        [this](const IPv4Address& dest_ip, const Udp& header, const Bytes& payload)
+        {
+            this->_send_udp_datagram(dest_ip, header, payload);
+        }
+    );
+
+    UdpSocket* socket_ptr = socket.get();
+    this->_udp_sockets[port] = std::move(socket);
+    return socket_ptr;
+}
+
 void NetworkStack::_watch_for_close(TcpConnection& connection)
 {
     uint64_t connection_id = connection.get_id();
@@ -309,14 +330,24 @@ void NetworkStack::_handle_ip(const Ip& ip)
         return;
     }
 
-    if (ip.get_protocol() != IpProtocol::TCP || !ip.has_next_layer())
+    if (!ip.has_next_layer())
     {
         return;
     }
 
-    if (const Tcp* tcp = dynamic_cast<const Tcp*>(&ip.get_next_layer()))
+    if (ip.get_protocol() == IpProtocol::TCP)
     {
-        this->_handle_tcp(ip, *tcp);
+        if (const Tcp* tcp = dynamic_cast<const Tcp*>(&ip.get_next_layer()))
+        {
+            this->_handle_tcp(ip, *tcp);
+        }
+    }
+    else if (ip.get_protocol() == IpProtocol::UDP)
+    {
+        if (const Udp* udp = dynamic_cast<const Udp*>(&ip.get_next_layer()))
+        {
+            this->_handle_udp(ip, *udp);
+        }
     }
 }
 
@@ -400,6 +431,34 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
     this->_watch_for_close(*connection);
     this->_connections_by_id[connection->get_id()] = key;
     this->_connections[key] = std::move(connection);
+}
+
+void NetworkStack::_handle_udp(const Ip& ip, const Udp& udp)
+{
+    IPv4Address src_ip(ip.get_src_address());
+
+    // UDP's checksum is optional (RFC 768) - a sender that didn't compute
+    // one sends exactly 0, which is what "skip verification" means here;
+    // any other value is a real checksum and must self-verify like TCP's
+    Bytes segment_bytes = const_cast<Udp&>(udp).to_bytes();
+    if (udp.get_checksum() != 0 && transport_checksum(src_ip, this->_local_ip, IpProtocol::UDP, segment_bytes) != 0)
+    {
+        LOG_WARNING("NetworkStack: dropping a UDP datagram with a bad checksum from " << src_ip.to_string());
+        return;
+    }
+
+    auto socket_it = this->_udp_sockets.find(udp.get_dest_port());
+    if (socket_it == this->_udp_sockets.end())
+    {
+        // no socket bound to this port - a real stack would send ICMP Port
+        // Unreachable here; this stack doesn't send ICMP at all, so it just
+        // drops, same as a fragmented/unrouted packet elsewhere in this file
+        LOG_DEBUG("NetworkStack: dropping a UDP datagram to port " << udp.get_dest_port()
+                  << " - nothing is bound there");
+        return;
+    }
+
+    socket_it->second->on_datagram(src_ip, udp);
 }
 
 MacAddress NetworkStack::_resolve_mac(const IPv4Address& ip) const
@@ -550,4 +609,23 @@ void NetworkStack::_send_rst(const Ip& ip, const Tcp& tcp)
 
     Tcp rst(tcp.get_dest_port(), tcp.get_src_port(), seq, ack, 5, flags, 0, 0, 0);
     this->_send_tcp_segment(remote_ip, rst, Bytes());
+}
+
+void NetworkStack::_send_udp_datagram(const IPv4Address& dest_ip, const Udp& header, const Bytes& payload)
+{
+    // Udp can't be copied (same ProtocolLayer reason as Tcp - see
+    // _send_tcp_segment) - rebuild a fresh one from header's fields instead
+    Udp datagram(header.get_src_port(), header.get_dest_port(), header.get_length(), 0, Bytes());
+    if (!payload.empty())
+    {
+        datagram /= std::make_unique<Raw>(payload);
+    }
+
+    uint16_t checksum = transport_checksum(this->_local_ip, dest_ip, IpProtocol::UDP, datagram.to_bytes());
+    // RFC 768: an all-zero result must be transmitted as all-ones instead -
+    // 0 is reserved to mean "no checksum was computed", so a genuine result
+    // of 0 would otherwise be indistinguishable from that
+    datagram.set_checksum(checksum == 0 ? 0xFFFF : checksum);
+
+    this->_send_ip_packet(dest_ip, IpProtocol::UDP, datagram.to_bytes());
 }

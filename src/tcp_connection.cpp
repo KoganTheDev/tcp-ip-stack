@@ -532,6 +532,18 @@ void TcpConnection::on_segment(const Tcp& segment)
 
 void TcpConnection::on_tick()
 {
+    if (_state == TcpState::CLOSED)
+    {
+        // idempotent no-op: in normal operation NetworkStack reaps a CLOSED
+        // connection within the same on_timer_tick() call that closed it,
+        // before any further tick could reach it - this guard just makes
+        // that assumption explicit rather than relying on it implicitly, so
+        // a closed connection ticked again (directly, or if reaping is ever
+        // skipped) doesn't keep incrementing retransmit_attempts and
+        // re-logging "giving up" past the point it already gave up
+        return;
+    }
+
     if (_state == TcpState::TIME_WAIT)
     {
         _time_wait_ticks_remaining -= 1;
