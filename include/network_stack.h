@@ -16,6 +16,7 @@
 #include "tcp_connection.h"
 #include "udp.h"
 #include "udp_socket.h"
+#include "icmp.h"
 
 // Ties Ethernet/Arp/Ip/Tcp together over a TAP device into something an
 // application can listen()/accept()/connect() on - the same shape as a
@@ -26,8 +27,11 @@
 // table.
 //
 // Scope:
-//  - TCP and UDP - Ip already decodes ICMP payloads too, but nothing here
-//    dispatches them further
+//  - TCP, UDP, and a small slice of ICMP: replying to an Echo Request
+//    (ping) with an Echo Reply, and sending Destination Unreachable/Port
+//    Unreachable for a UDP datagram to a port nothing is bound to. Every
+//    other ICMP type/code decodes correctly (the header shape is uniform)
+//    but isn't acted on - logged and dropped
 //  - UDP sends only ever answer a peer this stack has already heard from
 //    (same reply-and-learn ARP pattern TCP's passive-open used before
 //    active-open/connect() was added) - bind_udp()'s socket can send_to()
@@ -119,6 +123,7 @@ private:
     void _handle_ip(const Ip& ip);
     void _handle_tcp(const Ip& ip, const Tcp& tcp);
     void _handle_udp(const Ip& ip, const Udp& udp);
+    void _handle_icmp(const Ip& ip, const Icmp& icmp);
     void _reap_closed_connections();
     // Wires a connection's state-change notification to push its id onto
     // _pending_reap_ids the instant it reaches CLOSED - never erases
@@ -138,6 +143,14 @@ private:
     // RST directly.
     void _send_rst(const Ip& ip, const Tcp& tcp);
     void _send_udp_datagram(const IPv4Address& dest_ip, const Udp& header, const Bytes& payload);
+    // Rebuilds a fresh Icmp from header's type/code/rest_of_header (same
+    // non-copyable-ProtocolLayer reason as _send_tcp_segment/
+    // _send_udp_datagram), attaches payload, computes the checksum, and
+    // sends it - shared by the Echo Reply and Port Unreachable paths.
+    void _send_icmp_message(const IPv4Address& dest_ip, const Icmp& header, const Bytes& payload);
+    // RFC 792: Destination Unreachable/Port Unreachable, for a UDP
+    // datagram that arrived at a port nothing is bound to.
+    void _send_icmp_port_unreachable(const Ip& ip);
     MacAddress _resolve_mac(const IPv4Address& ip) const;
 
     uint16_t _allocate_ephemeral_port();

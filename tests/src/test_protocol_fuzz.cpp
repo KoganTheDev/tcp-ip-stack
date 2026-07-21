@@ -5,6 +5,7 @@
 #include "ip.h"
 #include "tcp.h"
 #include "udp.h"
+#include "icmp.h"
 
 #include <random>
 
@@ -76,6 +77,11 @@ TEST(TcpFromBytesNeverCrashesOnGarbage)
 TEST(UdpFromBytesNeverCrashesOnGarbage)
 {
     fuzz_from_bytes<Udp>(128);
+}
+
+TEST(IcmpFromBytesNeverCrashesOnGarbage)
+{
+    fuzz_from_bytes<Icmp>(128);
 }
 
 // Truncated-but-plausible-looking input is worth testing separately from

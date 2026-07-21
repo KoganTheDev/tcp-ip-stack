@@ -4,6 +4,8 @@
 #include "utils.h"
 #include "logger.h"
 
+#include <algorithm>
+
 namespace
 {
     constexpr uint16_t FIRST_EPHEMERAL_PORT = 49152; // IANA dynamic/private range starts here
@@ -349,6 +351,13 @@ void NetworkStack::_handle_ip(const Ip& ip)
             this->_handle_udp(ip, *udp);
         }
     }
+    else if (ip.get_protocol() == IpProtocol::ICMP)
+    {
+        if (const Icmp* icmp = dynamic_cast<const Icmp*>(&ip.get_next_layer()))
+        {
+            this->_handle_icmp(ip, *icmp);
+        }
+    }
 }
 
 void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
@@ -450,15 +459,47 @@ void NetworkStack::_handle_udp(const Ip& ip, const Udp& udp)
     auto socket_it = this->_udp_sockets.find(udp.get_dest_port());
     if (socket_it == this->_udp_sockets.end())
     {
-        // no socket bound to this port - a real stack would send ICMP Port
-        // Unreachable here; this stack doesn't send ICMP at all, so it just
-        // drops, same as a fragmented/unrouted packet elsewhere in this file
         LOG_DEBUG("NetworkStack: dropping a UDP datagram to port " << udp.get_dest_port()
-                  << " - nothing is bound there");
+                  << " - nothing is bound there, sending ICMP Port Unreachable");
+        this->_send_icmp_port_unreachable(ip);
         return;
     }
 
     socket_it->second->on_datagram(src_ip, udp);
+}
+
+void NetworkStack::_handle_icmp(const Ip& ip, const Icmp& icmp)
+{
+    IPv4Address src_ip(ip.get_src_address());
+
+    if (!icmp.verify_checksum())
+    {
+        LOG_WARNING("NetworkStack: dropping an ICMP message with a bad checksum from " << src_ip.to_string());
+        return;
+    }
+
+    if (icmp.get_type() == IcmpType::ICMP_ECHO_REQUEST)
+    {
+        Bytes payload;
+        if (icmp.has_next_layer())
+        {
+            if (const Raw* raw = dynamic_cast<const Raw*>(&icmp.get_next_layer()))
+            {
+                payload = raw->get_data();
+            }
+        }
+
+        LOG_DEBUG("NetworkStack: replying to an ICMP echo request from " << src_ip.to_string());
+        Icmp reply_header(IcmpType::ICMP_ECHO_REPLY, ICMP_CODE_NONE, 0, icmp.get_rest_of_header(), Bytes());
+        this->_send_icmp_message(src_ip, reply_header, payload);
+        return;
+    }
+
+    // decoded correctly (the header shape is uniform across every ICMP
+    // type/code), just not acted on - logged and dropped, not silently
+    // mishandled as if it meant something
+    LOG_DEBUG("NetworkStack: dropping unhandled ICMP message (type=" << static_cast<int>(icmp.get_type())
+              << ", code=" << static_cast<int>(icmp.get_code()) << ") from " << src_ip.to_string());
 }
 
 MacAddress NetworkStack::_resolve_mac(const IPv4Address& ip) const
@@ -628,4 +669,31 @@ void NetworkStack::_send_udp_datagram(const IPv4Address& dest_ip, const Udp& hea
     datagram.set_checksum(checksum == 0 ? 0xFFFF : checksum);
 
     this->_send_ip_packet(dest_ip, IpProtocol::UDP, datagram.to_bytes());
+}
+
+void NetworkStack::_send_icmp_message(const IPv4Address& dest_ip, const Icmp& header, const Bytes& payload)
+{
+    // Icmp can't be copied (same ProtocolLayer reason as Tcp/Udp) - rebuild
+    // a fresh one from header's fields instead
+    Icmp message(header.get_type(), header.get_code(), 0, header.get_rest_of_header(), payload);
+    message.compute_checksum(); // no pseudo-header, no transport_checksum() - see Icmp's own class comment
+    this->_send_ip_packet(dest_ip, IpProtocol::ICMP, message.to_bytes());
+}
+
+void NetworkStack::_send_icmp_port_unreachable(const Ip& ip)
+{
+    IPv4Address remote_ip(ip.get_src_address());
+
+    // RFC 792: Destination Unreachable carries the original IP header plus
+    // the first 8 bytes of its payload. This stack's IP header is always
+    // exactly 20 bytes (no options), and to_bytes() serializes the header
+    // immediately followed by the payload - so the first 28 bytes of the
+    // original packet's own serialization are exactly "header + first 8
+    // bytes", letting the sender see which UDP port failed without
+    // reconstructing anything by hand.
+    Bytes original = const_cast<Ip&>(ip).to_bytes();
+    Bytes embedded = original.slice(0, std::min<size_t>(28, original.size()));
+
+    Icmp header(IcmpType::ICMP_DESTINATION_UNREACHABLE, ICMP_CODE_PORT_UNREACHABLE, 0, 0, Bytes());
+    this->_send_icmp_message(remote_ip, header, embedded);
 }

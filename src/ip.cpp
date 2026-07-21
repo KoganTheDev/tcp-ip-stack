@@ -3,6 +3,7 @@
 #include "network_addresses.h"
 #include "tcp.h"
 #include "udp.h"
+#include "icmp.h"
 #include "raw.h"
 
 Ip::Ip(uint8_t version, uint8_t IHL, uint8_t TOS, uint16_t total_length, uint16_t identification,
@@ -86,6 +87,9 @@ void Ip::from_bytes(const Bytes& data)
         break;
     case IpProtocol::UDP:
         this->_next_layer = std::make_unique<Udp>(payload);
+        break;
+    case IpProtocol::ICMP:
+        this->_next_layer = std::make_unique<Icmp>(payload);
         break;
     default:
         if (!payload.empty())
