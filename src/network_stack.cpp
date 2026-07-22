@@ -37,16 +37,34 @@ size_t NetworkStack::ConnectionKeyHash::operator()(const ConnectionKey& key) con
     return h1 ^ (h2 << 1) ^ (h3 << 2);
 }
 
-NetworkStack::NetworkStack(const std::string& tap_device_path, const MacAddress& local_mac, const IPv4Address& local_ip)
-    : _tun(tap_device_path), _local_mac(local_mac), _local_ip(local_ip), _next_ephemeral_port(FIRST_EPHEMERAL_PORT)
+namespace
 {
-    this->_tun.start();
-    this->_tun.set_non_blocking();
+    // Opens and starts a real TAP device, then hands it back as the generic
+    // channel the string constructor stores - keeps the TunWrapper-specific
+    // lifecycle (start/non-blocking) out of NetworkStack's members, which only
+    // ever see the PacketChannel interface.
+    std::unique_ptr<PacketChannel> open_tap_channel(const std::string& tap_device_path)
+    {
+        auto tun = std::make_unique<TunWrapper>(tap_device_path);
+        tun->start();
+        tun->set_non_blocking();
+        return tun;
+    }
+}
+
+NetworkStack::NetworkStack(const std::string& tap_device_path, const MacAddress& local_mac, const IPv4Address& local_ip)
+    : NetworkStack(open_tap_channel(tap_device_path), local_mac, local_ip)
+{
+}
+
+NetworkStack::NetworkStack(std::unique_ptr<PacketChannel> channel, const MacAddress& local_mac, const IPv4Address& local_ip)
+    : _channel(std::move(channel)), _local_mac(local_mac), _local_ip(local_ip), _next_ephemeral_port(FIRST_EPHEMERAL_PORT)
+{
 }
 
 int NetworkStack::get_fd() const
 {
-    return this->_tun.get_fd();
+    return this->_channel->get_fd();
 }
 
 void NetworkStack::listen(uint16_t port)
@@ -95,11 +113,7 @@ TcpConnection* NetworkStack::connect(const IPv4Address& remote_ip, uint16_t remo
     else
     {
         this->_pending_outbound_connects[remote_ip].push_back(key);
-        if (this->_arp_requests_in_flight.find(remote_ip) == this->_arp_requests_in_flight.end())
-        {
-            this->_send_arp_request(remote_ip);
-            this->_arp_requests_in_flight[remote_ip] = {ARP_MAX_RETRIES, ARP_RETRY_TICKS};
-        }
+        this->_ensure_arp_resolution(remote_ip);
     }
 
     return connection_ptr;
@@ -129,7 +143,7 @@ UdpSocket* NetworkStack::bind_udp(uint16_t port)
         port,
         [this](const IPv4Address& dest_ip, const Udp& header, const Bytes& payload)
         {
-            this->_send_udp_datagram(dest_ip, header, payload);
+            this->_send_or_queue_udp(dest_ip, header, payload);
         }
     );
 
@@ -154,7 +168,7 @@ void NetworkStack::poll()
 {
     while (true)
     {
-        Bytes frame = this->_tun.read(2048);
+        Bytes frame = this->_channel->read(2048);
         if (frame.empty())
         {
             break; // no more frames available right now
@@ -193,10 +207,21 @@ void NetworkStack::on_timer_tick()
         it->second.retries_remaining -= 1;
         if (it->second.retries_remaining <= 0)
         {
-            // never got a reply - give up and fail every connect() waiting on it
+            // never got a reply - give up on everything waiting on this ip:
+            // fail every pending connect(), and drop every queued UDP datagram
+            // (fire-and-forget, so a drop is the whole of UDP's error handling)
             IPv4Address unresolved_ip = it->first;
             it = this->_arp_requests_in_flight.erase(it);
             this->_fail_pending_outbound_connects(unresolved_ip);
+
+            auto datagrams_it = this->_pending_outbound_datagrams.find(unresolved_ip);
+            if (datagrams_it != this->_pending_outbound_datagrams.end())
+            {
+                LOG_WARNING("NetworkStack: dropping " << datagrams_it->second.size()
+                            << " queued UDP datagram(s) to " << unresolved_ip.to_string()
+                            << " - ARP resolution gave up");
+                this->_pending_outbound_datagrams.erase(datagrams_it);
+            }
             continue;
         }
 
@@ -283,6 +308,8 @@ void NetworkStack::_handle_arp(const Arp& arp)
         this->_pending_outbound_connects.erase(pending_it);
     }
 
+    this->_flush_pending_outbound_datagrams(sender_ip);
+
     bool is_request_for_us = arp.get_operation() == ArpOperation::REQUEST
         && arp.get_target_protocol_address() == this->_local_ip;
     if (!is_request_for_us)
@@ -296,7 +323,7 @@ void NetworkStack::_handle_arp(const Arp& arp)
         arp.get_sender_hardware_address(), arp.get_sender_protocol_address()
     );
 
-    this->_tun.write(reply.to_bytes());
+    this->_channel->write(reply.to_bytes());
 }
 
 void NetworkStack::_handle_ip(const Ip& ip)
@@ -534,7 +561,20 @@ void NetworkStack::_send_arp_request(const IPv4Address& target_ip)
 {
     Ethernet request(this->_local_mac, MacAddress::BROADCAST, EtherType::ARP);
     request /= std::make_unique<Arp>(this->_local_mac, this->_local_ip, target_ip);
-    this->_tun.write(request.to_bytes());
+    this->_channel->write(request.to_bytes());
+}
+
+void NetworkStack::_ensure_arp_resolution(const IPv4Address& ip)
+{
+    // one in-flight request per ip serves every waiter (connects and UDP
+    // sends alike) - don't restart the retry clock if one's already running
+    if (this->_arp_requests_in_flight.find(ip) != this->_arp_requests_in_flight.end())
+    {
+        return;
+    }
+
+    this->_send_arp_request(ip);
+    this->_arp_requests_in_flight[ip] = {ARP_MAX_RETRIES, ARP_RETRY_TICKS};
 }
 
 void NetworkStack::_fail_pending_outbound_connects(const IPv4Address& ip)
@@ -562,7 +602,7 @@ void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol,
 {
     auto ip = std::make_unique<Ip>(
         4, 5, 0, static_cast<uint16_t>(20 + payload.size()), 0,
-        false, false, false, 0, 64, protocol, 0,
+        0, 0, 64, protocol, 0,
         this->_local_ip.get_address(), dest_ip.get_address()
     );
     *ip /= std::make_unique<Raw>(payload);
@@ -572,7 +612,7 @@ void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol,
     Ethernet ethernet(this->_local_mac, dest_mac, EtherType::IPv4);
     ethernet /= std::move(ip);
 
-    this->_tun.write(ethernet.to_bytes());
+    this->_channel->write(ethernet.to_bytes());
 }
 
 void NetworkStack::_send_tcp_segment(const IPv4Address& dest_ip, const Tcp& header, const Bytes& payload)
@@ -650,6 +690,42 @@ void NetworkStack::_send_rst(const Ip& ip, const Tcp& tcp)
 
     Tcp rst(tcp.get_dest_port(), tcp.get_src_port(), seq, ack, 5, flags, 0, 0, 0);
     this->_send_tcp_segment(remote_ip, rst, Bytes());
+}
+
+void NetworkStack::_send_or_queue_udp(const IPv4Address& dest_ip, const Udp& header, const Bytes& payload)
+{
+    if (this->_arp_table.find(dest_ip) != this->_arp_table.end())
+    {
+        this->_send_udp_datagram(dest_ip, header, payload);
+        return;
+    }
+
+    // peer's MAC isn't cached - queue the datagram and resolve, the same
+    // resolve-and-queue connect() does. length is recomputed from the payload
+    // when the datagram is finally built, so only the ports and payload need
+    // to survive the wait here.
+    LOG_DEBUG("NetworkStack: queueing a UDP datagram to " << dest_ip.to_string()
+              << " pending ARP resolution");
+    this->_pending_outbound_datagrams[dest_ip].push_back(
+        {header.get_src_port(), header.get_dest_port(), payload});
+    this->_ensure_arp_resolution(dest_ip);
+}
+
+void NetworkStack::_flush_pending_outbound_datagrams(const IPv4Address& ip)
+{
+    auto pending_it = this->_pending_outbound_datagrams.find(ip);
+    if (pending_it == this->_pending_outbound_datagrams.end())
+    {
+        return;
+    }
+
+    for (const PendingDatagram& pending : pending_it->second)
+    {
+        uint16_t length = static_cast<uint16_t>(8 + pending.payload.size());
+        Udp header(pending.src_port, pending.dest_port, length, 0, Bytes());
+        this->_send_udp_datagram(ip, header, pending.payload);
+    }
+    this->_pending_outbound_datagrams.erase(pending_it);
 }
 
 void NetworkStack::_send_udp_datagram(const IPv4Address& dest_ip, const Udp& header, const Bytes& payload)

@@ -12,11 +12,21 @@ enum IpProtocol
     UDP = 17,
 };
 
+// The three flag bits live in the top 3 bits of the flags/offset octet (byte
+// 6). Values match those wire positions, the same way Tcp's flags byte does,
+// so a single unified flags variable carries them everywhere.
+enum IpFlag : uint8_t
+{
+    IP_FLAG_RESERVED = 0x80,       // must be zero
+    IP_FLAG_DONT_FRAGMENT = 0x40,  // DF
+    IP_FLAG_MORE_FRAGMENTS = 0x20, // MF
+};
+
 class Ip : public ProtocolLayer
 {
 public:
     Ip(uint8_t version, uint8_t _IHL, uint8_t TOS, uint16_t total_length, uint16_t identification,
-        bool ip_flag_x, bool _ip_flag_d, bool _ip_flag_m, uint16_t fragment_offset, uint8_t TTL, uint8_t protocol,
+        uint8_t ip_flags, uint16_t fragment_offset, uint8_t TTL, uint8_t protocol,
         uint16_t header_checksum, const Bytes& src_address, const Bytes& dest_address);
     Ip(const Bytes& bytes); // Constructor that gets a bytestream and serializes it directly into an IP object
 
@@ -42,9 +52,10 @@ public:
     uint8_t get_type_of_service() const { return _TOS; }
     uint16_t get_total_length() const { return _total_length; }
     uint16_t get_identification() const { return _identification; }
-    bool get_ip_flag_x() const { return _ip_flag_x; }
-    bool get_ip_flag_d() const { return _ip_flag_d; }
-    bool get_ip_flag_m() const { return _ip_flag_m; }
+    uint8_t get_ip_flags() const { return _flags; }
+    bool get_ip_flag_x() const { return (_flags & IP_FLAG_RESERVED) != 0; }
+    bool get_ip_flag_d() const { return (_flags & IP_FLAG_DONT_FRAGMENT) != 0; }
+    bool get_ip_flag_m() const { return (_flags & IP_FLAG_MORE_FRAGMENTS) != 0; }
     uint16_t get_fragment_offset() const { return _fragment_offset; }
     uint8_t get_TTL() const { return _TTL; }
     uint8_t get_protocol() const { return _protocol; }
@@ -65,10 +76,10 @@ private:
     uint8_t _IHL; // Header length,if IHL = 5 there`s no field options
     uint8_t _TOS; // Type of service
     uint16_t _total_length; // Header length in bytes. allowed values: [20, 65,535]
-    uint16_t _identification; 
-    bool _ip_flag_x; // Flag not in use in IPv4
-    bool _ip_flag_d; // Don`t fragment
-    bool  _ip_flag_m; // More fragment
+    uint16_t _identification;
+    // The three flag bits (reserved/DF/MF) as one field, in their wire
+    // positions (see IpFlag) - mirrors how Tcp keeps a single flags byte.
+    uint8_t _flags;
     uint16_t _fragment_offset; // When fragmentation occurs, represents the offset from the start of the packet. valid values [0, 8191]
     uint8_t _TTL; // Time to live, used to prevent routing loops, when the packet reaches a router, the router decrements 1 from this field and recalculates the IP header checksum.
     uint8_t _protocol; // Defines the transport protocol within the packet

@@ -21,7 +21,7 @@ MacAddress::MacAddress(const std::string& address)
         throw EXCEPTION(BaseException, "Invalid MAC address length");
     }
 
-    for (int i = 2; i < address.size(); i += 3)
+    for (size_t i = 2; i < address.size(); i += 3)
     {
         if (address[i] != ':')
         {

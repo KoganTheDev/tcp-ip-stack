@@ -46,10 +46,10 @@ T bytes_to_int(const Bytes& bytes)
 {
     T result = 0;
     size_t byte_count = sizeof result;
-    for (int i = 0; i < byte_count; i++)
+    for (size_t i = 0; i < byte_count; i++)
     {
         result *= (1 << 8);
-        result += bytes[i]; 
+        result += bytes[i];
     }
     return result; 
 }

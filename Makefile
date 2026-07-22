@@ -1,4 +1,10 @@
-# TODO: ASK ALON for help with creating and running the test files via the makefile.
+# Targets:
+#   make            - build the tcpipstack binary (src/main.cpp sandbox)
+#   make all        - build both the binary and the test runner
+#   make run_tests  - build the test runner (tests/src/*.cpp are picked up
+#                     automatically by the wildcard below - no per-file wiring)
+#   make test       - build and run the whole test suite
+#   make clean      - remove build artifacts
 
 # Include all directories recursively under "include"
 INCLUDES = -I./include
@@ -23,25 +29,29 @@ CXXFLAGS = -std=c++17 -Wall -g
 TARGET = tcpipstack
 TEST_TARGET = run_tests
 
+# $(TARGET) stays the first rule so a bare `make` still builds just the binary,
+# as it always has - `all` and `test` are opt-in.
 $(TARGET) : $(OBJ)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $(TARGET) $^
 
+all: $(TARGET) $(TEST_TARGET)
+
 $(TEST_TARGET) : $(TEST_OBJ)
 	$(CXX) $(CXXFLAGS) $(TEST_INCLUDES) -o $(TEST_TARGET) $^
+
+test: $(TEST_TARGET)
+	./$(TEST_TARGET)
 
 bin/%.o: src/%.cpp $(HEADERS)
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
-tests/bin/%.o: tests/src/%.cpp $(TEST_HEADERS)
+tests/bin/%.o: tests/src/%.cpp $(HEADERS) $(TEST_HEADERS)
 	@mkdir -p tests/bin
 	$(CXX) $(CXXFLAGS) $(TEST_INCLUDES) -c $< -o $@
 
 clean:
-	rm -f bin/*.o
-	rm -f tests/bin/*.o
-	rmdir bin
-	rmdir tests/bin
-	rm $(TARGET) $(TEST_TARGET)
+	rm -rf bin tests/bin
+	rm -f $(TARGET) $(TEST_TARGET)
 
-.PHONY: clean
+.PHONY: all test clean

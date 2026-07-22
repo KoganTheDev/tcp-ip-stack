@@ -7,17 +7,14 @@
 #include "raw.h"
 
 Ip::Ip(uint8_t version, uint8_t IHL, uint8_t TOS, uint16_t total_length, uint16_t identification,
-     bool ip_flag_x, bool ip_flag_d, bool ip_flag_m, uint16_t fragment_offset, uint8_t TTL, uint8_t protocol,
+     uint8_t ip_flags, uint16_t fragment_offset, uint8_t TTL, uint8_t protocol,
      uint16_t header_checksum, const Bytes &src_address, const Bytes &dest_address)
-    : _version(4),
+    : _version(version),
       _IHL(IHL),
       _TOS(TOS),
       _total_length(total_length),
       _identification(identification),
-      // TODO: maybe change the flags to be from a unified flag variable. check TCP.cpp for reference.  
-     _ip_flag_x(0),
-     _ip_flag_d(ip_flag_d),
-     _ip_flag_m(ip_flag_m),
+     _flags(ip_flags & 0xE0), // only the top 3 bits are flags; the rest belongs to the offset
      _fragment_offset(fragment_offset),
      _TTL(TTL), _protocol(protocol),
      _header_checksum(header_checksum),
@@ -67,11 +64,10 @@ void Ip::from_bytes(const Bytes& data)
     _TOS = data[1];
     _total_length = data.slice_int<uint16_t>(2);
     _identification = data.slice_int<uint16_t>(4);
-    // the 3 flag bits are the top 3 bits of byte 6 (reserved, DF, MF);
-    // the remaining 13 bits of bytes 6-7 are the fragment offset
-    _ip_flag_x = data[6] & 0x80;
-    _ip_flag_d = data[6] & 0x40;
-    _ip_flag_m = data[6] & 0x20;
+    // the 3 flag bits are the top 3 bits of byte 6 (reserved, DF, MF), kept
+    // together in one field in those same wire positions; the remaining 13
+    // bits of bytes 6-7 are the fragment offset
+    _flags = data[6] & 0xE0;
     _fragment_offset = data.slice_int<uint16_t>(6) & 0x1fff;
     _TTL = data[8];
     _protocol = data[9];
@@ -109,10 +105,10 @@ Bytes Ip::_header_to_bytes() const
     result.append_int<uint8_t>(this->_TOS);
     result.append_int<uint16_t>(this->_total_length);
     result.append_int<uint16_t>(this->_identification);
+    // _flags already holds the 3 bits in their byte-6 positions (0x80/0x40/
+    // 0x20); shifting up by 8 lands them at bits 15/14/13 of the 16-bit field
     uint16_t flags_and_offset =
-    ((this->_ip_flag_x & 0x1) << 15) |  // Reserved
-    ((this->_ip_flag_d & 0x1) << 14) |  // DF
-    ((this->_ip_flag_m & 0x1) << 13) |  // MF
+    (static_cast<uint16_t>(this->_flags) << 8) |
     (this->_fragment_offset & 0x1FFF);  // 13-bit offset
     result.append_int<uint16_t>(flags_and_offset);
     result.append_int<uint8_t>(this->_TTL);
@@ -157,10 +153,8 @@ std::string Ip::to_string() const
     result += this->_field_to_string("idendtification", int_to_bytes<uint16_t>(this->_identification).to_hex());
 
     // IP flags
-    uint16_t flags_and_offset = 
-    ((this->_ip_flag_x & 0x1) << 15) |  // Reserved
-    ((this->_ip_flag_d & 0x1) << 14) |  // DF
-    ((this->_ip_flag_m & 0x1) << 13) |  // MF
+    uint16_t flags_and_offset =
+    (static_cast<uint16_t>(this->_flags) << 8) |
     (this->_fragment_offset & 0x1FFF);  // 13-bit offset
     result += this->_field_to_string("IP flags and offset", int_to_bytes<uint16_t>(flags_and_offset).to_hex());
 

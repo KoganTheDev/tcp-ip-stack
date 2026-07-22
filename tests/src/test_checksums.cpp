@@ -24,7 +24,7 @@ TEST(InternetChecksumMatchesKnownVector)
 // internet_checksum() directly over the same header fields.
 TEST(IpComputeChecksumMatchesKnownVector)
 {
-    Ip ip(4, 5, 0x00, 0x003c, 0x1c46, false, true, false, 0, 0x40, IpProtocol::TCP, 0,
+    Ip ip(4, 5, 0x00, 0x003c, 0x1c46, IP_FLAG_DONT_FRAGMENT, 0, 0x40, IpProtocol::TCP, 0,
           Bytes::from_hex("ac100a63"), Bytes::from_hex("ac100a0c"));
 
     ip.compute_checksum();
@@ -39,7 +39,7 @@ TEST(IpComputeChecksumMatchesKnownVector)
 // accepted by a real kernel TCP/IP stack.
 TEST(IpChecksumSelfVerifies)
 {
-    Ip ip(4, 5, 0x00, 0x0028, 0x0001, false, false, false, 0, 64, IpProtocol::TCP, 0,
+    Ip ip(4, 5, 0x00, 0x0028, 0x0001, 0, 0, 64, IpProtocol::TCP, 0,
           Bytes::from_hex("0a000001"), Bytes::from_hex("0a000002"));
     ip.compute_checksum();
 
@@ -66,12 +66,12 @@ TEST(TransportChecksumSelfVerifies)
 // a correctly-checksummed header must self-verify, and a corrupted one must not.
 TEST(IpVerifyChecksumAcceptsCorrectHeaderAndRejectsCorruptedOne)
 {
-    Ip ip(4, 5, 0x00, 0x0028, 0x0001, false, false, false, 0, 64, IpProtocol::TCP, 0,
+    Ip ip(4, 5, 0x00, 0x0028, 0x0001, 0, 0, 64, IpProtocol::TCP, 0,
           Bytes::from_hex("0a000001"), Bytes::from_hex("0a000002"));
     ip.compute_checksum();
     test_assert(ip.verify_checksum(), "a header with a correctly-computed checksum must verify");
 
-    Ip corrupted(4, 5, 0x01 /* TOS flipped after the checksum was computed */, 0x0028, 0x0001, false, false, false, 0, 64,
+    Ip corrupted(4, 5, 0x01 /* TOS flipped after the checksum was computed */, 0x0028, 0x0001, 0, 0, 64,
                  IpProtocol::TCP, ip.get_header_checksum(), Bytes::from_hex("0a000001"), Bytes::from_hex("0a000002"));
     test_assert(!corrupted.verify_checksum(), "a header whose fields changed after the checksum was computed must fail verification");
 }

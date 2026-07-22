@@ -8,6 +8,7 @@
 #include <cstdint>
 
 #include "tun_wrapper.h"
+#include "packet_channel.h"
 #include "network_addresses.h"
 #include "ethernet.h"
 #include "arp.h"
@@ -32,13 +33,11 @@
 //    Unreachable for a UDP datagram to a port nothing is bound to. Every
 //    other ICMP type/code decodes correctly (the header shape is uniform)
 //    but isn't acted on - logged and dropped
-//  - UDP sends only ever answer a peer this stack has already heard from
-//    (same reply-and-learn ARP pattern TCP's passive-open used before
-//    active-open/connect() was added) - bind_udp()'s socket can send_to()
-//    any peer whose MAC is already known, but there's no outbound ARP
-//    request/retry for a UDP send to a peer never heard from, the way
-//    connect() has for TCP; a send to an unresolved peer is dropped and
-//    logged rather than queued
+//  - UDP send_to() to a peer whose MAC isn't cached yet resolves it the same
+//    way connect() does: the datagram is queued and a bounded ARP request/
+//    retry is kicked off, then the datagram is flushed once the reply arrives
+//    (or dropped, fire-and-forget, if resolution gives up). bind_udp()'s
+//    socket can of course still send_to() any already-known peer immediately.
 //  - no IP fragmentation/reassembly - a fragmented packet (MF set, or a
 //    nonzero fragment offset) is detected and dropped with a log line, not
 //    silently mishandled; this stack's own TCP never produces a payload
@@ -62,6 +61,11 @@ class NetworkStack
 {
 public:
     NetworkStack(const std::string& tap_device_path, const MacAddress& local_mac, const IPv4Address& local_ip);
+    // Test seam: injects the frame transport directly instead of opening a
+    // real TAP device, so a fake can feed frames in and capture what goes out
+    // with no OS involved. The string constructor above delegates here after
+    // building and starting a TunWrapper.
+    NetworkStack(std::unique_ptr<PacketChannel> channel, const MacAddress& local_mac, const IPv4Address& local_ip);
 
     int get_fd() const;
 
@@ -142,7 +146,13 @@ private:
     // TcpConnection exists to answer through, so this builds and sends the
     // RST directly.
     void _send_rst(const Ip& ip, const Tcp& tcp);
+    // Sends a UDP datagram if the peer's MAC is already known, otherwise
+    // queues it and kicks off ARP resolution (see _pending_outbound_datagrams)
+    // - the UDP-side counterpart to connect()'s resolve-and-queue.
+    void _send_or_queue_udp(const IPv4Address& dest_ip, const Udp& header, const Bytes& payload);
     void _send_udp_datagram(const IPv4Address& dest_ip, const Udp& header, const Bytes& payload);
+    // Flushes every datagram queued for ip once its MAC has just been learned.
+    void _flush_pending_outbound_datagrams(const IPv4Address& ip);
     // Rebuilds a fresh Icmp from header's type/code/rest_of_header (same
     // non-copyable-ProtocolLayer reason as _send_tcp_segment/
     // _send_udp_datagram), attaches payload, computes the checksum, and
@@ -155,9 +165,13 @@ private:
 
     uint16_t _allocate_ephemeral_port();
     void _send_arp_request(const IPv4Address& target_ip);
+    // Sends an ARP request for ip and registers its retry state, unless one is
+    // already in flight for that ip - shared by connect() and UDP sends to a
+    // peer whose MAC isn't cached yet.
+    void _ensure_arp_resolution(const IPv4Address& ip);
     void _fail_pending_outbound_connects(const IPv4Address& ip);
 
-    TunWrapper _tun;
+    std::unique_ptr<PacketChannel> _channel;
     MacAddress _local_mac;
     IPv4Address _local_ip;
     uint16_t _next_ephemeral_port;
@@ -186,4 +200,16 @@ private:
     };
     std::unordered_map<IPv4Address, std::vector<ConnectionKey>> _pending_outbound_connects;
     std::unordered_map<IPv4Address, ArpRequestState> _arp_requests_in_flight;
+
+    // A UDP datagram whose send had to wait on ARP resolution - enough to
+    // rebuild it once the peer's MAC is known. Keyed (in the map below) by the
+    // destination IP the send was waiting on, the same key connect() queues
+    // its pending SYNs under.
+    struct PendingDatagram
+    {
+        uint16_t src_port;
+        uint16_t dest_port;
+        Bytes payload;
+    };
+    std::unordered_map<IPv4Address, std::vector<PendingDatagram>> _pending_outbound_datagrams;
 };
