@@ -11,6 +11,7 @@ namespace
     constexpr uint16_t FIRST_EPHEMERAL_PORT = 49152; // IANA dynamic/private range starts here
     constexpr int ARP_MAX_RETRIES = 3;
     constexpr int ARP_RETRY_TICKS = 4; // with a 500ms NetworkStack tick, ~2s between retries
+    constexpr int ARP_ENTRY_TTL_TICKS = 120; // ~60s at a 500ms tick - a learned mapping's lifetime while the peer stays silent
 
     constexpr uint8_t FLAG_ACK = 0x10;
     constexpr uint8_t FLAG_RST = 0x04;
@@ -195,6 +196,8 @@ void NetworkStack::on_timer_tick()
 
     this->_reap_closed_connections();
 
+    this->_age_arp_table();
+
     for (auto it = this->_arp_requests_in_flight.begin(); it != this->_arp_requests_in_flight.end(); )
     {
         it->second.ticks_until_retry -= 1;
@@ -290,7 +293,7 @@ void NetworkStack::_handle_arp(const Arp& arp)
     // teaches us its mapping); an active-open connect() below is what
     // actually needs to wait on this
     IPv4Address sender_ip = arp.get_sender_protocol_address();
-    this->_arp_table[sender_ip] = arp.get_sender_hardware_address();
+    this->_arp_table[sender_ip] = {arp.get_sender_hardware_address(), ARP_ENTRY_TTL_TICKS};
 
     this->_arp_requests_in_flight.erase(sender_ip);
 
@@ -332,6 +335,11 @@ void NetworkStack::_handle_ip(const Ip& ip)
     {
         return; // not addressed to us - this stack doesn't route or forward
     }
+
+    // hearing from a peer proves it's still alive at its cached MAC - keep that
+    // mapping fresh so an actively-talking peer never ages out mid-conversation
+    // (its data/acks arrive as IP frames, not ARP, so nothing else would)
+    this->_refresh_arp_entry(IPv4Address(ip.get_src_address()));
 
     // MF set, or a nonzero fragment offset, means this packet is one piece
     // of a larger one - reassembly isn't implemented. This stack's own TCP
@@ -522,11 +530,69 @@ void NetworkStack::_handle_icmp(const Ip& ip, const Icmp& icmp)
         return;
     }
 
+    if (icmp.get_type() == IcmpType::ICMP_DESTINATION_UNREACHABLE)
+    {
+        LOG_DEBUG("NetworkStack: received ICMP Destination Unreachable (code="
+                  << static_cast<int>(icmp.get_code()) << ") from " << src_ip.to_string());
+        this->_handle_icmp_error(icmp);
+        return;
+    }
+
     // decoded correctly (the header shape is uniform across every ICMP
     // type/code), just not acted on - logged and dropped, not silently
     // mishandled as if it meant something
     LOG_DEBUG("NetworkStack: dropping unhandled ICMP message (type=" << static_cast<int>(icmp.get_type())
               << ", code=" << static_cast<int>(icmp.get_code()) << ") from " << src_ip.to_string());
+}
+
+void NetworkStack::_handle_icmp_error(const Icmp& icmp)
+{
+    // The error quotes the offending packet back: its IP header plus the first
+    // 8 bytes of its payload (RFC 792). For TCP/UDP those 8 bytes begin with
+    // the source and destination ports, which - together with the quoted IP
+    // header's destination address - is exactly the 4-tuple that identifies the
+    // connection that sent it.
+    if (!icmp.has_next_layer())
+    {
+        return;
+    }
+    const Raw* raw = dynamic_cast<const Raw*>(&icmp.get_next_layer());
+    if (raw == nullptr)
+    {
+        return;
+    }
+    const Bytes& embedded = raw->get_data();
+    if (embedded.size() < 28) // 20-byte IP header (minimum) + 8 bytes of transport
+    {
+        return;
+    }
+
+    size_t ihl = static_cast<size_t>(embedded[0] & 0x0f) * 4;
+    if (ihl < 20 || embedded.size() < ihl + 4)
+    {
+        return;
+    }
+
+    uint8_t protocol = embedded[9];
+    if (protocol != IpProtocol::TCP)
+    {
+        // UDP is connectionless - there's no per-connection state to fail, and
+        // a lost datagram is already UDP's contract. Only TCP benefits here.
+        return;
+    }
+
+    IPv4Address original_dest(embedded.slice(16, 4)); // the peer we were trying to reach
+    uint16_t local_port = embedded.slice_int<uint16_t>(ihl);       // our source port
+    uint16_t remote_port = embedded.slice_int<uint16_t>(ihl + 2);  // the unreachable peer's port
+
+    ConnectionKey key{original_dest, remote_port, local_port};
+    auto it = this->_connections.find(key);
+    if (it != this->_connections.end())
+    {
+        LOG_DEBUG("NetworkStack: failing TCP connection to " << original_dest.to_string() << ":" << remote_port
+                  << " on an ICMP error (was going to time out otherwise)");
+        it->second->fail(); // -> CLOSED, reaped on the next poll()/on_timer_tick() pass
+    }
 }
 
 MacAddress NetworkStack::_resolve_mac(const IPv4Address& ip) const
@@ -542,7 +608,33 @@ MacAddress NetworkStack::_resolve_mac(const IPv4Address& ip) const
         // mapping. This is a safety net, not the normal resolution path.
         throw EXCEPTION(BaseException, "No ARP entry for " + ip.to_string());
     }
-    return it->second;
+    return it->second.mac;
+}
+
+void NetworkStack::_refresh_arp_entry(const IPv4Address& ip)
+{
+    auto it = this->_arp_table.find(ip);
+    if (it != this->_arp_table.end())
+    {
+        it->second.ticks_remaining = ARP_ENTRY_TTL_TICKS;
+    }
+}
+
+void NetworkStack::_age_arp_table()
+{
+    for (auto it = this->_arp_table.begin(); it != this->_arp_table.end(); )
+    {
+        it->second.ticks_remaining -= 1;
+        if (it->second.ticks_remaining <= 0)
+        {
+            LOG_DEBUG("NetworkStack: evicting stale ARP entry for " << it->first.to_string());
+            it = this->_arp_table.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
 }
 
 uint16_t NetworkStack::_allocate_ephemeral_port()

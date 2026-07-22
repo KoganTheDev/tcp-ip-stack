@@ -161,6 +161,12 @@ private:
     // RFC 792: Destination Unreachable/Port Unreachable, for a UDP
     // datagram that arrived at a port nothing is bound to.
     void _send_icmp_port_unreachable(const Ip& ip);
+    // Handles an *incoming* ICMP error (Destination/Port Unreachable): the
+    // message quotes back the IP header + first 8 bytes of the packet that
+    // triggered it (RFC 792), which is enough to identify the TCP connection
+    // that sent it and fail it fast, instead of leaving it to grind through
+    // the full retransmit-timeout budget before giving up.
+    void _handle_icmp_error(const Icmp& icmp);
     MacAddress _resolve_mac(const IPv4Address& ip) const;
 
     uint16_t _allocate_ephemeral_port();
@@ -170,13 +176,29 @@ private:
     // peer whose MAC isn't cached yet.
     void _ensure_arp_resolution(const IPv4Address& ip);
     void _fail_pending_outbound_connects(const IPv4Address& ip);
+    // Resets an ARP entry's TTL when we hear from that peer, so a peer we're
+    // actively talking to never ages out mid-conversation - a no-op if the
+    // peer isn't cached (nothing to keep alive).
+    void _refresh_arp_entry(const IPv4Address& ip);
+    // Ages every ARP entry by one tick and evicts any that reach zero, so a
+    // peer that has gone silent (moved, rebooted, reassigned its IP) doesn't
+    // leave a stale IP->MAC mapping blackholing traffic forever.
+    void _age_arp_table();
 
     std::unique_ptr<PacketChannel> _channel;
     MacAddress _local_mac;
     IPv4Address _local_ip;
     uint16_t _next_ephemeral_port;
 
-    std::unordered_map<IPv4Address, MacAddress> _arp_table;
+    // A learned IP->MAC mapping plus a tick countdown to its expiry. Refreshed
+    // to full TTL every time we hear from the peer (see _refresh_arp_entry),
+    // aged down and evicted at zero by _age_arp_table() on each timer tick.
+    struct ArpTableEntry
+    {
+        MacAddress mac;
+        int ticks_remaining;
+    };
+    std::unordered_map<IPv4Address, ArpTableEntry> _arp_table;
     std::unordered_map<uint16_t, bool> _listening_ports;
     std::unordered_map<uint16_t, std::deque<ConnectionKey>> _pending_accepts;
     std::unordered_map<uint16_t, std::unique_ptr<UdpSocket>> _udp_sockets;

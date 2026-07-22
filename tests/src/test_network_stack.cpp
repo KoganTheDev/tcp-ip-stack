@@ -1,6 +1,7 @@
 #include "test.h"
 #include "network_stack.h"
 #include "fake_packet_channel.h"
+#include "loopback_channel.h"
 #include "ethernet.h"
 #include "ip.h"
 #include "tcp.h"
@@ -86,6 +87,24 @@ namespace
         return wrap_ip(IpProtocol::ICMP, icmp.to_bytes());
     }
 
+    // An ICMP Port Unreachable as the peer's stack would send it: it quotes back
+    // our original outgoing packet (local -> peer), of which the first 28 bytes
+    // are the IP header + the first 8 bytes of our TCP header (RFC 792).
+    Bytes build_icmp_port_unreachable_for_our_tcp(uint16_t local_port, uint16_t remote_port)
+    {
+        Tcp our_segment(local_port, remote_port, 0, 0, 5, 0x02 /* SYN */, 65535, 0, 0);
+        auto embedded_ip = std::make_unique<Ip>(
+            4, 5, 0, 40, 0, 0, 0, 64, IpProtocol::TCP, 0,
+            LOCAL_IP.get_address(), PEER_IP.get_address());
+        *embedded_ip /= std::make_unique<Raw>(our_segment.to_bytes());
+        embedded_ip->compute_checksum();
+        Bytes embedded = embedded_ip->to_bytes().slice(0, 28);
+
+        Icmp icmp(IcmpType::ICMP_DESTINATION_UNREACHABLE, ICMP_CODE_PORT_UNREACHABLE, 0, 0, embedded);
+        icmp.compute_checksum();
+        return wrap_ip(IpProtocol::ICMP, icmp.to_bytes());
+    }
+
     // --- outbound-frame parsers (extract primitives, so the parsed layer
     // chain's lifetime doesn't have to outlive the call) ---
 
@@ -166,6 +185,18 @@ namespace
     {
         for (const Bytes& f : frames) { IcmpView v = view_icmp(f); if (v.is_icmp) return v; }
         return IcmpView();
+    }
+
+    bool contains_udp(const std::vector<Bytes>& frames)
+    {
+        for (const Bytes& frame : frames)
+        {
+            Ethernet eth(frame);
+            if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer()) continue;
+            const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
+            if (ip && ip->get_protocol() == IpProtocol::UDP) return true;
+        }
+        return false;
     }
 
     std::unique_ptr<NetworkStack> make_stack(FakePacketChannel*& out_channel)
@@ -339,4 +370,161 @@ TEST(ConnectToUnresolvedPeerArpsThenSendsSyn)
 
     TcpView syn = find_tcp(channel->outbound_frames());
     test_assert(syn.is_tcp && syn.syn && !syn.ack_flag, "a bare SYN should go out once the peer's MAC is resolved");
+}
+
+// An incoming ICMP Destination/Port Unreachable for a segment we sent should
+// fail the matching TCP connection immediately, rather than dropping the ICMP
+// and leaving the connection to grind through its whole retransmit budget.
+TEST(IcmpPortUnreachableFailsTheMatchingTcpConnection)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    // teach the stack the peer's MAC so connect() sends its SYN immediately
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+    channel->clear_outbound();
+
+    TcpConnection* client = stack->connect(PEER_IP, 80);
+    uint64_t id = client->get_id();
+    TcpView syn = find_tcp(channel->outbound_frames());
+    test_assert(syn.is_tcp && syn.syn, "connect() to an already-resolved peer should send a SYN");
+    test_assert(stack->find_connection(id) != nullptr, "the connection should exist right after connect()");
+
+    // the peer reports its port 80 is unreachable, quoting our SYN back
+    channel->push_inbound(build_icmp_port_unreachable_for_our_tcp(syn.src_port, 80));
+    stack->poll();
+
+    test_assert(stack->find_connection(id) == nullptr,
+                "an ICMP Port Unreachable for our SYN should fail (and reap) the connection, not leave it hanging");
+}
+
+// ARP entries must not live forever: a peer that goes silent (rebooted,
+// moved, reassigned its IP) would otherwise leave a stale IP->MAC mapping
+// blackholing traffic. After its TTL of idle ticks the entry is evicted, so
+// the next send to that peer re-resolves it via a fresh ARP request.
+TEST(ArpEntryExpiresWhenPeerGoesSilentAndIsReArped)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    UdpSocket* socket = stack->bind_udp(8080);
+
+    channel->push_inbound(build_arp_request()); // teaches the stack the peer's MAC
+    stack->poll();
+
+    // while the mapping is fresh, a send goes straight out - no re-resolution
+    channel->clear_outbound();
+    socket->send_to(PEER_IP, 9000, Bytes::from_hex("01"));
+    test_assert(contains_udp(channel->outbound_frames()), "a send to a freshly-learned peer should go out immediately");
+    test_assert(!find_arp(channel->outbound_frames()).is_arp, "a resolved send must not emit an ARP request");
+
+    // ARP_ENTRY_TTL_TICKS is 120 - tick well past it with no traffic from the peer
+    for (int i = 0; i < 130; i++)
+    {
+        stack->on_timer_tick();
+    }
+
+    channel->clear_outbound();
+    socket->send_to(PEER_IP, 9001, Bytes::from_hex("02"));
+    ArpView request = find_arp(channel->outbound_frames());
+    test_assert(request.is_arp && request.op == ArpOperation::REQUEST,
+                "once the entry has expired, a send should re-resolve the peer with a fresh ARP request");
+    test_assert(request.target_ip == PEER_IP.to_string(), "the re-resolution should target the now-expired peer");
+}
+
+// The flip side: a peer we keep hearing from must never age out mid-
+// conversation. Its data/acks arrive as IP frames (not ARP), so received IP
+// traffic has to refresh the entry - otherwise an active connection's ARP
+// mapping would expire out from under it after TTL ticks.
+TEST(ReceivedIpTrafficKeepsArpEntryFresh)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    UdpSocket* socket = stack->bind_udp(8080);
+
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+
+    // tick well past the TTL, but keep receiving traffic from the peer each
+    // tick - every received frame should refresh the entry
+    for (int i = 0; i < 200; i++)
+    {
+        channel->push_inbound(build_udp(40000, 8080, Bytes::from_hex("00")));
+        stack->poll();
+        stack->on_timer_tick();
+    }
+
+    channel->clear_outbound();
+    socket->send_to(PEER_IP, 9000, Bytes::from_hex("01"));
+    test_assert(contains_udp(channel->outbound_frames()),
+                "a peer that keeps sending traffic should stay resolved, so the send goes straight out");
+    test_assert(!find_arp(channel->outbound_frames()).is_arp,
+                "received traffic must keep the ARP entry fresh - no re-resolution should be needed");
+}
+
+// Whole-stack integration: two NetworkStacks wired back to back over crossed
+// LoopbackChannels run a real ARP resolution, TCP 3-way handshake, bidirectional
+// data exchange, and half-close against each other - no crafted frames, no OS.
+// This is the end-to-end path the earlier tests only exercise one side of.
+TEST(TwoStacksHandshakeExchangeDataAndHalfClose)
+{
+    const MacAddress MAC_A("aa:aa:aa:aa:aa:aa");
+    const MacAddress MAC_B("bb:bb:bb:bb:bb:bb");
+    const IPv4Address IP_A("10.0.0.1");
+    const IPv4Address IP_B("10.0.0.2");
+
+    auto channel_a = std::make_unique<LoopbackChannel>();
+    auto channel_b = std::make_unique<LoopbackChannel>();
+    channel_a->set_peer(channel_b.get()); // A writes -> B's inbound
+    channel_b->set_peer(channel_a.get()); // B writes -> A's inbound
+
+    NetworkStack stack_a(std::move(channel_a), MAC_A, IP_A); // client
+    NetworkStack stack_b(std::move(channel_b), MAC_B, IP_B); // server
+
+    // pumps both stacks in turn until the exchange goes quiet - each poll()
+    // drains one stack's inbound and may write into the other's, so alternating
+    // propagates ARP replies and handshake segments across the segment
+    auto pump = [&]() { for (int i = 0; i < 12; i++) { stack_a.poll(); stack_b.poll(); } };
+
+    stack_b.listen(80);
+    TcpConnection* client = stack_a.connect(IP_B, 80);
+    pump();
+
+    test_assert(client->get_state() == TcpState::ESTABLISHED,
+                "the client should reach ESTABLISHED through a real ARP + 3-way handshake");
+
+    TcpConnection* server = stack_b.accept(80);
+    test_assert(server != nullptr, "the server should have an accepted connection once the handshake completes");
+    test_assert(server->get_state() == TcpState::ESTABLISHED, "the accepted server connection should be ESTABLISHED");
+
+    // server echoes whatever it receives
+    std::vector<Bytes> server_received;
+    server->set_data_received_callback([&server_received, server](const Bytes& data)
+    {
+        server_received.push_back(data);
+        server->send(data);
+    });
+    std::vector<Bytes> client_received;
+    client->set_data_received_callback([&client_received](const Bytes& data)
+    {
+        client_received.push_back(data);
+    });
+
+    Bytes message = Bytes::from_hex("68656c6c6f"); // "hello"
+    client->send(message);
+    pump();
+
+    test_assert(server_received.size() == 1 && server_received[0].to_hex() == message.to_hex(),
+                "the server should receive exactly the bytes the client sent");
+    test_assert(client_received.size() == 1 && client_received[0].to_hex() == message.to_hex(),
+                "the client should receive the echoed bytes back");
+
+    // client half-closes; the FIN must propagate and move both sides forward
+    client->close();
+    pump();
+
+    test_assert(client->get_state() == TcpState::FIN_WAIT_2,
+                "after close() and the peer's ack of our FIN, the client should be in FIN_WAIT_2");
+    test_assert(server->get_state() == TcpState::CLOSE_WAIT,
+                "the server should see the client's FIN and move to CLOSE_WAIT");
 }

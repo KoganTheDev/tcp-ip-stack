@@ -149,6 +149,15 @@ private:
     // shared by the normal new-ack path and fast recovery's dup-ack path
     // (a fast-recovery window inflation can itself open room to send).
     void _send_queued_while_window_allows();
+    // Arms the zero-window persist timer when the peer's window is shut and we
+    // have data waiting with nothing in flight, or disarms it otherwise -
+    // called wherever the send queue or the peer window changes.
+    void _arm_or_disarm_persist();
+    // Sends a single-byte zero-window probe: a poke to make the peer
+    // re-advertise its window. Deliberately NOT tracked in _in_flight and does
+    // not advance _send_next - see the definition for why that keeps it clear
+    // of the retransmit/dup-ack machinery.
+    void _send_zero_window_probe();
     // Bytes outstanding between SND.UNA and SND.NXT - the front and back of
     // _in_flight are always contiguous in sequence-number space (each entry
     // starts exactly where the previous one ended), so this is an O(1)
@@ -202,6 +211,14 @@ private:
     // (meaning our ack for it was likely lost)
     int _time_wait_ticks_remaining;
 
+    // --- zero-window persist timer ---
+    // ticks until the next zero-window probe, or 0 when the persist timer is
+    // disarmed. Unlike the retransmit timer this never gives up: a peer with a
+    // full receive buffer is healthy, just not ready, so probing continues
+    // (with exponential backoff) until the window reopens.
+    int _persist_ticks_remaining;
+    int _persist_backoff; // shift applied to PERSIST_BASE_TICKS, capped at PERSIST_MAX_BACKOFF_SHIFT
+
     // --- MSS / window-scale negotiation (RFC 7323) ---
     uint16_t _local_mss;
     uint16_t _peer_mss; // from the peer's MSS option, or DEFAULT_PEER_MSS if it sent none
@@ -241,6 +258,8 @@ private:
     static constexpr int RETRANSMIT_TIMEOUT_TICKS = 3;
     static constexpr int MAX_RETRANSMIT_ATTEMPTS = 5;
     static constexpr int TIME_WAIT_TICKS = 4;
+    static constexpr int PERSIST_BASE_TICKS = 2;        // first probe ~1 tick-interval after the window shuts
+    static constexpr int PERSIST_MAX_BACKOFF_SHIFT = 5; // cap the probe interval at 32 * PERSIST_BASE_TICKS
 };
 
 // Clock-driven ISN generator (RFC 793 style: not cryptographically

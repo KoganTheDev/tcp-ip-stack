@@ -55,6 +55,7 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
       _state(TcpState::LISTEN),
       _send_next(initial_seq), _recv_next(0),
       _fin_requested(false), _time_wait_ticks_remaining(0),
+      _persist_ticks_remaining(0), _persist_backoff(0),
       _local_mss(local_mss), _peer_mss(DEFAULT_PEER_MSS), _effective_mss(std::min(local_mss, DEFAULT_PEER_MSS)),
       _window_scaling_negotiated(false), _peer_window_scale(0),
       _peer_window(local_mss), // conservative placeholder until the handshake's real window arrives
@@ -221,6 +222,56 @@ void TcpConnection::_send_queued_while_window_allows()
         _send_queue.pop_front();
         _send_flags(0, next_chunk);
     }
+
+    // whatever's left is blocked - if that's because the peer's window is shut
+    // (not just cwnd), the persist timer is the only thing that can unstick it
+    _arm_or_disarm_persist();
+}
+
+void TcpConnection::_arm_or_disarm_persist()
+{
+    // Persist is needed in exactly one situation: the peer's window is shut,
+    // we have data waiting, and nothing is in flight. If something were in
+    // flight, the retransmit timer would already keep eliciting acks (and
+    // their window updates); a cwnd-only block likewise clears itself as
+    // in-flight data is acked. Only a zero peer window with an empty pipe can
+    // deadlock on a single lost window-update ack.
+    bool should_persist = (_peer_window == 0) && !_send_queue.empty() && _in_flight.empty();
+    if (should_persist)
+    {
+        if (_persist_ticks_remaining == 0) // arm fresh; never restart an already-running timer
+        {
+            _persist_backoff = 0;
+            _persist_ticks_remaining = PERSIST_BASE_TICKS;
+        }
+    }
+    else
+    {
+        _persist_ticks_remaining = 0;
+        _persist_backoff = 0;
+    }
+}
+
+void TcpConnection::_send_zero_window_probe()
+{
+    if (_send_queue.empty())
+    {
+        return; // nothing to probe with - shouldn't happen while armed
+    }
+
+    // One byte of the next queued data, sent at SND.NXT but deliberately NOT
+    // recorded in _in_flight and NOT advancing _send_next: it's a poke to make
+    // the peer re-advertise its window, not a real transmission. Keeping it out
+    // of _in_flight is what stops it entangling with the other timers - the
+    // peer's zero-window ack in reply acks nothing new, so _handle_ack's
+    // dup-ack path (guarded by !_in_flight.empty()) never fires and the
+    // retransmit give-up never sees it, so persist can probe indefinitely. If
+    // the peer's window has since opened and it accepts the byte, the normal
+    // send path re-sends it once _handle_ack resumes sending and the peer
+    // discards the one-byte overlap.
+    Bytes probe = _send_queue.front().slice(0, 1);
+    LOG_DEBUG("TcpConnection[" << _id << "] zero-window probe at seq=" << _send_next);
+    _send_segment(_build_header(FLAG_ACK, _send_next), probe);
 }
 
 void TcpConnection::_handle_ack(const Tcp& segment)
@@ -286,6 +337,20 @@ void TcpConnection::_handle_ack(const Tcp& segment)
 
     if (!acked_anything)
     {
+        // An ack that advances nothing can still carry a window update - this
+        // is exactly the ack a zero-window probe elicits. If it reopened the
+        // window and the pipe is empty, resume the sends the persist timer was
+        // covering; the normal resume point at the end of this function is
+        // unreachable on this early return. Otherwise just re-evaluate persist
+        // (e.g. the window is still shut).
+        if (_peer_window > 0 && _in_flight.empty() && !_send_queue.empty())
+        {
+            _send_queued_while_window_allows();
+        }
+        else
+        {
+            _arm_or_disarm_persist();
+        }
         return; // nothing new acked yet
     }
 
@@ -556,6 +621,20 @@ void TcpConnection::on_tick()
 
     if (_in_flight.empty())
     {
+        // nothing to retransmit - but a shut peer window may have the persist
+        // timer running instead. Persist and retransmit are mutually exclusive
+        // (persist is only armed when _in_flight is empty), which is why this
+        // lives inside the empty-pipe branch.
+        if (_persist_ticks_remaining > 0)
+        {
+            _persist_ticks_remaining -= 1;
+            if (_persist_ticks_remaining <= 0)
+            {
+                _send_zero_window_probe();
+                _persist_backoff = std::min(_persist_backoff + 1, PERSIST_MAX_BACKOFF_SHIFT);
+                _persist_ticks_remaining = PERSIST_BASE_TICKS << _persist_backoff;
+            }
+        }
         return;
     }
 
@@ -625,6 +704,10 @@ void TcpConnection::send(const Bytes& data)
 
         offset += chunk_size;
     }
+
+    // if a zero window forced everything to queue with nothing in flight, the
+    // persist timer is what will eventually unstick it
+    _arm_or_disarm_persist();
 }
 
 void TcpConnection::close()

@@ -47,6 +47,13 @@ namespace
         return segment;
     }
 
+    // Same as make_incoming_segment but with an explicit advertised window, for
+    // driving zero-window / window-reopen behaviour.
+    std::unique_ptr<Tcp> make_incoming_segment_win(uint32_t seq, uint32_t ack, uint8_t flags, uint16_t window)
+    {
+        return std::make_unique<Tcp>(12345, 8080, seq, ack, 5, flags, window, 0, 0);
+    }
+
     // Builds a connection wired to record every segment it sends, and
     // drives it through the handshake to ESTABLISHED. peer_isn is the
     // peer's chosen initial sequence number; our own ISN is fixed at 1000
@@ -502,6 +509,50 @@ TEST(RstOutsideReceiveWindowIsIgnored)
 
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK | FLAG_RST));
     test_assert(connection->get_state() == TcpState::CLOSED, "an RST at the current RCV.NXT should still close the connection");
+}
+
+// Zero-window persist timer (RFC 1122 4.2.2.17): when the peer advertises a
+// zero window, queued data can't go out. Nothing is in flight, so the
+// retransmit timer never runs - if the peer's later window-update ack is lost,
+// the connection would deadlock forever. The persist timer prevents that by
+// periodically probing, and (unlike retransmit) never gives up.
+TEST(ZeroWindowStallsThenPersistProbesUntilWindowReopens)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    // peer shuts its window (an ack advancing nothing, window 0)
+    connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 0));
+
+    // the application's data must all queue - nothing may go on the wire
+    connection->send(Bytes::from_hex("68656c6c6f")); // "hello"
+    test_assert(sent.empty(), "with a shut peer window, send() must not put anything on the wire");
+    test_assert(connection->get_state() == TcpState::ESTABLISHED, "a shut window must not close the connection");
+
+    // PERSIST_BASE_TICKS is 2 - the first probe fires on the second tick
+    connection->on_tick();
+    test_assert(sent.empty(), "the persist timer must not probe before its interval elapses");
+    connection->on_tick();
+    test_assert(sent.size() == 1, "the persist timer should send a probe once its interval elapses");
+    test_assert(sent[0].payload.size() == 1, "a zero-window probe carries exactly one byte");
+    test_assert(sent[0].seq == 1001, "the probe sits at SND.NXT (our next unsent sequence number)");
+
+    // the critical property: persist NEVER gives up, unlike retransmit
+    // (MAX_RETRANSMIT_ATTEMPTS is 5). Tick far past that many probes.
+    for (int i = 0; i < 100; i++)
+    {
+        connection->on_tick();
+    }
+    test_assert(connection->get_state() == TcpState::ESTABLISHED,
+        "the persist timer must probe indefinitely, never closing the connection the way retransmit does");
+
+    // the peer finally reopens its window - the queued data must now flow, even
+    // though this ack advances nothing (it acks no new data of ours)
+    size_t before = sent.size();
+    connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 65535));
+    test_assert(sent.size() == before + 1, "reopening the window should release the queued data");
+    test_assert(sent.back().payload.to_hex() == "68656c6c6f", "the released segment should carry the full queued payload");
+    test_assert(sent.back().seq == 1001, "the released data starts at SND.NXT");
 }
 
 // MSS negotiation: a peer's SYN advertising a small MSS should cap every
