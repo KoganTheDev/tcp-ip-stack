@@ -74,7 +74,22 @@ Bytes int_to_bytes(T num)
 template <typename T>
 T Bytes::slice_int(size_t index) const
 {
-    return bytes_to_int<T>(this->slice(index, sizeof(T)));
+    // read the big-endian integer straight from the buffer - the old
+    // bytes_to_int(slice(...)) form allocated a throwaway Bytes for every
+    // field read (there are ~15 per parsed segment), which profiling showed as
+    // a real chunk of the receive path's malloc/free/memcpy cost. The explicit
+    // bounds check keeps the old slice()-based throw-on-overrun behaviour that
+    // the protocol parsers rely on to reject a truncated packet safely.
+    if (index + sizeof(T) > this->size())
+    {
+        throw EXCEPTION(BaseException, "slice_int out of range");
+    }
+    T result = 0;
+    for (size_t i = 0; i < sizeof(T); i++)
+    {
+        result = static_cast<T>((result << 8) | (*this)[index + i]);
+    }
+    return result;
 }
 
 template <typename T>

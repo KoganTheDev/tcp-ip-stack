@@ -7,7 +7,11 @@
 class MacAddress
 {
 public:
-    MacAddress() : MacAddress("00:00:00:00:00:00"){}
+    // a zero address, built directly - the old "00:00:00:00:00:00" string
+    // parse (from_hex + string_replace) was a measurable receive-path cost,
+    // since every Ethernet parse default-constructs two MacAddress members
+    // before overwriting them from the wire
+    MacAddress() : _address(6u) {}
     MacAddress(const Bytes& address);
     MacAddress(const std::string& address);
 
@@ -25,7 +29,7 @@ private:
 class IPv4Address
 {
 public:
-    IPv4Address() : IPv4Address("0.0.0.0"){}
+    IPv4Address() : _address(4u) {} // zero address, built directly (see MacAddress())
     IPv4Address(const Bytes& address);
     IPv4Address(const std::string& address);
 
