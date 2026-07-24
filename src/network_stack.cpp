@@ -13,6 +13,11 @@ namespace
     constexpr int ARP_RETRY_TICKS = 4; // with a 500ms NetworkStack tick, ~2s between retries
     constexpr int ARP_ENTRY_TTL_TICKS = 120; // ~60s at a 500ms tick - a learned mapping's lifetime while the peer stays silent
 
+    // Most IP payload that fits one frame: the TAP device's 1500-byte Ethernet
+    // MTU minus a 20-byte IP header. A multiple of 8, as a non-last fragment's
+    // payload must be (the fragment offset field counts 8-byte units).
+    constexpr size_t MAX_IP_FRAGMENT_PAYLOAD = 1480;
+
     constexpr uint8_t FLAG_ACK = 0x10;
     constexpr uint8_t FLAG_RST = 0x04;
     constexpr uint8_t FLAG_SYN = 0x02;
@@ -60,7 +65,7 @@ NetworkStack::NetworkStack(const std::string& tap_device_path, const MacAddress&
 
 NetworkStack::NetworkStack(std::unique_ptr<PacketChannel> channel, const MacAddress& local_mac, const IPv4Address& local_ip)
     : _channel(std::move(channel)), _local_mac(local_mac), _local_ip(local_ip),
-      _next_ephemeral_port(FIRST_EPHEMERAL_PORT), _arp_table(ARP_ENTRY_TTL_TICKS)
+      _next_ephemeral_port(FIRST_EPHEMERAL_PORT), _next_ip_id(1), _arp_table(ARP_ENTRY_TTL_TICKS)
 {
 }
 
@@ -667,19 +672,53 @@ void NetworkStack::_fail_pending_outbound_connects(const IPv4Address& ip)
 
 void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol, const Bytes& payload)
 {
-    auto ip = std::make_unique<Ip>(
-        4, 5, 0, static_cast<uint16_t>(20 + payload.size()), 0,
-        0, 0, 64, protocol, 0,
-        this->_local_ip.get_address(), dest_ip.get_address()
-    );
-    *ip /= std::make_unique<Raw>(payload);
-    ip->compute_checksum();
-
     MacAddress dest_mac = this->_resolve_mac(dest_ip);
-    Ethernet ethernet(this->_local_mac, dest_mac, EtherType::IPv4);
-    ethernet /= std::move(ip);
 
-    this->_channel->write(ethernet.to_bytes());
+    if (payload.size() <= MAX_IP_FRAGMENT_PAYLOAD)
+    {
+        // fits one frame - the common case (TCP is MSS-capped, so only an
+        // oversized UDP send ever needs the fragmentation path below)
+        auto ip = std::make_unique<Ip>(
+            4, 5, 0, static_cast<uint16_t>(20 + payload.size()), 0,
+            0, 0, 64, protocol, 0,
+            this->_local_ip.get_address(), dest_ip.get_address()
+        );
+        *ip /= std::make_unique<Raw>(payload);
+        ip->compute_checksum();
+
+        Ethernet ethernet(this->_local_mac, dest_mac, EtherType::IPv4);
+        ethernet /= std::move(ip);
+        this->_channel->write(ethernet.to_bytes());
+        return;
+    }
+
+    // RFC 791 fragmentation: split into MTU-sized pieces sharing one
+    // identification, each carrying its byte offset (in 8-byte units) and the
+    // More-Fragments flag on every piece but the last, so the receiver can
+    // reassemble them. Only whole 8-byte-aligned chunks go in a non-last
+    // fragment (MAX_IP_FRAGMENT_PAYLOAD is a multiple of 8).
+    uint16_t identification = this->_next_ip_id++;
+    size_t offset = 0;
+    while (offset < payload.size())
+    {
+        size_t chunk = std::min(MAX_IP_FRAGMENT_PAYLOAD, payload.size() - offset);
+        bool more_fragments = offset + chunk < payload.size();
+        uint8_t flags = more_fragments ? IP_FLAG_MORE_FRAGMENTS : 0;
+
+        auto ip = std::make_unique<Ip>(
+            4, 5, 0, static_cast<uint16_t>(20 + chunk), identification,
+            flags, static_cast<uint16_t>(offset / 8), 64, protocol, 0,
+            this->_local_ip.get_address(), dest_ip.get_address()
+        );
+        *ip /= std::make_unique<Raw>(payload.slice(offset, chunk));
+        ip->compute_checksum();
+
+        Ethernet ethernet(this->_local_mac, dest_mac, EtherType::IPv4);
+        ethernet /= std::move(ip);
+        this->_channel->write(ethernet.to_bytes());
+
+        offset += chunk;
+    }
 }
 
 void NetworkStack::_send_tcp_segment(const IPv4Address& dest_ip, const Tcp& header, const Bytes& payload)

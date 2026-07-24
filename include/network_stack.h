@@ -182,6 +182,7 @@ private:
     MacAddress _local_mac;
     IPv4Address _local_ip;
     uint16_t _next_ephemeral_port;
+    uint16_t _next_ip_id; // identification stamped on a fragmented packet's fragments
 
     // Learned (and static) IP->MAC mappings with tick-based expiry - see
     // ArpTable. Aged from on_timer_tick() and refreshed whenever we hear from a

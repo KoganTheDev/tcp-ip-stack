@@ -215,6 +215,40 @@ namespace
         return IcmpView();
     }
 
+    // A parsed IP fragment header + its payload chunk. Parsed by hand from the
+    // raw frame because Ip::from_bytes would try to sub-parse the chunk as a
+    // full UDP datagram and throw (a fragment's bytes don't match the datagram's
+    // length field - that's the whole point of fragmentation).
+    struct IpFragmentView
+    {
+        bool is_ipv4 = false;
+        uint8_t protocol = 0;
+        uint16_t identification = 0;
+        bool mf = false;
+        uint16_t frag_offset = 0; // in 8-byte units
+        Bytes payload;
+    };
+
+    IpFragmentView view_ip_fragment(const Bytes& frame)
+    {
+        IpFragmentView v;
+        if (frame.size() < 14 + 20) return v;
+        if (frame.slice_int<uint16_t>(12) != EtherType::IPv4) return v; // ethertype
+        Bytes ip = frame.slice(14);
+        if (ip.size() < 20) return v;
+        size_t ihl = static_cast<size_t>(ip[0] & 0x0f) * 4;
+        uint16_t total_length = ip.slice_int<uint16_t>(2);
+        if (ihl < 20 || total_length < ihl || ip.size() < total_length) return v;
+        v.is_ipv4 = true;
+        v.identification = ip.slice_int<uint16_t>(4);
+        uint16_t flags_and_offset = ip.slice_int<uint16_t>(6);
+        v.mf = (flags_and_offset & 0x2000) != 0; // MF is bit 13
+        v.frag_offset = flags_and_offset & 0x1FFF;
+        v.protocol = ip[9];
+        v.payload = ip.slice(ihl, total_length - ihl);
+        return v;
+    }
+
     bool contains_udp(const std::vector<Bytes>& frames)
     {
         for (const Bytes& frame : frames)
@@ -426,6 +460,58 @@ TEST(SynWithUnmodeledOptionsIsAcceptedNotDroppedAsBadChecksum)
     test_assert(syn_ack.is_tcp, "a SYN with unmodeled options and a valid checksum must not be dropped");
     test_assert(syn_ack.syn && syn_ack.ack_flag, "the stack should answer such a SYN with a SYN-ACK");
     test_assert(syn_ack.ack == 2001, "the SYN-ACK should acknowledge the peer's ISN + 1");
+}
+
+// A UDP datagram larger than the link MTU must be split into IP fragments
+// (RFC 791) instead of emitted as one oversized frame the peer would drop. TCP
+// is MSS-capped so only UDP hits this. The fragments must share one
+// identification, carry ascending 8-byte offsets, set More-Fragments on all but
+// the last, and reassemble back into the original datagram.
+TEST(OversizedUdpDatagramIsFragmented)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    channel->push_inbound(build_arp_request()); // learn the peer's MAC
+    stack->poll();
+    channel->clear_outbound();
+
+    UdpSocket* socket = stack->bind_udp(8080);
+    Bytes payload(3000); // datagram = 3008 bytes > 1480 MTU payload -> 3 fragments
+    for (size_t i = 0; i < payload.size(); i++)
+    {
+        payload[i] = static_cast<byte_t>(i & 0xff);
+    }
+    socket->send_to(PEER_IP, 9000, payload);
+
+    std::vector<IpFragmentView> frags;
+    for (const Bytes& frame : channel->outbound_frames())
+    {
+        IpFragmentView v = view_ip_fragment(frame);
+        if (v.is_ipv4 && v.protocol == IpProtocol::UDP) frags.push_back(v);
+    }
+    test_assert(frags.size() >= 2, "an oversized UDP datagram should be split into multiple IP fragments");
+
+    uint16_t id = frags[0].identification;
+    Bytes reassembled;
+    size_t expected_offset = 0;
+    for (size_t i = 0; i < frags.size(); i++)
+    {
+        test_assert(frags[i].identification == id, "all fragments of one datagram must share the identification");
+        test_assert(frags[i].frag_offset * 8u == expected_offset, "each fragment's offset should follow the previous one");
+        bool is_last = (i + 1 == frags.size());
+        test_assert(frags[i].mf == !is_last, "More-Fragments should be set on every fragment except the last");
+        reassembled |= frags[i].payload;
+        expected_offset += frags[i].payload.size();
+    }
+    test_assert(reassembled.size() == 8 + payload.size(), "the fragments should reassemble into the whole UDP datagram");
+
+    Udp datagram(reassembled); // parses only because the reassembled length now matches
+    test_assert(datagram.get_src_port() == 8080, "the reassembled datagram should carry the socket's source port");
+    test_assert(datagram.get_dest_port() == 9000, "the reassembled datagram should carry the destination port");
+    const Raw* raw = datagram.has_next_layer() ? dynamic_cast<const Raw*>(&datagram.get_next_layer()) : nullptr;
+    test_assert(raw != nullptr && raw->get_data().to_hex() == payload.to_hex(),
+                "the reassembled payload should equal the original data byte for byte");
 }
 
 // An incoming ICMP Destination/Port Unreachable for a segment we sent should
