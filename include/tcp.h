@@ -52,6 +52,14 @@ public:
     uint8_t get_window_scale_option() const { return _window_scale_option; }
     void set_window_scale_option(uint8_t shift) { _has_window_scale_option = true; _window_scale_option = shift; }
 
+    // The exact bytes this segment was parsed from (empty for a segment built
+    // to send). The checksum MUST be verified over these, not over to_bytes():
+    // this stack's codec only round-trips the MSS/window-scale options it
+    // models, so re-serializing a real peer's segment that also carried SACK-
+    // permitted or timestamp options would drop them and change the bytes,
+    // failing the checksum on a segment that was actually fine.
+    const Bytes& get_received_bytes() const { return _received_bytes; }
+
 private:
     // Serializes whatever options are currently set (MSS/window-scale),
     // NOP-padded to a 4-byte boundary, and updates _data_offset to match -
@@ -118,4 +126,8 @@ private:
     uint16_t _mss_option = 0;
     bool _has_window_scale_option = false;
     uint8_t _window_scale_option = 0;
+
+    // populated by from_bytes() with the exact wire bytes - see
+    // get_received_bytes()
+    Bytes _received_bytes;
 };

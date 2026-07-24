@@ -36,6 +36,9 @@ void Tcp::from_bytes(const Bytes& data)
 		throw EXCEPTION(BaseException, "Invalid TCP header length");
 	}
 
+	// keep the exact bytes for checksum verification - see get_received_bytes()
+	this->_received_bytes = data;
+
 	_src_port = data.slice_int<uint16_t>(0);
 	_dest_port = data.slice_int<uint16_t>(2);
 	_sequence_number = data.slice_int<uint32_t>(4);

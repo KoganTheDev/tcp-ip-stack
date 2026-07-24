@@ -70,6 +70,34 @@ namespace
         return wrap_ip(IpProtocol::TCP, tcp.to_bytes());
     }
 
+    // Hand-builds a TCP segment carrying arbitrary raw option bytes (which must
+    // pad to a multiple of 4). Used to reproduce a real kernel SYN that carries
+    // options this stack's codec doesn't model (SACK-permitted, timestamps):
+    // the checksum is computed over the exact bytes on the wire, so verifying
+    // over a re-serialization (which would drop those options) must not reject
+    // it. options.size() must be a multiple of 4.
+    Bytes build_tcp_with_options(uint8_t flags, uint32_t seq, uint32_t ack,
+                                 uint16_t src_port, uint16_t dest_port, const Bytes& options)
+    {
+        Bytes seg;
+        seg.append_int<uint16_t>(src_port);
+        seg.append_int<uint16_t>(dest_port);
+        seg.append_int<uint32_t>(seq);
+        seg.append_int<uint32_t>(ack);
+        seg.append_int<uint8_t>(static_cast<uint8_t>((5 + options.size() / 4) << 4)); // data offset, reserved=0
+        seg.append_int<uint8_t>(flags);
+        seg.append_int<uint16_t>(65535); // window
+        seg.append_int<uint16_t>(0);     // checksum placeholder
+        seg.append_int<uint16_t>(0);     // urgent pointer
+        seg |= options;
+
+        uint16_t checksum = transport_checksum(PEER_IP, LOCAL_IP, IpProtocol::TCP, seg);
+        Bytes cs = int_to_bytes<uint16_t>(checksum);
+        seg[16] = cs[0];
+        seg[17] = cs[1];
+        return wrap_ip(IpProtocol::TCP, seg);
+    }
+
     Bytes build_udp(uint16_t src_port, uint16_t dest_port, const Bytes& payload)
     {
         Udp udp(src_port, dest_port, static_cast<uint16_t>(8 + payload.size()), 0, Bytes());
@@ -370,6 +398,34 @@ TEST(ConnectToUnresolvedPeerArpsThenSendsSyn)
 
     TcpView syn = find_tcp(channel->outbound_frames());
     test_assert(syn.is_tcp && syn.syn && !syn.ack_flag, "a bare SYN should go out once the peer's MAC is resolved");
+}
+
+// Regression test for a bug found only by running against a real Linux kernel:
+// a kernel SYN carries options this stack doesn't model (SACK-permitted,
+// timestamps). The checksum was being verified over a re-serialization of the
+// parsed segment, which dropped those options and changed the bytes, so every
+// real SYN was wrongly rejected as "bad checksum" and no connection could ever
+// form. Verifying over the received bytes fixes it. This crafts a SYN with a
+// SACK-permitted option (which the codec skips) and a correct checksum, and
+// asserts the stack accepts it (sends a SYN-ACK) rather than dropping it.
+TEST(SynWithUnmodeledOptionsIsAcceptedNotDroppedAsBadChecksum)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    stack->listen(80);
+
+    channel->push_inbound(build_arp_request()); // teach the peer's MAC first
+    // options: MSS=1460 (kind 2), SACK-permitted (kind 4, len 2), NOP, NOP - 8
+    // bytes total. The codec understands MSS but not SACK-permitted; on the old
+    // code its re-serialization would drop SACK-permitted and fail the checksum.
+    Bytes options = Bytes::from_hex("020405b4" "0402" "0101");
+    channel->push_inbound(build_tcp_with_options(FLAG_SYN, 2000, 0, 40000, 80, options));
+    stack->poll();
+
+    TcpView syn_ack = find_tcp(channel->outbound_frames());
+    test_assert(syn_ack.is_tcp, "a SYN with unmodeled options and a valid checksum must not be dropped");
+    test_assert(syn_ack.syn && syn_ack.ack_flag, "the stack should answer such a SYN with a SYN-ACK");
+    test_assert(syn_ack.ack == 2001, "the SYN-ACK should acknowledge the peer's ISN + 1");
 }
 
 // An incoming ICMP Destination/Port Unreachable for a segment we sent should

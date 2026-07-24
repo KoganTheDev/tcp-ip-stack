@@ -59,8 +59,13 @@ private:
     uint16_t _port;
     NetworkStack _network_stack;
     EpollWrapper _epoll;
-    ThreadPool _thread_pool;
+    // Declaration order matters for destruction: members are destroyed in
+    // reverse, so _thread_pool must come AFTER _completion_queue here. That way
+    // ~ThreadPool (which stops and joins every worker) runs BEFORE
+    // ~CompletionQueue - a worker's task calls _completion_queue.push(), so
+    // destroying the queue while workers are still alive is a use-after-free.
     CompletionQueue _completion_queue;
+    ThreadPool _thread_pool;
     int _timer_fd;
 
     std::unordered_set<uint64_t> _connections_busy;

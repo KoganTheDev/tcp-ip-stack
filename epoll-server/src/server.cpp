@@ -13,7 +13,7 @@ namespace
 Server::Server(uint16_t port, size_t worker_count)
     : _port(port),
       _network_stack("/dev/net/tun", MacAddress("02:00:00:00:00:01"), IPv4Address("10.0.0.2")),
-      _epoll(), _thread_pool(worker_count), _completion_queue(), _timer_fd(-1)
+      _epoll(), _completion_queue(), _thread_pool(worker_count), _timer_fd(-1)
 {
     this->_network_stack.listen(port);
     this->_epoll.add(this->_network_stack.get_fd(), EPOLLIN | EPOLLET);

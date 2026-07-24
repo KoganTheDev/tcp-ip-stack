@@ -399,12 +399,12 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
 {
     IPv4Address src_ip(ip.get_src_address());
 
-    // to_bytes() isn't declared const (ProtocolLayer's virtual signature
-    // isn't, and nothing else in the codebase needed to call it through a
-    // const reference before) but it only serializes already-parsed fields -
-    // no observable mutation - so a const_cast here is safe, not a hack
-    // around real constness.
-    Bytes segment_bytes = const_cast<Tcp&>(tcp).to_bytes();
+    // Verify over the exact wire bytes, never a re-serialization: this stack's
+    // TCP codec only round-trips the MSS/window-scale options it models, so
+    // to_bytes() on a real peer's SYN (which also carries SACK-permitted and
+    // timestamp options) would emit a different, shorter option set and fail
+    // the checksum on a segment that was actually valid.
+    const Bytes& segment_bytes = tcp.get_received_bytes();
     if (transport_checksum(src_ip, this->_local_ip, IpProtocol::TCP, segment_bytes) != 0)
     {
         // corrupted segment - dropped silently, same as a real kernel stack;
