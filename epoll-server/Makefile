@@ -11,7 +11,7 @@ vpath %.cpp $(SRC_DIRS)
 
 LOCAL_SOURCES = epoll_wrapper.cpp thread_pool.cpp completion_queue.cpp server.cpp main.cpp
 STACK_SOURCES = exceptions.cpp bytes.cpp utils.cpp network_addresses.cpp \
-                protocol_layer.cpp raw.cpp ethernet.cpp arp.cpp ip.cpp tcp.cpp udp.cpp icmp.cpp \
+                protocol_layer.cpp raw.cpp ethernet.cpp arp.cpp arp_table.cpp ip.cpp tcp.cpp udp.cpp icmp.cpp \
                 tcp_connection.cpp udp_socket.cpp tun_wrapper.cpp system_network_object.cpp network_stack.cpp \
                 logger.cpp
 

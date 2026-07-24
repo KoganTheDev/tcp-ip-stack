@@ -2,19 +2,18 @@
 
 #include <string>
 #include "network_addresses.h"
+#include "raw_socket_interface.h"
 
-const size_t DEFAULT_RECV_SIZE = 2048;
-
-class RawSocket
+class RawSocket : public RawSocketInterface
 {
 public:
     RawSocket(const std::string& interface_name);
     ~RawSocket();
     ssize_t send(const Bytes& data, MacAddress target) const;
-    ssize_t send(const Bytes& data) const;
-    Bytes recv(size_t size=DEFAULT_RECV_SIZE) const;
+    ssize_t send(const Bytes& data) const override;
+    Bytes recv(size_t size=DEFAULT_RECV_SIZE) const override;
 
-    const MacAddress& get_mac_address() const;
+    const MacAddress& get_mac_address() const override;
 
 private:
     void _create_socket();

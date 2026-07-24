@@ -9,6 +9,7 @@
 
 #include "tun_wrapper.h"
 #include "packet_channel.h"
+#include "arp_table.h"
 #include "network_addresses.h"
 #include "ethernet.h"
 #include "arp.h"
@@ -176,29 +177,16 @@ private:
     // peer whose MAC isn't cached yet.
     void _ensure_arp_resolution(const IPv4Address& ip);
     void _fail_pending_outbound_connects(const IPv4Address& ip);
-    // Resets an ARP entry's TTL when we hear from that peer, so a peer we're
-    // actively talking to never ages out mid-conversation - a no-op if the
-    // peer isn't cached (nothing to keep alive).
-    void _refresh_arp_entry(const IPv4Address& ip);
-    // Ages every ARP entry by one tick and evicts any that reach zero, so a
-    // peer that has gone silent (moved, rebooted, reassigned its IP) doesn't
-    // leave a stale IP->MAC mapping blackholing traffic forever.
-    void _age_arp_table();
 
     std::unique_ptr<PacketChannel> _channel;
     MacAddress _local_mac;
     IPv4Address _local_ip;
     uint16_t _next_ephemeral_port;
 
-    // A learned IP->MAC mapping plus a tick countdown to its expiry. Refreshed
-    // to full TTL every time we hear from the peer (see _refresh_arp_entry),
-    // aged down and evicted at zero by _age_arp_table() on each timer tick.
-    struct ArpTableEntry
-    {
-        MacAddress mac;
-        int ticks_remaining;
-    };
-    std::unordered_map<IPv4Address, ArpTableEntry> _arp_table;
+    // Learned (and static) IP->MAC mappings with tick-based expiry - see
+    // ArpTable. Aged from on_timer_tick() and refreshed whenever we hear from a
+    // peer, so an actively-talking peer never ages out mid-conversation.
+    ArpTable _arp_table;
     std::unordered_map<uint16_t, bool> _listening_ports;
     std::unordered_map<uint16_t, std::deque<ConnectionKey>> _pending_accepts;
     std::unordered_map<uint16_t, std::unique_ptr<UdpSocket>> _udp_sockets;

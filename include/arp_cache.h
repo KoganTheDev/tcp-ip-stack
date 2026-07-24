@@ -6,7 +6,7 @@
 #include "network_addresses.h"
 #include "arp.h"
 #include "ethernet.h"
-#include "raw_socket.h"
+#include "raw_socket_interface.h"
 
 
 #define ARP_DEFAULT_TIMEOUT (3)
@@ -64,7 +64,7 @@ public:
 class ArpCache
 {
 public:
-    ArpCache(const RawSocket& interface_raw_socket);
+    ArpCache(const RawSocketInterface& interface_raw_socket);
 
     void add_static_entry(const IPv4Address& ip, const MacAddress& mac);
     MacAddress resolve_address(const IPv4Address& ip);
@@ -76,6 +76,6 @@ private:
     void _update_cache();
     MacAddress _resolve_through_network(const IPv4Address& ip, const int timeout_seconds=ARP_DEFAULT_TIMEOUT);
 
-    const RawSocket& _raw_socket;
+    const RawSocketInterface& _raw_socket;
     std::unordered_map<IPv4Address, std::unique_ptr<BaseArpCacheEntry>> _entries;
 };

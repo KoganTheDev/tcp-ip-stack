@@ -59,7 +59,8 @@ NetworkStack::NetworkStack(const std::string& tap_device_path, const MacAddress&
 }
 
 NetworkStack::NetworkStack(std::unique_ptr<PacketChannel> channel, const MacAddress& local_mac, const IPv4Address& local_ip)
-    : _channel(std::move(channel)), _local_mac(local_mac), _local_ip(local_ip), _next_ephemeral_port(FIRST_EPHEMERAL_PORT)
+    : _channel(std::move(channel)), _local_mac(local_mac), _local_ip(local_ip),
+      _next_ephemeral_port(FIRST_EPHEMERAL_PORT), _arp_table(ARP_ENTRY_TTL_TICKS)
 {
 }
 
@@ -107,7 +108,7 @@ TcpConnection* NetworkStack::connect(const IPv4Address& remote_ip, uint16_t remo
     this->_connections_by_id[connection_ptr->get_id()] = key;
     this->_connections[key] = std::move(connection);
 
-    if (this->_arp_table.find(remote_ip) != this->_arp_table.end())
+    if (this->_arp_table.contains(remote_ip))
     {
         connection_ptr->initiate_connect(); // peer's MAC already known - send the SYN now
     }
@@ -196,7 +197,7 @@ void NetworkStack::on_timer_tick()
 
     this->_reap_closed_connections();
 
-    this->_age_arp_table();
+    this->_arp_table.age_one_tick();
 
     for (auto it = this->_arp_requests_in_flight.begin(); it != this->_arp_requests_in_flight.end(); )
     {
@@ -293,7 +294,7 @@ void NetworkStack::_handle_arp(const Arp& arp)
     // teaches us its mapping); an active-open connect() below is what
     // actually needs to wait on this
     IPv4Address sender_ip = arp.get_sender_protocol_address();
-    this->_arp_table[sender_ip] = {arp.get_sender_hardware_address(), ARP_ENTRY_TTL_TICKS};
+    this->_arp_table.learn(sender_ip, arp.get_sender_hardware_address());
 
     this->_arp_requests_in_flight.erase(sender_ip);
 
@@ -339,7 +340,7 @@ void NetworkStack::_handle_ip(const Ip& ip)
     // hearing from a peer proves it's still alive at its cached MAC - keep that
     // mapping fresh so an actively-talking peer never ages out mid-conversation
     // (its data/acks arrive as IP frames, not ARP, so nothing else would)
-    this->_refresh_arp_entry(IPv4Address(ip.get_src_address()));
+    this->_arp_table.refresh(IPv4Address(ip.get_src_address()));
 
     // MF set, or a nonzero fragment offset, means this packet is one piece
     // of a larger one - reassembly isn't implemented. This stack's own TCP
@@ -597,8 +598,8 @@ void NetworkStack::_handle_icmp_error(const Icmp& icmp)
 
 MacAddress NetworkStack::_resolve_mac(const IPv4Address& ip) const
 {
-    auto it = this->_arp_table.find(ip);
-    if (it == this->_arp_table.end())
+    MacAddress mac;
+    if (!this->_arp_table.lookup(ip, mac))
     {
         // Reachable in principle for either open path, but genuinely
         // shouldn't happen in practice: passive-open only ever replies to a
@@ -608,33 +609,7 @@ MacAddress NetworkStack::_resolve_mac(const IPv4Address& ip) const
         // mapping. This is a safety net, not the normal resolution path.
         throw EXCEPTION(BaseException, "No ARP entry for " + ip.to_string());
     }
-    return it->second.mac;
-}
-
-void NetworkStack::_refresh_arp_entry(const IPv4Address& ip)
-{
-    auto it = this->_arp_table.find(ip);
-    if (it != this->_arp_table.end())
-    {
-        it->second.ticks_remaining = ARP_ENTRY_TTL_TICKS;
-    }
-}
-
-void NetworkStack::_age_arp_table()
-{
-    for (auto it = this->_arp_table.begin(); it != this->_arp_table.end(); )
-    {
-        it->second.ticks_remaining -= 1;
-        if (it->second.ticks_remaining <= 0)
-        {
-            LOG_DEBUG("NetworkStack: evicting stale ARP entry for " << it->first.to_string());
-            it = this->_arp_table.erase(it);
-        }
-        else
-        {
-            ++it;
-        }
-    }
+    return mac;
 }
 
 uint16_t NetworkStack::_allocate_ephemeral_port()
@@ -786,7 +761,7 @@ void NetworkStack::_send_rst(const Ip& ip, const Tcp& tcp)
 
 void NetworkStack::_send_or_queue_udp(const IPv4Address& dest_ip, const Udp& header, const Bytes& payload)
 {
-    if (this->_arp_table.find(dest_ip) != this->_arp_table.end())
+    if (this->_arp_table.contains(dest_ip))
     {
         this->_send_udp_datagram(dest_ip, header, payload);
         return;

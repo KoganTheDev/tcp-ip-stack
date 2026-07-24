@@ -80,7 +80,7 @@ std::string StaticArpCacheEntry::to_string()
 }
 
 
-ArpCache::ArpCache(const RawSocket& interface_raw_socket)
+ArpCache::ArpCache(const RawSocketInterface& interface_raw_socket)
     : _raw_socket(interface_raw_socket)
 {
 }
@@ -185,7 +185,7 @@ MacAddress ArpCache::_resolve_through_network(const IPv4Address& ip_target, cons
     {
         try
         {
-            Bytes p = this->_raw_socket.recv();
+            Bytes p = this->_raw_socket.recv(DEFAULT_RECV_SIZE);
             Ethernet ether = Ethernet(p);
             
             if (ether.get_ethernet_protocol() == EtherType::ARP && ether.get_dest() == mac_src)
