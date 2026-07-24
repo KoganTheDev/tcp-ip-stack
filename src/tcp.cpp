@@ -3,6 +3,8 @@
 #include "exceptions.h"
 #include "raw.h"
 
+#include <utility>
+
 
 Tcp::Tcp(uint16_t src_port, uint16_t dest_port, uint32_t sequence_number, uint32_t acknowledgement_number,
      uint8_t data_offset, uint8_t tcp_flags,uint16_t window, uint16_t checksum, uint16_t urgent_pointer)
@@ -24,20 +26,30 @@ Tcp::Tcp(uint16_t src_port, uint16_t dest_port, uint32_t sequence_number, uint32
 {
 }
 
-Tcp::Tcp(const Bytes &bytes)
+Tcp::Tcp(Bytes bytes)
 {
-	this->from_bytes(bytes);
+	// move the buffer straight into the field we keep for the checksum, then
+	// parse out of it - no second copy of the segment
+	this->_received_bytes = std::move(bytes);
+	this->_parse();
 }
 
 void Tcp::from_bytes(const Bytes& data)
 {
+	// virtual-interface entry point - copies the bytes in, unlike the Tcp(Bytes)
+	// constructor the receive hot path uses, then parses the same way
+	this->_received_bytes = data;
+	this->_parse();
+}
+
+void Tcp::_parse()
+{
+	const Bytes& data = this->_received_bytes;
+
 	if (data.size() < 20)
 	{
 		throw EXCEPTION(BaseException, "Invalid TCP header length");
 	}
-
-	// keep the exact bytes for checksum verification - see get_received_bytes()
-	this->_received_bytes = data;
 
 	_src_port = data.slice_int<uint16_t>(0);
 	_dest_port = data.slice_int<uint16_t>(2);

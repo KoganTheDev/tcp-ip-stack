@@ -1,4 +1,5 @@
 #include "ip.h"
+#include <utility>
 #include "utils.h"
 #include "network_addresses.h"
 #include "tcp.h"
@@ -78,8 +79,10 @@ void Ip::from_bytes(const Bytes& data)
     Bytes payload = data.slice(header_bytes);
     switch (this->_protocol)
     {
+    // only one branch runs, so the payload buffer can be moved into whichever
+    // layer takes it by value (Tcp, Raw) instead of copied
     case IpProtocol::TCP:
-        this->_next_layer = std::make_unique<Tcp>(payload);
+        this->_next_layer = std::make_unique<Tcp>(std::move(payload));
         break;
     case IpProtocol::UDP:
         this->_next_layer = std::make_unique<Udp>(payload);
@@ -90,7 +93,7 @@ void Ip::from_bytes(const Bytes& data)
     default:
         if (!payload.empty())
         {
-            this->_next_layer = std::make_unique<Raw>(payload);
+            this->_next_layer = std::make_unique<Raw>(std::move(payload));
         }
         break;
     }

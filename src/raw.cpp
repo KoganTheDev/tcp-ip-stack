@@ -1,9 +1,11 @@
 #include "raw.h"
 
+#include <utility>
 
-Raw::Raw(const Bytes& data)
+
+Raw::Raw(Bytes data)
+    : _data(std::move(data))
 {
-    this->_data = data;
 }
 
 std::string Raw::to_string() const

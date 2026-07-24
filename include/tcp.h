@@ -9,7 +9,11 @@ class Tcp : public ProtocolLayer
 public:
     Tcp(uint16_t src_port, uint16_t dest_port, uint32_t sequence_number, uint32_t acknowledgement_number, uint8_t data_offset,
         uint8_t tcp_flags, uint16_t window, uint16_t checksum, uint16_t urgent_pointer);
-    Tcp(const Bytes& bytes); // Constructor that gets a bytestream and serializes it directly into an TCP object
+    // Parses a segment off the wire. Takes the buffer by value and moves it in
+    // as _received_bytes, so the receive path (which passes an rvalue slice)
+    // doesn't copy the whole segment a second time just to keep it for the
+    // checksum - see get_received_bytes().
+    Tcp(Bytes bytes);
 
     void from_bytes(const Bytes& data);
     Bytes to_bytes();
@@ -66,6 +70,9 @@ private:
     // shared by to_bytes() (needs the bytes) and anything that needs to
     // know the resulting header length before serializing.
     Bytes _options_to_bytes();
+    // Parses every field from _received_bytes - shared by the move-in
+    // constructor and the (copying) virtual from_bytes().
+    void _parse();
     uint16_t _src_port; // Identifies the sending port
 
     uint16_t _dest_port; // Identifies the receiving port
