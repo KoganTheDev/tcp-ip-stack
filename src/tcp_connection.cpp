@@ -56,6 +56,7 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
       _send_next(initial_seq), _recv_next(0),
       _fin_requested(false), _time_wait_ticks_remaining(0),
       _persist_ticks_remaining(0), _persist_backoff(0),
+      _ack_pending(false), _ack_delay_ticks_remaining(0),
       _local_mss(local_mss), _peer_mss(DEFAULT_PEER_MSS), _effective_mss(std::min(local_mss, DEFAULT_PEER_MSS)),
       _window_scaling_negotiated(false), _peer_window_scale(0),
       _peer_window(local_mss), // conservative placeholder until the handshake's real window arrives
@@ -139,6 +140,12 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
     }
     _send_segment(header, payload);
 
+    // this segment carries our current RCV.NXT in its ack field, so it
+    // discharges any pending delayed ack - exactly the piggyback delayed ack
+    // hopes for
+    _ack_pending = false;
+    _ack_delay_ticks_remaining = 0;
+
     size_t consumed = payload.size();
     if (flags & FLAG_SYN) consumed += 1;
     if (flags & FLAG_FIN) consumed += 1;
@@ -159,6 +166,25 @@ void TcpConnection::_send_pure_ack()
     // an ACK with nothing new to say is never itself acknowledged - it isn't
     // tracked in the window, unlike everything sent through _send_flags
     _send_segment(_build_header(FLAG_ACK, _send_next), Bytes());
+    _ack_pending = false;
+    _ack_delay_ticks_remaining = 0;
+}
+
+void TcpConnection::_schedule_or_send_ack()
+{
+    // RFC 1122 4.2.3.2: an in-order segment needn't be acked at once - hold the
+    // ack briefly to coalesce it with the next segment or piggyback it on
+    // outgoing data. But ack at least every *second* full-sized segment, so a
+    // second segment arriving with one already pending forces the ack out now.
+    if (_ack_pending)
+    {
+        _send_pure_ack(); // clears the pending state
+    }
+    else
+    {
+        _ack_pending = true;
+        _ack_delay_ticks_remaining = DELAYED_ACK_TICKS;
+    }
 }
 
 void TcpConnection::accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss,
@@ -218,6 +244,15 @@ void TcpConnection::_send_queued_while_window_allows()
         {
             break;
         }
+        // Nagle (RFC 896): keep holding a sub-MSS segment while earlier data is
+        // still unacked - it goes out once the pipe drains (or the window/cwnd
+        // frees up enough for a full segment). A full-sized segment is never
+        // held.
+        if (_send_queue.front().size() < _effective_mss && _bytes_in_flight() > 0)
+        {
+            break;
+        }
+
         Bytes next_chunk = std::move(_send_queue.front());
         _send_queue.pop_front();
         _send_flags(0, next_chunk);
@@ -544,6 +579,10 @@ void TcpConnection::on_segment(const Tcp& segment)
                     _reorder_buffer.erase(next_it);
                     _deliver(buffered);
                 }
+
+                // in-order data: the ack may be delayed (RFC 1122) to coalesce
+                // with the next segment or piggyback on our own data
+                _schedule_or_send_ack();
             }
             else if (seq > _recv_next)
             {
@@ -551,12 +590,14 @@ void TcpConnection::on_segment(const Tcp& segment)
                 // already there (a retransmit of an already-buffered
                 // segment), and either way tell the peer our current
                 // RCV.NXT again: that duplicate ack is the signal a sender's
-                // fast retransmit depends on
+                // fast retransmit depends on, so it must be sent *immediately*,
+                // never delayed
                 if (_reorder_buffer.find(seq) == _reorder_buffer.end()
                     && _seq_in_receive_window(seq))
                 {
                     _reorder_buffer[seq] = payload;
                 }
+                _send_pure_ack();
             }
             else
             {
@@ -580,12 +621,9 @@ void TcpConnection::on_segment(const Tcp& segment)
                         _deliver(buffered);
                     }
                 }
+                // a duplicate/overlap of already-seen data: ack now, don't delay
+                _send_pure_ack();
             }
-
-            // ack current RCV.NXT either way - a duplicate ack if this
-            // wasn't the in-order case, exactly the RFC 793 SS3.3
-            // "unacceptable/out-of-order segment" response
-            _send_pure_ack();
         }
     }
 
@@ -617,6 +655,17 @@ void TcpConnection::on_tick()
             _transition(TcpState::CLOSED);
         }
         return;
+    }
+
+    // a delayed ack that never got coalesced or piggybacked must still be sent
+    // within the delay bound, so the peer's own send window keeps advancing
+    if (_ack_pending)
+    {
+        _ack_delay_ticks_remaining -= 1;
+        if (_ack_delay_ticks_remaining <= 0)
+        {
+            _send_pure_ack();
+        }
     }
 
     if (_in_flight.empty())
@@ -690,10 +739,17 @@ void TcpConnection::send(const Bytes& data)
         size_t chunk_size = std::min<size_t>(_effective_mss, data.size() - offset);
         Bytes chunk = data.slice(offset, chunk_size);
 
+        // Nagle (RFC 896): a sub-MSS segment waits while earlier data is still
+        // in flight, so small writes coalesce into fewer, larger segments
+        // instead of dribbling out one tiny packet at a time. A full-sized
+        // segment, or one sent with an empty pipe, always goes immediately.
+        bool nagle_holds = chunk.size() < _effective_mss && _bytes_in_flight() > 0;
+
         // once anything is queued, everything after it must queue too -
         // otherwise a later, smaller chunk could jump ahead of an earlier
         // one still waiting on window room and arrive out of order
-        if (!_send_queue.empty() || _bytes_in_flight() + chunk.size() > std::min(_cwnd, _peer_window))
+        if (!_send_queue.empty() || nagle_holds
+            || _bytes_in_flight() + chunk.size() > std::min(_cwnd, _peer_window))
         {
             _send_queue.push_back(std::move(chunk));
         }

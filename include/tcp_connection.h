@@ -138,6 +138,13 @@ private:
     // open: every other segment this stack ever sends acks something.
     void _send_flags(uint8_t flags, const Bytes& payload = Bytes(), bool include_ack = true);
     void _send_pure_ack();
+    // Delayed ACK (RFC 1122 4.2.3.2): rather than acking every in-order data
+    // segment immediately, coalesce - send the ack when a second segment
+    // arrives, when the delay timer fires, or piggybacked on any segment we
+    // send. Roughly halves pure-ack traffic. Only in-order data is delayed; an
+    // out-of-order or duplicate segment is still acked at once (that duplicate
+    // ack is the fast-retransmit signal).
+    void _schedule_or_send_ack();
     void _handle_ack(const Tcp& segment);
     void _handle_fin();
     // Delivers payload to the application (or buffers it if no callback is
@@ -219,6 +226,10 @@ private:
     int _persist_ticks_remaining;
     int _persist_backoff; // shift applied to PERSIST_BASE_TICKS, capped at PERSIST_MAX_BACKOFF_SHIFT
 
+    // --- delayed ACK ---
+    bool _ack_pending;              // an in-order segment is awaiting a coalesced ack
+    int _ack_delay_ticks_remaining; // countdown that forces a pending ack out on time
+
     // --- MSS / window-scale negotiation (RFC 7323) ---
     uint16_t _local_mss;
     uint16_t _peer_mss; // from the peer's MSS option, or DEFAULT_PEER_MSS if it sent none
@@ -260,6 +271,7 @@ private:
     static constexpr int TIME_WAIT_TICKS = 4;
     static constexpr int PERSIST_BASE_TICKS = 2;        // first probe ~1 tick-interval after the window shuts
     static constexpr int PERSIST_MAX_BACKOFF_SHIFT = 5; // cap the probe interval at 32 * PERSIST_BASE_TICKS
+    static constexpr int DELAYED_ACK_TICKS = 1;         // hold an in-order ack at most this long (RFC 1122: <=500ms)
 };
 
 // Clock-driven ISN generator (RFC 793 style: not cryptographically

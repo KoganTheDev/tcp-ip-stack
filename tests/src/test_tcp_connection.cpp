@@ -192,9 +192,49 @@ TEST(InboundDataTriggersCallbackAndAcksCorrectly)
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, payload));
 
     test_assert(received.to_hex() == payload.to_hex(), "data_received callback should fire with the exact payload");
-    test_assert(sent.size() == 1, "receiving data should send exactly one ACK");
-    test_assert(sent[0].flags == FLAG_ACK, "the ack for received data should be a pure ACK");
+    // delayed ACK: a single in-order segment's ack is held, not sent at once
+    test_assert(sent.empty(), "an in-order segment's ack should be delayed, not sent immediately");
+
+    connection->on_tick(); // the delay timer fires
+    test_assert(sent.size() == 1, "the delayed ack should be flushed on the next tick");
+    test_assert(sent[0].flags == FLAG_ACK, "the flushed ack should be a pure ACK");
     test_assert(sent[0].ack == 501 + payload.size(), "the ack should advance past the received payload");
+}
+
+// RFC 1122: at most one ack may be outstanding - a second in-order segment
+// forces the delayed ack out immediately (ack-every-other-segment).
+TEST(DelayedAckIsSentImmediatelyOnSecondSegment)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->set_data_received_callback([](const Bytes&) {});
+
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes::from_hex("68656c6c6f"))); // seq 501..505
+    test_assert(sent.empty(), "the first in-order segment's ack should be delayed");
+
+    connection->on_segment(*make_incoming_segment(506, 1001, FLAG_ACK, Bytes::from_hex("776f726c64"))); // seq 506..510
+    test_assert(sent.size() == 1, "a second in-order segment should force the delayed ack out at once");
+    test_assert(sent[0].ack == 511, "the ack should cover both segments (RCV.NXT past the second)");
+}
+
+// A delayed ack should never cost an extra segment when we have data to send:
+// the outgoing data carries the ack, so no separate pure ACK goes out.
+TEST(DelayedAckIsPiggybackedOnOutgoingData)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->set_data_received_callback([](const Bytes&) {});
+
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes::from_hex("68656c6c6f")));
+    test_assert(sent.empty(), "the ack should be pending, not yet sent");
+
+    connection->send(Bytes::from_hex("6f6b")); // "ok" - a data segment goes out
+    test_assert(sent.size() == 1, "sending data should not also produce a separate pure ack");
+    test_assert(sent[0].payload.to_hex() == "6f6b", "the segment should carry our data");
+    test_assert(sent[0].ack == 506, "the data segment should piggyback the pending ack (RCV.NXT)");
+
+    connection->on_tick();
+    test_assert(sent.size() == 1, "no delayed ack should fire after it was already piggybacked");
 }
 
 TEST(SendProducesDataSegmentAtCorrectSequence)
@@ -413,32 +453,43 @@ TEST(RetransmitTimeoutCollapsesCongestionWindowToOneSegment)
     test_assert(sent.size() == 2, "with cwnd collapsed to one segment, a send this size should queue rather than pipeline");
 }
 
+// Full-sized (MSS) segments so the congestion *window*, not Nagle, governs
+// what can be in flight: the initial window is one MSS (536 here), so the
+// first full segment goes out and the second must queue until an ack frees
+// room, then drains.
 TEST(CumulativeAckDrainsQueueIntoWindow)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
-    connection->send(Bytes::from_hex("01"));
-    connection->send(Bytes::from_hex("02"));
-    connection->send(Bytes::from_hex("03"));
-    connection->send(Bytes::from_hex("04"));
-    connection->send(Bytes::from_hex("05")); // queued - window is full
+    connection->send(Bytes(536)); // one MSS - fills the initial congestion window, goes out
+    connection->send(Bytes(536)); // second full segment - queued, window is full
+    test_assert(sent.size() == 1, "the second full segment should queue behind the full congestion window");
 
-    // cumulative ack covering all 4 in-flight segments at once
-    connection->on_segment(*make_incoming_segment(501, sent[3].seq + 1, FLAG_ACK));
+    // acking the first frees the window
+    connection->on_segment(*make_incoming_segment(501, sent[0].seq + 536, FLAG_ACK));
 
-    test_assert(sent.size() == 5, "acking the whole window should let the queued 5th segment go out");
-    test_assert(sent[4].payload.to_hex() == "05", "the queued segment's payload should be exactly what was queued");
+    test_assert(sent.size() == 2, "acking the in-flight segment should let the queued one go out");
+    test_assert(sent[1].payload.size() == 536, "the drained segment should be the full queued payload");
 }
 
+// Two full-MSS segments in flight at once (Nagle only holds sub-MSS ones), so
+// a timeout has more than one unacked segment to choose from - and must
+// retransmit only the oldest. The congestion window is first grown to 2 MSS so
+// both fit.
 TEST(RetransmitOnlyRetransmitsOldestSegmentInWindow)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
-    connection->send(Bytes::from_hex("01"));
-    connection->send(Bytes::from_hex("02"));
-    test_assert(sent.size() == 2, "both sends should go out - well within the window");
+    // grow cwnd from 1 MSS to 2 MSS by sending and acking one full segment
+    connection->send(Bytes(536));
+    connection->on_segment(*make_incoming_segment(501, sent[0].seq + 536, FLAG_ACK));
+    sent.clear();
+
+    connection->send(Bytes(536));
+    connection->send(Bytes(536));
+    test_assert(sent.size() == 2, "two full segments should be in flight at once under the 2-MSS window");
 
     // RETRANSMIT_TIMEOUT_TICKS is 3 - tick past it with neither acked
     connection->on_tick();
@@ -447,6 +498,24 @@ TEST(RetransmitOnlyRetransmitsOldestSegmentInWindow)
 
     test_assert(sent.size() == 3, "only one retransmission should happen per timeout, not one per in-flight segment");
     test_assert(sent[2].seq == sent[0].seq, "the retransmission must be of the oldest (first) unacked segment, not the newer one");
+}
+
+// Nagle: a small (sub-MSS) write waits while earlier data is unacked, then goes
+// out once that data is acked - coalescing rather than dribbling tiny packets.
+TEST(NagleHoldsSmallSegmentWhileDataIsInFlight)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->send(Bytes::from_hex("01")); // empty pipe - a small segment goes out at once
+    test_assert(sent.size() == 1, "the first small write goes out immediately (nothing in flight)");
+
+    connection->send(Bytes::from_hex("02")); // data now in flight - Nagle holds this small write
+    test_assert(sent.size() == 1, "a second small write should be held by Nagle while the first is unacked");
+
+    connection->on_segment(*make_incoming_segment(501, sent[0].seq + 1, FLAG_ACK)); // ack the first
+    test_assert(sent.size() == 2, "once the in-flight data is acked, Nagle releases the held segment");
+    test_assert(sent[1].payload.to_hex() == "02", "the released segment should carry the held data");
 }
 
 // Out-of-order reassembly: a segment arriving ahead of RCV.NXT must be

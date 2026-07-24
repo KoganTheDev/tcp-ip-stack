@@ -539,8 +539,17 @@ TEST(TwoStacksHandshakeExchangeDataAndHalfClose)
 
     // pumps both stacks in turn until the exchange goes quiet - each poll()
     // drains one stack's inbound and may write into the other's, so alternating
-    // propagates ARP replies and handshake segments across the segment
-    auto pump = [&]() { for (int i = 0; i < 12; i++) { stack_a.poll(); stack_b.poll(); } };
+    // propagates ARP replies and handshake segments across the segment. Ticking
+    // too (as a real reactor does) flushes any delayed ack that didn't get
+    // piggybacked on outgoing data.
+    auto pump = [&]()
+    {
+        for (int i = 0; i < 12; i++)
+        {
+            stack_a.poll(); stack_b.poll();
+            stack_a.on_timer_tick(); stack_b.on_timer_tick();
+        }
+    };
 
     stack_b.listen(80);
     TcpConnection* client = stack_a.connect(IP_B, 80);
