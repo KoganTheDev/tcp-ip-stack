@@ -13,6 +13,22 @@ namespace
     constexpr uint8_t FLAG_SYN = 0x02;
     constexpr uint8_t FLAG_FIN = 0x01;
 
+    // Wraparound-safe "does sequence number a sit at or before b" in TCP's
+    // modular sequence space. The unsigned difference is reinterpreted as
+    // signed, so the answer stays correct across a 2^32 wrap - the same idiom
+    // as the Linux kernel's before()/after().
+    //
+    // A plain `a <= b` is wrong here and fails in a way that only shows up
+    // after 4 GiB has moved on one connection: two in-flight segments
+    // straddling the wrap (say end_seq 0xFFFFFFFA and 4) compared against a
+    // legitimate cumulative ack of 4 would leave the first unretired forever,
+    // so the retransmit timer keeps firing on data the peer already has and
+    // the connection is torn down after MAX_RETRANSMIT_ATTEMPTS.
+    bool seq_at_or_before(uint32_t a, uint32_t b)
+    {
+        return static_cast<int32_t>(a - b) <= 0;
+    }
+
     const char* state_name(TcpState state)
     {
         switch (state)
@@ -405,6 +421,13 @@ void TcpConnection::_handle_ack(const Tcp& segment)
             // duplicate acks prove segments are still flowing, so unlike a
             // timeout this is no evidence that the path got slower.
             oldest.retransmitted = true;
+            // Restart this segment's retransmit countdown, exactly as the
+            // timeout path and _send_flags() both do. Without it the timer
+            // keeps counting down from wherever it already was, so the
+            // *timeout* path can fire moments later for the same segment -
+            // collapsing cwnd to one MSS and cancelling fast recovery, a
+            // second and much harsher reaction to what is one loss event.
+            oldest.retransmit_ticks_remaining = _rto_ticks;
             _ssthresh = std::max(_bytes_in_flight() / 2, static_cast<uint32_t>(2 * _effective_mss));
             _cwnd = _ssthresh + DUP_ACK_FAST_RETRANSMIT_THRESHOLD * static_cast<uint32_t>(_effective_mss);
             _in_fast_recovery = true;
@@ -434,7 +457,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     bool have_rtt_sample = false;
     uint32_t rtt_sample_ticks = 0;
 
-    while (!_in_flight.empty() && _in_flight.front().end_seq <= ack)
+    while (!_in_flight.empty() && seq_at_or_before(_in_flight.front().end_seq, ack))
     {
         bytes_acked += _in_flight.front().end_seq - _in_flight.front().seq;
         if (_in_flight.front().flags & FLAG_FIN)
@@ -535,7 +558,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     }
 }
 
-void TcpConnection::_handle_fin()
+void TcpConnection::_handle_fin(uint32_t fin_seq)
 {
     if (_state == TcpState::TIME_WAIT)
     {
@@ -544,6 +567,23 @@ void TcpConnection::_handle_fin()
         // state again (it was already consumed by the first FIN)
         _send_pure_ack();
         _time_wait_ticks_remaining = TIME_WAIT_TICKS;
+        return;
+    }
+
+    // The FIN only consumes a sequence number if it actually sits at RCV.NXT.
+    // Anything else is either a retransmission of a FIN already consumed - our
+    // ack for it was lost, or IP simply duplicated the segment, which needs no
+    // loss at all - or a FIN that arrived ahead of a gap in the data before it.
+    //
+    // Without this check every state reachable *after* a FIN has been consumed
+    // (CLOSE_WAIT, CLOSING, LAST_ACK) fell through to the increment below, and
+    // since none of the branches after it match those states, the connection
+    // silently advanced RCV.NXT again and sent nothing back: our ack numbers
+    // desynchronised permanently and the peer's FIN was never acknowledged, so
+    // its retransmit timer could never be satisfied. Only TIME_WAIT was guarded.
+    if (fin_seq != _recv_next)
+    {
+        _send_pure_ack(); // re-ack, so a peer still retransmitting learns we heard it
         return;
     }
 
@@ -643,19 +683,21 @@ void TcpConnection::on_segment(const Tcp& segment)
         _handle_ack(segment);
     }
 
+    // Resolved before the state check because the FIN handling at the bottom
+    // needs the payload's length too: a segment carrying both data and FIN
+    // places the FIN one past the end of that data in sequence space, and
+    // _handle_fin() has to know where the FIN actually sits. Held as a pointer
+    // rather than a copied Bytes so states that ignore data pay nothing.
+    const Raw* payload_layer = segment.has_next_layer()
+        ? dynamic_cast<const Raw*>(&segment.get_next_layer())
+        : nullptr;
+    uint32_t payload_size = payload_layer ? static_cast<uint32_t>(payload_layer->get_data().size()) : 0;
+
     if (_state == TcpState::ESTABLISHED || _state == TcpState::FIN_WAIT_1 || _state == TcpState::FIN_WAIT_2)
     {
-        Bytes payload;
-        if (segment.has_next_layer())
+        if (payload_size > 0)
         {
-            if (const Raw* raw = dynamic_cast<const Raw*>(&segment.get_next_layer()))
-            {
-                payload = raw->get_data();
-            }
-        }
-
-        if (!payload.empty())
-        {
+            const Bytes& payload = payload_layer->get_data();
             uint32_t seq = segment.get_sequence_number();
 
             if (seq == _recv_next)
@@ -725,7 +767,7 @@ void TcpConnection::on_segment(const Tcp& segment)
 
     if (segment.get_fin())
     {
-        _handle_fin();
+        _handle_fin(segment.get_sequence_number() + payload_size);
     }
 }
 

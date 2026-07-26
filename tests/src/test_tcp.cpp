@@ -52,3 +52,30 @@ TEST(UnknownOptionKindIsSkippedWithoutBreakingParsing)
     test_assert(parsed.has_mss_option(), "the known MSS option before the unknown one should still parse correctly");
     test_assert(parsed.get_mss_option() == 1460, "the known MSS option's value should be unaffected by the unknown option after it");
 }
+
+// RFC 7323 SS2.3 caps the window scale shift at 14. The value arrives as a raw
+// byte off the wire and is later used as a shift count, so an unclamped one is
+// undefined behaviour (shifting a uint32_t by >= 32) that a peer can trigger
+// with a single crafted SYN. The clamp must therefore happen at parse time.
+TEST(OversizedWindowScaleOptionIsClampedAtParseTime)
+{
+    Tcp segment(12345, 80, 1000, 2000, 5, 0x02 /* SYN */, 65535, 0, 0);
+    segment.set_window_scale_option(200); // absurd, but a legal byte on the wire
+
+    Tcp parsed(segment.to_bytes());
+
+    test_assert(parsed.has_window_scale_option(), "the option should still be recognised, not discarded");
+    test_assert(parsed.get_window_scale_option() == Tcp::MAX_WINDOW_SCALE,
+                "a shift count above the RFC 7323 maximum must be clamped to 14, never stored raw - it is used as a shift count");
+}
+
+// The boundary itself must pass through untouched - the clamp has to be a cap,
+// not an off-by-one that also rewrites legal values.
+TEST(MaximumLegalWindowScaleOptionIsPreservedExactly)
+{
+    Tcp segment(12345, 80, 1000, 2000, 5, 0x02 /* SYN */, 65535, 0, 0);
+    segment.set_window_scale_option(14);
+
+    Tcp parsed(segment.to_bytes());
+    test_assert(parsed.get_window_scale_option() == 14, "a shift count of exactly 14 is legal and must survive parsing unchanged");
+}

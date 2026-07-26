@@ -117,7 +117,14 @@ void Tcp::_parse()
 		else if (kind == 3 && length == 3)
 		{
 			_has_window_scale_option = true;
-			_window_scale_option = data[i + 2];
+			// Clamp rather than reject: RFC 7323 SS2.3 says a shift count above
+			// 14 should be treated as 14 (with the peer's behaviour logged as
+			// suspect), not that the segment is invalid. Clamping here rather
+			// than at each use site is deliberate - this is the boundary where
+			// untrusted bytes become a value the rest of the stack trusts, and
+			// there are four separate places that use it as a shift count.
+			uint8_t shift = data[i + 2];
+			_window_scale_option = shift > MAX_WINDOW_SCALE ? MAX_WINDOW_SCALE : shift;
 		}
 
 		i += length;

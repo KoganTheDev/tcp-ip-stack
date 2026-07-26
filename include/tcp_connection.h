@@ -156,7 +156,11 @@ private:
     // ack is the fast-retransmit signal).
     void _schedule_or_send_ack();
     void _handle_ack(const Tcp& segment);
-    void _handle_fin();
+    // fin_seq is where the FIN itself sits in sequence space, which is the
+    // segment's sequence number plus any payload it carried - not the segment's
+    // own sequence number. A FIN is only consumed when that lands exactly on
+    // RCV.NXT; see the definition for what went wrong without the check.
+    void _handle_fin(uint32_t fin_seq);
     // Delivers payload to the application (or buffers it if no callback is
     // registered yet - see set_data_received_callback()'s comment), and
     // advances _recv_next past it. Shared by the in-order-arrival path and

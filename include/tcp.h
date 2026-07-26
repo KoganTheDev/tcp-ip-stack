@@ -53,6 +53,8 @@ public:
     void set_mss_option(uint16_t mss) { _has_mss_option = true; _mss_option = mss; }
 
     bool has_window_scale_option() const { return _has_window_scale_option; }
+    // Always in [0, MAX_WINDOW_SCALE] - clamped at parse time, so a caller may
+    // use it directly as a shift count without re-checking. See _parse().
     uint8_t get_window_scale_option() const { return _window_scale_option; }
     void set_window_scale_option(uint8_t shift) { _has_window_scale_option = true; _window_scale_option = shift; }
 
@@ -133,6 +135,14 @@ private:
     uint16_t _mss_option = 0;
     bool _has_window_scale_option = false;
     uint8_t _window_scale_option = 0;
+
+public:
+    // RFC 7323 SS2.3 caps the window scale shift at 14. Enforcing it is not
+    // pedantry: the value arrives as a raw byte off the wire and is used as a
+    // shift count, and shifting a uint32_t by >= 32 is undefined behavior. An
+    // unclamped byte here is therefore peer-triggerable UB, so the clamp lives
+    // at the parse boundary where untrusted input first enters.
+    static constexpr uint8_t MAX_WINDOW_SCALE = 14;
 
     // populated by from_bytes() with the exact wire bytes - see
     // get_received_bytes()

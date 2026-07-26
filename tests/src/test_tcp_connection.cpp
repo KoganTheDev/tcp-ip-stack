@@ -791,3 +791,148 @@ TEST(RtoIsRecomputedFromTheFirstUnambiguousSampleAfterABackoff)
 
     test_assert(connection->get_rto_ticks() == 3, "a clean sample after a backoff should recompute the RTO from the measured round trip");
 }
+
+// A FIN only consumes a sequence number if it sits exactly at RCV.NXT. A
+// retransmitted FIN (our ack for the first one was lost, or IP simply
+// duplicated the segment - no loss required) must be re-acked without moving
+// sequence state again. Before this was checked, only TIME_WAIT was guarded:
+// in CLOSE_WAIT the duplicate advanced RCV.NXT a second time and sent nothing
+// back, so our ack numbers desynchronised permanently and the peer's FIN was
+// never acknowledged, leaving its retransmit timer unable to ever be satisfied.
+TEST(DuplicateFinInCloseWaitIsReAckedWithoutAdvancingSequence)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_FIN | FLAG_ACK));
+    test_assert(connection->get_state() == TcpState::CLOSE_WAIT, "a peer FIN in ESTABLISHED should move us to CLOSE_WAIT");
+    test_assert(sent.size() == 1, "the FIN should be acked");
+    test_assert(sent[0].ack == 502, "the ack must cover the FIN's one sequence number");
+
+    // the same FIN again, exactly as a peer whose ack was lost would resend it
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_FIN | FLAG_ACK));
+
+    test_assert(connection->get_state() == TcpState::CLOSE_WAIT, "a duplicate FIN must not change state");
+    test_assert(sent.size() == 2, "a duplicate FIN must still be acked, or the peer retransmits forever");
+    test_assert(sent[1].ack == 502, "the re-ack must repeat 502, not advance to 503 - the FIN consumes one sequence number, not one per copy");
+}
+
+// Same guarantee on the simultaneous-close path, which reaches CLOSING rather
+// than CLOSE_WAIT and was equally unguarded.
+TEST(DuplicateFinInClosingIsReAckedWithoutAdvancingSequence)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->close(); // our FIN goes out, we are in FIN_WAIT_1
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_FIN | FLAG_ACK)); // simultaneous close
+    test_assert(connection->get_state() == TcpState::CLOSING, "both sides sending FIN before acking should reach CLOSING");
+    uint32_t ack_after_first_fin = sent.back().ack;
+
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_FIN | FLAG_ACK));
+
+    test_assert(connection->get_state() == TcpState::CLOSING, "a duplicate FIN must not change state");
+    test_assert(sent.back().ack == ack_after_first_fin, "the re-ack must not advance past the single sequence number the FIN consumed");
+}
+
+// A segment carrying both data and FIN puts the FIN one past the end of that
+// data, so the check above has to be against the FIN's own position, not the
+// segment's sequence number.
+TEST(FinCarriedAlongsideDataIsConsumedAtTheEndOfThatData)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_FIN | FLAG_ACK, Bytes::from_hex("6f6b")));
+
+    test_assert(connection->get_state() == TcpState::CLOSE_WAIT, "a data-carrying FIN should still close the peer's direction");
+    test_assert(sent.back().ack == 504, "the ack must cover 2 payload bytes plus the FIN: 501 + 2 + 1");
+}
+
+// The cumulative-ack retirement loop must use TCP's modular sequence
+// arithmetic, not a plain unsigned comparison. With a plain <=, two in-flight
+// segments straddling the 2^32 wrap are never retired by a legitimate ack, so
+// the retransmit timer keeps firing on data the peer already has and the
+// connection is torn down after MAX_RETRANSMIT_ATTEMPTS - a working transfer
+// dying deterministically the moment it crosses 4 GiB.
+// Getting this to fail without the fix takes care: a single segment whose own
+// end_seq wraps is still retired correctly by a naive `end_seq <= ack`, because
+// both values wrapped together. The bug needs TWO segments in flight where the
+// FIRST ends just below 2^32 and the ack lands just above it - then the ack is
+// numerically smaller than an end_seq it logically covers, the loop stops at the
+// front entry, and nothing is retired at all.
+TEST(CumulativeAckRetiresSegmentsAcrossASequenceNumberWrap)
+{
+    std::vector<RecordedSegment> sent;
+    // chosen so that, after the SYN and one 8-byte segment, the next two
+    // segments end at 0xFFFFFFFE (just short of the wrap) and 0x00000006 (past it)
+    uint32_t isn = 0xFFFFFFEDu;
+    auto connection = std::make_unique<TcpConnection>(
+        8080, IPv4Address("10.0.0.1"), 12345, isn,
+        [&sent](const Tcp& header, const Bytes& payload)
+        {
+            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload});
+        }
+    );
+    // an 8-byte peer MSS keeps the segments small enough to place precisely
+    connection->accept_incoming_syn(500, 8);
+    connection->on_segment(*make_incoming_segment(501, isn + 1, FLAG_ACK));
+    test_assert(connection->get_state() == TcpState::ESTABLISHED, "handshake should complete regardless of where the ISN sits");
+    sent.clear();
+
+    // one full-MSS segment, acked, to grow cwnd to two segments' worth
+    connection->send(Bytes(8));
+    test_assert(sent.size() == 1, "the first 8-byte segment should go out under the initial 1-MSS window");
+    connection->on_segment(*make_incoming_segment(501, isn + 9, FLAG_ACK));
+
+    // now two full-MSS segments fit at once: 0xFFFFFFF6..0xFFFFFFFE and
+    // 0xFFFFFFFE..0x00000006. Both are exactly MSS, so Nagle does not hold them.
+    connection->send(Bytes(16));
+    test_assert(sent.size() == 3, "two more full-MSS segments should be in flight once cwnd has grown");
+    uint32_t first_end = sent[1].seq + 8;
+    uint32_t second_end = sent[2].seq + 8;
+    test_assert(first_end == 0xFFFFFFFEu, "precondition: the first of the two must end just below the wrap");
+    test_assert(second_end == 0x00000006u, "precondition: the second must end just past the wrap");
+
+    // one cumulative ack covering both - numerically 6, which is *less than*
+    // the first segment's end_seq of 0xFFFFFFFE despite logically following it
+    connection->on_segment(*make_incoming_segment(501, second_end, FLAG_ACK));
+
+    // if both were retired nothing is outstanding, so no amount of ticking may
+    // retransmit anything or eventually tear the connection down
+    for (int i = 0; i < 60; i++)
+    {
+        connection->on_tick();
+    }
+    test_assert(sent.size() == 3, "a cumulative ack that wrapped past 2^32 must retire both segments - any retransmission means the loop compared sequence numbers non-modularly");
+    test_assert(connection->get_state() == TcpState::ESTABLISHED, "the connection must survive a sequence-number wraparound, not die after MAX_RETRANSMIT_ATTEMPTS");
+}
+
+// Fast retransmit resends a segment, so it must restart that segment's
+// retransmit countdown the same way every other send path does. Otherwise the
+// timer carries on from wherever it already was and the timeout path fires
+// moments later for the same segment - collapsing cwnd to one MSS and
+// cancelling fast recovery, a second and far harsher reaction to one loss.
+TEST(FastRetransmitRestartsTheRetransmitTimer)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->send(Bytes::from_hex("6f6b"));
+    test_assert(sent.size() == 1, "send() should produce one segment");
+    uint32_t snd_una = sent[0].seq;
+
+    // burn most of the initial 3-tick RTO before the duplicate acks arrive
+    connection->on_tick();
+    connection->on_tick();
+    test_assert(sent.size() == 1, "two ticks should not yet have reached the timeout");
+
+    connection->on_segment(*make_incoming_segment(501, snd_una, FLAG_ACK));
+    connection->on_segment(*make_incoming_segment(501, snd_una, FLAG_ACK));
+    connection->on_segment(*make_incoming_segment(501, snd_una, FLAG_ACK));
+    test_assert(sent.size() == 2, "the 3rd duplicate ack should trigger a fast retransmit");
+
+    // one more tick would have hit the un-reset countdown's last tick
+    connection->on_tick();
+    test_assert(sent.size() == 2, "the timer must have been restarted by the fast retransmit, so a single further tick cannot trigger a timeout retransmit of the same segment");
+}
