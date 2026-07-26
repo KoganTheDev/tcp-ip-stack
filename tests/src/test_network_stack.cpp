@@ -679,3 +679,76 @@ TEST(TwoStacksHandshakeExchangeDataAndHalfClose)
     test_assert(server->get_state() == TcpState::CLOSE_WAIT,
                 "the server should see the client's FIN and move to CLOSE_WAIT");
 }
+
+// Ethernet pads frames up to a 60-byte minimum, so a short datagram legitimately
+// arrives with trailing bytes that are not part of it. IP's total_length is what
+// says where the real datagram ends - and it was parsed but never used, with the
+// payload sliced as "everything left in the buffer" instead.
+//
+// UDP is where that became visible: Udp::from_bytes hard-requires its length
+// field to equal the buffer it is handed, so every padded (i.e. every short) UDP
+// datagram threw as "Invalid UDP header size" and was dropped.
+TEST(PaddedShortUdpDatagramStillReachesTheSocket)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    std::vector<Bytes> received;
+    UdpSocket* socket = stack->bind_udp(8080);
+    socket->set_datagram_received_callback(
+        [&received](const IPv4Address&, uint16_t, const Bytes& data) { received.push_back(data); });
+
+    Bytes payload = Bytes::from_hex("68656c6c6f"); // "hello" - 5 bytes, well under the minimum
+    Bytes frame = build_udp(40000, 8080, payload);
+    test_assert(frame.size() < 60, "precondition: this frame is short enough that a real NIC would pad it");
+
+    // pad exactly as Ethernet would, without touching the IP header's total_length
+    Bytes padded = frame;
+    while (padded.size() < 60)
+    {
+        padded.push_back(0x00);
+    }
+    channel->push_inbound(padded);
+    stack->poll();
+
+    test_assert(received.size() == 1, "a padded short datagram must still reach the socket - the payload has to be trimmed to IP's total_length, not to the end of the frame");
+    test_assert(received[0].to_hex() == payload.to_hex(), "the trailing padding must not be delivered as part of the payload");
+}
+
+// _reap_closed_connections() erases from _connections but never from
+// _pending_accepts, so a peer that aborts right after handshaking leaves a stale
+// key queued. accept() used to pop exactly one key and return nullptr on a miss,
+// which hides every genuinely ready connection queued behind it: a caller that
+// treats nullptr as "nothing pending" simply moves on.
+TEST(AcceptSkipsStaleQueueEntriesAndReturnsTheReadyConnection)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    stack->listen(80);
+
+    // two connections complete their handshakes, queued in this order
+    channel->push_inbound(build_arp_request()); // teach the stack the peer's MAC
+    channel->push_inbound(build_tcp(FLAG_SYN, 1000, 0, 40000, 80));
+    stack->poll();
+    uint32_t isn_a = find_tcp(channel->outbound_frames()).seq;
+    channel->clear_outbound();
+    channel->push_inbound(build_tcp(FLAG_ACK, 1001, isn_a + 1, 40000, 80));
+    stack->poll();
+
+    channel->push_inbound(build_tcp(FLAG_SYN, 2000, 0, 40001, 80));
+    stack->poll();
+    uint32_t isn_b = find_tcp(channel->outbound_frames()).seq;
+    channel->clear_outbound();
+    channel->push_inbound(build_tcp(FLAG_ACK, 2001, isn_b + 1, 40001, 80));
+    stack->poll();
+
+    // the FIRST one aborts before the application ever accepts it, so it is
+    // closed and reaped while its key is still at the front of the queue
+    channel->push_inbound(build_tcp(FLAG_RST | FLAG_ACK, 1001, isn_a + 1, 40000, 80));
+    stack->poll();
+
+    TcpConnection* accepted = stack->accept(80);
+
+    test_assert(accepted != nullptr, "accept() must skip the stale key and return the connection queued behind it, not report nothing pending");
+    test_assert(accepted->get_state() == TcpState::ESTABLISHED, "the returned connection should be the live, established one");
+}

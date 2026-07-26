@@ -87,11 +87,27 @@ TcpConnection* NetworkStack::accept(uint16_t port)
         return nullptr;
     }
 
-    ConnectionKey key = pending_it->second.front();
-    pending_it->second.pop_front();
+    // Keep popping until a live connection is found. A queued key can go stale:
+    // _reap_closed_connections() erases from _connections but never from
+    // _pending_accepts, so a peer that RSTs immediately after handshaking leaves
+    // an entry here pointing at nothing.
+    //
+    // Returning nullptr on the first stale key - as this did - hides every
+    // genuinely ready connection queued behind it, because a caller treating
+    // nullptr as "nothing pending" moves on. One aborting peer was enough to
+    // stall accepts for all the connections behind it.
+    while (!pending_it->second.empty())
+    {
+        ConnectionKey key = pending_it->second.front();
+        pending_it->second.pop_front();
 
-    auto connection_it = this->_connections.find(key);
-    return connection_it != this->_connections.end() ? connection_it->second.get() : nullptr;
+        auto connection_it = this->_connections.find(key);
+        if (connection_it != this->_connections.end())
+        {
+            return connection_it->second.get();
+        }
+    }
+    return nullptr;
 }
 
 TcpConnection* NetworkStack::connect(const IPv4Address& remote_ip, uint16_t remote_port)

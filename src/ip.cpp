@@ -56,11 +56,10 @@ void Ip::from_bytes(const Bytes& data)
     {
         throw EXCEPTION(BaseException, "Data shorter than IHL indicates");
     }
-    //* Note, causes exceptions, probably wrong one when slicing from a full packet to an ARP frame
-    // if (data.size() > header_bytes)
-    // {
-    //     throw EXCEPTION(BaseException, "Data larger than IHL indicates");
-    // }
+    // (A commented-out "data larger than IHL indicates" check used to sit here.
+    // It was correctly abandoned - IHL describes the header, so a payload
+    // legitimately follows it. The real invariant is total_length, enforced
+    // below once it has been parsed.)
 
     _TOS = data[1];
     _total_length = data.slice_int<uint16_t>(2);
@@ -76,7 +75,25 @@ void Ip::from_bytes(const Bytes& data)
     _src_address = Bytes(data.slice(12, 4));
     _dest_address = Bytes(data.slice(16, 4));
 
-    Bytes payload = data.slice(header_bytes);
+    // Trim the payload to what total_length actually declares, rather than
+    // handing on "everything left in the buffer".
+    //
+    // Two reasons this matters. Ethernet pads frames up to a 60-byte minimum,
+    // so a small datagram legitimately arrives with trailing bytes that are not
+    // part of it - and Udp::from_bytes hard-requires its length field to equal
+    // the buffer it is given, so an untrimmed payload made every short UDP
+    // datagram throw as "Invalid UDP header size". For protocols with no length
+    // field of their own (ICMP) the padding silently became payload instead, and
+    // got echoed back in an Echo Reply.
+    //
+    // A total_length that disagrees with the buffer is not trusted in either
+    // direction: shorter than the header is malformed, longer than what actually
+    // arrived means the frame was truncated in transit.
+    if (_total_length < header_bytes || _total_length > data.size())
+    {
+        throw EXCEPTION(BaseException, "IP total_length inconsistent with the received frame");
+    }
+    Bytes payload = data.slice(header_bytes, _total_length - header_bytes);
     switch (this->_protocol)
     {
     // only one branch runs, so the payload buffer can be moved into whichever
