@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The ordinary build most changes need to pass. Runs on two compilers because
+  # they disagree about enough real things (uninitialized-use analysis, template
+  # diagnostics, standard-library assertions) to be worth the extra minute.
+  test:
+    name: test (${{ matrix.cxx }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang
+        if: matrix.cxx == 'clang++'
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Build and run the test suite
+        run: make test CXX=${{ matrix.cxx }}
+
+      - name: Build the stack binary
+        run: make CXX=${{ matrix.cxx }}
+
+      - name: Build epoll-server
+        working-directory: epoll-server
+        run: make CXX=${{ matrix.cxx }}
+
+  # Treat warnings as errors, but only on the code this project actually owns.
+  # A blanket -Werror would fail on -Wextra noise coming out of system headers
+  # (sockaddr_ll and ifreq have members no caller is meant to initialize), which
+  # would make the job fail for reasons nobody can act on.
+  warnings:
+    name: strict warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with -Wall -Wextra -Werror
+        run: |
+          make run_tests CXXFLAGS="-std=c++17 -Wall -Wextra -Werror -g \
+            -Wno-missing-field-initializers -Wno-unused-parameter"
+
+  # Unit tests confirm behavior; sanitizers confirm the behavior was not
+  # reached through undefined behavior. Both bugs fixed in the commit that
+  # introduced this workflow (a missing virtual destructor on a class deleted
+  # through a base pointer, and enums assigned from wire data without a fixed
+  # underlying type) were invisible to a fully passing test suite and caught
+  # here.
+  #
+  # Note what each job is actually worth. The asan job carries the weight: it
+  # runs ASan, UBSan, and leak detection over the whole suite, which parses
+  # deliberately malformed input in the fuzz tests. The tsan job is currently a
+  # build-and-link check rather than a real race hunt, because the unit tests
+  # are single-threaded - the only threaded code in this project is
+  # epoll-server's reactor and thread pool, and exercising that needs a TAP
+  # device and NET_ADMIN, which this workflow does not have. It is here so the
+  # suite stays TSan-clean and ready the moment threaded tests exist.
+  sanitizers:
+    name: ${{ matrix.sanitizer }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [asan, tsan]
+    # asan blocks the build; tsan reports without blocking. TSan aborts at
+    # startup (exit 66) on hosts where it cannot get the memory layout it
+    # needs, which is an environment property rather than anything about this
+    # code - not worth failing a build over while the suite it runs is still
+    # single-threaded. Revisit once there are threaded tests for it to bite on.
+    continue-on-error: ${{ matrix.sanitizer == 'tsan' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the suite under ${{ matrix.sanitizer }}
+        run: make ${{ matrix.sanitizer }}
