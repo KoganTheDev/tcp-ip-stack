@@ -26,6 +26,16 @@ enum ArpEntryType
 class BaseArpCacheEntry
 {
 public:
+    // ArpCache stores these as unique_ptr<BaseArpCacheEntry> pointing at
+    // Dynamic/Static subclasses, so every one of them is destroyed through a
+    // base pointer. Without a virtual destructor that is undefined behavior:
+    // the subclass destructor never runs, and operator delete is handed the
+    // wrong size. Found by AddressSanitizer (new-delete-type-mismatch) - the
+    // tests passed either way, because the subclasses here happen to add only
+    // trivially-destructible members, which is exactly what makes this class
+    // of bug survive so long unnoticed.
+    virtual ~BaseArpCacheEntry() = default;
+
     BaseArpCacheEntry(const MacAddress& mac, ArpEntryType type);
     MacAddress get_mac_address();
     ArpEntryType get_type();

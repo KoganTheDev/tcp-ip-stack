@@ -4,17 +4,24 @@
 #include "protocol_layer.h"
 #include "network_addresses.h"
 
-enum ArpProtocolType
+// All three carry an explicit underlying type for the same reason EtherType
+// does (see ethernet.h): they are assigned directly from bytes off the wire in
+// Arp::from_bytes, and without a fixed underlying type any value outside the
+// enumerators' own narrow bit-width is undefined behavior. These are the worst
+// offenders of the set - ArpHardwareType's only enumerator is 1, so its valid
+// range would be a single bit, and virtually any malformed ARP packet would
+// land outside it.
+enum ArpProtocolType : uint16_t
 {
     IPV4 = 0x0800,
 };
 
-enum ArpHardwareType
+enum ArpHardwareType : uint16_t
 {
     ETHERNET = 1,
 };
 
-enum ArpOperation
+enum ArpOperation : uint16_t
 {
     REQUEST = 1,
     REPLY = 2,
