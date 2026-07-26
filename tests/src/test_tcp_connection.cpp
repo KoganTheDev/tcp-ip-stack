@@ -310,14 +310,20 @@ TEST(GivesUpAndClosesAfterMaxRetransmitAttempts)
 
     connection->send(Bytes::from_hex("6f6b"));
 
-    // MAX_RETRANSMIT_ATTEMPTS is 5, each needing RETRANSMIT_TIMEOUT_TICKS (3)
-    // ticks - tick well past that with no ack ever arriving
-    for (int i = 0; i < 20; i++)
+    // MAX_RETRANSMIT_ATTEMPTS is 5, but the wait before each one doubles
+    // (RTO backoff: 3, 6, 12, 24, 48 ticks), so the give-up point is a few
+    // hundred ticks out rather than a fixed multiple of the initial timeout.
+    // Tick until it closes rather than hard-coding that total - the bound
+    // just stops a broken implementation from looping forever.
+    int ticks = 0;
+    while (connection->get_state() != TcpState::CLOSED && ticks < 1000)
     {
         connection->on_tick();
+        ticks++;
     }
 
     test_assert(connection->get_state() == TcpState::CLOSED, "should give up and close after exceeding max retransmit attempts");
+    test_assert(ticks > 20, "with exponential backoff the give-up point must be well past the un-backed-off 5 * 3 ticks");
 }
 
 TEST(OurCloseThenPeerFinMovesToTimeWaitThenCloses)
@@ -647,4 +653,141 @@ TEST(NegotiatedMssCapsSentSegmentSize)
     connection.send(Bytes(250));
     test_assert(sent.size() == 1, "only the first MSS-sized chunk should go out under the initial (1 MSS) congestion window");
     test_assert(sent[0].payload.size() == 100, "the sent chunk must be capped at the negotiated 100-byte MSS, not sent as one 250-byte segment");
+}
+
+// --- RTT estimation / adaptive RTO (RFC 6298 + Karn's algorithm) ---
+//
+// These drive the estimator through the tick clock rather than wall time:
+// on_tick() is the only clock TcpConnection has, so "a 2-tick round trip"
+// means send, tick twice, then deliver the ack.
+
+TEST(RtoStartsAtTheFixedInitialValueBeforeAnySample)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    // RFC 6298 rule 2.1: with no measurement yet there is nothing to derive a
+    // timeout from, so it must be the fixed conservative default
+    test_assert(connection->get_rto_ticks() == 3, "RTO should start at the fixed initial value before any RTT sample");
+}
+
+TEST(RtoAdaptsToAMeasuredRoundTrip)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->send(Bytes::from_hex("6f6b"));
+    test_assert(sent.size() == 1, "send() should produce one segment");
+
+    // two ticks, staying under the initial 3-tick RTO so the segment is never
+    // retransmitted - the sample must stay unambiguous for Karn to accept it
+    connection->on_tick();
+    connection->on_tick();
+    connection->on_segment(*make_incoming_segment(501, 1003, FLAG_ACK));
+
+    // first sample: SRTT = 2 ticks, RTTVAR = 1 tick, so
+    // RTO = SRTT + 4*RTTVAR = 6 - measurably adapted, not the default
+    test_assert(connection->get_rto_ticks() == 6, "RTO should be recomputed from the measured round trip, not left at the default");
+}
+
+TEST(RtoConvergesAsRoundTripsStayConsistent)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    uint32_t peer_seq = 501;
+    uint32_t our_seq = 1001;
+    int rto_after_first_sample = 0;
+
+    // six consecutive round trips, every one taking exactly 2 ticks
+    for (int round = 0; round < 6; round++)
+    {
+        connection->send(Bytes::from_hex("6f6b"));
+        connection->on_tick();
+        connection->on_tick();
+        our_seq += 2;
+        connection->on_segment(*make_incoming_segment(peer_seq, our_seq, FLAG_ACK));
+
+        if (round == 0)
+        {
+            rto_after_first_sample = connection->get_rto_ticks();
+        }
+    }
+
+    // The first sample deliberately seeds RTTVAR wide (half the sample), so
+    // the initial RTO overshoots. As identical samples keep arriving the
+    // variance term decays and the timeout settles closer to the true round
+    // trip - it must come down, and must never fall below the measured RTT.
+    int settled = connection->get_rto_ticks();
+    test_assert(settled < rto_after_first_sample, "RTO should converge downward as repeated samples show a steady path");
+    test_assert(settled >= 2, "RTO must never settle below the measured 2-tick round trip");
+}
+
+TEST(RtoBacksOffExponentiallyOnConsecutiveTimeouts)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->send(Bytes::from_hex("6f6b"));
+
+    // first timeout at the initial 3-tick RTO
+    connection->on_tick();
+    connection->on_tick();
+    connection->on_tick();
+    test_assert(sent.size() == 2, "the segment should be retransmitted once the initial RTO elapses");
+    test_assert(connection->get_rto_ticks() == 6, "RTO should double on the first timeout");
+
+    // second timeout now takes the doubled 6 ticks, not 3
+    for (int i = 0; i < 5; i++)
+    {
+        connection->on_tick();
+    }
+    test_assert(sent.size() == 2, "the next retransmission must wait the full backed-off RTO, not the original one");
+    connection->on_tick();
+    test_assert(sent.size() == 3, "the segment should be retransmitted again once the backed-off RTO elapses");
+    test_assert(connection->get_rto_ticks() == 12, "RTO should double again on the second consecutive timeout");
+}
+
+TEST(KarnsAlgorithmRejectsTheAmbiguousSampleFromARetransmittedSegment)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->send(Bytes::from_hex("6f6b"));
+
+    connection->on_tick();
+    connection->on_tick();
+    connection->on_tick();
+    test_assert(sent.size() == 2, "the segment should have been retransmitted");
+    test_assert(connection->get_rto_ticks() == 6, "RTO should have backed off on the timeout");
+
+    // Now the peer acks. This ack cannot be attributed to either transmission,
+    // so it must produce no RTT sample at all - the backed-off RTO has to
+    // survive it untouched. (Were the sample taken, the 3-tick age of the
+    // original transmission would seed the estimator and move the RTO to 10.)
+    connection->on_segment(*make_incoming_segment(501, 1003, FLAG_ACK));
+    test_assert(connection->get_rto_ticks() == 6, "an ack for a retransmitted segment is ambiguous and must not update the RTO");
+}
+
+TEST(RtoIsRecomputedFromTheFirstUnambiguousSampleAfterABackoff)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    // force a timeout so the RTO is backed off and the estimator is still unseeded
+    connection->send(Bytes::from_hex("6f6b"));
+    connection->on_tick();
+    connection->on_tick();
+    connection->on_tick();
+    connection->on_segment(*make_incoming_segment(501, 1003, FLAG_ACK));
+    test_assert(connection->get_rto_ticks() == 6, "precondition: RTO backed off and Karn rejected the ambiguous sample");
+
+    // a fresh segment, never retransmitted, acked after a single tick - this
+    // one is unambiguous, so it seeds the estimator and replaces the
+    // backed-off value rather than being ignored
+    connection->send(Bytes::from_hex("6f6b"));
+    connection->on_tick();
+    connection->on_segment(*make_incoming_segment(501, 1005, FLAG_ACK));
+
+    test_assert(connection->get_rto_ticks() == 3, "a clean sample after a backoff should recompute the RTO from the measured round trip");
 }

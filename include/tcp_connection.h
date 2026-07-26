@@ -41,8 +41,10 @@ enum class TcpState
 //
 // Still deliberately out of scope (documented, not accidental):
 //  - no SACK or timestamps options - a lost segment still stalls delivery
-//    until it's retransmitted and fills the gap, and RTT is estimated with a
-//    single fixed timeout rather than a live sample
+//    until it's retransmitted and fills the gap. RTT *is* sampled live (see
+//    the RTO block below), but only from the ack clock, not from a
+//    timestamp option, so at most one sample per window rather than one
+//    per segment
 //  - TIME_WAIT lasts a fixed, short number of timer ticks
 //    (TIME_WAIT_TICKS), not the real 2*MSL - long enough to catch an
 //    immediately-retransmitted duplicate FIN, not long enough to guarantee
@@ -94,6 +96,14 @@ public:
 
     TcpState get_state() const { return _state; }
     bool is_closed() const { return _state == TcpState::CLOSED; }
+
+    // The current retransmission timeout, in timer ticks - what a freshly
+    // sent segment will wait before being retransmitted. Starts at
+    // INITIAL_RTO_TICKS and thereafter tracks the measured round-trip time
+    // (see _update_rto_from_sample). Exposed for tests and for anyone
+    // wanting to observe the estimator; nothing in the stack's own data
+    // path reads it from outside.
+    int get_rto_ticks() const { return _rto_ticks; }
 
     // Hard-closes without any teardown handshake - nothing has been
     // transmitted yet, so there's nothing to tear down. NetworkStack calls
@@ -176,6 +186,11 @@ private:
     // of RECEIVE_BUFFER_CAPACITY after subtracting this is what gets
     // advertised as this side's receive window.
     uint32_t _receive_buffer_occupied() const;
+    // Folds one round-trip measurement into the smoothed RTT/variance pair
+    // and recomputes _rto_ticks from them (RFC 6298's estimator, Jacobson &
+    // Karels' algorithm). Called only with an *unambiguous* sample - see
+    // Karn's algorithm at the call site in _handle_ack().
+    void _update_rto_from_sample(uint32_t rtt_ticks);
     // RFC 793 SS3.3's sequence-number acceptability test, done with unsigned
     // wraparound arithmetic (seq - _recv_next) so it's correct across a
     // sequence-number wraparound the same way real TCP's modular arithmetic
@@ -193,6 +208,18 @@ private:
         Bytes payload;
         int retransmit_ticks_remaining;
         int retransmit_attempts;
+        // The connection's tick counter when this segment first went out.
+        // Storing the absolute tick rather than an age counter keeps ticking
+        // O(1): on_tick() would otherwise have to walk the whole window every
+        // tick just to age each entry, and this window is walked often enough
+        // already. Age is _tick_count - sent_at_tick, computed only when a
+        // segment is actually acked.
+        uint64_t sent_at_tick;
+        // Karn's algorithm: once a segment has been retransmitted, an ack for
+        // it is ambiguous - it could be acking the original or the
+        // retransmission, and those imply very different round-trip times.
+        // Such a segment never yields an RTT sample.
+        bool retransmitted;
     };
 
     uint64_t _id;
@@ -217,6 +244,33 @@ private:
     // counts down while in TIME_WAIT; reset if a duplicate FIN arrives
     // (meaning our ack for it was likely lost)
     int _time_wait_ticks_remaining;
+
+    // --- RTT estimation / adaptive RTO (RFC 6298, Jacobson & Karels) ---
+    // A fixed retransmission timeout can only be wrong in one of two
+    // directions: too short on a slow path and it retransmits segments that
+    // were merely still in transit, adding load to a link that is already the
+    // bottleneck; too long on a fast path and every real loss costs far more
+    // idle time than it needs to. The fix is to measure the round trip and
+    // derive the timeout from it - but the *mean* RTT alone is not enough,
+    // which is the lesson of the 1988 congestion collapse: on a loaded path
+    // RTT varies wildly, and a timeout set near the mean fires constantly on
+    // ordinary jitter. So the variance is tracked alongside the mean and the
+    // timeout is set several deviations out, where ordinary jitter cannot
+    // reach it and only a real loss can.
+    //
+    // Both are held scaled by RTO_SCALE so the exponential moving averages
+    // keep fractional precision in pure integer arithmetic - the same trick
+    // the BSD implementation uses, and the reason there is no floating point
+    // anywhere in this path.
+    uint64_t _tick_count;   // monotonic tick counter, the clock RTT is measured against
+    uint32_t _srtt_scaled;  // smoothed RTT (SRTT), in ticks * RTO_SCALE
+    uint32_t _rttvar_scaled; // RTT variation (RTTVAR), in ticks * RTO_SCALE
+    bool _has_rtt_sample;   // false until the first measurement seeds the estimator
+    // The live timeout, in whole ticks. Doubled on every retransmission
+    // (Karn's second half: back off, and keep the backed-off value rather
+    // than recomputing it from an estimator no valid sample can currently
+    // update) and recomputed from SRTT/RTTVAR on the next unambiguous sample.
+    int _rto_ticks;
 
     // --- zero-window persist timer ---
     // ticks until the next zero-window probe, or 0 when the persist timer is
@@ -266,7 +320,27 @@ private:
     static constexpr uint32_t RECEIVE_BUFFER_CAPACITY = 131072; // 128 KiB - bounds the reorder buffer and the advertised window
     static constexpr uint32_t INITIAL_SSTHRESH = 65536; // effectively "no ceiling yet" until a real loss recalibrates it
     static constexpr int DUP_ACK_FAST_RETRANSMIT_THRESHOLD = 3;
-    static constexpr int RETRANSMIT_TIMEOUT_TICKS = 3;
+    // RFC 6298 rule 2.1: before any RTT has been measured there is nothing to
+    // derive a timeout from, so the first one is simply a fixed conservative
+    // guess. Every segment sent after the first ack comes back uses a
+    // measured value instead.
+    static constexpr int INITIAL_RTO_TICKS = 3;
+    // Fixed-point shift for _srtt_scaled/_rttvar_scaled: eighths of a tick.
+    static constexpr uint32_t RTO_SCALE = 8;
+    // RFC 6298's alpha = 1/8 and beta = 1/4, as right-shifts. Powers of two
+    // are not an approximation chosen for speed - the original algorithm
+    // picked them precisely so the filters need no division at all.
+    static constexpr int RTT_SMOOTHING_SHIFT = 3;  // alpha = 1/8
+    static constexpr int RTT_VARIANCE_SHIFT = 2;   // beta  = 1/4
+    // RFC 6298's K: how many deviations above the smoothed mean the timeout
+    // sits. Four is what makes ordinary jitter unable to reach it.
+    static constexpr uint32_t RTO_VARIANCE_MULTIPLIER = 4;
+    // A timeout below one tick could never be observed by a tick-driven timer
+    // in the first place; two gives the estimator a floor with some headroom.
+    static constexpr int MIN_RTO_TICKS = 2;
+    // Caps the exponential backoff, so a connection to a black hole stops
+    // doubling rather than growing without bound.
+    static constexpr int MAX_RTO_TICKS = 60;
     static constexpr int MAX_RETRANSMIT_ATTEMPTS = 5;
     static constexpr int TIME_WAIT_TICKS = 4;
     static constexpr int PERSIST_BASE_TICKS = 2;        // first probe ~1 tick-interval after the window shuts

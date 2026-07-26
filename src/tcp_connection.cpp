@@ -55,6 +55,8 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
       _state(TcpState::LISTEN),
       _send_next(initial_seq), _recv_next(0),
       _fin_requested(false), _time_wait_ticks_remaining(0),
+      _tick_count(0), _srtt_scaled(0), _rttvar_scaled(0), _has_rtt_sample(false),
+      _rto_ticks(INITIAL_RTO_TICKS),
       _persist_ticks_remaining(0), _persist_backoff(0),
       _ack_pending(false), _ack_delay_ticks_remaining(0),
       _local_mss(local_mss), _peer_mss(DEFAULT_PEER_MSS), _effective_mss(std::min(local_mss, DEFAULT_PEER_MSS)),
@@ -156,8 +158,10 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
     entry.end_seq = _send_next;
     entry.flags = full_flags;
     entry.payload = payload;
-    entry.retransmit_ticks_remaining = RETRANSMIT_TIMEOUT_TICKS;
+    entry.retransmit_ticks_remaining = _rto_ticks;
     entry.retransmit_attempts = 0;
+    entry.sent_at_tick = _tick_count;
+    entry.retransmitted = false;
     _in_flight.push_back(std::move(entry));
 }
 
@@ -309,6 +313,68 @@ void TcpConnection::_send_zero_window_probe()
     _send_segment(_build_header(FLAG_ACK, _send_next), probe);
 }
 
+void TcpConnection::_update_rto_from_sample(uint32_t rtt_ticks)
+{
+    // A segment sent and acked inside the same tick measures as zero, which
+    // says "faster than this clock can see", not "instant". Clamp to the
+    // clock's own granularity - one tick - so the estimator is never fed a
+    // round trip shorter than the shortest one it could actually observe.
+    if (rtt_ticks == 0)
+    {
+        rtt_ticks = 1;
+    }
+    uint32_t sample_scaled = rtt_ticks * RTO_SCALE;
+
+    if (!_has_rtt_sample)
+    {
+        // RFC 6298 rule 2.2: the first measurement has no history to smooth
+        // against, so it becomes the mean outright, and the variance is
+        // seeded at half of it - a deliberately wide initial guess, since one
+        // sample says nothing yet about how much this path actually varies.
+        _srtt_scaled = sample_scaled;
+        _rttvar_scaled = sample_scaled / 2;
+        _has_rtt_sample = true;
+    }
+    else
+    {
+        // RFC 6298 rule 2.3. Order matters: RTTVAR is updated against the
+        // *old* SRTT, so the deviation measured is this sample's distance
+        // from the mean as it stood before this sample moved it.
+        //
+        // Both filters are written in the expanded "decay the old, add the
+        // scaled new" form rather than the RFC's compact
+        // `x += (new - x) * gain`. The compact form needs signed arithmetic:
+        // whenever a sample lands below the current mean, `new - x` is
+        // negative, and in unsigned arithmetic that wraps to an enormous
+        // positive value which the shift then folds straight into the
+        // estimate. The expanded form only ever adds and subtracts
+        // non-negative quantities, so it is exact in unsigned integers.
+        uint32_t error = sample_scaled > _srtt_scaled ? sample_scaled - _srtt_scaled
+                                                      : _srtt_scaled - sample_scaled;
+        _rttvar_scaled = _rttvar_scaled - (_rttvar_scaled >> RTT_VARIANCE_SHIFT)
+                       + (error >> RTT_VARIANCE_SHIFT);
+        _srtt_scaled = _srtt_scaled - (_srtt_scaled >> RTT_SMOOTHING_SHIFT)
+                     + (sample_scaled >> RTT_SMOOTHING_SHIFT);
+    }
+
+    // RTO = SRTT + max(G, K * RTTVAR), where G is the clock granularity (one
+    // tick). The max() matters on a very steady path: RTTVAR can converge
+    // toward zero, and without a floor of one granularity the timeout would
+    // collapse onto the mean itself, firing on the first sample that lands a
+    // hair above average.
+    uint32_t variance_term = std::max(RTO_SCALE, RTO_VARIANCE_MULTIPLIER * _rttvar_scaled);
+    uint32_t rto_scaled = _srtt_scaled + variance_term;
+
+    // Round up rather than truncate: a timeout is a deadline, and rounding it
+    // down would systematically fire early.
+    int rto = static_cast<int>((rto_scaled + RTO_SCALE - 1) / RTO_SCALE);
+    _rto_ticks = std::min(std::max(rto, MIN_RTO_TICKS), MAX_RTO_TICKS);
+
+    LOG_DEBUG("TcpConnection[" << _id << "] rtt sample " << rtt_ticks << " ticks -> srtt "
+              << (_srtt_scaled / RTO_SCALE) << " rttvar " << (_rttvar_scaled / RTO_SCALE)
+              << " rto " << _rto_ticks);
+}
+
 void TcpConnection::_handle_ack(const Tcp& segment)
 {
     uint32_t ack = segment.get_acknowledgement_number();
@@ -333,6 +399,12 @@ void TcpConnection::_handle_ack(const Tcp& segment)
             InFlightSegment& oldest = _in_flight.front();
             uint32_t cwnd_before = _cwnd;
             _send_segment(_build_header(oldest.flags, oldest.seq), oldest.payload);
+            // Karn again: this segment has now been sent twice, so the ack
+            // that eventually retires it can't be attributed to either
+            // transmission. Note there is deliberately no RTO backoff here -
+            // duplicate acks prove segments are still flowing, so unlike a
+            // timeout this is no evidence that the path got slower.
+            oldest.retransmitted = true;
             _ssthresh = std::max(_bytes_in_flight() / 2, static_cast<uint32_t>(2 * _effective_mss));
             _cwnd = _ssthresh + DUP_ACK_FAST_RETRANSMIT_THRESHOLD * static_cast<uint32_t>(_effective_mss);
             _in_fast_recovery = true;
@@ -359,6 +431,9 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     // cumulative ack: everything whose end_seq it covers is done, oldest
     // (front) first - this is what lets several segments be in flight at
     // once instead of stop-and-wait's exactly one
+    bool have_rtt_sample = false;
+    uint32_t rtt_sample_ticks = 0;
+
     while (!_in_flight.empty() && _in_flight.front().end_seq <= ack)
     {
         bytes_acked += _in_flight.front().end_seq - _in_flight.front().seq;
@@ -366,8 +441,29 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         {
             fin_acked = true;
         }
+        // Karn's algorithm: only a segment that was never retransmitted
+        // yields a usable round trip. For a retransmitted one there is no way
+        // to tell which transmission this ack answers, and guessing wrong in
+        // either direction corrupts the estimator - guess "the original" on a
+        // path that really did lose the segment and the sample is inflated by
+        // the entire timeout, which then feeds back into a longer timeout and
+        // an even more inflated next sample.
+        //
+        // The newest such segment in this batch wins: a cumulative ack can
+        // retire several at once, and the most recently sent one reflects the
+        // path as it is now.
+        if (!_in_flight.front().retransmitted)
+        {
+            rtt_sample_ticks = static_cast<uint32_t>(_tick_count - _in_flight.front().sent_at_tick);
+            have_rtt_sample = true;
+        }
         _in_flight.pop_front();
         acked_anything = true;
+    }
+
+    if (have_rtt_sample)
+    {
+        _update_rto_from_sample(rtt_sample_ticks);
     }
 
     if (!acked_anything)
@@ -647,6 +743,11 @@ void TcpConnection::on_tick()
         return;
     }
 
+    // the clock RTT is measured against - advanced before anything else this
+    // tick, so a segment sent from within this same tick is stamped with the
+    // tick it actually went out on
+    _tick_count += 1;
+
     if (_state == TcpState::TIME_WAIT)
     {
         _time_wait_ticks_remaining -= 1;
@@ -716,12 +817,26 @@ void TcpConnection::on_tick()
     _in_fast_recovery = false;
     _dup_ack_count = 0;
 
+    // Karn's second half - the part that is easy to miss and matters as much
+    // as ignoring the ambiguous sample. Having lost a segment, the estimator
+    // is now cut off from its own input: no unretransmitted segment is
+    // outstanding, so nothing can legitimately update SRTT/RTTVAR. Backing
+    // the timeout off exponentially is what covers that blind spot - if the
+    // path just got much slower, successive doublings will find its real
+    // scale without needing a sample to tell them so. The backed-off value
+    // then *persists* until an unambiguous sample arrives, rather than being
+    // recomputed from a now-stale estimator.
+    int rto_before = _rto_ticks;
+    _rto_ticks = std::min(_rto_ticks * 2, MAX_RTO_TICKS);
+
     LOG_DEBUG("TcpConnection[" << _id << "] retransmit timeout at seq=" << oldest.seq
               << " (attempt " << oldest.retransmit_attempts << "/" << MAX_RETRANSMIT_ATTEMPTS
-              << "), cwnd " << cwnd_before << " -> " << _cwnd);
+              << "), cwnd " << cwnd_before << " -> " << _cwnd
+              << ", rto " << rto_before << " -> " << _rto_ticks);
 
     _send_segment(_build_header(oldest.flags, oldest.seq), oldest.payload);
-    oldest.retransmit_ticks_remaining = RETRANSMIT_TIMEOUT_TICKS;
+    oldest.retransmitted = true; // no RTT sample may ever come from it now
+    oldest.retransmit_ticks_remaining = _rto_ticks;
 }
 
 void TcpConnection::send(const Bytes& data)
