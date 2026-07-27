@@ -833,3 +833,20 @@ TEST(ArpForAThirdPartyIsNeitherAnsweredNorLearned)
     test_assert(out.get_ethernet_protocol() == EtherType::ARP,
                 "the peer's MAC must not have been learned from third-party ARP - connect() should have to resolve it, emitting an ARP request rather than a SYN");
 }
+
+// A static ARP entry never ages out and is never replaced by anything learned
+// from the wire. Operationally it pins a peer that must not be spoofable; for
+// tests it takes address resolution out of the picture entirely.
+TEST(StaticArpEntryLetsConnectSkipResolutionEntirely)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    stack->add_static_arp_entry(PEER_IP, PEER_MAC);
+    stack->connect(PEER_IP, 80);
+
+    test_assert(channel->outbound_frames().size() == 1, "connect() should emit exactly one frame");
+    TcpView syn = view_tcp(channel->outbound_frames()[0]);
+    test_assert(syn.is_tcp && syn.syn,
+                "with the peer's MAC already known statically, connect() should send the SYN straight out rather than an ARP request first");
+}

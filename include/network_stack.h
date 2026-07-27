@@ -39,17 +39,25 @@
 //    retry is kicked off, then the datagram is flushed once the reply arrives
 //    (or dropped, fire-and-forget, if resolution gives up). bind_udp()'s
 //    socket can of course still send_to() any already-known peer immediately.
-//  - no IP fragmentation/reassembly - a fragmented packet (MF set, or a
-//    nonzero fragment offset) is detected and dropped with a log line, not
-//    silently mishandled; this stack's own TCP never produces a payload
-//    that would need fragmenting, so the only way one could arrive is a
-//    peer doing it, which nothing this project talks to does
-//  - no routing/forwarding at all, not a partial or simplified version of
-//    it - this stack has exactly one interface (the TAP device) and one L2
-//    segment. Routing means choosing a next-hop across *multiple*
-//    interfaces; with only one, there's nothing to choose between. Every
-//    packet must already be addressed to this stack's own IP and directly
-//    reachable on that one segment.
+//  - IP fragmentation is send-side only. An oversized outbound datagram (in
+//    practice only UDP; TCP is MSS-capped) is split per RFC 791 in
+//    _send_ip_packet. There is no receive-side reassembly: an inbound
+//    fragment (MF set, or a nonzero fragment offset) is detected and dropped
+//    with a log line rather than silently mishandled
+//  - no next-hop selection, and therefore no reaching anything off-link.
+//    _resolve_mac() ARPs for the destination address itself, so every
+//    destination is assumed to be on this segment; there is no subnet mask
+//    and no gateway. A connect() to an address beyond the local network
+//    would ARP for that address, hear nothing, and fail.
+//
+//    Note this is a real limitation, not an inapplicable one. An earlier
+//    version of this comment argued routing was meaningless with a single
+//    interface because there was "nothing to choose between" - that is
+//    wrong. Even with one interface there is a choice on every send: is the
+//    destination on-link (ARP for it) or off-link (ARP for the gateway)?
+//    That decision is a route lookup over a table that happens to be small.
+//    Forwarding is a separate, later thing: it is what happens when the
+//    lookup names a *different* interface than the packet arrived on.
 //
 // Passive-open (listen()/accept()) never needs to resolve a peer's MAC
 // itself - a peer's own ARP request for our IP already teaches us its
@@ -100,6 +108,17 @@ public:
     // the same port returns the same socket rather than creating a second
     // one bound to the same port.
     UdpSocket* bind_udp(uint16_t port);
+
+    // Installs a permanent IP->MAC mapping that never ages out and is never
+    // replaced by anything learned from the wire.
+    //
+    // Two uses. Operationally it pins a peer whose address is known and must
+    // not be spoofable, which is the standard defence against ARP poisoning on
+    // a segment you do not trust. For testing it removes ARP entirely from the
+    // picture: a test can state the mapping up front instead of driving a
+    // request/reply exchange first, which makes anything built on top of
+    // address resolution deterministic.
+    void add_static_arp_entry(const IPv4Address& ip, const MacAddress& mac);
 
     // Reads and processes every frame currently available on the TAP fd -
     // it's edge-triggered under epoll, so this must drain it - then reaps

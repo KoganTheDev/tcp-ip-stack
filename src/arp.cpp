@@ -38,6 +38,27 @@ void Arp::from_bytes(const Bytes& data)
     this->_hardware_address_length = data.slice_int<uint8_t>(4);
     this->_protocol_address_length = data.slice_int<uint8_t>(5);
     this->_operation = static_cast<ArpOperation>(data.slice_int<uint16_t>(6));
+
+    // Reject anything that is not Ethernet/IPv4 with the address lengths that
+    // implies. These four fields were parsed and then trusted, which meant the
+    // address slices below were taken at fixed offsets regardless of what the
+    // packet said its address sizes were - so a packet claiming, say, 16-byte
+    // protocol addresses was still read as though it carried 4-byte ones, and
+    // the mismatch silently became a learned ARP entry.
+    //
+    // This stack speaks exactly one ARP binding: Ethernet hardware addresses to
+    // IPv4 protocol addresses. Anything else is not a packet it can act on, so
+    // refusing it here is both the honest answer and the narrower attack
+    // surface - ARP is the protocol that believes whatever it is told, and the
+    // fixed fields are the one part that can be checked cheaply.
+    if (this->_hardware_type != ArpHardwareType::ETHERNET
+        || this->_protocol_type != ArpProtocolType::IPV4
+        || this->_hardware_address_length != 6
+        || this->_protocol_address_length != 4)
+    {
+        throw EXCEPTION(BaseException, "Unsupported ARP binding (not Ethernet/IPv4 with 6/4 address lengths)");
+    }
+
     this->_sender_hardware_address = data.slice(8, 6);
     this->_sender_protocol_address = data.slice(14, 4);
     this->_target_hardware_address = data.slice(18, 6);

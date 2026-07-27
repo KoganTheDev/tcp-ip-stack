@@ -187,6 +187,11 @@ void NetworkStack::_watch_for_close(TcpConnection& connection)
     });
 }
 
+void NetworkStack::add_static_arp_entry(const IPv4Address& ip, const MacAddress& mac)
+{
+    this->_arp_table.add_static(ip, mac);
+}
+
 void NetworkStack::poll()
 {
     while (true)

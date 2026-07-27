@@ -10,7 +10,7 @@ kernel actually does underneath them.
 
 ```mermaid
 graph TD
-    APP["Application<br/><i>epoll-server, or src/main.cpp</i>"]
+    APP["Application<br/><i>epoll-server</i>"]
     NS["NetworkStack<br/><i>identity, demux, connection table, TAP I/O</i>"]
     TCPC["TcpConnection<br/><i>the TCP state machine</i>"]
     UDPS["UdpSocket"]
@@ -92,9 +92,11 @@ These are documented decisions, not gaps that were missed:
 - **No SACK or timestamps.** A lost segment still stalls delivery until a retransmit
   fills the gap. RTT is sampled from the ack clock, so at most once per window rather
   than once per segment.
-- **No routing or forwarding.** Not a simplified version of it, but genuinely not
-  applicable: there is exactly one interface and one L2 segment, and routing means
-  choosing a next hop among several.
+- **No next-hop selection, so nothing off-link is reachable.** There is no subnet mask
+  and no gateway: sending ARPs for the destination address itself, so every destination
+  is assumed to be on this segment. Connecting to an address beyond the local network
+  fails. Forwarding is a separate, further step - that is what happens when a route
+  lookup names a different interface than the one a packet arrived on.
 - **No receive-side IP reassembly.** A fragmented inbound packet is detected and
   dropped with a log line, not silently mishandled.
 - **`TIME_WAIT` is a short fixed tick budget**, not a real 2\*MSL wait.
