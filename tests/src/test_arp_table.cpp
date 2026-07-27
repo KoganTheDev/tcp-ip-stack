@@ -94,3 +94,31 @@ TEST(ArpTableRemove)
     table.remove(IP_A);
     test_assert(!table.contains(IP_A), "a removed entry should be gone");
 }
+
+// The table is filled from ARP observed on the wire, so without a bound its
+// size is whatever a peer cares to make it by inventing sender IPs. Refusing
+// new entries when full (rather than evicting) is deliberate: every eviction
+// candidate is a mapping we are plausibly using, while the refused one is a
+// stranger - and entries age out on their own, so a full table drains.
+TEST(ArpTableRefusesNewEntriesOnceFull)
+{
+    ArpTable table(60);
+    const MacAddress MAC("11:22:33:44:55:66");
+
+    for (size_t i = 0; i < ArpTable::MAX_ENTRIES; i++)
+    {
+        // 10.<hi>.<lo>.1 - distinct for every i within the cap
+        std::string ip = "10." + std::to_string(i / 256) + "." + std::to_string(i % 256) + ".1";
+        test_assert(table.learn(IPv4Address(ip), MAC), "learning should succeed while there is room");
+    }
+    test_assert(table.size() == ArpTable::MAX_ENTRIES, "the table should now be exactly full");
+
+    test_assert(!table.learn(IPv4Address("172.16.0.1"), MAC), "a new mapping must be refused once the table is full");
+    test_assert(table.size() == ArpTable::MAX_ENTRIES, "a refused mapping must not grow the table");
+
+    // refreshing something already held replaces rather than adds, so it must
+    // still be allowed even when full - otherwise a busy peer's mapping would
+    // age out and could never be relearned
+    test_assert(table.learn(IPv4Address("10.0.0.1"), MAC), "refreshing an existing mapping must still be allowed when full");
+    test_assert(table.size() == ArpTable::MAX_ENTRIES, "refreshing must not change the table's size");
+}

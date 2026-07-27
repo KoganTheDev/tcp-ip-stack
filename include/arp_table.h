@@ -20,7 +20,12 @@ public:
 
     // Learn or refresh a dynamic mapping, (re)setting its TTL to the full
     // default. Overwrites a previous mapping for the same IP.
-    void learn(const IPv4Address& ip, const MacAddress& mac);
+    //
+    // Returns false if the mapping was refused because the table is full. A
+    // refusal is not an error the caller must handle - resolution simply falls
+    // back to sending an ARP request later - but it is worth logging, since a
+    // full table means either a very large segment or someone filling it.
+    bool learn(const IPv4Address& ip, const MacAddress& mac);
 
     // A permanent mapping that age_one_tick() never evicts.
     void add_static(const IPv4Address& ip, const MacAddress& mac);
@@ -54,4 +59,9 @@ private:
 
     std::unordered_map<IPv4Address, Entry> _entries;
     int _default_ttl_ticks;
+
+public:
+    // Far above any plausible single L2 segment, so a legitimate network never
+    // reaches it, while still bounding what an ARP flood can cost us.
+    static constexpr size_t MAX_ENTRIES = 1024;
 };

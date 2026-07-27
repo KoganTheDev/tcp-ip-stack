@@ -279,11 +279,48 @@ void NetworkStack::_reap_closed_connections()
     }
 }
 
+namespace
+{
+    // Is this frame's destination one we should look at? Either our own unicast
+    // address, or a group address - broadcast, or any multicast.
+    //
+    // Broadcast is really just the all-ones multicast address, so the group-bit
+    // test alone would cover it. Both are spelled out because that equivalence
+    // is not obvious, and because broadcast is the case that actually matters
+    // here (ARP requests arrive that way).
+    bool is_addressed_to_us(const MacAddress& dest, const MacAddress& local_mac)
+    {
+        if (dest == local_mac)
+        {
+            return true;
+        }
+        if (dest == MacAddress::BROADCAST)
+        {
+            return true;
+        }
+        // IEEE 802: the low bit of the first octet is the group/individual bit
+        return (dest.get_address()[0] & 0x01) != 0;
+    }
+}
+
 void NetworkStack::_handle_frame(const Bytes& frame)
 {
     try
     {
         Ethernet ethernet(frame);
+
+        // On a TAP device every frame that arrives really is for us, so this
+        // check never fires and the stack ran without it for a long time. On a
+        // shared segment it is what stops us acting on other hosts' traffic:
+        // without it a frame carrying our IP but someone else's MAC is answered
+        // (RST, ICMP port unreachable), and any IPv4 frame on the wire is fully
+        // parsed before the destination-IP test at the top of _handle_ip drops
+        // it. It is also needed on interfaces that do no hardware filtering of
+        // their own, such as veth and tap.
+        if (!is_addressed_to_us(ethernet.get_dest(), this->_local_mac))
+        {
+            return;
+        }
 
         if (ethernet.get_ethernet_protocol() == EtherType::ARP)
         {
@@ -309,13 +346,39 @@ void NetworkStack::_handle_frame(const Bytes& frame)
 
 void NetworkStack::_handle_arp(const Arp& arp)
 {
-    // learn the sender's mapping regardless of whether the request is for
-    // us - a passive-open connection never needs to send its own ARP
-    // request because of this (the peer's request for our IP already
-    // teaches us its mapping); an active-open connect() below is what
-    // actually needs to wait on this
+    // Act only on ARP that concerns us, meaning the target protocol address is
+    // our own IP. That single condition covers both cases the stack depends on:
+    //
+    //  - passive open: a peer's REQUEST for our IP targets us, and learning
+    //    from it is why an accepting connection never has to send its own ARP
+    //    request (the peer's question already taught us its mapping),
+    //  - active open: the REPLY to a request we sent targets us, which is what
+    //    connect() and a queued UDP send are waiting on.
+    //
+    // What it excludes is everything that is none of our business: requests and
+    // replies between other hosts, and gratuitous announcements (whose target
+    // is the sender's own IP). On a TAP device none of those ever arrive, so
+    // learning unconditionally was harmless there. On a shared segment it means
+    // the table fills with the whole network, any host can overwrite any
+    // mapping, and - worse - the side effects below fire on traffic we had no
+    // part in, cancelling our own in-flight retries and releasing queued sends
+    // against a mapping we never asked for.
+    //
+    // Deliberately given up: gratuitous ARP no longer refreshes an entry (it
+    // ages out and we re-resolve), and we no longer pre-populate the table by
+    // snooping. Neither was ever load-bearing. RFC 5227 address-defence probes
+    // still work, since a probe carries sender 0.0.0.0 but targets our IP.
+    if (!(arp.get_target_protocol_address() == this->_local_ip))
+    {
+        return;
+    }
+
     IPv4Address sender_ip = arp.get_sender_protocol_address();
-    this->_arp_table.learn(sender_ip, arp.get_sender_hardware_address());
+    if (!this->_arp_table.learn(sender_ip, arp.get_sender_hardware_address()))
+    {
+        LOG_WARNING("NetworkStack: ARP table full (" << ArpTable::MAX_ENTRIES
+                    << " entries), refusing to learn " << sender_ip.to_string());
+    }
 
     this->_arp_requests_in_flight.erase(sender_ip);
 
@@ -335,9 +398,9 @@ void NetworkStack::_handle_arp(const Arp& arp)
 
     this->_flush_pending_outbound_datagrams(sender_ip);
 
-    bool is_request_for_us = arp.get_operation() == ArpOperation::REQUEST
-        && arp.get_target_protocol_address() == this->_local_ip;
-    if (!is_request_for_us)
+    // the target was already confirmed to be us above, so only a REQUEST is
+    // left to distinguish - a REPLY needs no answer
+    if (arp.get_operation() != ArpOperation::REQUEST)
     {
         return;
     }

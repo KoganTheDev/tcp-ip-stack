@@ -752,3 +752,84 @@ TEST(AcceptSkipsStaleQueueEntriesAndReturnsTheReadyConnection)
     test_assert(accepted != nullptr, "accept() must skip the stale key and return the connection queued behind it, not report nothing pending");
     test_assert(accepted->get_state() == TcpState::ESTABLISHED, "the returned connection should be the live, established one");
 }
+
+// --- inbound filtering: what makes this stack safe on a shared segment ---
+//
+// On a TAP device every frame that arrives is genuinely for us, so none of
+// these checks ever fire and the stack ran without them for a long time. On a
+// real NIC they are what stop it acting on other hosts' traffic.
+
+// A frame carrying our IP but addressed to somebody else's MAC must be ignored
+// outright. Without the check it is fully parsed and answered - here it would
+// draw a SYN-ACK, and a segment matching no connection would draw a RST.
+TEST(FrameAddressedToAnotherHostsMacIsIgnored)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    stack->listen(80);
+
+    // Teach the stack the peer's MAC first. Without this the test would pass
+    // even with no L2 filter at all, but for the wrong reason: replying to the
+    // SYN needs the peer's MAC, so _resolve_mac would throw and no SYN-ACK
+    // could be emitted regardless of whether the frame was filtered.
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+    channel->clear_outbound(); // discard the ARP reply that produced
+
+    Bytes frame = build_tcp(FLAG_SYN, 1000, 0, 40000, 80);
+    // rewrite the destination MAC (the first 6 bytes of the frame) to a host
+    // that is not us, leaving everything else - including our IP - untouched
+    const MacAddress OTHER_MAC("de:ad:be:ef:00:01");
+    for (size_t i = 0; i < 6; i++)
+    {
+        frame[i] = OTHER_MAC.get_address()[i];
+    }
+
+    channel->push_inbound(frame);
+    stack->poll();
+
+    test_assert(channel->outbound_frames().empty(),
+                "a frame addressed to another host's MAC must be dropped at L2, not parsed and answered");
+    test_assert(stack->accept(80) == nullptr, "no connection should have been created");
+}
+
+// Multicast and broadcast still have to get through - ARP requests arrive that
+// way, and dropping them would break passive open entirely.
+TEST(BroadcastFrameIsStillAccepted)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    channel->push_inbound(build_arp_request()); // sent to ff:ff:ff:ff:ff:ff
+    stack->poll();
+
+    test_assert(!channel->outbound_frames().empty(),
+                "a broadcast ARP request for our IP must still be answered - the L2 filter must accept group addresses");
+}
+
+// ARP that does not target our IP is somebody else's conversation. Acting on it
+// lets any host on the segment populate our table, overwrite mappings we are
+// using, and cancel our own in-flight resolution retries.
+TEST(ArpForAThirdPartyIsNeitherAnsweredNorLearned)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    // a broadcast ARP request from PEER, asking about some other host entirely
+    Ethernet eth(PEER_MAC, MacAddress::BROADCAST, EtherType::ARP);
+    eth /= std::make_unique<Arp>(PEER_MAC, PEER_IP, IPv4Address("10.0.0.99"));
+    channel->push_inbound(eth.to_bytes());
+    stack->poll();
+
+    test_assert(channel->outbound_frames().empty(), "an ARP request that does not target our IP must not be answered");
+
+    // and it must not have taught us PEER's mapping either. Proof: connecting
+    // to PEER now has to resolve its MAC first, so the stack emits an ARP
+    // request rather than going straight to a SYN.
+    stack->connect(PEER_IP, 9999);
+    test_assert(channel->outbound_frames().size() == 1, "connect() to an unresolved peer should emit exactly one frame");
+
+    Ethernet out(channel->outbound_frames()[0]);
+    test_assert(out.get_ethernet_protocol() == EtherType::ARP,
+                "the peer's MAC must not have been learned from third-party ARP - connect() should have to resolve it, emitting an ARP request rather than a SYN");
+}
