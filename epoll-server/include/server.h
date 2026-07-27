@@ -3,8 +3,6 @@
 #include <cstdint>
 #include <csignal>
 #include <unordered_map>
-#include <unordered_set>
-#include <deque>
 
 #include "network_stack.h"
 #include "channel_factory.h"
@@ -86,6 +84,33 @@ private:
     ThreadPool _thread_pool;
     int _timer_fd;
 
-    std::unordered_set<uint64_t> _connections_busy;
-    std::unordered_map<uint64_t, std::deque<Bytes>> _pending_chunks;
+    // One entry per connection with work outstanding. Previously this was two
+    // containers - a busy set and a map of pending chunks - which could
+    // disagree: an exception anywhere between marking a connection busy and
+    // applying its response left the id in the set forever, so every later byte
+    // was queued and never dispatched, on a connection that still acked but had
+    // silently stopped answering. One object cannot disagree with itself, and
+    // there is exactly one place it is erased.
+    struct ConnectionWork
+    {
+        bool in_flight = false;
+        // Coalesced rather than a queue of chunks. The queue only ever existed
+        // to preserve arrival order, which concatenation preserves just as well
+        // while keeping the object count flat and the size trivially checkable.
+        Bytes pending;
+    };
+
+    std::unordered_map<uint64_t, ConnectionWork> _work;
+
+    // Cap on bytes queued for one connection. Needed because TcpConnection
+    // counts a byte as delivered the moment it invokes the data callback, so
+    // its receive window reopens as soon as the byte lands here - meaning the
+    // stack's own flow control bounds nothing once this class is the consumer,
+    // and a peer that outruns the thread pool grows this without limit.
+    //
+    // The honest fix is backpressure: stop delivering, so the advertised window
+    // genuinely shrinks. That needs a pause-reads hook TcpConnection does not
+    // have. Until then, exceeding the cap closes the connection rather than
+    // growing forever or silently discarding data the stack has already acked.
+    static constexpr size_t MAX_PENDING_BYTES = 256 * 1024;
 };

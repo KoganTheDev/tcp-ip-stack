@@ -1,5 +1,6 @@
 #include "server.h"
 #include "exceptions.h"
+#include "logger.h"
 
 #include <sys/timerfd.h>
 #include <unistd.h>
@@ -126,12 +127,27 @@ void Server::_handle_new_connections()
 
 void Server::_enqueue_or_dispatch(uint64_t connection_id, const Bytes& data)
 {
-    if (this->_connections_busy.count(connection_id) > 0)
+    ConnectionWork& work = this->_work[connection_id];
+
+    if (work.in_flight)
     {
-        // something for this connection is already in flight - queue this
+        // something for this connection is already in the pool - append this
         // chunk instead of dispatching it now, so responses can never be
         // applied out of the order their data arrived in
-        this->_pending_chunks[connection_id].push_back(data);
+        if (work.pending.size() + data.size() > MAX_PENDING_BYTES)
+        {
+            LOG_WARNING("Server: connection " << connection_id << " queued more than "
+                        << MAX_PENDING_BYTES << " bytes waiting on the thread pool - closing it."
+                        << " The peer is outrunning processing and this class cannot exert"
+                        << " backpressure through the stack's receive window.");
+            if (TcpConnection* connection = this->_network_stack.find_connection(connection_id))
+            {
+                connection->close();
+            }
+            this->_work.erase(connection_id);
+            return;
+        }
+        work.pending |= data;
         return;
     }
 
@@ -140,7 +156,7 @@ void Server::_enqueue_or_dispatch(uint64_t connection_id, const Bytes& data)
 
 void Server::_dispatch_chunk(uint64_t connection_id, const Bytes& data)
 {
-    this->_connections_busy.insert(connection_id);
+    this->_work[connection_id].in_flight = true;
 
     // The "work" (a plain echo here, but this is the seam where real
     // per-connection processing would go) runs on a worker thread; the
@@ -148,7 +164,21 @@ void Server::_dispatch_chunk(uint64_t connection_id, const Bytes& data)
     // queue, since NetworkStack/TcpConnection are only safe to touch there.
     this->_thread_pool.submit([this, connection_id, data]()
     {
-        Bytes response = data;
+        Bytes response;
+        try
+        {
+            response = data;
+        }
+        catch (const std::exception& e)
+        {
+            // The completion MUST still be pushed. It is what clears in_flight
+            // and dispatches whatever queued up behind this chunk, so failing
+            // to push it wedges the connection permanently - every later byte
+            // queued and never dispatched, on a connection that keeps acking.
+            // An empty response is a bad answer; no response is a stuck one.
+            LOG_ERROR("Server: work for connection " << connection_id << " failed: " << e.what());
+        }
+
         this->_completion_queue.push([this, connection_id, response]()
         {
             this->_apply_response(connection_id, response);
@@ -162,7 +192,17 @@ void Server::_apply_response(uint64_t connection_id, const Bytes& response)
     // find_connection() safely returns nullptr if NetworkStack already
     // reaped this connection (e.g. the peer sent RST) instead of dangling.
     TcpConnection* connection = this->_network_stack.find_connection(connection_id);
-    if (connection != nullptr)
+    if (connection == nullptr)
+    {
+        // Reaped while this was in the pool (the peer sent RST, say). Drop the
+        // whole entry rather than falling through: dispatching what queued up
+        // behind it would round-trip every chunk through a worker only for the
+        // next completion to discard it again.
+        this->_work.erase(connection_id);
+        return;
+    }
+
+    try
     {
         connection->send(response);
 
@@ -175,16 +215,27 @@ void Server::_apply_response(uint64_t connection_id, const Bytes& response)
             connection->close();
         }
     }
-
-    auto pending_it = this->_pending_chunks.find(connection_id);
-    if (pending_it != this->_pending_chunks.end() && !pending_it->second.empty())
+    catch (const std::exception& e)
     {
-        Bytes next_chunk = std::move(pending_it->second.front());
-        pending_it->second.pop_front();
+        // Same reasoning as the worker's catch: whatever went wrong sending,
+        // the bookkeeping below still has to run or the connection is wedged.
+        LOG_ERROR("Server: sending the response for connection " << connection_id
+                  << " failed: " << e.what());
+    }
+
+    auto work_it = this->_work.find(connection_id);
+    if (work_it == this->_work.end())
+    {
+        return; // closed for exceeding MAX_PENDING_BYTES while this was in flight
+    }
+
+    if (!work_it->second.pending.empty())
+    {
+        Bytes next_chunk;
+        next_chunk.swap(work_it->second.pending);
         this->_dispatch_chunk(connection_id, next_chunk);
         return;
     }
 
-    this->_pending_chunks.erase(connection_id);
-    this->_connections_busy.erase(connection_id);
+    this->_work.erase(work_it);
 }
