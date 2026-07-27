@@ -850,3 +850,39 @@ TEST(StaticArpEntryLetsConnectSkipResolutionEntirely)
     test_assert(syn.is_tcp && syn.syn,
                 "with the peer's MAC already known statically, connect() should send the SYN straight out rather than an ARP request first");
 }
+
+// poll() used to drain unconditionally, so a peer sending faster than the stack
+// processes could keep it from returning at all - starving everything else the
+// caller multiplexes, the retransmit timer most importantly. It now stops on a
+// frame budget and reports that it did, and the caller is required to come back
+// because the fd is edge-triggered and will not notify again for queued frames.
+TEST(PollStopsOnItsBudgetAndReportsThatFramesRemain)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    // one more frame than a single poll() will take
+    const int total = NetworkStack::POLL_FRAME_BUDGET + 5;
+    for (int i = 0; i < total; i++)
+    {
+        channel->push_inbound(build_arp_request());
+    }
+
+    test_assert(stack->poll() == false, "poll() must report false when it stopped on the budget with frames still queued");
+    test_assert(static_cast<int>(channel->outbound_frames().size()) == NetworkStack::POLL_FRAME_BUDGET,
+                "exactly the budgeted number of frames should have been processed in the first pass");
+
+    test_assert(stack->poll() == true, "a second poll() should drain the remainder and report the channel empty");
+    test_assert(static_cast<int>(channel->outbound_frames().size()) == total,
+                "every queued frame should be processed once the caller comes back");
+}
+
+TEST(PollReportsDrainedWhenItEmptiesTheChannel)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    channel->push_inbound(build_arp_request());
+    test_assert(stack->poll() == true, "poll() must report true when it emptied the channel - the common case");
+    test_assert(stack->poll() == true, "polling an already-empty channel must also report drained");
+}

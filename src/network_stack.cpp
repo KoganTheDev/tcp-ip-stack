@@ -192,10 +192,22 @@ void NetworkStack::add_static_arp_entry(const IPv4Address& ip, const MacAddress&
     this->_arp_table.add_static(ip, mac);
 }
 
-void NetworkStack::poll()
+bool NetworkStack::poll()
 {
-    while (true)
+    bool fully_drained = true;
+
+    for (int processed = 0; ; processed++)
     {
+        if (processed >= POLL_FRAME_BUDGET)
+        {
+            // Frames may still be queued. Say so rather than looping, so the
+            // caller can service its timer and completion work before coming
+            // back - and it must come back, since an edge-triggered fd will
+            // not notify again for what is already waiting.
+            fully_drained = false;
+            break;
+        }
+
         Bytes frame = this->_channel->read(2048);
         if (frame.empty())
         {
@@ -205,6 +217,7 @@ void NetworkStack::poll()
     }
 
     this->_reap_closed_connections();
+    return fully_drained;
 }
 
 void NetworkStack::on_timer_tick()

@@ -120,10 +120,28 @@ public:
     // address resolution deterministic.
     void add_static_arp_entry(const IPv4Address& ip, const MacAddress& mac);
 
-    // Reads and processes every frame currently available on the TAP fd -
-    // it's edge-triggered under epoll, so this must drain it - then reaps
-    // any connection that finished closing.
-    void poll();
+    // Reads and processes frames waiting on the channel, then reaps any
+    // connection that finished closing.
+    //
+    // Returns true when the channel was fully drained, false when it stopped
+    // early on POLL_FRAME_BUDGET. The caller MUST act on false by calling
+    // poll() again before it goes back to waiting for readiness: the fd is
+    // edge-triggered, so there will be no second notification for frames that
+    // are already queued, and treating false as "done" stalls the stack until
+    // some unrelated frame happens to arrive.
+    //
+    // The budget exists because this used to drain unconditionally. A peer
+    // sending faster than the stack processes could keep this function from
+    // returning, and everything else the caller multiplexes - the retransmit
+    // timer above all - got no service in the meantime. Retransmissions being
+    // late is precisely the wrong failure under load, since load is when they
+    // matter.
+    bool poll();
+
+    // Frames processed per poll() call before returning to let the caller
+    // service its other work. Large enough that the common case drains in one
+    // pass, small enough to bound how long the timer can be starved.
+    static constexpr int POLL_FRAME_BUDGET = 64;
 
     // Drives every open connection's retransmission timer. Call this once
     // per NetworkStack-level timer tick (a timerfd in the caller).

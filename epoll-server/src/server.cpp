@@ -85,15 +85,24 @@ void Server::_create_retransmit_timer()
 
 void Server::run(const volatile std::sig_atomic_t& stop_flag)
 {
+    // Set when poll() stopped on its frame budget with frames still queued. The
+    // stack's fd is edge-triggered, so there will be no further notification
+    // for those - blocking in epoll_wait would strand them. Instead the next
+    // wait uses a zero timeout, which services any other ready fd and returns
+    // immediately so the drain can continue.
+    bool stack_has_more_frames = false;
+
     while (!stop_flag)
     {
-        std::vector<epoll_event> events = this->_epoll.wait();
+        std::vector<epoll_event> events = this->_epoll.wait(stack_has_more_frames ? 0 : -1);
 
+        bool polled_this_round = false;
         for (const epoll_event& event : events)
         {
             if (event.data.fd == this->_network_stack.get_fd())
             {
-                this->_network_stack.poll();
+                stack_has_more_frames = !this->_network_stack.poll();
+                polled_this_round = true;
                 this->_handle_new_connections();
             }
             else if (event.data.fd == this->_timer_fd)
@@ -109,6 +118,16 @@ void Server::run(const volatile std::sig_atomic_t& stop_flag)
             {
                 this->_completion_queue.drain_and_run();
             }
+        }
+
+        // A zero-timeout wait can legitimately return no events at all - the
+        // other fds simply were not ready. The pending frames still have to be
+        // collected, or the loop spins on epoll_wait forever without ever
+        // draining them.
+        if (stack_has_more_frames && !polled_this_round)
+        {
+            stack_has_more_frames = !this->_network_stack.poll();
+            this->_handle_new_connections();
         }
     }
 }
