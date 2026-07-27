@@ -26,6 +26,41 @@ Server::Server(uint16_t port, size_t worker_count, OpenedChannel opened, const I
     this->_create_retransmit_timer();
 }
 
+Server::~Server()
+{
+    // Order here is the whole point, and each step depends on the previous one.
+    //
+    // 1. Join the workers first. ~ThreadPool would do this eventually, but only
+    //    after _connections_busy and _pending_chunks have already been
+    //    destroyed - they are declared below it, so they die first - while
+    //    workers are still running queued tasks that capture `this`. Today
+    //    those tasks touch nothing else and get away with it; the moment real
+    //    per-connection work goes in that lambda it is a use-after-free.
+    //
+    // 2. Then drain the completion queue, once, on this thread. Every task the
+    //    workers just finished pushed a response onto it, and nothing else will
+    //    ever look at it again: run() has returned, and ~CompletionQueue only
+    //    closes its eventfd - the queued closures would simply be destroyed
+    //    unrun. That silently dropped already-computed responses on every
+    //    shutdown with traffic in flight. Safe to do here because every member
+    //    it touches (_network_stack included) is still alive until this body
+    //    returns.
+    this->_thread_pool.shutdown();
+    this->_completion_queue.drain_and_run();
+
+    if (this->_timer_fd >= 0)
+    {
+        close(this->_timer_fd);
+        this->_timer_fd = -1;
+    }
+
+    // Note what this still does NOT do: send a FIN to every live connection.
+    // A genuinely graceful close would walk the connection table, close() each
+    // one, and keep polling until they drain - which needs an iteration API
+    // NetworkStack does not expose. Peers currently see the connection stop
+    // rather than close.
+}
+
 void Server::_create_retransmit_timer()
 {
     this->_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);

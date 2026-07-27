@@ -12,6 +12,11 @@ ThreadPool::ThreadPool(size_t worker_count)
 
 ThreadPool::~ThreadPool()
 {
+    this->shutdown();
+}
+
+void ThreadPool::shutdown()
+{
     // Set the stop flag AND signal under the lock. Setting _stopping without
     // it is a lost-wakeup: a worker sitting between "checked the predicate,
     // saw no reason to wake" and "actually blocked in wait()" is still holding
@@ -24,6 +29,9 @@ ThreadPool::~ThreadPool()
         this->_condition.notify_all();
     }
 
+    // join() is skipped for an already-joined thread, so calling shutdown()
+    // twice (explicitly, then again from the destructor) is a no-op the
+    // second time round
     for (std::thread& worker : this->_workers)
     {
         if (worker.joinable())

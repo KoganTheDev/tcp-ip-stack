@@ -42,6 +42,10 @@ public:
     // what this has always used) or an AF_PACKET socket on a real NIC.
     Server(uint16_t port, size_t worker_count, const ChannelOptions& channel_options);
 
+    // Stops the workers and applies whatever they already computed, before any
+    // member of this object starts being destroyed. See the definition.
+    ~Server();
+
     // Loops until stop_flag is set from a signal handler - a volatile
     // sig_atomic_t is the only shared state a signal handler may touch safely.
     void run(const volatile std::sig_atomic_t& stop_flag);
@@ -68,11 +72,16 @@ private:
     uint16_t _port;
     NetworkStack _network_stack;
     EpollWrapper _epoll;
-    // Declaration order matters for destruction: members are destroyed in
-    // reverse, so _thread_pool must come AFTER _completion_queue here. That way
-    // ~ThreadPool (which stops and joins every worker) runs BEFORE
-    // ~CompletionQueue - a worker's task calls _completion_queue.push(), so
-    // destroying the queue while workers are still alive is a use-after-free.
+    // Declaration order still matters for destruction (members are destroyed in
+    // reverse, so _thread_pool must come after _completion_queue - a worker's
+    // task calls _completion_queue.push(), and destroying the queue while
+    // workers are alive is a use-after-free). But ordering alone was never
+    // enough: _connections_busy and _pending_chunks are declared *below*
+    // _thread_pool and so are destroyed *before* it joins, while workers are
+    // still draining queued tasks that capture `this`. ~Server now joins the
+    // pool explicitly before any of that happens, which makes the invariant
+    // "no worker runs once this object starts being destroyed" a statement in
+    // code rather than a property of the declaration order below.
     CompletionQueue _completion_queue;
     ThreadPool _thread_pool;
     int _timer_fd;

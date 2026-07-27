@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <typeinfo>
 #include <unistd.h>
 
 #include "server.h"
@@ -197,6 +198,24 @@ int main(int argc, char** argv)
     {
         LOG_ERROR(e.what());
         LOG_ERROR("Exception from " << e.position());
+        return -1;
+    }
+    // Anything else escaping the reactor would otherwise call std::terminate,
+    // which aborts with no message beyond "terminate called" and without
+    // running ~Server. std::bad_alloc under load is the realistic case, and
+    // that failure mode is invisible to both AddressSanitizer (a legitimately
+    // thrown, uncaught exception is not a memory error) and Helgrind (it is
+    // not a data race) - so an abort here looks exactly like the rare,
+    // unreproducible crash this project has been chasing. Naming it is the
+    // whole point of these two arms.
+    catch (const std::exception& e)
+    {
+        LOG_ERROR("Unhandled " << typeid(e).name() << " escaped the reactor: " << e.what());
+        return -1;
+    }
+    catch (...)
+    {
+        LOG_ERROR("Unhandled non-std exception escaped the reactor");
         return -1;
     }
 }

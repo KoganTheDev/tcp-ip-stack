@@ -19,6 +19,15 @@ public:
 
     void submit(std::function<void()> task);
 
+    // Stops accepting work, lets the workers drain whatever is already queued,
+    // and joins them. Idempotent, and called by the destructor - so an owner
+    // that needs the workers provably stopped *before* its own members start
+    // being destroyed can call it explicitly first. That is not a theoretical
+    // concern: worker tasks capture their owner, so anything they touch has to
+    // outlive the join, and member destruction order alone is a fragile way to
+    // guarantee that.
+    void shutdown();
+
 private:
     void _worker_loop();
 
