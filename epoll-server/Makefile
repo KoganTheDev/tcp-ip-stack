@@ -13,7 +13,7 @@ LOCAL_SOURCES = epoll_wrapper.cpp thread_pool.cpp completion_queue.cpp server.cp
 STACK_SOURCES = exceptions.cpp bytes.cpp utils.cpp network_addresses.cpp \
                 protocol_layer.cpp raw.cpp ethernet.cpp arp.cpp arp_table.cpp ip.cpp tcp.cpp udp.cpp icmp.cpp \
                 tcp_connection.cpp udp_socket.cpp tun_wrapper.cpp system_network_object.cpp network_stack.cpp \
-                raw_packet_channel.cpp channel_factory.cpp logger.cpp
+                raw_packet_channel.cpp channel_factory.cpp interface_config.cpp route_table.cpp logger.cpp
 
 SOURCES = $(LOCAL_SOURCES) $(STACK_SOURCES)
 OBJ = $(addprefix bin/,$(SOURCES:.cpp=.o))

@@ -886,3 +886,113 @@ TEST(PollReportsDrainedWhenItEmptiesTheChannel)
     test_assert(stack->poll() == true, "poll() must report true when it emptied the channel - the common case");
     test_assert(stack->poll() == true, "polling an already-empty channel must also report drained");
 }
+
+// --- next-hop routing: reaching beyond the local segment ---
+//
+// Before this, sending meant ARPing for the destination address itself, which
+// only ever works if the destination is a neighbour. A connection to anything
+// off-link would broadcast a request nobody could answer and time out.
+
+namespace
+{
+    // The peer network plus a gateway on it, which is what makes anything
+    // outside 10.0.0.0/24 reachable at all.
+    std::unique_ptr<NetworkStack> make_routed_stack(FakePacketChannel*& out_channel)
+    {
+        auto channel = std::make_unique<FakePacketChannel>();
+        out_channel = channel.get();
+
+        InterfaceConfig config;
+        config.mac = LOCAL_MAC;
+        config.ip = LOCAL_IP;            // 10.0.0.2
+        config.prefix_length = 24;
+        config.gateway = PEER_IP;        // 10.0.0.1 acts as the router
+        return std::make_unique<NetworkStack>(std::move(channel), config);
+    }
+}
+
+TEST(ConnectingOffLinkResolvesTheGatewayNotTheDestination)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_routed_stack(channel);
+
+    stack->connect(IPv4Address("8.8.8.8"), 443);
+
+    test_assert(channel->outbound_frames().size() == 1, "connect() to an unresolved next hop should emit one ARP request");
+    ArpView arp = view_arp(channel->outbound_frames()[0]);
+    test_assert(arp.is_arp && arp.op == ArpOperation::REQUEST, "it should be an ARP request");
+    test_assert(arp.target_ip == PEER_IP.to_string(),
+                "the request must ask for the GATEWAY's MAC. Asking for 8.8.8.8 is the old behaviour and can never be answered - no host on this segment owns it");
+}
+
+TEST(GatewayArpReplyReleasesTheOffLinkConnection)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_routed_stack(channel);
+
+    stack->connect(IPv4Address("8.8.8.8"), 443);
+    channel->clear_outbound();
+
+    // the gateway answers; that reply carries the gateway's address, which is
+    // why the pending connection has to be queued under the next hop
+    channel->push_inbound(build_arp_reply());
+    stack->poll();
+
+    TcpView syn = find_tcp(channel->outbound_frames());
+    test_assert(syn.is_tcp && syn.syn, "the gateway's ARP reply should release the queued SYN");
+    test_assert(syn.dest_port == 443, "the SYN should be addressed to the original destination's port");
+
+    // and the frame must be addressed to the gateway's MAC while the IP header
+    // still names the real destination
+    Ethernet eth(channel->outbound_frames()[0]);
+    test_assert(eth.get_dest() == PEER_MAC, "the frame goes to the gateway's MAC");
+    const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
+    test_assert(ip != nullptr && IPv4Address(ip->get_dest_address()) == IPv4Address("8.8.8.8"),
+                "the IP header must still name 8.8.8.8 - the L3 destination and the L2 destination are different things");
+}
+
+TEST(OnLinkDestinationsStillResolveThemselvesWithAGatewayPresent)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_routed_stack(channel);
+
+    stack->connect(IPv4Address("10.0.0.55"), 80);
+
+    ArpView arp = view_arp(channel->outbound_frames()[0]);
+    test_assert(arp.is_arp && arp.target_ip == "10.0.0.55",
+                "a neighbour must still be resolved directly - the default route must not swallow on-link traffic");
+}
+
+TEST(BroadcastIsSentWithoutResolutionAndAcceptedInbound)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_routed_stack(channel);
+
+    // outbound: no ARP, straight to the broadcast MAC
+    UdpSocket* socket = stack->bind_udp(68);
+    socket->send_to(IPv4Address("255.255.255.255"), 67, Bytes::from_hex("abcd"));
+
+    test_assert(channel->outbound_frames().size() == 1, "a broadcast datagram should go straight out, with no ARP request first");
+    Ethernet eth(channel->outbound_frames()[0]);
+    test_assert(eth.get_dest() == MacAddress::BROADCAST, "it must be addressed to the broadcast MAC");
+
+    // inbound: a broadcast datagram is not addressed to our IP, and must be
+    // accepted anyway or a host could never be reached before it has an address
+    std::vector<Bytes> received;
+    socket->set_datagram_received_callback(
+        [&received](const IPv4Address&, uint16_t, const Bytes& data) { received.push_back(data); });
+
+    Bytes frame = build_udp(67, 68, Bytes::from_hex("beef"));
+    // rewrite the IP destination (bytes 30-33 of the frame) to the broadcast
+    for (int i = 0; i < 4; i++) { frame[30 + i] = 0xFF; }
+    // and recompute the IP header checksum over the modified header
+    frame[24] = 0; frame[25] = 0;
+    Bytes header = frame.slice(14, 20);
+    Bytes cs = int_to_bytes<uint16_t>(internet_checksum(header));
+    frame[24] = cs[0]; frame[25] = cs[1];
+
+    channel->push_inbound(frame);
+    stack->poll();
+
+    test_assert(received.size() == 1, "a broadcast datagram must be accepted even though it is not addressed to our own IP");
+}

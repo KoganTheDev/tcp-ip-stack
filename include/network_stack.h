@@ -10,6 +10,8 @@
 #include "tun_wrapper.h"
 #include "packet_channel.h"
 #include "arp_table.h"
+#include "interface_config.h"
+#include "route_table.h"
 #include "network_addresses.h"
 #include "ethernet.h"
 #include "arp.h"
@@ -74,7 +76,29 @@ public:
     // real TAP device, so a fake can feed frames in and capture what goes out
     // with no OS involved. The string constructor above delegates here after
     // building and starting a TunWrapper.
+    //
+    // The mac/ip overload is a convenience that builds an InterfaceConfig with
+    // a /24 and no gateway - the behaviour this stack had before it could route
+    // at all, kept so callers that genuinely only have one segment need not
+    // think about prefixes.
     NetworkStack(std::unique_ptr<PacketChannel> channel, const MacAddress& local_mac, const IPv4Address& local_ip);
+    NetworkStack(std::unique_ptr<PacketChannel> channel, const InterfaceConfig& config);
+
+    // Replaces this interface's addressing and rebuilds the routes derived from
+    // it: a connected route for the local network, and a default route through
+    // the gateway if there is one.
+    //
+    // Reconfigurable at runtime on purpose. An address is not a property fixed
+    // when the object was built - it can be replaced, and it can legitimately
+    // be absent to begin with, which is the state an address-configuration
+    // protocol has to operate from before it has anything to configure.
+    void configure_interface(const InterfaceConfig& config);
+    const InterfaceConfig& interface_config() const { return _config; }
+
+    // Routes beyond the two derived from the interface. Use this for a route
+    // to a network reachable through some router other than the default.
+    void add_route(const IPv4Address& destination, uint8_t prefix_length, const IPv4Address& next_hop);
+    const RouteTable& routes() const { return _routes; }
 
     int get_fd() const;
 
@@ -205,6 +229,11 @@ private:
     // that sent it and fail it fast, instead of leaving it to grind through
     // the full retransmit-timeout budget before giving up.
     void _handle_icmp_error(const Icmp& icmp);
+    // The address to actually resolve to a MAC for a packet aimed at
+    // destination. The same address for an on-link destination, the gateway for
+    // anything else - the distinction between the address in the IP header and
+    // the address the frame is sent to.
+    IPv4Address _next_hop_for(const IPv4Address& destination) const;
     MacAddress _resolve_mac(const IPv4Address& ip) const;
 
     uint16_t _allocate_ephemeral_port();
@@ -216,8 +245,11 @@ private:
     void _fail_pending_outbound_connects(const IPv4Address& ip);
 
     std::unique_ptr<PacketChannel> _channel;
-    MacAddress _local_mac;
-    IPv4Address _local_ip;
+    InterfaceConfig _config;
+    // Derived from _config by configure_interface(), plus anything added
+    // explicitly via add_route(). Consulted on every send to decide which
+    // address to resolve to a MAC.
+    RouteTable _routes;
     uint16_t _next_ephemeral_port;
     uint16_t _next_ip_id; // identification stamped on a fragmented packet's fragments
 
@@ -255,6 +287,11 @@ private:
     // its pending SYNs under.
     struct PendingDatagram
     {
+        // The datagram's real destination, which is NOT the key this is stored
+        // under. The map is keyed by next hop, because that is whose ARP reply
+        // releases it - but the packet still has to be addressed to where it
+        // was actually going.
+        IPv4Address destination;
         uint16_t src_port;
         uint16_t dest_port;
         Bytes payload;

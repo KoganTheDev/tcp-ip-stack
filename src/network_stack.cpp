@@ -13,19 +13,16 @@ namespace
     constexpr int ARP_RETRY_TICKS = 4; // with a 500ms NetworkStack tick, ~2s between retries
     constexpr int ARP_ENTRY_TTL_TICKS = 120; // ~60s at a 500ms tick - a learned mapping's lifetime while the peer stays silent
 
-    // Most IP payload that fits one frame: the TAP device's 1500-byte Ethernet
-    // MTU minus a 20-byte IP header. A multiple of 8, as a non-last fragment's
-    // payload must be (the fragment offset field counts 8-byte units).
-    constexpr size_t MAX_IP_FRAGMENT_PAYLOAD = 1480;
-
     constexpr uint8_t FLAG_ACK = 0x10;
     constexpr uint8_t FLAG_RST = 0x04;
     constexpr uint8_t FLAG_SYN = 0x02;
     constexpr uint8_t FLAG_FIN = 0x01;
 
-    // 1500 (the TAP device's Ethernet MTU) minus 20 bytes of IP header and
-    // 20 of TCP header - what this stack advertises in its own MSS option.
-    constexpr uint16_t LOCAL_MSS = 1460;
+    // The MSS this stack advertises and the point at which a datagram has to
+    // be fragmented both come from InterfaceConfig now - see local_mss() and
+    // max_ip_payload() there. They were fixed at the 1500 an Ethernet TAP
+    // device happens to have, which quietly made that number a property of the
+    // stack rather than of the interface it was running over.
 }
 
 bool NetworkStack::ConnectionKey::operator==(const ConnectionKey& other) const
@@ -63,10 +60,67 @@ NetworkStack::NetworkStack(const std::string& tap_device_path, const MacAddress&
 {
 }
 
+namespace
+{
+    // The addressing this stack had before it could route: an address, and an
+    // assumption that everything is on the same /24 with no way out of it.
+    InterfaceConfig single_segment_config(const MacAddress& mac, const IPv4Address& ip)
+    {
+        InterfaceConfig config;
+        config.mac = mac;
+        config.ip = ip;
+        config.prefix_length = 24;
+        return config;
+    }
+}
+
 NetworkStack::NetworkStack(std::unique_ptr<PacketChannel> channel, const MacAddress& local_mac, const IPv4Address& local_ip)
-    : _channel(std::move(channel)), _local_mac(local_mac), _local_ip(local_ip),
+    : NetworkStack(std::move(channel), single_segment_config(local_mac, local_ip))
+{
+}
+
+NetworkStack::NetworkStack(std::unique_ptr<PacketChannel> channel, const InterfaceConfig& config)
+    : _channel(std::move(channel)), _config(config),
       _next_ephemeral_port(FIRST_EPHEMERAL_PORT), _next_ip_id(1), _arp_table(ARP_ENTRY_TTL_TICKS)
 {
+    this->configure_interface(config);
+}
+
+void NetworkStack::configure_interface(const InterfaceConfig& config)
+{
+    this->_config = config;
+
+    // Rebuild the routes that follow from the addressing rather than adding to
+    // them, so reconfiguring cannot leave a route to a network this interface
+    // is no longer on. Routes added explicitly via add_route() are rebuilt too;
+    // that is the cost of deriving state, and re-adding them is the caller's
+    // job because only the caller knows whether they still apply.
+    this->_routes.clear();
+
+    if (this->_config.has_address())
+    {
+        // The connected route: this network is reachable without help, so its
+        // next hop is zero, meaning "resolve the destination itself".
+        this->_routes.add(this->_config.ip, this->_config.prefix_length, IPv4Address());
+    }
+
+    if (this->_config.has_gateway())
+    {
+        // The default route. A /0 matches every destination, so longest-prefix
+        // matching only ever selects it when nothing more specific did.
+        this->_routes.add(IPv4Address(), 0, this->_config.gateway);
+    }
+
+    LOG_DEBUG("NetworkStack: interface configured - ip=" << this->_config.ip.to_string()
+             << "/" << static_cast<int>(this->_config.prefix_length)
+             << " mac=" << this->_config.mac.to_string()
+             << " gateway=" << (this->_config.has_gateway() ? this->_config.gateway.to_string() : "none")
+             << " mtu=" << this->_config.mtu);
+}
+
+void NetworkStack::add_route(const IPv4Address& destination, uint8_t prefix_length, const IPv4Address& next_hop)
+{
+    this->_routes.add(destination, prefix_length, next_hop);
 }
 
 int NetworkStack::get_fd() const
@@ -121,7 +175,7 @@ TcpConnection* NetworkStack::connect(const IPv4Address& remote_ip, uint16_t remo
         {
             this->_send_tcp_segment(remote_ip, header, payload);
         },
-        LOCAL_MSS
+        this->_config.local_mss()
     );
 
     TcpConnection* connection_ptr = connection.get();
@@ -129,14 +183,21 @@ TcpConnection* NetworkStack::connect(const IPv4Address& remote_ip, uint16_t remo
     this->_connections_by_id[connection_ptr->get_id()] = key;
     this->_connections[key] = std::move(connection);
 
-    if (this->_arp_table.contains(remote_ip))
+    // Resolve and queue against the NEXT HOP, not the peer. For an off-link
+    // peer the ARP reply that unblocks this connection comes from the gateway
+    // and carries the gateway's address, so keying any of this on the peer's
+    // address would mean the reply never matches and the connection waits out
+    // its retries for a mapping nobody was ever going to send.
+    IPv4Address next_hop = this->_next_hop_for(remote_ip);
+
+    if (this->_arp_table.contains(next_hop))
     {
-        connection_ptr->initiate_connect(); // peer's MAC already known - send the SYN now
+        connection_ptr->initiate_connect(); // next hop's MAC already known - send the SYN now
     }
     else
     {
-        this->_pending_outbound_connects[remote_ip].push_back(key);
-        this->_ensure_arp_resolution(remote_ip);
+        this->_pending_outbound_connects[next_hop].push_back(key);
+        this->_ensure_arp_resolution(next_hop);
     }
 
     return connection_ptr;
@@ -335,7 +396,7 @@ void NetworkStack::_handle_frame(const Bytes& frame)
         // parsed before the destination-IP test at the top of _handle_ip drops
         // it. It is also needed on interfaces that do no hardware filtering of
         // their own, such as veth and tap.
-        if (!is_addressed_to_us(ethernet.get_dest(), this->_local_mac))
+        if (!is_addressed_to_us(ethernet.get_dest(), this->_config.mac))
         {
             return;
         }
@@ -386,7 +447,7 @@ void NetworkStack::_handle_arp(const Arp& arp)
     // ages out and we re-resolve), and we no longer pre-populate the table by
     // snooping. Neither was ever load-bearing. RFC 5227 address-defence probes
     // still work, since a probe carries sender 0.0.0.0 but targets our IP.
-    if (!(arp.get_target_protocol_address() == this->_local_ip))
+    if (!(arp.get_target_protocol_address() == this->_config.ip))
     {
         return;
     }
@@ -423,9 +484,9 @@ void NetworkStack::_handle_arp(const Arp& arp)
         return;
     }
 
-    Ethernet reply(this->_local_mac, arp.get_sender_hardware_address(), EtherType::ARP);
+    Ethernet reply(this->_config.mac, arp.get_sender_hardware_address(), EtherType::ARP);
     reply /= std::make_unique<Arp>(
-        ArpOperation::REPLY, this->_local_mac, this->_local_ip,
+        ArpOperation::REPLY, this->_config.mac, this->_config.ip,
         arp.get_sender_hardware_address(), arp.get_sender_protocol_address()
     );
 
@@ -434,9 +495,16 @@ void NetworkStack::_handle_arp(const Arp& arp)
 
 void NetworkStack::_handle_ip(const Ip& ip)
 {
-    if (!(ip.get_dest_address() == this->_local_ip.get_address()))
+    // Ours if it names our address, or if it is a broadcast for this segment.
+    // Broadcast has to be accepted separately because it is by definition not
+    // our address - and refusing it is what would make an address-configuration
+    // exchange impossible, since a host without an address can only be reached
+    // that way.
+    IPv4Address destination(ip.get_dest_address());
+    bool addressed_to_us = this->_config.has_address() && destination == this->_config.ip;
+    if (!addressed_to_us && !is_broadcast_address(destination, this->_config))
     {
-        return; // not addressed to us - this stack doesn't route or forward
+        return; // someone else's packet - this stack does not forward
     }
 
     // hearing from a peer proves it's still alive at its cached MAC - keep that
@@ -508,7 +576,7 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
     // timestamp options) would emit a different, shorter option set and fail
     // the checksum on a segment that was actually valid.
     const Bytes& segment_bytes = tcp.get_received_bytes();
-    if (transport_checksum(src_ip, this->_local_ip, IpProtocol::TCP, segment_bytes) != 0)
+    if (transport_checksum(src_ip, this->_config.ip, IpProtocol::TCP, segment_bytes) != 0)
     {
         // corrupted segment - dropped silently, same as a real kernel stack;
         // no RST, since we can't trust the header enough to safely answer it
@@ -557,7 +625,7 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
         {
             this->_send_tcp_segment(remote_ip, header, payload);
         },
-        LOCAL_MSS
+        this->_config.local_mss()
     );
 
     try
@@ -588,7 +656,7 @@ void NetworkStack::_handle_udp(const Ip& ip, const Udp& udp)
     // one sends exactly 0, which is what "skip verification" means here;
     // any other value is a real checksum and must self-verify like TCP's
     Bytes segment_bytes = const_cast<Udp&>(udp).to_bytes();
-    if (udp.get_checksum() != 0 && transport_checksum(src_ip, this->_local_ip, IpProtocol::UDP, segment_bytes) != 0)
+    if (udp.get_checksum() != 0 && transport_checksum(src_ip, this->_config.ip, IpProtocol::UDP, segment_bytes) != 0)
     {
         LOG_WARNING("NetworkStack: dropping a UDP datagram with a bad checksum from " << src_ip.to_string());
         return;
@@ -698,8 +766,36 @@ void NetworkStack::_handle_icmp_error(const Icmp& icmp)
     }
 }
 
+IPv4Address NetworkStack::_next_hop_for(const IPv4Address& destination) const
+{
+    // Broadcast is never routed and never resolved - it goes to every host on
+    // the segment by definition, so it is its own next hop and the caller sends
+    // it to the broadcast MAC without asking ARP anything.
+    if (is_broadcast_address(destination, this->_config))
+    {
+        return destination;
+    }
+
+    IPv4Address next_hop;
+    if (this->_routes.lookup(destination, next_hop))
+    {
+        return next_hop;
+    }
+
+    // No route. Falling back to the destination preserves what this stack did
+    // before it had routes at all, which keeps a caller that never configured a
+    // prefix working on its own segment; it will simply fail to resolve if the
+    // destination really is not a neighbour.
+    return destination;
+}
+
 MacAddress NetworkStack::_resolve_mac(const IPv4Address& ip) const
 {
+    if (is_broadcast_address(ip, this->_config))
+    {
+        return MacAddress::BROADCAST;
+    }
+
     MacAddress mac;
     if (!this->_arp_table.lookup(ip, mac))
     {
@@ -728,8 +824,8 @@ uint16_t NetworkStack::_allocate_ephemeral_port()
 
 void NetworkStack::_send_arp_request(const IPv4Address& target_ip)
 {
-    Ethernet request(this->_local_mac, MacAddress::BROADCAST, EtherType::ARP);
-    request /= std::make_unique<Arp>(this->_local_mac, this->_local_ip, target_ip);
+    Ethernet request(this->_config.mac, MacAddress::BROADCAST, EtherType::ARP);
+    request /= std::make_unique<Arp>(this->_config.mac, this->_config.ip, target_ip);
     this->_channel->write(request.to_bytes());
 }
 
@@ -769,21 +865,24 @@ void NetworkStack::_fail_pending_outbound_connects(const IPv4Address& ip)
 
 void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol, const Bytes& payload)
 {
-    MacAddress dest_mac = this->_resolve_mac(dest_ip);
+    // The IP header keeps naming the final destination; the frame goes to
+    // whoever will carry it onward.
+    MacAddress dest_mac = this->_resolve_mac(this->_next_hop_for(dest_ip));
 
-    if (payload.size() <= MAX_IP_FRAGMENT_PAYLOAD)
+    const size_t max_ip_payload = this->_config.max_ip_payload();
+    if (payload.size() <= max_ip_payload)
     {
         // fits one frame - the common case (TCP is MSS-capped, so only an
         // oversized UDP send ever needs the fragmentation path below)
         auto ip = std::make_unique<Ip>(
             4, 5, 0, static_cast<uint16_t>(20 + payload.size()), 0,
             0, 0, 64, protocol, 0,
-            this->_local_ip.get_address(), dest_ip.get_address()
+            this->_config.ip.get_address(), dest_ip.get_address()
         );
         *ip /= std::make_unique<Raw>(payload);
         ip->compute_checksum();
 
-        Ethernet ethernet(this->_local_mac, dest_mac, EtherType::IPv4);
+        Ethernet ethernet(this->_config.mac, dest_mac, EtherType::IPv4);
         ethernet /= std::move(ip);
         this->_channel->write(ethernet.to_bytes());
         return;
@@ -798,19 +897,19 @@ void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol,
     size_t offset = 0;
     while (offset < payload.size())
     {
-        size_t chunk = std::min(MAX_IP_FRAGMENT_PAYLOAD, payload.size() - offset);
+        size_t chunk = std::min(max_ip_payload, payload.size() - offset);
         bool more_fragments = offset + chunk < payload.size();
         uint8_t flags = more_fragments ? IP_FLAG_MORE_FRAGMENTS : 0;
 
         auto ip = std::make_unique<Ip>(
             4, 5, 0, static_cast<uint16_t>(20 + chunk), identification,
             flags, static_cast<uint16_t>(offset / 8), 64, protocol, 0,
-            this->_local_ip.get_address(), dest_ip.get_address()
+            this->_config.ip.get_address(), dest_ip.get_address()
         );
         *ip /= std::make_unique<Raw>(payload.slice(offset, chunk));
         ip->compute_checksum();
 
-        Ethernet ethernet(this->_local_mac, dest_mac, EtherType::IPv4);
+        Ethernet ethernet(this->_config.mac, dest_mac, EtherType::IPv4);
         ethernet /= std::move(ip);
         this->_channel->write(ethernet.to_bytes());
 
@@ -850,7 +949,7 @@ void NetworkStack::_send_tcp_segment(const IPv4Address& dest_ip, const Tcp& head
         segment /= std::make_unique<Raw>(payload);
     }
 
-    uint16_t checksum = transport_checksum(this->_local_ip, dest_ip, IpProtocol::TCP, segment.to_bytes());
+    uint16_t checksum = transport_checksum(this->_config.ip, dest_ip, IpProtocol::TCP, segment.to_bytes());
     segment.set_checksum(checksum);
 
     this->_send_ip_packet(dest_ip, IpProtocol::TCP, segment.to_bytes());
@@ -897,7 +996,22 @@ void NetworkStack::_send_rst(const Ip& ip, const Tcp& tcp)
 
 void NetworkStack::_send_or_queue_udp(const IPv4Address& dest_ip, const Udp& header, const Bytes& payload)
 {
-    if (this->_arp_table.contains(dest_ip))
+    // Broadcast needs no resolution at all - it has a fixed destination MAC and
+    // no neighbour to ask. Sending it straight out is what lets a stack with no
+    // address of its own talk at all, which address-configuration protocols
+    // depend on.
+    if (is_broadcast_address(dest_ip, this->_config))
+    {
+        this->_send_udp_datagram(dest_ip, header, payload);
+        return;
+    }
+
+    // Queue against the next hop for the same reason connect() does: an
+    // off-link destination is unblocked by the gateway's ARP reply, not the
+    // destination's.
+    IPv4Address next_hop = this->_next_hop_for(dest_ip);
+
+    if (this->_arp_table.contains(next_hop))
     {
         this->_send_udp_datagram(dest_ip, header, payload);
         return;
@@ -909,9 +1023,9 @@ void NetworkStack::_send_or_queue_udp(const IPv4Address& dest_ip, const Udp& hea
     // to survive the wait here.
     LOG_DEBUG("NetworkStack: queueing a UDP datagram to " << dest_ip.to_string()
               << " pending ARP resolution");
-    this->_pending_outbound_datagrams[dest_ip].push_back(
-        {header.get_src_port(), header.get_dest_port(), payload});
-    this->_ensure_arp_resolution(dest_ip);
+    this->_pending_outbound_datagrams[next_hop].push_back(
+        {dest_ip, header.get_src_port(), header.get_dest_port(), payload});
+    this->_ensure_arp_resolution(next_hop);
 }
 
 void NetworkStack::_flush_pending_outbound_datagrams(const IPv4Address& ip)
@@ -926,7 +1040,9 @@ void NetworkStack::_flush_pending_outbound_datagrams(const IPv4Address& ip)
     {
         uint16_t length = static_cast<uint16_t>(8 + pending.payload.size());
         Udp header(pending.src_port, pending.dest_port, length, 0, Bytes());
-        this->_send_udp_datagram(ip, header, pending.payload);
+        // ip is the next hop whose ARP reply just arrived; the datagram goes to
+        // the destination it was queued for
+        this->_send_udp_datagram(pending.destination, header, pending.payload);
     }
     this->_pending_outbound_datagrams.erase(pending_it);
 }
@@ -941,7 +1057,7 @@ void NetworkStack::_send_udp_datagram(const IPv4Address& dest_ip, const Udp& hea
         datagram /= std::make_unique<Raw>(payload);
     }
 
-    uint16_t checksum = transport_checksum(this->_local_ip, dest_ip, IpProtocol::UDP, datagram.to_bytes());
+    uint16_t checksum = transport_checksum(this->_config.ip, dest_ip, IpProtocol::UDP, datagram.to_bytes());
     // RFC 768: an all-zero result must be transmitted as all-ones instead -
     // 0 is reserved to mean "no checksum was computed", so a genuine result
     // of 0 would otherwise be indistinguishable from that
