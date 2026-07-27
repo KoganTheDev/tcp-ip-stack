@@ -7,6 +7,7 @@
 #include <deque>
 
 #include "network_stack.h"
+#include "channel_factory.h"
 #include "epoll_wrapper.h"
 #include "thread_pool.h"
 #include "completion_queue.h"
@@ -37,13 +38,21 @@
 class Server
 {
 public:
-    Server(uint16_t port, size_t worker_count);
+    // channel_options selects the transport: a TAP device (the default, and
+    // what this has always used) or an AF_PACKET socket on a real NIC.
+    Server(uint16_t port, size_t worker_count, const ChannelOptions& channel_options);
 
     // Loops until stop_flag is set from a signal handler - a volatile
     // sig_atomic_t is the only shared state a signal handler may touch safely.
     void run(const volatile std::sig_atomic_t& stop_flag);
 
 private:
+    // The public constructor delegates here. The channel has to be opened
+    // before the member initializer list runs, since NetworkStack needs both
+    // the channel and the MAC that opening it resolved, and open_channel()
+    // must be called exactly once.
+    Server(uint16_t port, size_t worker_count, OpenedChannel opened, const IPv4Address& local_ip);
+
     void _create_retransmit_timer();
     void _handle_new_connections();
 

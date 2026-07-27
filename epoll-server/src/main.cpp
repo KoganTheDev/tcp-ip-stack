@@ -1,7 +1,12 @@
 #include <csignal>
+#include <cstring>
+#include <cstdlib>
+#include <iostream>
+#include <string>
 #include <unistd.h>
 
 #include "server.h"
+#include "channel_factory.h"
 #include "exceptions.h"
 #include "logger.h"
 
@@ -13,16 +18,155 @@ namespace
     {
         g_stop_flag = 1;
     }
+
+    struct Config
+    {
+        uint16_t port = 8080;
+        size_t worker_count = 4;
+        ChannelOptions channel;
+    };
+
+    void print_usage(const char* program)
+    {
+        std::cout <<
+            "Usage: " << program << " [options]\n"
+            "\n"
+            "  --transport tap|nic   tap: a TAP device (default)\n"
+            "                        nic: an AF_PACKET socket on a real interface\n"
+            "  --device PATH|NAME    TAP device path, or interface name for nic\n"
+            "                          (default /dev/net/tun)\n"
+            "  --ip A.B.C.D          address this stack answers for (default 10.0.0.2)\n"
+            "  --mac AA:BB:...       override the MAC. Defaults to a fixed locally\n"
+            "                          administered address for tap, and to the\n"
+            "                          interface's real hardware address for nic\n"
+            "  --port N              TCP port to listen on (default 8080)\n"
+            "  --workers N           thread pool size (default 4)\n"
+            "  -h, --help            this message\n"
+            "\n"
+            "With --transport nic, --ip must be an address NOTHING else on the segment\n"
+            "owns, and in particular one the kernel does not own on any local interface.\n"
+            "The server refuses to start otherwise: the kernel's own TCP would reset\n"
+            "every connection before the handshake completed.\n";
+    }
+
+    // Returns false if the program should exit (help, or a bad argument).
+    bool parse_arguments(int argc, char** argv, Config& config, int& exit_code)
+    {
+        auto next_value = [&](int& i, const char* flag) -> std::string
+        {
+            if (i + 1 >= argc)
+            {
+                throw EXCEPTION(BaseException, std::string("missing value for ") + flag);
+            }
+            return argv[++i];
+        };
+
+        try
+        {
+            for (int i = 1; i < argc; i++)
+            {
+                std::string flag = argv[i];
+
+                if (flag == "-h" || flag == "--help")
+                {
+                    print_usage(argv[0]);
+                    exit_code = 0;
+                    return false;
+                }
+                else if (flag == "--transport")
+                {
+                    std::string value = next_value(i, "--transport");
+                    if (value == "tap")
+                    {
+                        config.channel.transport = Transport::Tap;
+                    }
+                    else if (value == "nic")
+                    {
+                        config.channel.transport = Transport::RawNic;
+                        // the TAP default is meaningless for a NIC, and leaving
+                        // it would produce a baffling "no such interface
+                        // /dev/net/tun" if --device were omitted
+                        config.channel.device = "eth0";
+                    }
+                    else
+                    {
+                        throw EXCEPTION(BaseException, "--transport must be 'tap' or 'nic'");
+                    }
+                }
+                else if (flag == "--device")
+                {
+                    config.channel.device = next_value(i, "--device");
+                }
+                else if (flag == "--ip")
+                {
+                    config.channel.local_ip = IPv4Address(next_value(i, "--ip"));
+                }
+                else if (flag == "--mac")
+                {
+                    config.channel.local_mac = MacAddress(next_value(i, "--mac"));
+                }
+                else if (flag == "--port")
+                {
+                    config.port = static_cast<uint16_t>(std::stoi(next_value(i, "--port")));
+                }
+                else if (flag == "--workers")
+                {
+                    config.worker_count = static_cast<size_t>(std::stoi(next_value(i, "--workers")));
+                }
+                else
+                {
+                    throw EXCEPTION(BaseException, "unknown option: " + flag);
+                }
+            }
+        }
+        catch (const BaseException& e)
+        {
+            std::cerr << e.what() << "\n\n";
+            print_usage(argv[0]);
+            exit_code = 1;
+            return false;
+        }
+        catch (const std::exception& e) // stoi, address parsing
+        {
+            std::cerr << "bad argument: " << e.what() << "\n\n";
+            print_usage(argv[0]);
+            exit_code = 1;
+            return false;
+        }
+
+        // --transport nic with an explicit --device ordering the other way round
+        // would otherwise silently keep the TAP path
+        if (config.channel.transport == Transport::RawNic
+            && config.channel.device.rfind("/dev/", 0) == 0)
+        {
+            std::cerr << "--transport nic needs an interface name in --device (e.g. eth0), not "
+                      << config.channel.device << "\n";
+            exit_code = 1;
+            return false;
+        }
+
+        exit_code = 0;
+        return true;
+    }
 }
 
-int main()
+int main(int argc, char** argv)
 {
-    const uint16_t PORT = 8080;
-    const size_t WORKER_COUNT = 4;
+    Config config;
+    int exit_code = 0;
+    if (!parse_arguments(argc, argv, config, exit_code))
+    {
+        return exit_code;
+    }
 
+    // Both transports need privilege: /dev/net/tun for a TAP device, and
+    // CAP_NET_RAW for a packet socket. Checked here so the failure names its
+    // own fix, rather than surfacing as an opaque EPERM from open() or socket().
     if (geteuid() != 0)
     {
-        LOG_ERROR("This program must be run as root (it opens /dev/net/tun). Exiting.");
+        LOG_ERROR("This program needs root: /dev/net/tun for --transport tap, CAP_NET_RAW for"
+                  " --transport nic. Run under sudo, or grant the capability with"
+                  " 'setcap cap_net_raw,cap_net_admin+ep " << argv[0] << "'.");
         return 1;
     }
 
@@ -30,10 +174,18 @@ int main()
     {
         std::signal(SIGINT, handle_shutdown_signal);
         std::signal(SIGTERM, handle_shutdown_signal);
-        std::signal(SIGPIPE, SIG_IGN); // defensive - nothing here writes to a raw kernel socket anymore
+        std::signal(SIGPIPE, SIG_IGN); // defensive - nothing here writes to a raw kernel socket
 
-        Server server(PORT, WORKER_COUNT);
-        LOG_INFO("epoll-server listening on TCP port " << PORT
+        Server server(config.port, config.worker_count, config.channel);
+
+        // One line stating everything that was actually resolved, including the
+        // MAC the factory picked. Worth its weight the first time something on
+        // a real network does not behave.
+        LOG_INFO("epoll-server listening on TCP port " << config.port
+                 << " | transport=" << (config.channel.transport == Transport::Tap ? "tap" : "nic")
+                 << " device=" << config.channel.device
+                 << " ip=" << config.channel.local_ip.to_string()
+                 << " workers=" << config.worker_count
                  << " (custom Ethernet/ARP/IP/TCP stack, no kernel sockets)");
 
         server.run(g_stop_flag);

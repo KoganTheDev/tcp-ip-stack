@@ -10,9 +10,14 @@ namespace
     constexpr long RETRANSMIT_TICK_MS = 500;
 }
 
-Server::Server(uint16_t port, size_t worker_count)
+Server::Server(uint16_t port, size_t worker_count, const ChannelOptions& channel_options)
+    : Server(port, worker_count, open_channel(channel_options), channel_options.local_ip)
+{
+}
+
+Server::Server(uint16_t port, size_t worker_count, OpenedChannel opened, const IPv4Address& local_ip)
     : _port(port),
-      _network_stack("/dev/net/tun", MacAddress("02:00:00:00:00:01"), IPv4Address("10.0.0.2")),
+      _network_stack(std::move(opened.channel), opened.local_mac, local_ip),
       _epoll(), _completion_queue(), _thread_pool(worker_count), _timer_fd(-1)
 {
     this->_network_stack.listen(port);
