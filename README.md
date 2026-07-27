@@ -66,7 +66,15 @@ simultaneous close rather than folding it into `FIN_WAIT_2`. On top of that:
 send-side fragmentation for oversized datagrams.
 
 **ARP.** Request and reply in both directions, with a tick-based TTL refreshed on
-received traffic, so an actively-talking peer never ages out mid-conversation.
+received traffic, so an actively-talking peer never ages out mid-conversation. The table
+is bounded, and the stack only learns from ARP that targets its own address, so a shared
+segment cannot fill it or overwrite mappings it is using.
+
+**Two transports.** A TAP device, or an `AF_PACKET` socket on a physical NIC, both behind
+one `PacketChannel` seam that nothing downstream can distinguish. The real-NIC path
+adopts the interface's own hardware address, which is what lets the card filter frames in
+hardware and is why promiscuous mode is never needed. See
+[docs/running-on-a-real-nic.md](docs/running-on-a-real-nic.md).
 
 **UDP.** A connectionless `UdpSocket` with bind, `send_to`, and a receive callback.
 Sending to a peer whose MAC is not yet known queues the datagram and kicks off a
@@ -137,6 +145,14 @@ Two seams make the untestable parts testable without any OS involvement: `Packet
 injects a fake frame transport into `NetworkStack`, and `LoopbackChannel` wires two
 complete stacks back to back through a real ARP exchange, handshake, data transfer, and
 half-close.
+
+The one component that cannot be unit tested is the `AF_PACKET` transport, since it is
+nothing but syscalls. It has an integration test instead, driving the whole stack over a
+veth pair against a peer in its own network namespace:
+
+```sh
+sudo scripts/veth_test.sh    # needs root, iproute2, ethtool, ping, nc
+```
 
 ```sh
 make test

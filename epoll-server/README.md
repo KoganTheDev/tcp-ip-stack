@@ -47,10 +47,39 @@ make
 sudo ./epoll-server
 ```
 
-Requires root (opens `/dev/net/tun`). Brings up a TAP interface at `10.0.0.2` and
-listens on TCP port 8080 - see the project page in the LLM wiki for how to reach it
-from a real kernel TCP client on the same machine. `Ctrl+C`/`SIGTERM` shut it down
-cleanly.
+Requires root (`/dev/net/tun` for a TAP device, `CAP_NET_RAW` for a packet socket).
+With no arguments it brings up a TAP interface answering for `10.0.0.2` and listens on
+TCP port 8080. `Ctrl+C`/`SIGTERM` shut it down cleanly.
+
+### Options
+
+```
+--transport tap|nic   tap: a TAP device (default)
+                      nic: an AF_PACKET socket on a real interface
+--device PATH|NAME    TAP device path, or interface name for nic (default /dev/net/tun)
+--ip A.B.C.D          address this stack answers for (default 10.0.0.2)
+--mac AA:BB:...       override the MAC. Defaults to a fixed locally administered
+                        address for tap, and to the interface's real hardware
+                        address for nic
+--port N              TCP port to listen on (default 8080)
+--workers N           thread pool size (default 4)
+```
+
+### Running over a real network interface
+
+```sh
+sudo ./epoll-server --transport nic --device eth0 --ip 192.168.1.90
+```
+
+**Read [docs/running-on-a-real-nic.md](../docs/running-on-a-real-nic.md) first.** The
+short version: `--ip` must be an address the kernel does not own, or the kernel's own
+TCP will reset every connection before the handshake completes. The server refuses to
+start otherwise. There is also a self-contained integration test that exercises the
+whole path over a veth pair without touching a real network:
+
+```sh
+sudo ../scripts/veth_test.sh
+```
 
 ## Load testing
 

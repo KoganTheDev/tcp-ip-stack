@@ -1,0 +1,5 @@
+# Shell scripts must keep LF endings. This repo is edited on Windows, where the
+# working tree otherwise gets CRLF - and a script with CRLF line endings fails
+# with a confusing "bad interpreter" error the moment it runs on Linux, which is
+# the only place these scripts are meant to run.
+*.sh text eol=lf
