@@ -59,7 +59,7 @@ std::string Logger::_timestamp()
 {
     std::time_t now = std::time(nullptr);
     std::tm local_tm{};
-    localtime_r(&now, &local_tm); // thread-safe (unlike ctime()/localtime(), already a known gap elsewhere - see arp_cache.cpp)
+    localtime_r(&now, &local_tm); // thread-safe, unlike ctime()/localtime()
 
     char buffer[32];
     std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &local_tm);

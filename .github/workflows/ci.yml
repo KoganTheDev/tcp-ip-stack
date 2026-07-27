@@ -27,9 +27,6 @@ jobs:
       - name: Build and run the test suite
         run: make test CXX=${{ matrix.cxx }}
 
-      - name: Build the stack binary
-        run: make CXX=${{ matrix.cxx }}
-
       - name: Build epoll-server
         working-directory: epoll-server
         run: make CXX=${{ matrix.cxx }}

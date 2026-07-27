@@ -8,9 +8,9 @@ class SystemNetworkObject
         // Any class with virtual methods is meant to be held by base pointer,
         // and destroying one that way without a virtual destructor is
         // undefined behavior. Nothing deletes a SystemNetworkObject
-        // polymorphically today - unlike BaseArpCacheEntry, which ASan caught
-        // doing exactly that - but the moment something does, the bug would be
-        // silent. Cheap to close now.
+        // polymorphically today, but the moment something does the bug would be
+        // silent - which is exactly how it went unnoticed in the (since
+        // deleted) ArpCache entry hierarchy until AddressSanitizer caught it.
         virtual ~SystemNetworkObject() = default;
 
         virtual void start() = 0;

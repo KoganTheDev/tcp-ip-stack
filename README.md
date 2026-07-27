@@ -100,11 +100,13 @@ These are documented decisions, not gaps that were missed:
 Requires a Linux toolchain with C++17. Everything below assumes GNU Make and `g++`.
 
 ```sh
-make            # build the tcpipstack binary
-make all        # binary and test runner
+make            # build the test runner
 make test       # build and run the full test suite
 make clean
 ```
+
+The root Makefile builds the stack's objects and its tests. The program built on top of
+the stack is [`epoll-server/`](epoll-server/), which has its own Makefile.
 
 There is no native Linux requirement for the *tests* - they run anywhere, because every
 component takes an injectable seam instead of touching the OS directly. Running the

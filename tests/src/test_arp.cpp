@@ -1,10 +1,6 @@
 #include "test.h"
 #include "arp.h"
-#include "arp_cache.h"
 #include "network_addresses.h"
-
-#include <thread>
-#include <chrono>
 
 namespace
 {
@@ -51,27 +47,7 @@ TEST(UndersizedArpPacketIsRejected)
     test_assert(threw, "an ARP packet shorter than 28 bytes should throw");
 }
 
-TEST(StaticEntryIsAlwaysValid)
-{
-    StaticArpCacheEntry entry(TARGET_MAC);
-    test_assert(entry.is_valid(), "a static entry never expires");
-    test_assert(entry.get_type() == ArpEntryType::STATIC, "a static entry reports its type");
-    test_assert(entry.get_mac_address() == TARGET_MAC, "a static entry holds the MAC it was built with");
-}
-
-TEST(DynamicEntryIsValidWhileFresh)
-{
-    DynamicArpCacheEntry entry(TARGET_MAC, 60);
-    test_assert(entry.is_valid(), "a dynamic entry within its timeout is valid");
-    test_assert(entry.get_type() == ArpEntryType::DYNAMIC, "a dynamic entry reports its type");
-}
-
-// is_valid() is wall-clock based (time(NULL) <= creation + timeout), so a
-// timeout of 0 plus a one-second wait guarantees the entry is now past it -
-// deterministic without depending on how long the rest of the suite took.
-TEST(DynamicEntryExpiresPastItsTimeout)
-{
-    DynamicArpCacheEntry entry(TARGET_MAC, 0);
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    test_assert(!entry.is_valid(), "a dynamic entry past its timeout should be invalid");
-}
+// The static/dynamic cache-entry tests that used to live here went with
+// ArpCache. Their behaviour is covered by test_arp_table.cpp, which tests the
+// same static-never-expires / dynamic-ages-out semantics against ArpTable -
+// deterministically, by ticking, rather than by sleeping a real second.
