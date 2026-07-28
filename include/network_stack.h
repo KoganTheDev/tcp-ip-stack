@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <cstdint>
+#include <functional>
 
 #include "tun_wrapper.h"
 #include "packet_channel.h"
@@ -146,6 +147,17 @@ public:
     // one bound to the same port.
     UdpSocket* bind_udp(uint16_t port);
 
+    // Sends an ICMP Echo Request - a ping. identifier and sequence are echoed
+    // back untouched by the peer, which is how a reply is matched to the
+    // request that caused it; the payload comes back verbatim too, which is
+    // what lets a ping measure a round trip without any state at this end.
+    void send_echo_request(const IPv4Address& destination, uint16_t identifier,
+                           uint16_t sequence, const Bytes& payload = Bytes());
+
+    // Notified when an Echo Reply arrives: source, identifier, sequence, payload.
+    using EchoReplyFn = std::function<void(const IPv4Address&, uint16_t, uint16_t, const Bytes&)>;
+    void set_echo_reply_callback(EchoReplyFn callback) { _on_echo_reply = std::move(callback); }
+
     // Installs a permanent IP->MAC mapping that never ages out and is never
     // replaced by anything learned from the wire.
     //
@@ -250,6 +262,12 @@ private:
     // RFC 792: Destination Unreachable/Port Unreachable, for a UDP
     // datagram that arrived at a port nothing is bound to.
     void _send_icmp_port_unreachable(const Ip& ip);
+    // Consumes one token from the ICMP error budget, returning false when there
+    // is none. Errors are generated in response to received traffic, so without
+    // a bound a peer sets the rate at which this stack emits them - and can aim
+    // that stream at somebody else by spoofing a source address. That is
+    // reflection, and an error larger than its trigger makes it amplification.
+    bool _may_send_icmp_error();
     // RFC 792 Time Exceeded, code 1: a datagram whose remaining fragments never
     // arrived, so the reassembly timer ran out. Unlike the other ICMP errors
     // this stack sends, there is no original packet left to quote back - the
@@ -298,6 +316,13 @@ private:
     // peer, so an actively-talking peer never ages out mid-conversation.
     ArpTable _arp_table;
     IpReassembler _reassembler;
+
+    // Token bucket over generated ICMP errors: one token per error, refilled on
+    // the timer up to a burst. A burst is allowed on purpose - errors normally
+    // arrive in clusters, and refusing the second of two is unhelpful - but the
+    // sustained rate is what an attacker would otherwise choose.
+    int _icmp_error_tokens;
+    EchoReplyFn _on_echo_reply;
     std::unordered_map<uint16_t, size_t> _listening_ports; // port -> backlog
     std::unordered_map<uint16_t, std::deque<ConnectionKey>> _pending_accepts;
     std::unordered_map<uint16_t, std::unique_ptr<UdpSocket>> _udp_sockets;

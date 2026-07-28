@@ -1266,3 +1266,111 @@ TEST(TcpSegmentsAreSentWithDontFragmentSet)
     test_assert(ip != nullptr && ip->get_ip_flag_d(),
                 "a TCP segment must carry DF - without it a small link silently fragments and the sender never learns the path MTU");
 }
+
+// --- ICMP as a control plane: rate limiting, a ping client, and smurf ---
+
+// An error generator with no bound lets a peer set the rate at which this stack
+// emits errors - and, by spoofing a source address, aim that stream at somebody
+// else. That is reflection; an error larger than its trigger is amplification.
+TEST(GeneratedIcmpErrorsAreRateLimited)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+    channel->clear_outbound();
+
+    // far more UDP datagrams to an unbound port than the error budget allows
+    for (int i = 0; i < 40; i++)
+    {
+        channel->push_inbound(build_udp(40000, 9999, Bytes::from_hex("aa")));
+    }
+    stack->poll();
+
+    size_t errors = 0;
+    for (const Bytes& frame : channel->outbound_frames())
+    {
+        IcmpView view = view_icmp(frame);
+        if (view.is_icmp && view.type == IcmpType::ICMP_DESTINATION_UNREACHABLE) { errors++; }
+    }
+
+    test_assert(errors > 0, "some errors should still be sent - the budget is a limit, not a mute");
+    test_assert(errors < 40, "a peer must not be able to set the rate at which this stack emits ICMP errors");
+
+    // the budget refills over time rather than being spent once and gone
+    channel->clear_outbound();
+    for (int i = 0; i < 20; i++) { stack->on_timer_tick(); }
+    channel->push_inbound(build_udp(40000, 9999, Bytes::from_hex("aa")));
+    stack->poll();
+
+    IcmpView after_refill = find_icmp(channel->outbound_frames());
+    test_assert(after_refill.is_icmp, "after refilling, errors should be sent again");
+}
+
+// One broadcast ping draws a reply from every host on the segment, so an
+// attacker spoofing a victim's address turns the segment into an amplifier
+// aimed at it. Only reachable at all since broadcast started being accepted.
+TEST(BroadcastPingIsIgnored)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+    channel->clear_outbound();
+
+    // a normal ping is answered
+    channel->push_inbound(build_icmp_echo_request(0x00010001, Bytes::from_hex("beef")));
+    stack->poll();
+    test_assert(find_icmp(channel->outbound_frames()).is_icmp, "precondition: a unicast ping is answered");
+
+    // the same ping addressed to the broadcast address is not
+    channel->clear_outbound();
+    Icmp icmp(IcmpType::ICMP_ECHO_REQUEST, ICMP_CODE_NONE, 0, 0x00010002, Bytes::from_hex("beef"));
+    icmp.compute_checksum();
+    Bytes segment = icmp.to_bytes();
+
+    auto ip = std::make_unique<Ip>(
+        4, 5, 0, static_cast<uint16_t>(20 + segment.size()), 0, 0, 0, 64,
+        IpProtocol::ICMP, 0, PEER_IP.get_address(), IPv4Address("255.255.255.255").get_address());
+    *ip /= std::make_unique<Raw>(segment);
+    ip->compute_checksum();
+    Ethernet eth(PEER_MAC, MacAddress::BROADCAST, EtherType::IPv4);
+    eth /= std::move(ip);
+
+    channel->push_inbound(eth.to_bytes());
+    stack->poll();
+
+    test_assert(channel->outbound_frames().empty(),
+                "a ping to the broadcast address must be ignored - answering makes this host one voice in an amplifier");
+}
+
+TEST(EchoRequestIsSentAndItsReplyReported)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    stack->add_static_arp_entry(PEER_IP, PEER_MAC);
+
+    stack->send_echo_request(PEER_IP, 0x1234, 7, Bytes::from_hex("cafe"));
+
+    IcmpView sent = find_icmp(channel->outbound_frames());
+    test_assert(sent.is_icmp && sent.type == IcmpType::ICMP_ECHO_REQUEST, "an echo request should go out");
+
+    // the peer echoes identifier, sequence and payload back untouched
+    struct Reply { IPv4Address source; uint16_t id; uint16_t seq; Bytes payload; };
+    std::vector<Reply> replies;
+    stack->set_echo_reply_callback(
+        [&replies](const IPv4Address& src, uint16_t id, uint16_t seq, const Bytes& payload)
+        {
+            replies.push_back({src, id, seq, payload});
+        });
+
+    Icmp reply(IcmpType::ICMP_ECHO_REPLY, ICMP_CODE_NONE, 0, (0x1234u << 16) | 7u, Bytes::from_hex("cafe"));
+    reply.compute_checksum();
+    channel->push_inbound(wrap_ip(IpProtocol::ICMP, reply.to_bytes()));
+    stack->poll();
+
+    test_assert(replies.size() == 1, "the reply should be reported to the application");
+    test_assert(replies[0].id == 0x1234 && replies[0].seq == 7,
+                "identifier and sequence come back untouched, which is how a reply is matched to its request");
+    test_assert(replies[0].payload.to_hex() == "cafe", "and the payload verbatim, which is what lets a ping time a round trip");
+}

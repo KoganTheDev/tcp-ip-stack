@@ -15,7 +15,13 @@ namespace
     // Short on purpose - a partial datagram is memory held for something that
     // may never arrive.
     constexpr int FRAGMENT_TIMEOUT_TICKS = 30;
-    constexpr int ARP_ENTRY_TTL_TICKS = 120; // ~60s at a 500ms tick - a learned mapping's lifetime while the peer stays silent
+    constexpr int ARP_ENTRY_TTL_TICKS = 120;
+
+    // ICMP error budget: a burst of this many, refilled at REFILL per tick.
+    // At a 500ms tick that is a sustained few per second, which is ample for
+    // genuine diagnostics and useless as an amplifier.
+    constexpr int ICMP_ERROR_BURST = 10;
+    constexpr int ICMP_ERROR_REFILL_PER_TICK = 2; // ~60s at a 500ms tick - a learned mapping's lifetime while the peer stays silent
 
     constexpr uint8_t FLAG_ACK = 0x10;
     constexpr uint8_t FLAG_RST = 0x04;
@@ -85,7 +91,7 @@ NetworkStack::NetworkStack(std::unique_ptr<PacketChannel> channel, const MacAddr
 
 NetworkStack::NetworkStack(std::unique_ptr<PacketChannel> channel, const InterfaceConfig& config)
     : _channel(std::move(channel)), _config(config),
-      _next_ephemeral_port(FIRST_EPHEMERAL_PORT), _next_ip_id(1), _arp_table(ARP_ENTRY_TTL_TICKS), _reassembler(FRAGMENT_TIMEOUT_TICKS)
+      _next_ephemeral_port(FIRST_EPHEMERAL_PORT), _next_ip_id(1), _arp_table(ARP_ENTRY_TTL_TICKS), _reassembler(FRAGMENT_TIMEOUT_TICKS), _icmp_error_tokens(ICMP_ERROR_BURST)
 {
     this->configure_interface(config);
 }
@@ -305,6 +311,9 @@ void NetworkStack::on_timer_tick()
     this->_reap_closed_connections();
 
     this->_arp_table.age_one_tick();
+
+    this->_icmp_error_tokens = std::min(this->_icmp_error_tokens + ICMP_ERROR_REFILL_PER_TICK,
+                                        ICMP_ERROR_BURST);
 
     // A datagram whose remaining fragments never arrived is dropped, and the
     // sender told: RFC 792 Time Exceeded, code 1. Without it the peer waits on
@@ -765,6 +774,21 @@ void NetworkStack::_handle_icmp(const Ip& ip, const Icmp& icmp)
 
     if (icmp.get_type() == IcmpType::ICMP_ECHO_REQUEST)
     {
+        // Never answer a ping sent to a broadcast address. One such request
+        // draws a reply from every host on the segment at once, so an attacker
+        // spoofing a victim's source address turns the whole segment into an
+        // amplifier pointed at it - the smurf attack. This only became
+        // reachable when broadcast started being accepted at all, and a
+        // broadcast ping is not a diagnostic anyone needs.
+        IPv4Address destination(ip.get_dest_address());
+        if (is_broadcast_address(destination, this->_config))
+        {
+            LOG_WARNING("NetworkStack: ignoring an ICMP echo request sent to the broadcast address "
+                        << destination.to_string() << " from " << src_ip.to_string()
+                        << " - answering it would make this host an amplifier");
+            return;
+        }
+
         Bytes payload;
         if (icmp.has_next_layer())
         {
@@ -777,6 +801,25 @@ void NetworkStack::_handle_icmp(const Ip& ip, const Icmp& icmp)
         LOG_DEBUG("NetworkStack: replying to an ICMP echo request from " << src_ip.to_string());
         Icmp reply_header(IcmpType::ICMP_ECHO_REPLY, ICMP_CODE_NONE, 0, icmp.get_rest_of_header(), Bytes());
         this->_send_icmp_message(src_ip, reply_header, payload);
+        return;
+    }
+
+    if (icmp.get_type() == IcmpType::ICMP_ECHO_REPLY)
+    {
+        if (this->_on_echo_reply)
+        {
+            Bytes payload;
+            if (icmp.has_next_layer())
+            {
+                if (const Raw* raw = dynamic_cast<const Raw*>(&icmp.get_next_layer()))
+                {
+                    payload = raw->get_data();
+                }
+            }
+            uint32_t rest = icmp.get_rest_of_header();
+            this->_on_echo_reply(src_ip, static_cast<uint16_t>(rest >> 16),
+                                 static_cast<uint16_t>(rest & 0xFFFF), payload);
+        }
         return;
     }
 
@@ -795,8 +838,35 @@ void NetworkStack::_handle_icmp(const Ip& ip, const Icmp& icmp)
               << ", code=" << static_cast<int>(icmp.get_code()) << ") from " << src_ip.to_string());
 }
 
+bool NetworkStack::_may_send_icmp_error()
+{
+    if (this->_icmp_error_tokens <= 0)
+    {
+        return false;
+    }
+    this->_icmp_error_tokens -= 1;
+    return true;
+}
+
+void NetworkStack::send_echo_request(const IPv4Address& destination, uint16_t identifier,
+                                     uint16_t sequence, const Bytes& payload)
+{
+    // Identifier and sequence share the rest-of-header field, identifier first.
+    // The peer echoes the whole thing back untouched, which is what lets a
+    // reply be matched to its request with no state held here.
+    uint32_t rest_of_header = (static_cast<uint32_t>(identifier) << 16) | sequence;
+    LOG_DEBUG("NetworkStack: sending ICMP echo request to " << destination.to_string()
+              << " id=" << identifier << " seq=" << sequence);
+    Icmp request(IcmpType::ICMP_ECHO_REQUEST, ICMP_CODE_NONE, 0, rest_of_header, Bytes());
+    this->_send_icmp_message(destination, request, payload);
+}
+
 void NetworkStack::_send_icmp_fragment_reassembly_time_exceeded(const IPv4Address& destination)
 {
+    if (!this->_may_send_icmp_error())
+    {
+        return;
+    }
     LOG_DEBUG("NetworkStack: sending ICMP Time Exceeded (fragment reassembly) to " << destination.to_string());
     Icmp message(IcmpType::ICMP_TIME_EXCEEDED, ICMP_CODE_FRAGMENT_REASSEMBLY_TIME_EXCEEDED, 0, 0, Bytes());
     this->_send_icmp_message(destination, message, Bytes());
@@ -1221,6 +1291,12 @@ void NetworkStack::_send_icmp_message(const IPv4Address& dest_ip, const Icmp& he
 
 void NetworkStack::_send_icmp_port_unreachable(const Ip& ip)
 {
+    if (!this->_may_send_icmp_error())
+    {
+        LOG_DEBUG("NetworkStack: suppressing an ICMP Port Unreachable - error budget exhausted");
+        return;
+    }
+
     IPv4Address remote_ip(ip.get_src_address());
 
     // RFC 792: Destination Unreachable carries the original IP header plus
