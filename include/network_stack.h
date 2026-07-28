@@ -222,7 +222,13 @@ private:
     // _reap_closed_connections().
     void _watch_for_close(TcpConnection& connection);
 
-    void _send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol, const Bytes& payload);
+    // dont_fragment sets the DF bit, which is what asks the network to report
+    // a too-small link rather than silently splitting the packet. That report
+    // is the only way a sender can learn the path MTU, so TCP sets it; UDP does
+    // not, because this stack fragments oversized datagrams itself and there is
+    // no per-connection state to adjust in response.
+    void _send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol, const Bytes& payload,
+                         bool dont_fragment = false);
     void _send_tcp_segment(const IPv4Address& dest_ip, const Tcp& header, const Bytes& payload);
     // RFC 793 SS3.4's reset-generation rule for a segment that doesn't match
     // any existing connection and isn't a SYN to a listening port: no
@@ -255,6 +261,14 @@ private:
     // that sent it and fail it fast, instead of leaving it to grind through
     // the full retransmit-timeout budget before giving up.
     void _handle_icmp_error(const Icmp& icmp);
+    // RFC 1191: a router could not forward a DF-set packet because the next
+    // link's MTU is too small, and reported that MTU. Lowers the offending
+    // connection's segment size instead of failing it.
+    void _handle_icmp_fragmentation_needed(const Icmp& icmp);
+    // Pulls the connection identified by an ICMP error's quoted packet out of
+    // the connection table, or nullptr. Shared by the two handlers above, which
+    // agree on how to identify the connection and disagree on what to do to it.
+    TcpConnection* _connection_from_icmp_quote(const Icmp& icmp) const;
     // The address to actually resolve to a MAC for a packet aimed at
     // destination. The same address for an on-link destination, the gateway for
     // anything else - the distinction between the address in the IP header and

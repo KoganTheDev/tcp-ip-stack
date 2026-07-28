@@ -802,7 +802,7 @@ void NetworkStack::_send_icmp_fragment_reassembly_time_exceeded(const IPv4Addres
     this->_send_icmp_message(destination, message, Bytes());
 }
 
-void NetworkStack::_handle_icmp_error(const Icmp& icmp)
+TcpConnection* NetworkStack::_connection_from_icmp_quote(const Icmp& icmp) const
 {
     // The error quotes the offending packet back: its IP header plus the first
     // 8 bytes of its payload (RFC 792). For TCP/UDP those 8 bytes begin with
@@ -811,31 +811,31 @@ void NetworkStack::_handle_icmp_error(const Icmp& icmp)
     // connection that sent it.
     if (!icmp.has_next_layer())
     {
-        return;
+        return nullptr;
     }
     const Raw* raw = dynamic_cast<const Raw*>(&icmp.get_next_layer());
     if (raw == nullptr)
     {
-        return;
+        return nullptr;
     }
     const Bytes& embedded = raw->get_data();
     if (embedded.size() < 28) // 20-byte IP header (minimum) + 8 bytes of transport
     {
-        return;
+        return nullptr;
     }
 
     size_t ihl = static_cast<size_t>(embedded[0] & 0x0f) * 4;
     if (ihl < 20 || embedded.size() < ihl + 4)
     {
-        return;
+        return nullptr;
     }
 
     uint8_t protocol = embedded[9];
     if (protocol != IpProtocol::TCP)
     {
-        // UDP is connectionless - there's no per-connection state to fail, and
-        // a lost datagram is already UDP's contract. Only TCP benefits here.
-        return;
+        // UDP is connectionless - there's no per-connection state to act on,
+        // and a lost datagram is already UDP's contract. Only TCP benefits.
+        return nullptr;
     }
 
     IPv4Address original_dest(embedded.slice(16, 4)); // the peer we were trying to reach
@@ -844,11 +844,56 @@ void NetworkStack::_handle_icmp_error(const Icmp& icmp)
 
     ConnectionKey key{original_dest, remote_port, local_port};
     auto it = this->_connections.find(key);
-    if (it != this->_connections.end())
+    return it != this->_connections.end() ? it->second.get() : nullptr;
+}
+
+void NetworkStack::_handle_icmp_fragmentation_needed(const Icmp& icmp)
+{
+    TcpConnection* connection = this->_connection_from_icmp_quote(icmp);
+    if (connection == nullptr)
     {
-        LOG_DEBUG("NetworkStack: failing TCP connection to " << original_dest.to_string() << ":" << remote_port
-                  << " on an ICMP error (was going to time out otherwise)");
-        it->second->fail(); // -> CLOSED, reaped on the next poll()/on_timer_tick() pass
+        return;
+    }
+
+    // RFC 1191 puts the next hop's MTU in the low half of the rest-of-header
+    // field. Routers predating it send zero, which is the case that made path
+    // MTU discovery notoriously unreliable: the sender is told its packet was
+    // too big but not by how much. Falling back to the smallest MTU every IPv4
+    // host must support is the conservative answer.
+    uint16_t next_hop_mtu = static_cast<uint16_t>(icmp.get_rest_of_header() & 0xFFFF);
+    if (next_hop_mtu == 0)
+    {
+        next_hop_mtu = 576;
+        LOG_DEBUG("NetworkStack: an ICMP Fragmentation Needed carried no next-hop MTU"
+                  " (a pre-RFC-1191 router) - assuming the 576-byte minimum");
+    }
+
+    uint16_t path_mss = next_hop_mtu > 40 ? static_cast<uint16_t>(next_hop_mtu - 40) : 0;
+    LOG_DEBUG("NetworkStack: path MTU to a peer is " << next_hop_mtu
+              << " - lowering that connection's MSS to " << path_mss);
+    connection->reduce_effective_mss(path_mss);
+}
+
+void NetworkStack::_handle_icmp_error(const Icmp& icmp)
+{
+    // Fragmentation Needed is not a failure. It says the destination is fine
+    // and the packet was simply too big for a link on the way - the answer is
+    // to send smaller ones, not to give up. Failing the connection on it, as
+    // this used to for every Destination Unreachable code alike, turns a
+    // recoverable path problem into a dead connection, and is exactly how a
+    // path-MTU black hole presents: small exchanges work, large ones die.
+    if (icmp.get_code() == ICMP_CODE_FRAGMENTATION_NEEDED)
+    {
+        this->_handle_icmp_fragmentation_needed(icmp);
+        return;
+    }
+
+    TcpConnection* connection = this->_connection_from_icmp_quote(icmp);
+    if (connection != nullptr)
+    {
+        LOG_DEBUG("NetworkStack: failing a TCP connection on an ICMP error"
+                  " (it was going to time out otherwise)");
+        connection->fail(); // -> CLOSED, reaped on the next poll()/on_timer_tick() pass
     }
 }
 
@@ -949,7 +994,7 @@ void NetworkStack::_fail_pending_outbound_connects(const IPv4Address& ip)
     this->_pending_outbound_connects.erase(pending_it);
 }
 
-void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol, const Bytes& payload)
+void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol, const Bytes& payload, bool dont_fragment)
 {
     // The IP header keeps naming the final destination; the frame goes to
     // whoever will carry it onward.
@@ -962,7 +1007,7 @@ void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol,
         // oversized UDP send ever needs the fragmentation path below)
         auto ip = std::make_unique<Ip>(
             4, 5, 0, static_cast<uint16_t>(20 + payload.size()), 0,
-            0, 0, 64, protocol, 0,
+            dont_fragment ? IP_FLAG_DONT_FRAGMENT : 0, 0, 64, protocol, 0,
             this->_config.ip.get_address(), dest_ip.get_address()
         );
         *ip /= std::make_unique<Raw>(payload);
@@ -971,6 +1016,19 @@ void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol,
         Ethernet ethernet(this->_config.mac, dest_mac, EtherType::IPv4);
         ethernet /= std::move(ip);
         this->_channel->write(ethernet.to_bytes());
+        return;
+    }
+
+    // Too big for one frame, and the caller asked for DF. Fragmenting anyway
+    // would defeat the point: DF is what makes a too-small link report itself
+    // instead of silently splitting the packet, and that report is the only way
+    // the path MTU can be learned. So this is dropped, loudly. It should be
+    // unreachable for TCP, which caps its segments at the negotiated MSS.
+    if (dont_fragment)
+    {
+        LOG_WARNING("NetworkStack: dropping a " << payload.size() << "-byte packet to "
+                    << dest_ip.to_string() << " - it exceeds the " << max_ip_payload
+                    << "-byte limit and was marked Don't Fragment");
         return;
     }
 
@@ -1038,7 +1096,7 @@ void NetworkStack::_send_tcp_segment(const IPv4Address& dest_ip, const Tcp& head
     uint16_t checksum = transport_checksum(this->_config.ip, dest_ip, IpProtocol::TCP, segment.to_bytes());
     segment.set_checksum(checksum);
 
-    this->_send_ip_packet(dest_ip, IpProtocol::TCP, segment.to_bytes());
+    this->_send_ip_packet(dest_ip, IpProtocol::TCP, segment.to_bytes(), true);
 }
 
 void NetworkStack::_send_rst(const Ip& ip, const Tcp& tcp)

@@ -282,6 +282,25 @@ Bytes TcpConnection::read(size_t max_bytes)
     return taken;
 }
 
+void TcpConnection::reduce_effective_mss(uint16_t path_mss)
+{
+    // RFC 1122's floor: every IPv4 host must handle a 576-byte datagram, so
+    // 536 bytes of payload is the smallest MSS worth honouring. A report below
+    // it is either a broken router or someone trying to make this stack emit
+    // tiny segments, and either way clamping is the right answer.
+    uint16_t floor = DEFAULT_PEER_MSS;
+    uint16_t candidate = path_mss < floor ? floor : path_mss;
+
+    if (candidate >= _effective_mss)
+    {
+        return; // never upward - see the header
+    }
+
+    LOG_DEBUG("TcpConnection[" << _id << "] lowering effective MSS " << _effective_mss
+              << " -> " << candidate << " after an ICMP Fragmentation Needed");
+    _effective_mss = candidate;
+}
+
 void TcpConnection::initiate_connect()
 {
     _transition(TcpState::SYN_SENT);

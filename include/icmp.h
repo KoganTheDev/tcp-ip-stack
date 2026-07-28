@@ -17,6 +17,12 @@ enum IcmpCode : uint8_t
 {
     ICMP_CODE_NONE = 0,             // Echo Request/Reply always use this
     ICMP_CODE_PORT_UNREACHABLE = 3, // Destination Unreachable, when the failure was a UDP port with nothing bound
+    // Destination Unreachable, but the destination is fine - the packet was
+    // too big for some link on the way and had DF set, so a router could not
+    // fragment it and said so instead. RFC 1191 puts the next hop's MTU in the
+    // low half of the rest-of-header field, which is what makes path MTU
+    // discovery possible rather than a guessing game.
+    ICMP_CODE_FRAGMENTATION_NEEDED = 4,
     // Time Exceeded has two codes, and only the second applies to a host that
     // does not forward. Code 0 is the TTL running out in transit, which only a
     // router generates. Code 1 is a datagram whose remaining fragments never

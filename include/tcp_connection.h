@@ -128,6 +128,19 @@ public:
     // path reads it from outside.
     int get_rto_ticks() const { return _rto_ticks; }
 
+    // Lowers the largest segment this side will send, in response to learning
+    // the path cannot carry what was negotiated - an ICMP Fragmentation Needed
+    // naming a smaller next-hop MTU.
+    //
+    // Only ever downward. The MSS option is a statement about what the peer's
+    // receive buffer can take; this is a statement about what the path can
+    // carry, and the smaller of the two wins. Raising it again on a later,
+    // larger report would mean trusting an unauthenticated ICMP message to make
+    // this stack send bigger packets, which is a lever not worth handing out.
+    void reduce_effective_mss(uint16_t path_mss);
+
+    uint16_t get_effective_mss() const { return _effective_mss; }
+
     // Hard-closes without any teardown handshake - nothing has been
     // transmitted yet, so there's nothing to tear down. NetworkStack calls
     // this when an active open's ARP resolution exhausts its retries.

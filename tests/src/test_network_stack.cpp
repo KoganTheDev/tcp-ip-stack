@@ -1120,3 +1120,149 @@ TEST(AFragmentThatNeverCompletesDrawsIcmpTimeExceeded)
     test_assert(icmp.code == ICMP_CODE_FRAGMENT_REASSEMBLY_TIME_EXCEEDED,
                 "code 1 - the timer that ran out is the reassembly timer, not the TTL (code 0 is a router's business)");
 }
+
+// --- path MTU discovery ---
+//
+// Fragmentation Needed says the destination is fine and the packet was simply
+// too big for a link on the way. Failing the connection on it - which this did,
+// treating every Destination Unreachable code alike - turns a recoverable path
+// problem into a dead connection, and is exactly how a path-MTU black hole
+// presents: small exchanges work, large ones die for no visible reason.
+namespace
+{
+    // An ICMP Fragmentation Needed for a segment we sent, naming next_hop_mtu.
+    Bytes build_icmp_fragmentation_needed(uint16_t local_port, uint16_t remote_port, uint16_t next_hop_mtu)
+    {
+        Tcp our_segment(local_port, remote_port, 0, 0, 5, 0x02 /* SYN */, 65535, 0, 0);
+        auto embedded_ip = std::make_unique<Ip>(
+            4, 5, 0, 40, 0, 0, 0, 64, IpProtocol::TCP, 0,
+            LOCAL_IP.get_address(), PEER_IP.get_address());
+        *embedded_ip /= std::make_unique<Raw>(our_segment.to_bytes());
+        embedded_ip->compute_checksum();
+        Bytes embedded = embedded_ip->to_bytes().slice(0, 28);
+
+        // RFC 1191: the next hop's MTU lives in the low half of rest-of-header
+        Icmp icmp(IcmpType::ICMP_DESTINATION_UNREACHABLE, ICMP_CODE_FRAGMENTATION_NEEDED,
+                  0, static_cast<uint32_t>(next_hop_mtu), embedded);
+        icmp.compute_checksum();
+        return wrap_ip(IpProtocol::ICMP, icmp.to_bytes());
+    }
+
+    // Opens a connection to PEER and returns it, with the MAC already known so
+    // the SYN goes straight out.
+    TcpConnection* open_connection(NetworkStack& stack, uint16_t remote_port)
+    {
+        stack.add_static_arp_entry(PEER_IP, PEER_MAC);
+        return stack.connect(PEER_IP, remote_port);
+    }
+
+    // Accepts a connection whose peer advertised a full-sized MSS.
+    //
+    // This matters for the path-MTU tests: a connection opened with connect()
+    // has no peer MSS option yet, so its effective MSS is RFC 793's 536-byte
+    // fallback - already at the floor, so no report could lower it and the test
+    // would pass without the mechanism doing anything. Starting from a real
+    // 1460 is what makes a reduction observable.
+    TcpConnection* accept_connection_with_peer_mss(NetworkStack& stack, FakePacketChannel& channel,
+                                                   uint16_t local_port, uint16_t remote_port)
+    {
+        stack.listen(local_port);
+        stack.add_static_arp_entry(PEER_IP, PEER_MAC);
+
+        Bytes mss_option = Bytes::from_hex("020405b4"); // kind 2, length 4, MSS 1460
+        channel.push_inbound(build_tcp_with_options(FLAG_SYN, 1000, 0, remote_port, local_port, mss_option));
+        stack.poll();
+
+        uint32_t isn = find_tcp(channel.outbound_frames()).seq;
+        channel.clear_outbound();
+        channel.push_inbound(build_tcp(FLAG_ACK, 1001, isn + 1, remote_port, local_port));
+        stack.poll();
+
+        return stack.accept(local_port);
+    }
+}
+
+TEST(FragmentationNeededLowersTheMssInsteadOfKillingTheConnection)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    TcpConnection* connection = accept_connection_with_peer_mss(*stack, *channel, 80, 40000);
+    test_assert(connection != nullptr, "precondition: the connection was accepted");
+    uint16_t mss_before = connection->get_effective_mss();
+    test_assert(mss_before == 1460, "precondition: the peer advertised a full-sized MSS, so there is room to come down from");
+
+    channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 1000));
+    stack->poll();
+
+    test_assert(stack->find_connection(connection->get_id()) != nullptr,
+                "Fragmentation Needed must NOT fail the connection - the destination is reachable, the packet was just too big");
+    test_assert(connection->get_effective_mss() < mss_before,
+                "it must lower the segment size instead");
+    test_assert(connection->get_effective_mss() == 1000 - 40,
+                "the new MSS should be the reported next-hop MTU less an IP and a TCP header");
+}
+
+// Only ever downward. Raising it on a later, larger report would mean trusting
+// an unauthenticated ICMP message to make this stack send bigger packets.
+TEST(FragmentationNeededNeverRaisesTheMss)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    TcpConnection* connection = accept_connection_with_peer_mss(*stack, *channel, 80, 40000);
+    channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 1000));
+    stack->poll();
+    test_assert(connection->get_effective_mss() == 960, "precondition: lowered once");
+
+    channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 9000));
+    stack->poll();
+    test_assert(connection->get_effective_mss() == 960,
+                "a report claiming a larger MTU must be ignored - an attacker could otherwise talk this stack into oversized segments");
+}
+
+TEST(OtherUnreachableCodesStillFailTheConnection)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    TcpConnection* connection = open_connection(*stack, 80);
+    uint64_t id = connection->get_id();
+    uint16_t local_port = find_tcp(channel->outbound_frames()).src_port;
+
+    channel->push_inbound(build_icmp_port_unreachable_for_our_tcp(local_port, 80));
+    stack->poll();
+
+    test_assert(stack->find_connection(id) == nullptr,
+                "a genuine unreachable must still fail the connection fast rather than letting it grind through its retransmit budget");
+}
+
+// Routers predating RFC 1191 report the failure without saying how small is
+// small enough, which is what made path MTU discovery notoriously unreliable.
+TEST(FragmentationNeededWithoutAnMtuFallsBackToTheMinimum)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    TcpConnection* connection = accept_connection_with_peer_mss(*stack, *channel, 80, 40000);
+    test_assert(connection->get_effective_mss() == 1460, "precondition: starting from a full-sized MSS");
+
+    channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 0));
+    stack->poll();
+
+    test_assert(connection->get_effective_mss() == 576 - 40,
+                "with no MTU reported the conservative answer is the smallest datagram every IPv4 host must handle");
+}
+
+// TCP sets DF, because that report is the only way the path MTU can be learned.
+TEST(TcpSegmentsAreSentWithDontFragmentSet)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    open_connection(*stack, 80);
+
+    Ethernet eth(channel->outbound_frames()[0]);
+    const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
+    test_assert(ip != nullptr && ip->get_ip_flag_d(),
+                "a TCP segment must carry DF - without it a small link silently fragments and the sender never learns the path MTU");
+}
