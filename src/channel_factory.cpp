@@ -71,13 +71,33 @@ namespace
     }
 }
 
+namespace
+{
+    // The addressing every transport shares, before the transport-specific
+    // parts (MAC, MTU) are filled in by whichever one was opened.
+    InterfaceConfig base_config(const ChannelOptions& options)
+    {
+        InterfaceConfig config;
+        config.ip = options.local_ip;
+        config.prefix_length = options.prefix_length;
+        if (options.gateway.has_value())
+        {
+            config.gateway = *options.gateway;
+        }
+        return config;
+    }
+}
+
 OpenedChannel open_channel(const ChannelOptions& options)
 {
     if (options.transport == Transport::Tap)
     {
         OpenedChannel opened;
         opened.channel = open_tap(options.device);
-        opened.local_mac = options.local_mac.value_or(MacAddress(DEFAULT_TAP_MAC));
+        opened.config = base_config(options);
+        opened.config.mac = options.local_mac.value_or(MacAddress(DEFAULT_TAP_MAC));
+        // A TAP device has no hardware MTU to ask about; the kernel side is
+        // created with the 1500 the default already assumes.
         return opened;
     }
 
@@ -103,7 +123,9 @@ OpenedChannel open_channel(const ChannelOptions& options)
     }
 
     OpenedChannel opened;
+    opened.config = base_config(options);
+    opened.config.mac = resolved_mac;
+    opened.config.mtu = raw->get_mtu();
     opened.channel = std::move(raw);
-    opened.local_mac = resolved_mac;
     return opened;
 }

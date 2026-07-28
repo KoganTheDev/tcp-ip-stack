@@ -6,6 +6,7 @@
 
 #include "packet_channel.h"
 #include "network_addresses.h"
+#include "interface_config.h"
 
 // Chooses and opens the transport the stack runs over. Both options end up
 // behind the same PacketChannel seam, so nothing downstream - NetworkStack,
@@ -47,16 +48,27 @@ struct ChannelOptions
     //  - RawNic: the interface's real hardware address. Adopting it is what
     //    lets the NIC filter for us and makes promiscuous mode unnecessary.
     std::optional<MacAddress> local_mac;
+
+    // Network prefix length, so 24 means 255.255.255.0. This is what decides
+    // which destinations are neighbours and which have to go via the gateway.
+    uint8_t prefix_length = 24;
+
+    // Next hop for anything not on the local network. Unset means there is no
+    // gateway, in which case off-link destinations are simply unreachable
+    // rather than being ARP'd for hopelessly.
+    std::optional<IPv4Address> gateway;
 };
 
 struct OpenedChannel
 {
     std::unique_ptr<PacketChannel> channel;
-    // The resolved MAC, ready to hand to NetworkStack's constructor. Returned
-    // alongside the channel rather than being queryable through PacketChannel,
-    // because only RawNic has a hardware address to report and the value is
-    // wanted exactly once, here, by code that knows the concrete type.
-    MacAddress local_mac;
+    // The resolved interface configuration, ready to hand to NetworkStack.
+    // Returned alongside the channel rather than being queryable through
+    // PacketChannel because parts of it can only be answered by the concrete
+    // transport - a real NIC reports its own hardware address and MTU, a TAP
+    // device has neither - and they are wanted exactly once, here, by the code
+    // that just built the thing and therefore knows which it is.
+    InterfaceConfig config;
 };
 
 // Opens the configured transport. Throws with an actionable message if the

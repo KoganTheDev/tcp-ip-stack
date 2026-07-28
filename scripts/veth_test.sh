@@ -25,6 +25,10 @@ HOST_IF=vstack0
 PEER_IF=vstack1
 PEER_IP=10.9.0.1
 STACK_IP=10.9.0.2
+# An address on a network the stack is NOT on, reachable only via the peer
+# acting as a router. This is what exercises next-hop selection.
+OFFLINK_IP=192.168.77.1
+OFFLINK_NET=192.168.77.0/24
 PORT=8080
 LOG=$(mktemp /tmp/veth_test_server.XXXXXX.log)
 SERVER_PID=""
@@ -89,6 +93,15 @@ ip link set "$HOST_IF" up
 ip -n "$NS" link set "$PEER_IF" up
 ip -n "$NS" addr add "$PEER_IP/24" dev "$PEER_IF"
 
+# Give the peer a second address on a different network, so it can act as a
+# router: traffic the stack sends to OFFLINK_IP is off-link from the stack's
+# point of view and can only be delivered by resolving the gateway instead of
+# the destination. Without next-hop selection the stack would ARP for
+# 192.168.77.1, hear nothing, and give up.
+ip -n "$NS" link add offlink0 type dummy 2>/dev/null || true
+ip -n "$NS" addr add "$OFFLINK_IP/24" dev offlink0 2>/dev/null || true
+ip -n "$NS" link set offlink0 up 2>/dev/null || true
+
 # Disable checksum offload on BOTH ends. This is not optional and it is not
 # papering over a stack bug.
 #
@@ -108,7 +121,7 @@ echo "  $HOST_IF hardware address: $HOST_MAC"
 
 # --- run -------------------------------------------------------------------
 
-"$SERVER" --transport nic --device "$HOST_IF" --ip "$STACK_IP" --port "$PORT" >"$LOG" 2>&1 &
+"$SERVER" --transport nic --device "$HOST_IF" --ip "$STACK_IP" --prefix 24     --gateway "$PEER_IP" --port "$PORT" >"$LOG" 2>&1 &
 SERVER_PID=$!
 
 # wait for it to report itself ready rather than sleeping a guessed interval
@@ -133,6 +146,9 @@ echo "Checks:"
 
 grep -q "transport=nic device=$HOST_IF ip=$STACK_IP" "$LOG"
 check $? "server started on $HOST_IF over AF_PACKET"
+
+grep -q "gateway=$PEER_IP" "$LOG"
+check $? "server reports the configured gateway"
 
 ip netns exec "$NS" ping -c 2 -W 2 "$STACK_IP" >/dev/null 2>&1
 check $? "peer can ping the stack (our ICMP echo reply, not the kernel's)"
@@ -171,6 +187,28 @@ if ip -br link show "$HOST_IF" | grep -q PROMISC; then
     fail "$HOST_IF is in promiscuous mode - this stack must never need it"
 else
     pass "no promiscuous mode on $HOST_IF"
+fi
+
+# --- off-link reachability -------------------------------------------------
+#
+# These only pass if the stack resolves the GATEWAY rather than the
+# destination. The source address is on a network the stack has no route to
+# except the default one, so every reply has to be sent to the peer's MAC while
+# the IP header still names 192.168.77.1.
+
+if ip netns exec "$NS" ip addr show offlink0 >/dev/null 2>&1; then
+    ip netns exec "$NS" ping -c 2 -W 2 -I "$OFFLINK_IP" "$STACK_IP" >/dev/null 2>&1
+    check $? "stack replies to an off-link source (reply must go via the gateway, not be ARPed for directly)"
+
+    echo -n "offlink-echo" | timeout 10 ip netns exec "$NS" nc -s "$OFFLINK_IP" -q 1 "$STACK_IP" "$PORT" > /tmp/offlink.out 2>/dev/null
+    if [ "$(cat /tmp/offlink.out 2>/dev/null)" = "offlink-echo" ]; then
+        pass "TCP round-trip with an off-link peer"
+    else
+        fail "off-link TCP echo returned '$(cat /tmp/offlink.out 2>/dev/null)', expected 'offlink-echo'"
+    fi
+    rm -f /tmp/offlink.out
+else
+    echo "  SKIP  off-link checks (could not create a dummy interface in the namespace)"
 fi
 
 kill -0 "$SERVER_PID" 2>/dev/null

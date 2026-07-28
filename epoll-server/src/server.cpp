@@ -12,13 +12,13 @@ namespace
 }
 
 Server::Server(uint16_t port, size_t worker_count, const ChannelOptions& channel_options)
-    : Server(port, worker_count, open_channel(channel_options), channel_options.local_ip)
+    : Server(port, worker_count, open_channel(channel_options))
 {
 }
 
-Server::Server(uint16_t port, size_t worker_count, OpenedChannel opened, const IPv4Address& local_ip)
+Server::Server(uint16_t port, size_t worker_count, OpenedChannel opened)
     : _port(port),
-      _network_stack(std::move(opened.channel), opened.local_mac, local_ip),
+      _network_stack(std::move(opened.channel), opened.config),
       _epoll(), _completion_queue(), _thread_pool(worker_count), _timer_fd(-1)
 {
     this->_network_stack.listen(port);

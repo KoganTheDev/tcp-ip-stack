@@ -67,10 +67,19 @@ public:
     const MacAddress& get_mac_address() const { return this->_interface_mac; }
     const std::string& get_interface_name() const { return this->_interface_name; }
 
-    // The stack hardcodes a 1500-byte MTU in its MSS and fragmentation limits,
-    // so an interface with any other MTU is rejected at construction rather
-    // than silently producing frames the driver drops.
-    static constexpr int REQUIRED_MTU = 1500;
+    // The interface's MTU, read at construction. The stack derives its
+    // advertised MSS and its fragmentation threshold from this, so it is
+    // reported rather than assumed - it used to insist on exactly 1500, which
+    // made a property of one Ethernet device into a requirement of the stack.
+    uint16_t get_mtu() const { return this->_mtu; }
+
+    // Bounds on an MTU this stack will work with. The floor is RFC 791's
+    // minimum that every IPv4 host must handle, below which the advertised MSS
+    // stops being sensible. The ceiling is what the receive buffer can hold
+    // once an Ethernet header (and room for a VLAN tag) is accounted for -
+    // a larger MTU would silently truncate frames on read.
+    static constexpr uint16_t MIN_SUPPORTED_MTU = 576;
+    static constexpr uint16_t MAX_SUPPORTED_MTU = 2030;
 
 private:
     void _query_interface(); // index, MAC, IFF_UP and MTU checks
@@ -85,4 +94,5 @@ private:
     // own transmitted frames are still delivered and read() must discard them
     // itself, using the kernel's own classification of each frame.
     bool _kernel_ignores_outgoing;
+    uint16_t _mtu;
 };

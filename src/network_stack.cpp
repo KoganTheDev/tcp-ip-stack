@@ -269,7 +269,10 @@ bool NetworkStack::poll()
             break;
         }
 
-        Bytes frame = this->_channel->read(2048);
+        // Sized from the interface rather than a fixed 2048: enough for the
+        // largest frame this MTU can produce, plus an Ethernet header and room
+        // for a VLAN tag that is not parsed but can still arrive.
+        Bytes frame = this->_channel->read(static_cast<unsigned int>(this->_config.mtu) + 18);
         if (frame.empty())
         {
             break; // no more frames available right now

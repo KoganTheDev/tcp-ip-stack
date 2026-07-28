@@ -23,7 +23,7 @@ namespace
 }
 
 RawPacketChannel::RawPacketChannel(const std::string& interface_name)
-    : _fd(-1), _interface_name(interface_name), _interface_index(0), _kernel_ignores_outgoing(false)
+    : _fd(-1), _interface_name(interface_name), _interface_index(0), _kernel_ignores_outgoing(false), _mtu(0)
 {
     if (interface_name.empty() || interface_name.size() >= IFNAMSIZ)
     {
@@ -59,6 +59,7 @@ RawPacketChannel::RawPacketChannel(const std::string& interface_name)
     LOG_INFO("RawPacketChannel: bound to " << this->_interface_name
              << " (index " << this->_interface_index
              << ", mac " << this->_interface_mac.to_string()
+             << ", mtu " << this->_mtu
              << ", kernel drops our own frames: " << (this->_kernel_ignores_outgoing ? "yes" : "no") << ")");
 }
 
@@ -107,17 +108,21 @@ void RawPacketChannel::_query_interface()
             + this->_interface_name + " up");
     }
 
-    // The stack's MSS and fragmentation limits are compiled in against a
-    // 1500-byte MTU. On a smaller one it would emit frames the driver drops,
-    // and the symptom - small exchanges fine, bulk transfers stalling - points
-    // nowhere near the cause. Refuse up front.
+    // Read the MTU rather than insisting on a particular one: the stack now
+    // derives its MSS and fragmentation threshold from whatever this reports.
+    // The range check is still needed, because both ends of it are real - too
+    // small and the advertised MSS stops making sense, too large and the
+    // receive buffer truncates frames, which presents as bulk transfers
+    // stalling for no visible reason.
     interface_ioctl(SIOCGIFMTU, "the MTU");
-    if (request.ifr_mtu != REQUIRED_MTU)
+    if (request.ifr_mtu < MIN_SUPPORTED_MTU || request.ifr_mtu > MAX_SUPPORTED_MTU)
     {
         throw EXCEPTION(BaseException,
             "interface " + this->_interface_name + " has MTU " + std::to_string(request.ifr_mtu)
-            + ", but this stack's segment sizing assumes " + std::to_string(REQUIRED_MTU));
+            + ", outside the supported range " + std::to_string(MIN_SUPPORTED_MTU)
+            + "-" + std::to_string(MAX_SUPPORTED_MTU));
     }
+    this->_mtu = static_cast<uint16_t>(request.ifr_mtu);
 }
 
 void RawPacketChannel::_bind_to_interface()

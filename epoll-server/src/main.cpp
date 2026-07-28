@@ -37,6 +37,11 @@ namespace
             "  --device PATH|NAME    TAP device path, or interface name for nic\n"
             "                          (default /dev/net/tun)\n"
             "  --ip A.B.C.D          address this stack answers for (default 10.0.0.2)\n"
+            "  --prefix N            network prefix length, so 24 means 255.255.255.0\n"
+            "                          (default 24). Decides which destinations are\n"
+            "                          neighbours and which go via the gateway\n"
+            "  --gateway A.B.C.D     next hop for anything off the local network.\n"
+            "                          Without one, only the local segment is reachable\n"
             "  --mac AA:BB:...       override the MAC. Defaults to a fixed locally\n"
             "                          administered address for tap, and to the\n"
             "                          interface's real hardware address for nic\n"
@@ -101,6 +106,19 @@ namespace
                 else if (flag == "--ip")
                 {
                     config.channel.local_ip = IPv4Address(next_value(i, "--ip"));
+                }
+                else if (flag == "--prefix")
+                {
+                    int prefix = std::stoi(next_value(i, "--prefix"));
+                    if (prefix < 0 || prefix > 32)
+                    {
+                        throw EXCEPTION(BaseException, "--prefix must be between 0 and 32");
+                    }
+                    config.channel.prefix_length = static_cast<uint8_t>(prefix);
+                }
+                else if (flag == "--gateway")
+                {
+                    config.channel.gateway = IPv4Address(next_value(i, "--gateway"));
                 }
                 else if (flag == "--mac")
                 {
@@ -186,6 +204,9 @@ int main(int argc, char** argv)
                  << " | transport=" << (config.channel.transport == Transport::Tap ? "tap" : "nic")
                  << " device=" << config.channel.device
                  << " ip=" << config.channel.local_ip.to_string()
+                 << "/" << static_cast<int>(config.channel.prefix_length)
+                 << " gateway=" << (config.channel.gateway.has_value()
+                                    ? config.channel.gateway->to_string() : "none")
                  << " workers=" << config.worker_count
                  << " (custom Ethernet/ARP/IP/TCP stack, no kernel sockets)");
 

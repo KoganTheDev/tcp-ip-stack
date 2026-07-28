@@ -53,7 +53,7 @@ private:
     // before the member initializer list runs, since NetworkStack needs both
     // the channel and the MAC that opening it resolved, and open_channel()
     // must be called exactly once.
-    Server(uint16_t port, size_t worker_count, OpenedChannel opened, const IPv4Address& local_ip);
+    Server(uint16_t port, size_t worker_count, OpenedChannel opened);
 
     void _create_retransmit_timer();
     void _handle_new_connections();
