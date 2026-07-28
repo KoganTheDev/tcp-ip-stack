@@ -18,6 +18,7 @@ namespace
         uint32_t ack;
         uint8_t flags;
         Bytes payload;
+        uint16_t window;
     };
 
     uint8_t flags_of(const Tcp& header)
@@ -64,7 +65,7 @@ namespace
             8080, IPv4Address("10.0.0.1"), 12345, 1000,
             [&sent](const Tcp& header, const Bytes& payload)
             {
-                sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload});
+                sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload, header.get_window()});
             }
         );
 
@@ -82,7 +83,7 @@ TEST(HandshakeSendsSynAckWithCorrectSeqAndAck)
     TcpConnection connection(8080, IPv4Address("10.0.0.1"), 12345, 1000,
         [&sent](const Tcp& header, const Bytes& payload)
         {
-            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload});
+            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload, header.get_window()});
         }
     );
 
@@ -104,7 +105,7 @@ TEST(ActiveOpenSendsBareSynThenCompletesHandshake)
     TcpConnection connection(54321, IPv4Address("10.0.0.2"), 8080, 2000,
         [&sent](const Tcp& header, const Bytes& payload)
         {
-            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload});
+            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload, header.get_window()});
         }
     );
 
@@ -131,13 +132,18 @@ TEST(FinalHandshakeAckMovesToEstablished)
     test_assert(connection->get_state() == TcpState::ESTABLISHED, "final handshake ACK should move to ESTABLISHED");
 }
 
-// Regression test for a load-testing find: under a burst of many
-// connections, a connection's handshake-completing ACK and its first data
-// segment can land in the same processing batch, before the application
-// (Server) has called accept() and wired up a data_received callback.
-// NetworkStack delivers data the instant a segment arrives, with no
-// buffering of its own - on_segment() must not silently drop data that
-// arrives before any callback is registered.
+// Regression test for a load-testing find: under a burst of many connections, a
+// connection's handshake-completing ACK and its first data segment can land in
+// the same processing batch, before the application has called accept() and
+// registered anything. That data must not be dropped.
+//
+// The receive queue makes this fall out for free rather than needing a special
+// case - unread data waits in the queue whether or not anyone is listening yet,
+// so "arrived before a callback existed" stopped being a distinct situation.
+// What it also means is that the bytes are now coalesced: registering fires one
+// notification and one read() returns everything waiting, instead of one
+// delivery per segment. The guarantee worth asserting is that no byte is lost
+// and the order is preserved, not how many chunks it arrives in.
 TEST(DataArrivingBeforeCallbackRegisteredIsNotLost)
 {
     std::vector<RecordedSegment> sent;
@@ -149,7 +155,7 @@ TEST(DataArrivingBeforeCallbackRegisteredIsNotLost)
         8080, IPv4Address("10.0.0.1"), 12345, 1000,
         [&sent](const Tcp& header, const Bytes& payload)
         {
-            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload});
+            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload, header.get_window()});
         }
     );
     connection->accept_incoming_syn(500);
@@ -161,20 +167,22 @@ TEST(DataArrivingBeforeCallbackRegisteredIsNotLost)
     connection->on_segment(*make_incoming_segment(506, 1001, FLAG_ACK, second_chunk));
 
     std::vector<Bytes> received;
-    connection->set_data_received_callback([&received](const Bytes& data)
+    connection->set_data_ready_callback([&received, &connection]()
     {
-        received.push_back(data);
+        received.push_back(connection->read());
     });
 
-    test_assert(received.size() == 2, "both segments received before the callback existed should be delivered once it's registered");
-    test_assert(received[0].to_hex() == first_chunk.to_hex(), "buffered data should be delivered in the order it arrived");
-    test_assert(received[1].to_hex() == second_chunk.to_hex(), "buffered data should be delivered in the order it arrived");
+    test_assert(received.size() == 1, "registering should fire one notification for everything already waiting");
+    test_assert(received[0].to_hex() == (first_chunk.to_hex() + second_chunk.to_hex()),
+                "every byte that arrived before anyone was listening must still be readable, in arrival order");
 
-    // data arriving after the callback is already set should still go
-    // straight through, not get buffered again
+    // data arriving after the callback is set should notify straight away
     Bytes third_chunk = Bytes::from_hex("2131");           // "!1"
     connection->on_segment(*make_incoming_segment(511, 1001, FLAG_ACK, third_chunk));
-    test_assert(received.size() == 3, "data arriving after the callback is set should be delivered immediately");
+    test_assert(received.size() == 2, "data arriving after the callback is set should notify immediately");
+    test_assert(received[1].to_hex() == third_chunk.to_hex(), "and read() should return just the new data");
+
+    test_assert(connection->bytes_available() == 0, "everything read leaves nothing queued");
 }
 
 TEST(InboundDataTriggersCallbackAndAcksCorrectly)
@@ -183,15 +191,15 @@ TEST(InboundDataTriggersCallbackAndAcksCorrectly)
     auto connection = make_established_connection(sent);
 
     Bytes received;
-    connection->set_data_received_callback([&received](const Bytes& data)
+    connection->set_data_ready_callback([&received, &connection]()
     {
-        received = data;
+        received = connection->read();
     });
 
     Bytes payload = Bytes::from_hex("68656c6c6f"); // "hello"
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, payload));
 
-    test_assert(received.to_hex() == payload.to_hex(), "data_received callback should fire with the exact payload");
+    test_assert(received.to_hex() == payload.to_hex(), "the readiness callback should fire and read() should return the exact payload");
     // delayed ACK: a single in-order segment's ack is held, not sent at once
     test_assert(sent.empty(), "an in-order segment's ack should be delayed, not sent immediately");
 
@@ -207,7 +215,7 @@ TEST(DelayedAckIsSentImmediatelyOnSecondSegment)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
-    connection->set_data_received_callback([](const Bytes&) {});
+    connection->set_data_ready_callback([&connection]() { connection->read(); });
 
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes::from_hex("68656c6c6f"))); // seq 501..505
     test_assert(sent.empty(), "the first in-order segment's ack should be delayed");
@@ -223,7 +231,7 @@ TEST(DelayedAckIsPiggybackedOnOutgoingData)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
-    connection->set_data_received_callback([](const Bytes&) {});
+    connection->set_data_ready_callback([&connection]() { connection->read(); });
 
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes::from_hex("68656c6c6f")));
     test_assert(sent.empty(), "the ack should be pending, not yet sent");
@@ -533,7 +541,7 @@ TEST(OutOfOrderSegmentIsBufferedThenDeliveredOnceGapFills)
     auto connection = make_established_connection(sent);
 
     std::vector<Bytes> received;
-    connection->set_data_received_callback([&received](const Bytes& data) { received.push_back(data); });
+    connection->set_data_ready_callback([&received, &connection]() { received.push_back(connection->read()); });
 
     Bytes first = Bytes::from_hex("68656c6c6f");  // "hello" - seq 501..505
     Bytes second = Bytes::from_hex("776f726c64"); // "world" - seq 506..510
@@ -639,7 +647,7 @@ TEST(NegotiatedMssCapsSentSegmentSize)
     TcpConnection connection(8080, IPv4Address("10.0.0.1"), 12345, 1000,
         [&sent](const Tcp& header, const Bytes& payload)
         {
-            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload});
+            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload, header.get_window()});
         }
     );
 
@@ -871,7 +879,7 @@ TEST(CumulativeAckRetiresSegmentsAcrossASequenceNumberWrap)
         8080, IPv4Address("10.0.0.1"), 12345, isn,
         [&sent](const Tcp& header, const Bytes& payload)
         {
-            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload});
+            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload, header.get_window()});
         }
     );
     // an 8-byte peer MSS keeps the segments small enough to place precisely
@@ -935,4 +943,78 @@ TEST(FastRetransmitRestartsTheRetransmitTimer)
     // one more tick would have hit the un-reset countdown's last tick
     connection->on_tick();
     test_assert(sent.size() == 2, "the timer must have been restarted by the fast retransmit, so a single further tick cannot trigger a timeout retransmit of the same segment");
+}
+
+// --- flow control that actually exists ---
+//
+// The advertised window used to describe a buffer nothing was held in: RCV.NXT
+// advanced and the data was pushed at the application in the same breath, so
+// the window reopened for bytes nobody had consumed. An application that stopped
+// reading could not slow a sender down at all. These cover the real thing.
+
+TEST(UnreadDataShrinksTheAdvertisedWindow)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->set_data_ready_callback([]() {}); // notified, but deliberately does not read
+
+    // Enough unread data that the remaining space drops below what the 16-bit
+    // window field can express. Without window scaling the advertised value is
+    // clamped to 65535, so a smaller amount would be genuinely held but not yet
+    // visible on the wire - the buffer is 128 KiB.
+    uint32_t seq = 501;
+    while (connection->bytes_available() < 70000)
+    {
+        connection->on_segment(*make_incoming_segment(seq, 1001, FLAG_ACK, Bytes(1000)));
+        seq += 1000;
+    }
+
+    test_assert(connection->bytes_available() >= 70000, "unread data should be sitting in the receive queue");
+
+    // force an ack out so the advertised window is observable on the wire
+    connection->on_tick();
+    test_assert(!sent.empty(), "the delayed ack should have gone out by now");
+    test_assert(sent.back().window < 65535,
+                "the advertised window must shrink to account for data the application has not read - before the receive queue existed it stayed wide open, because delivery advanced RCV.NXT and handed the bytes away in one step");
+}
+
+TEST(ReadingReopensTheWindowAndTellsThePeer)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->set_data_ready_callback([]() {});
+
+    // fill the receive buffer completely, so the window is genuinely zero
+    uint32_t seq = 501;
+    while (connection->bytes_available() < TcpConnection::RECEIVE_BUFFER_CAPACITY)
+    {
+        connection->on_segment(*make_incoming_segment(seq, 1001, FLAG_ACK, Bytes(1000)));
+        seq += 1000;
+    }
+
+    connection->on_tick();
+    test_assert(!sent.empty() && sent.back().window == 0,
+                "with the receive buffer full of unread data the advertised window must be zero - this is the sender being told to stop");
+
+    size_t sent_before = sent.size();
+    Bytes taken = connection->read(4000);
+
+    test_assert(taken.size() == 4000, "read() should return exactly what was asked for when that much is queued");
+    test_assert(sent.size() == sent_before + 1, "reopening a window that was shut must send a window update, not wait for the peer's next probe");
+    test_assert(sent.back().window > 0, "the update must advertise the freed space");
+}
+
+TEST(ReadTakesInOrderAndCanBePartial)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->set_data_ready_callback([]() {});
+
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes::from_hex("aaaa")));
+    connection->on_segment(*make_incoming_segment(503, 1001, FLAG_ACK, Bytes::from_hex("bbbb")));
+
+    test_assert(connection->read(3).to_hex() == "aaaabb", "a partial read should span chunk boundaries and stop exactly at the limit");
+    test_assert(connection->bytes_available() == 1, "the remainder should stay queued");
+    test_assert(connection->read().to_hex() == "bb", "the rest should come back in order on the next read");
+    test_assert(connection->read().empty(), "reading an empty queue should return nothing rather than blocking or faulting");
 }

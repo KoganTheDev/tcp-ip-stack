@@ -650,15 +650,16 @@ TEST(TwoStacksHandshakeExchangeDataAndHalfClose)
 
     // server echoes whatever it receives
     std::vector<Bytes> server_received;
-    server->set_data_received_callback([&server_received, server](const Bytes& data)
+    server->set_data_ready_callback([&server_received, server]()
     {
+        Bytes data = server->read();
         server_received.push_back(data);
         server->send(data);
     });
     std::vector<Bytes> client_received;
-    client->set_data_received_callback([&client_received](const Bytes& data)
+    client->set_data_ready_callback([&client_received, client]()
     {
-        client_received.push_back(data);
+        client_received.push_back(client->read());
     });
 
     Bytes message = Bytes::from_hex("68656c6c6f"); // "hello"

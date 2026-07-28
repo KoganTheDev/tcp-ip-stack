@@ -63,7 +63,11 @@ public:
     // already blocks the implicit copy constructor. A by-value std::function
     // parameter would need one of those to invoke its stored target.
     using SendSegmentFn = std::function<void(const Tcp& segment, const Bytes& payload)>;
-    using DataReceivedFn = std::function<void(const Bytes& data)>;
+    // Notification that readable data has arrived. It deliberately carries no
+    // data: the bytes stay in this connection's receive queue until the
+    // application takes them with read(). That is what makes the advertised
+    // window mean something - see read() and _receive_buffer_occupied().
+    using DataReadyFn = std::function<void()>;
     using StateChangedFn = std::function<void(TcpState new_state)>;
 
     // local_port/remote_ip/remote_port identify the 4-tuple (local IP is
@@ -124,7 +128,35 @@ public:
     // data-carrying segment lands in the same poll() drain as the segment
     // that completed its handshake, it arrives before accept() was even
     // called - silently lost without this buffer.
-    void set_data_received_callback(DataReceivedFn callback);
+    // Registers the readiness notification, and fires it immediately if data
+    // is already waiting - which it can be, since a data-carrying segment may
+    // land in the same batch as the one completing the handshake, before the
+    // application has been handed the connection at all.
+    void set_data_ready_callback(DataReadyFn callback);
+
+    // Takes up to max_bytes of received data out of the receive queue.
+    //
+    // This is the half of flow control that used to be missing. Data used to be
+    // pushed straight at the application and RCV.NXT advanced regardless, so
+    // the advertised window reopened for bytes nobody had consumed - the window
+    // described a buffer that was not actually holding anything. Now the bytes
+    // stay here until they are read, the window is computed from what is still
+    // unread, and an application that stops reading genuinely closes the window
+    // and stops the sender.
+    //
+    // Reading enough to reopen a window that had shut also sends a window
+    // update, so the peer resumes immediately rather than waiting for its next
+    // persist probe to discover the change.
+    Bytes read(size_t max_bytes = static_cast<size_t>(-1));
+
+    // Bytes waiting to be read. The application's share of the receive buffer.
+    size_t bytes_available() const { return _receive_queued_bytes; }
+
+    // How much this connection will hold on the receive side before the
+    // advertised window reaches zero and the peer is told to stop. Public
+    // because it is the number an application needs to reason about how much
+    // it can afford not to read.
+    static constexpr uint32_t RECEIVE_BUFFER_CAPACITY = 131072; // 128 KiB
     void set_state_changed_callback(StateChangedFn callback) { _on_state_changed = std::move(callback); }
 
     // Called by NetworkStack immediately after constructing this object for
@@ -184,12 +216,12 @@ private:
     // starts exactly where the previous one ended), so this is an O(1)
     // subtraction instead of an O(n) sum over every entry.
     uint32_t _bytes_in_flight() const;
-    // Bytes still occupying the receive buffer - the reorder buffer's
-    // out-of-order segments plus anything already delivered out of
-    // sequence but not yet handed to an application callback. What's left
-    // of RECEIVE_BUFFER_CAPACITY after subtracting this is what gets
-    // advertised as this side's receive window.
+    // Bytes occupying the receive buffer: out-of-order segments waiting for a
+    // gap to fill, plus in-order data the application has not read yet. What is
+    // left of RECEIVE_BUFFER_CAPACITY after subtracting this is the window.
     uint32_t _receive_buffer_occupied() const;
+    // The window this side would advertise right now.
+    uint32_t _advertised_window() const;
     // Folds one round-trip measurement into the smoothed RTT/variance pair
     // and recomputes _rto_ticks from them (RFC 6298's estimator, Jacobson &
     // Karels' algorithm). Called only with an *unambiguous* sample - see
@@ -312,16 +344,25 @@ private:
     bool _in_fast_recovery;
 
     SendSegmentFn _send_segment;
-    DataReceivedFn _on_data_received;
+    DataReadyFn _on_data_ready;
     StateChangedFn _on_state_changed;
-    // received data waiting for a callback to be registered - see
-    // set_data_received_callback()'s comment
-    std::deque<Bytes> _received_before_callback;
+    // In-order data that has been acknowledged to the peer but not yet read by
+    // the application. This is what the advertised window is a window onto: it
+    // is counted as occupied, so it shrinks the window while it sits here, and
+    // frees the window again when read() takes it.
+    //
+    // It also subsumes what used to be a separate "arrived before a callback
+    // was registered" buffer. There is no such special case any more - data
+    // that arrives before anyone is listening simply waits in the queue like
+    // any other unread data.
+    std::deque<Bytes> _receive_queue;
+    // Kept alongside the queue so the advertised window is an O(1) subtraction
+    // rather than a walk over every buffered chunk on every header build.
+    size_t _receive_queued_bytes;
 
     static constexpr uint16_t DEFAULT_LOCAL_MSS = 1460; // 1500 (typical Ethernet MTU) - 20 (IP) - 20 (TCP)
     static constexpr uint16_t DEFAULT_PEER_MSS = 536; // RFC 793's fallback when a peer's SYN carries no MSS option
     static constexpr uint8_t WINDOW_SCALE_SHIFT = 1; // this stack's advertised shift
-    static constexpr uint32_t RECEIVE_BUFFER_CAPACITY = 131072; // 128 KiB - bounds the reorder buffer and the advertised window
     static constexpr uint32_t INITIAL_SSTHRESH = 65536; // effectively "no ceiling yet" until a real loss recalibrates it
     static constexpr int DUP_ACK_FAST_RETRANSMIT_THRESHOLD = 3;
     // RFC 6298 rule 2.1: before any RTT has been measured there is nothing to

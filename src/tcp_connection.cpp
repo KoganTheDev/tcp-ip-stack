@@ -70,7 +70,7 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
       _local_port(local_port), _remote_ip(remote_ip), _remote_port(remote_port),
       _state(TcpState::LISTEN),
       _send_next(initial_seq), _recv_next(0),
-      _fin_requested(false), _time_wait_ticks_remaining(0),
+      _fin_requested(false), _time_wait_ticks_remaining(0), _receive_queued_bytes(0),
       _tick_count(0), _srtt_scaled(0), _rttvar_scaled(0), _has_rtt_sample(false),
       _rto_ticks(INITIAL_RTO_TICKS),
       _persist_ticks_remaining(0), _persist_backoff(0),
@@ -109,11 +109,14 @@ uint32_t TcpConnection::_receive_buffer_occupied() const
     {
         occupied += static_cast<uint32_t>(entry.second.size());
     }
-    for (const Bytes& buffered : _received_before_callback)
-    {
-        occupied += static_cast<uint32_t>(buffered.size());
-    }
+    occupied += static_cast<uint32_t>(_receive_queued_bytes);
     return occupied;
+}
+
+uint32_t TcpConnection::_advertised_window() const
+{
+    uint32_t occupied = _receive_buffer_occupied();
+    return occupied < RECEIVE_BUFFER_CAPACITY ? RECEIVE_BUFFER_CAPACITY - occupied : 0;
 }
 
 bool TcpConnection::_seq_in_receive_window(uint32_t seq) const
@@ -132,8 +135,7 @@ bool TcpConnection::_seq_in_receive_window(uint32_t seq) const
 
 Tcp TcpConnection::_build_header(uint8_t flags, uint32_t seq) const
 {
-    uint32_t occupied = _receive_buffer_occupied();
-    uint32_t available = occupied < RECEIVE_BUFFER_CAPACITY ? RECEIVE_BUFFER_CAPACITY - occupied : 0;
+    uint32_t available = _advertised_window();
     // RFC 7323: if window scaling wasn't negotiated, this side must
     // advertise its window unscaled too - the peer has no way to know our
     // shift otherwise, since it's only exchanged on the SYN
@@ -220,16 +222,59 @@ void TcpConnection::accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss,
     _send_flags(FLAG_SYN);
 }
 
-void TcpConnection::set_data_received_callback(DataReceivedFn callback)
+void TcpConnection::set_data_ready_callback(DataReadyFn callback)
 {
-    _on_data_received = std::move(callback);
+    _on_data_ready = std::move(callback);
 
-    while (!_received_before_callback.empty())
+    // Data can already be waiting: a data-carrying segment may arrive in the
+    // same batch as the one completing the handshake, before the application
+    // has even been handed this connection. Notifying now is what stops that
+    // data sitting unnoticed until the peer happens to send more.
+    if (_on_data_ready && _receive_queued_bytes > 0)
     {
-        Bytes buffered = std::move(_received_before_callback.front());
-        _received_before_callback.pop_front();
-        _on_data_received(buffered);
+        _on_data_ready();
     }
+}
+
+Bytes TcpConnection::read(size_t max_bytes)
+{
+    uint32_t window_before = _advertised_window();
+
+    Bytes taken;
+    while (!_receive_queue.empty() && taken.size() < max_bytes)
+    {
+        Bytes& front = _receive_queue.front();
+        size_t room = max_bytes - taken.size();
+
+        if (front.size() <= room)
+        {
+            taken |= front;
+            _receive_queue.pop_front();
+        }
+        else
+        {
+            // partial take - keep the remainder at the front, in order
+            taken |= front.slice(0, room);
+            front = front.slice(room);
+        }
+    }
+
+    _receive_queued_bytes -= taken.size();
+
+    // Reading is what reopens the window, so the peer has to be told. Without
+    // this it would sit blocked until its own persist probe happened to ask -
+    // correct, but a whole probe interval slower than it needs to be. Only
+    // worth a segment when the window was actually shut.
+    if (window_before == 0 && _advertised_window() > 0
+        && (_state == TcpState::ESTABLISHED || _state == TcpState::FIN_WAIT_1
+            || _state == TcpState::FIN_WAIT_2))
+    {
+        LOG_DEBUG("TcpConnection[" << _id << "] window reopened to " << _advertised_window()
+                  << " after read - sending a window update");
+        _send_pure_ack();
+    }
+
+    return taken;
 }
 
 void TcpConnection::initiate_connect()
@@ -240,18 +285,21 @@ void TcpConnection::initiate_connect()
 
 void TcpConnection::_deliver(const Bytes& payload)
 {
+    // RCV.NXT advances here because the bytes are acknowledged - they arrived
+    // in order and this side is responsible for them now. What it does NOT mean
+    // is that anyone has consumed them: they go on the receive queue and stay
+    // counted against the advertised window until read() takes them. That
+    // separation is the whole point. Advancing RCV.NXT *and* handing the data
+    // straight out, as this used to, reopened the window for bytes the
+    // application had not seen, which is flow control that describes a buffer
+    // nothing is actually held in.
     _recv_next += static_cast<uint32_t>(payload.size());
-    if (_on_data_received)
+    _receive_queue.push_back(payload);
+    _receive_queued_bytes += payload.size();
+
+    if (_on_data_ready)
     {
-        _on_data_received(payload);
-    }
-    else
-    {
-        // no application has registered a callback yet (this segment landed
-        // in the same processing batch as the one that completed the
-        // handshake, before accept() could run) - hold onto it instead of
-        // dropping it
-        _received_before_callback.push_back(payload);
+        _on_data_ready();
     }
 }
 

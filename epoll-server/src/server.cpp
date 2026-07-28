@@ -137,45 +137,39 @@ void Server::_handle_new_connections()
     while (TcpConnection* connection = this->_network_stack.accept(this->_port))
     {
         uint64_t connection_id = connection->get_id();
-        connection->set_data_received_callback([this, connection_id](const Bytes& data)
+        connection->set_data_ready_callback([this, connection_id]()
         {
-            this->_enqueue_or_dispatch(connection_id, data);
+            this->_try_dispatch(connection_id);
         });
     }
 }
 
-void Server::_enqueue_or_dispatch(uint64_t connection_id, const Bytes& data)
+void Server::_try_dispatch(uint64_t connection_id)
 {
-    ConnectionWork& work = this->_work[connection_id];
-
-    if (work.in_flight)
+    // Already working on this connection: leave the data where it is. NOT
+    // reading is the backpressure - the bytes stay counted against the
+    // advertised window, so the window shrinks and a peer that outruns this
+    // server is told to slow down by the protocol itself. That replaced a
+    // buffer here plus a cap that closed the connection when it overflowed,
+    // which was punishing the peer for a limitation on this side.
+    if (this->_in_flight.count(connection_id) > 0)
     {
-        // something for this connection is already in the pool - append this
-        // chunk instead of dispatching it now, so responses can never be
-        // applied out of the order their data arrived in
-        if (work.pending.size() + data.size() > MAX_PENDING_BYTES)
-        {
-            LOG_WARNING("Server: connection " << connection_id << " queued more than "
-                        << MAX_PENDING_BYTES << " bytes waiting on the thread pool - closing it."
-                        << " The peer is outrunning processing and this class cannot exert"
-                        << " backpressure through the stack's receive window.");
-            if (TcpConnection* connection = this->_network_stack.find_connection(connection_id))
-            {
-                connection->close();
-            }
-            this->_work.erase(connection_id);
-            return;
-        }
-        work.pending |= data;
         return;
     }
 
-    this->_dispatch_chunk(connection_id, data);
-}
+    TcpConnection* connection = this->_network_stack.find_connection(connection_id);
+    if (connection == nullptr)
+    {
+        return;
+    }
 
-void Server::_dispatch_chunk(uint64_t connection_id, const Bytes& data)
-{
-    this->_work[connection_id].in_flight = true;
+    Bytes data = connection->read();
+    if (data.empty())
+    {
+        return;
+    }
+
+    this->_in_flight.insert(connection_id);
 
     // The "work" (a plain echo here, but this is the seam where real
     // per-connection processing would go) runs on a worker thread; the
@@ -211,14 +205,16 @@ void Server::_apply_response(uint64_t connection_id, const Bytes& response)
     // find_connection() safely returns nullptr if NetworkStack already
     // reaped this connection (e.g. the peer sent RST) instead of dangling.
     TcpConnection* connection = this->_network_stack.find_connection(connection_id);
+
+    // Clear the in-flight mark first, unconditionally. It is what lets the next
+    // chunk be picked up, so anything that could throw below must not be able
+    // to skip it - that is how a connection ends up acking forever while
+    // silently answering nothing.
+    this->_in_flight.erase(connection_id);
+
     if (connection == nullptr)
     {
-        // Reaped while this was in the pool (the peer sent RST, say). Drop the
-        // whole entry rather than falling through: dispatching what queued up
-        // behind it would round-trip every chunk through a worker only for the
-        // next completion to discard it again.
-        this->_work.erase(connection_id);
-        return;
+        return; // reaped while this was in the pool - the peer sent RST, say
     }
 
     try
@@ -236,25 +232,13 @@ void Server::_apply_response(uint64_t connection_id, const Bytes& response)
     }
     catch (const std::exception& e)
     {
-        // Same reasoning as the worker's catch: whatever went wrong sending,
-        // the bookkeeping below still has to run or the connection is wedged.
         LOG_ERROR("Server: sending the response for connection " << connection_id
                   << " failed: " << e.what());
     }
 
-    auto work_it = this->_work.find(connection_id);
-    if (work_it == this->_work.end())
-    {
-        return; // closed for exceeding MAX_PENDING_BYTES while this was in flight
-    }
-
-    if (!work_it->second.pending.empty())
-    {
-        Bytes next_chunk;
-        next_chunk.swap(work_it->second.pending);
-        this->_dispatch_chunk(connection_id, next_chunk);
-        return;
-    }
-
-    this->_work.erase(work_it);
+    // Whatever arrived while that chunk was in the pool is still sitting unread
+    // in the stack's receive queue, holding the window down. Reading it now is
+    // what reopens the window and lets the peer continue - so the cycle is
+    // "read, work, respond, read again" with the window doing the pacing.
+    this->_try_dispatch(connection_id);
 }

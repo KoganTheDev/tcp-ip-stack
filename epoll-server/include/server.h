@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <csignal>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "network_stack.h"
 #include "channel_factory.h"
@@ -58,10 +59,10 @@ private:
     void _create_retransmit_timer();
     void _handle_new_connections();
 
-    // Submits data for connection_id to the thread pool if nothing is
-    // currently in flight for it, otherwise queues it for later.
-    void _enqueue_or_dispatch(uint64_t connection_id, const Bytes& data);
-    void _dispatch_chunk(uint64_t connection_id, const Bytes& data);
+    // Reads whatever is waiting on a connection and submits it, unless a chunk
+    // is already in flight for it - in which case it deliberately leaves the
+    // data unread, which is what applies backpressure through the window.
+    void _try_dispatch(uint64_t connection_id);
     // Runs on the reactor thread via CompletionQueue: applies a computed
     // response (if the connection still exists) and dispatches the next
     // queued chunk for the same connection, if any.
@@ -84,33 +85,17 @@ private:
     ThreadPool _thread_pool;
     int _timer_fd;
 
-    // One entry per connection with work outstanding. Previously this was two
-    // containers - a busy set and a map of pending chunks - which could
-    // disagree: an exception anywhere between marking a connection busy and
-    // applying its response left the id in the set forever, so every later byte
-    // was queued and never dispatched, on a connection that still acked but had
-    // silently stopped answering. One object cannot disagree with itself, and
-    // there is exactly one place it is erased.
-    struct ConnectionWork
-    {
-        bool in_flight = false;
-        // Coalesced rather than a queue of chunks. The queue only ever existed
-        // to preserve arrival order, which concatenation preserves just as well
-        // while keeping the object count flat and the size trivially checkable.
-        Bytes pending;
-    };
-
-    std::unordered_map<uint64_t, ConnectionWork> _work;
-
-    // Cap on bytes queued for one connection. Needed because TcpConnection
-    // counts a byte as delivered the moment it invokes the data callback, so
-    // its receive window reopens as soon as the byte lands here - meaning the
-    // stack's own flow control bounds nothing once this class is the consumer,
-    // and a peer that outruns the thread pool grows this without limit.
+    // Connections with a chunk currently in the thread pool. Nothing more is
+    // needed, because unread data now stays in the stack's own receive queue
+    // rather than being copied into a buffer here.
     //
-    // The honest fix is backpressure: stop delivering, so the advertised window
-    // genuinely shrinks. That needs a pause-reads hook TcpConnection does not
-    // have. Until then, exceeding the cap closes the connection rather than
-    // growing forever or silently discarding data the stack has already acked.
-    static constexpr size_t MAX_PENDING_BYTES = 256 * 1024;
+    // This replaced a per-connection pending buffer and a 256 KiB cap on it,
+    // both of which existed only because TcpConnection used to count a byte as
+    // delivered the moment it announced it - so its window reopened for data
+    // this class was still holding, and the stack's flow control bounded
+    // nothing. The fix was backpressure in the right place: while a connection
+    // is busy this class simply does not read, the unread bytes keep the window
+    // closed, and the peer stops sending. No buffer here, no cap to pick, and
+    // no connection killed for the crime of being faster than the thread pool.
+    std::unordered_set<uint64_t> _in_flight;
 };
