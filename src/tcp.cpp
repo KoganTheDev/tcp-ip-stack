@@ -114,6 +114,23 @@ void Tcp::_parse()
 			_has_mss_option = true;
 			_mss_option = data.slice_int<uint16_t>(i + 2);
 		}
+		else if (kind == 4 && length == 2)
+		{
+			_has_sack_permitted_option = true;
+		}
+		else if (kind == 5 && length >= 10 && ((length - 2) % 8) == 0)
+		{
+			// Each block is two 32-bit sequence numbers: left edge, right edge.
+			size_t block_count = static_cast<size_t>(length - 2) / 8;
+			for (size_t b = 0; b < block_count; b++)
+			{
+				size_t at = i + 2 + b * 8;
+				SackBlock block;
+				block.start = data.slice_int<uint32_t>(at);
+				block.end = data.slice_int<uint32_t>(at + 4);
+				_sack_blocks.push_back(block);
+			}
+		}
 		else if (kind == 8 && length == 10)
 		{
 			_has_timestamp_option = true;
@@ -156,6 +173,26 @@ Bytes Tcp::_options_to_bytes()
 		options.append_int<uint8_t>(3); // kind: window scale
 		options.append_int<uint8_t>(3);
 		options.append_int<uint8_t>(this->_window_scale_option);
+	}
+	if (this->_has_sack_permitted_option)
+	{
+		options.append_int<uint8_t>(4); // kind: SACK-permitted
+		options.append_int<uint8_t>(2);
+	}
+	if (!this->_sack_blocks.empty())
+	{
+		// Two NOPs so the sequence numbers themselves land 32-bit aligned,
+		// which is what every implementation does and what makes them cheap to
+		// read on the far side.
+		options.append_int<uint8_t>(1); // NOP
+		options.append_int<uint8_t>(1); // NOP
+		options.append_int<uint8_t>(5); // kind: SACK
+		options.append_int<uint8_t>(static_cast<uint8_t>(2 + this->_sack_blocks.size() * 8));
+		for (const SackBlock& block : this->_sack_blocks)
+		{
+			options.append_int<uint32_t>(block.start);
+			options.append_int<uint32_t>(block.end);
+		}
 	}
 	if (this->_has_timestamp_option)
 	{

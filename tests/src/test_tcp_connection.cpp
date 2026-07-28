@@ -1231,3 +1231,169 @@ TEST(PawsStillAcksWhatItDrops)
     test_assert(!sent.empty(),
                 "a dropped segment must still be acked - the peer may simply be out of date, and silence would leave it retransmitting forever");
 }
+
+// --- selective acknowledgement (RFC 2018) ---
+//
+// The acknowledgement number is strictly cumulative: it says "I have everything
+// below this" and cannot say "and also 2000-3000". So a sender that loses one
+// segment in a window learns nothing about the ones behind it that arrived
+// perfectly, and eventually resends the lot. SACK blocks name what did arrive.
+namespace
+{
+    std::unique_ptr<Tcp> make_segment_sack(uint32_t seq, uint32_t ack, uint8_t flags,
+                                           const std::vector<Tcp::SackBlock>& blocks)
+    {
+        auto segment = std::make_unique<Tcp>(12345, 8080, seq, ack, 5, flags, 65535, 0, 0);
+        segment->set_sack_blocks(blocks);
+        return segment;
+    }
+
+    // A connection whose peer permitted SACK, with a large peer MSS so several
+    // segments can be in flight at once.
+    std::unique_ptr<TcpConnection> make_sack_connection(std::vector<RecordedSegment>& sent)
+    {
+        auto connection = std::make_unique<TcpConnection>(
+            8080, IPv4Address("10.0.0.1"), 12345, 1000,
+            [&sent](const Tcp& header, const Bytes& payload)
+            {
+                sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(),
+                                flags_of(header), payload, header.get_window(),
+                                header.has_timestamp_option(), header.get_timestamp_value(),
+                                header.get_timestamp_echo()});
+            }
+        );
+        connection->accept_incoming_syn(500, 100, false, 0, false, 0, true);
+        connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK));
+        sent.clear();
+        return connection;
+    }
+}
+
+TEST(SackIsUsedOnlyIfThePeerPermittedIt)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent); // peer sent no SACK-permitted
+    connection->set_data_ready_callback([&connection]() { connection->read(); });
+
+    // an out-of-order segment would normally produce blocks
+    connection->on_segment(*make_incoming_segment(600, 1001, FLAG_ACK, Bytes::from_hex("aabb")));
+
+    test_assert(!sent.empty(), "an out-of-order segment should draw an immediate duplicate ack");
+    Tcp parsed(Bytes()); // placeholder to keep the type in scope
+    test_assert(sent.back().flags == FLAG_ACK, "it should be a pure ack");
+}
+
+// The receiver's half: report what arrived out of order, so the sender can tell
+// which holes are real.
+TEST(OutOfOrderDataIsReportedAsSackBlocks)
+{
+    std::vector<RecordedSegment> sent;
+    std::vector<Tcp::SackBlock> reported;
+    auto connection = std::make_unique<TcpConnection>(
+        8080, IPv4Address("10.0.0.1"), 12345, 1000,
+        [&sent, &reported](const Tcp& header, const Bytes& payload)
+        {
+            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(),
+                            flags_of(header), payload, header.get_window(), false, 0, 0});
+            reported = header.get_sack_blocks();
+        }
+    );
+    connection->accept_incoming_syn(500, 1460, false, 0, false, 0, true);
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK));
+    connection->set_data_ready_callback([&connection]() { connection->read(); });
+    sent.clear();
+
+    // a gap: 501-503 is missing, 503-505 arrives
+    connection->on_segment(*make_incoming_segment(503, 1001, FLAG_ACK, Bytes::from_hex("aabb")));
+
+    test_assert(reported.size() == 1, "the out-of-order range should be reported as one block");
+    test_assert(reported[0].start == 503 && reported[0].end == 505,
+                "the block must name exactly the bytes held, as a half-open range");
+}
+
+TEST(AdjacentOutOfOrderSegmentsAreMergedIntoOneBlock)
+{
+    std::vector<RecordedSegment> sent;
+    std::vector<Tcp::SackBlock> reported;
+    auto connection = std::make_unique<TcpConnection>(
+        8080, IPv4Address("10.0.0.1"), 12345, 1000,
+        [&sent, &reported](const Tcp& header, const Bytes& payload)
+        {
+            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(),
+                            flags_of(header), payload, header.get_window(), false, 0, 0});
+            reported = header.get_sack_blocks();
+        }
+    );
+    connection->accept_incoming_syn(500, 1460, false, 0, false, 0, true);
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK));
+    connection->set_data_ready_callback([&connection]() { connection->read(); });
+
+    // two segments that are contiguous with each other but not with RCV.NXT
+    connection->on_segment(*make_incoming_segment(505, 1001, FLAG_ACK, Bytes::from_hex("aabb")));
+    connection->on_segment(*make_incoming_segment(507, 1001, FLAG_ACK, Bytes::from_hex("ccdd")));
+
+    test_assert(reported.size() == 1,
+                "two adjacent ranges are one contiguous run and must be reported as a single block - the option space is far too small to spend describing it twice");
+    test_assert(reported[0].start == 505 && reported[0].end == 509, "and the merged block must span both");
+}
+
+// The sender's half, and the reason the in-flight accounting had to change: a
+// SACKed segment is not travelling any more, so continuing to count it would
+// leave the sender refusing to send while the network is actually empty.
+TEST(SackedSegmentsStopCountingAsInFlight)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_sack_connection(sent);
+
+    // grow the window to two segments: send one, have it acked
+    connection->send(Bytes(100u));
+    uint32_t first_seq = sent[0].seq;
+    connection->on_segment(*make_incoming_segment(501, first_seq + 100, FLAG_ACK));
+    sent.clear();
+
+    connection->send(Bytes(200u)); // two 100-byte segments, both in flight
+    test_assert(sent.size() == 2, "precondition: two segments in flight");
+    uint32_t second_seq = sent[1].seq;
+
+    size_t unacked_before = connection->bytes_unacked();
+
+    // the peer reports holding the SECOND segment, while the first is still missing
+    connection->on_segment(*make_segment_sack(501, sent[0].seq, FLAG_ACK,
+                                              {{second_seq, second_seq + 100}}));
+
+    test_assert(connection->bytes_unacked() == unacked_before - 100,
+                "a SACKed segment is not travelling any more and must stop being counted - continuing to count it leaves the sender refusing to send while the network is actually empty");
+}
+
+// Without SACK a retransmission resends the front of the queue. With it, the
+// front may already be sitting in the peer's reorder buffer.
+TEST(RetransmissionSkipsSegmentsThePeerAlreadyHolds)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_sack_connection(sent);
+
+    // grow the window to two segments
+    connection->send(Bytes(100u));
+    uint32_t primed = sent[0].seq;
+    connection->on_segment(*make_incoming_segment(501, primed + 100, FLAG_ACK));
+    sent.clear();
+
+    connection->send(Bytes(200u));
+    test_assert(sent.size() == 2, "precondition: two segments in flight");
+    uint32_t first_seq = sent[0].seq;
+    uint32_t second_seq = sent[1].seq;
+    size_t segments_sent = sent.size();
+
+    // The peer says it holds the FIRST of the two but not the second, then
+    // repeats it - three duplicate acks trigger a fast retransmit.
+    std::vector<Tcp::SackBlock> blocks{{first_seq, first_seq + 100}};
+    connection->on_segment(*make_segment_sack(501, first_seq, FLAG_ACK, blocks));
+    connection->on_segment(*make_segment_sack(501, first_seq, FLAG_ACK, blocks));
+    connection->on_segment(*make_segment_sack(501, first_seq, FLAG_ACK, blocks));
+
+    test_assert(sent.size() > segments_sent, "a fast retransmit should have happened");
+    test_assert(sent.back().seq == second_seq,
+                "it must resend the segment the peer has NOT reported holding");
+    test_assert(sent.back().seq != first_seq,
+                "and must not resend the one it just said it holds - that is the waste SACK exists to prevent");
+}

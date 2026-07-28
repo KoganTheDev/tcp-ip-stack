@@ -1,5 +1,7 @@
 #pragma once
 
+#include <vector>
+
 #include "bytes.h"
 #include "protocol_layer.h"
 #include <stdbool.h>
@@ -43,8 +45,8 @@ public:
     // to_bytes() with this set to 0 first) and writes the result back here.
     void set_checksum(uint16_t checksum) { _checksum = checksum; }
 
-    // TCP options (RFC 793 SS3.1 / RFC 7323) - MSS, window scaling and
-    // timestamps; SACK stays a deliberate scope cut. Both are meaningful only
+    // TCP options: MSS and window scaling (RFC 7323), timestamps (RFC 7323),
+    // and selective acknowledgement (RFC 2018). Both are meaningful only
     // on a SYN (RFC 7323: window scaling is used at all only if *both*
     // sides' SYNs carried it) but nothing here enforces that - it's on the
     // caller (TcpConnection) to only set these before sending a SYN.
@@ -66,6 +68,29 @@ public:
     // the most recent TSval it received back, echoed unchanged. That echo is
     // the whole mechanism: it lets a sender measure a round trip against a
     // number it chose itself, with no state to keep and nothing to match up.
+    // RFC 2018 SACK, in two parts.
+    //
+    // SACK-permitted is a bare flag on the SYN, negotiated like the others -
+    // blocks may only be sent if both sides offered it.
+    bool has_sack_permitted_option() const { return _has_sack_permitted_option; }
+    void set_sack_permitted_option() { _has_sack_permitted_option = true; }
+
+    // SACK blocks name ranges of sequence space that arrived out of order, as
+    // half-open [start, end) pairs. They exist because the acknowledgement
+    // number is strictly cumulative and so can only ever say "I have everything
+    // below this" - it has no way to express "and also 2000-3000". Without that
+    // a sender learning of one loss cannot tell what else got through, and
+    // retransmits a whole window of data the receiver already holds.
+    //
+    // At most four fit in the 40 bytes of option space, and only three
+    // alongside a timestamp, which is why a receiver reports the most useful
+    // ones rather than all it has.
+    struct SackBlock { uint32_t start; uint32_t end; };
+    const std::vector<SackBlock>& get_sack_blocks() const { return _sack_blocks; }
+    void set_sack_blocks(const std::vector<SackBlock>& blocks) { _sack_blocks = blocks; }
+    static constexpr size_t MAX_SACK_BLOCKS = 4;
+    static constexpr size_t MAX_SACK_BLOCKS_WITH_TIMESTAMP = 3;
+
     bool has_timestamp_option() const { return _has_timestamp_option; }
     uint32_t get_timestamp_value() const { return _timestamp_value; }
     uint32_t get_timestamp_echo() const { return _timestamp_echo; }
@@ -153,6 +178,8 @@ private:
     uint16_t _mss_option = 0;
     bool _has_window_scale_option = false;
     uint8_t _window_scale_option = 0;
+    bool _has_sack_permitted_option = false;
+    std::vector<SackBlock> _sack_blocks;
     bool _has_timestamp_option = false;
     uint32_t _timestamp_value = 0;
     uint32_t _timestamp_echo = 0;

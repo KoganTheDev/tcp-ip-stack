@@ -76,6 +76,7 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
       _persist_ticks_remaining(0), _persist_backoff(0),
       _ack_pending(false), _ack_delay_ticks_remaining(0),
       _local_mss(local_mss), _peer_mss(DEFAULT_PEER_MSS), _effective_mss(std::min(local_mss, DEFAULT_PEER_MSS)),
+      _sack_permitted(false), _last_out_of_order_seq(0), _unsacked_in_flight_bytes(0),
       _timestamps_negotiated(false), _ts_recent(0), _have_ts_recent(false),
       _window_scaling_negotiated(false), _peer_window_scale(0),
       _peer_window(local_mss), // conservative placeholder until the handshake's real window arrives
@@ -99,15 +100,6 @@ void TcpConnection::_transition(TcpState new_state)
     }
 }
 
-uint32_t TcpConnection::_bytes_in_flight() const
-{
-    // the window is always contiguous in sequence-number space (each entry
-    // starts exactly where the previous one ended), so the span from the
-    // first entry's start to the last entry's end covers every outstanding
-    // byte without needing to sum every entry individually
-    return _in_flight.empty() ? 0 : (_in_flight.back().end_seq - _in_flight.front().seq);
-}
-
 uint32_t TcpConnection::_receive_buffer_occupied() const
 {
     uint32_t occupied = 0;
@@ -117,6 +109,61 @@ uint32_t TcpConnection::_receive_buffer_occupied() const
     }
     occupied += static_cast<uint32_t>(_receive_queued_bytes);
     return occupied;
+}
+
+std::vector<Tcp::SackBlock> TcpConnection::_sack_blocks_to_report() const
+{
+    std::vector<Tcp::SackBlock> blocks;
+    if (_reorder_buffer.empty())
+    {
+        return blocks;
+    }
+
+    // The reorder buffer keys segments by their exact sequence number, so a run
+    // of bytes that is logically contiguous can sit in it as several entries.
+    // Reporting each entry separately would waste the very small option space
+    // on describing something the peer can be told in one block, so adjacent
+    // entries are merged as they are walked - the map being ordered is what
+    // makes that a single pass.
+    for (const auto& entry : _reorder_buffer)
+    {
+        uint32_t start = entry.first;
+        uint32_t end = start + static_cast<uint32_t>(entry.second.size());
+
+        if (!blocks.empty() && blocks.back().end == start)
+        {
+            blocks.back().end = end;
+            continue;
+        }
+        blocks.push_back({start, end});
+    }
+
+    // RFC 2018: the first block must name the range that most recently arrived,
+    // because it is the one the sender has not heard about yet. The rest repeat
+    // earlier reports, which is deliberate redundancy - a SACK option is not
+    // retransmitted, so repeating older blocks is what makes the mechanism
+    // survive a lost ack.
+    if (blocks.size() > 1)
+    {
+        for (size_t i = 0; i < blocks.size(); i++)
+        {
+            if (blocks[i].start <= _last_out_of_order_seq && _last_out_of_order_seq < blocks[i].end)
+            {
+                std::swap(blocks[0], blocks[i]);
+                break;
+            }
+        }
+    }
+
+    // Only so many fit in 40 bytes of option space, and fewer alongside a
+    // timestamp. The ones dropped are the oldest, which the peer has most
+    // likely already heard.
+    size_t limit = _timestamps_negotiated ? Tcp::MAX_SACK_BLOCKS_WITH_TIMESTAMP : Tcp::MAX_SACK_BLOCKS;
+    if (blocks.size() > limit)
+    {
+        blocks.resize(limit);
+    }
+    return blocks;
 }
 
 uint32_t TcpConnection::_advertised_window() const
@@ -164,12 +211,22 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
         header.set_mss_option(_local_mss);
         header.set_window_scale_option(WINDOW_SCALE_SHIFT);
         header.set_timestamp_option(_tick_count, _have_ts_recent ? _ts_recent : 0);
+        header.set_sack_permitted_option();
     }
     else if (_timestamps_negotiated)
     {
         // Unlike the other two this goes on EVERY segment - each one is a fresh
         // clock reading, not a parameter agreed once.
         header.set_timestamp_option(_tick_count, _ts_recent);
+    }
+
+    if (_sack_permitted && !(flags & FLAG_SYN))
+    {
+        std::vector<Tcp::SackBlock> blocks = _sack_blocks_to_report();
+        if (!blocks.empty())
+        {
+            header.set_sack_blocks(blocks);
+        }
     }
     _send_segment(header, payload);
 
@@ -193,6 +250,8 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
     entry.retransmit_attempts = 0;
     entry.sent_at_tick = _tick_count;
     entry.retransmitted = false;
+    entry.sacked = false;
+    _unsacked_in_flight_bytes += entry.end_seq - entry.seq;
     _in_flight.push_back(std::move(entry));
 }
 
@@ -204,6 +263,17 @@ void TcpConnection::_send_pure_ack()
     if (_timestamps_negotiated)
     {
         header.set_timestamp_option(_tick_count, _ts_recent);
+    }
+    if (_sack_permitted)
+    {
+        // The duplicate acks a loss produces are exactly the segments that
+        // carry this information, so a pure ack is the most important place
+        // for it to appear.
+        std::vector<Tcp::SackBlock> blocks = _sack_blocks_to_report();
+        if (!blocks.empty())
+        {
+            header.set_sack_blocks(blocks);
+        }
     }
     _send_segment(header, Bytes());
     _ack_pending = false;
@@ -229,8 +299,10 @@ void TcpConnection::_schedule_or_send_ack()
 
 void TcpConnection::accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss,
                                          bool peer_supports_window_scaling, uint8_t peer_window_scale,
-                                         bool peer_supports_timestamps, uint32_t peer_timestamp)
+                                         bool peer_supports_timestamps, uint32_t peer_timestamp,
+                                         bool peer_permits_sack)
 {
+    _sack_permitted = peer_permits_sack;
     _recv_next = peer_isn + 1; // the SYN itself consumes one sequence number
     _peer_mss = peer_mss != 0 ? peer_mss : DEFAULT_PEER_MSS;
     _effective_mss = std::min(_local_mss, _peer_mss);
@@ -484,8 +556,55 @@ void TcpConnection::_update_rto_from_sample(uint32_t rtt_ticks)
               << " rto " << _rto_ticks);
 }
 
+bool TcpConnection::_apply_sack_blocks(const Tcp& segment)
+{
+    if (!_sack_permitted || segment.get_sack_blocks().empty())
+    {
+        return false;
+    }
+
+    bool marked_anything = false;
+    for (const Tcp::SackBlock& block : segment.get_sack_blocks())
+    {
+        for (InFlightSegment& entry : _in_flight)
+        {
+            if (entry.sacked)
+            {
+                continue;
+            }
+            // A block names a half-open range the peer holds. Only a segment
+            // wholly inside it is safe to mark: a partial overlap means the
+            // peer holds some of those bytes, and resending the segment is
+            // still the only way to deliver the rest.
+            if (seq_at_or_before(block.start, entry.seq) && seq_at_or_before(entry.end_seq, block.end))
+            {
+                entry.sacked = true;
+                _unsacked_in_flight_bytes -= entry.end_seq - entry.seq;
+                marked_anything = true;
+            }
+        }
+    }
+    return marked_anything;
+}
+
+TcpConnection::InFlightSegment* TcpConnection::_oldest_unsacked_segment()
+{
+    for (InFlightSegment& entry : _in_flight)
+    {
+        if (!entry.sacked)
+        {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
 void TcpConnection::_handle_ack(const Tcp& segment)
 {
+    // Apply the scoreboard before anything else looks at the window: what the
+    // peer reports holding changes how much is genuinely outstanding, and
+    // therefore how much may be sent.
+    bool sack_advanced = _apply_sack_blocks(segment);
     uint32_t ack = segment.get_acknowledgement_number();
 
     // the peer's advertised window is worth updating even on a duplicate
@@ -505,7 +624,16 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         _dup_ack_count += 1;
         if (_dup_ack_count == DUP_ACK_FAST_RETRANSMIT_THRESHOLD)
         {
-            InFlightSegment& oldest = _in_flight.front();
+            // With SACK the front of the deque may be sitting in the peer's
+            // reorder buffer already; resending it would be pure waste. The
+            // segment worth resending is the oldest one the peer has NOT
+            // reported holding.
+            InFlightSegment* target = _oldest_unsacked_segment();
+            if (target == nullptr)
+            {
+                return; // everything outstanding is already held by the peer
+            }
+            InFlightSegment& oldest = *target;
             uint32_t cwnd_before = _cwnd;
             _send_segment(_build_header(oldest.flags, oldest.seq), oldest.payload);
             // Karn again: this segment has now been sent twice, so the ack
@@ -527,11 +655,15 @@ void TcpConnection::_handle_ack(const Tcp& segment)
             LOG_DEBUG("TcpConnection[" << _id << "] fast retransmit at seq=" << oldest.seq
                       << " (3 duplicate acks), cwnd " << cwnd_before << " -> " << _cwnd);
         }
-        else if (_in_fast_recovery)
+        else if (_in_fast_recovery || sack_advanced)
         {
             // window inflation: each further duplicate ack means another
             // segment left the network, so there's room for one more MSS
-            // in flight while waiting for the retransmit to be acked
+            // in flight while waiting for the retransmit to be acked.
+            //
+            // A SACK that named something new is the same signal made
+            // explicit - it does not merely suggest a segment arrived, it says
+            // which - so it opens room even outside fast recovery.
             _cwnd += _effective_mss;
             _send_queued_while_window_allows();
         }
@@ -572,6 +704,10 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         {
             rtt_sample_ticks = static_cast<uint32_t>(_tick_count - _in_flight.front().sent_at_tick);
             have_rtt_sample = true;
+        }
+        if (!_in_flight.front().sacked)
+        {
+            _unsacked_in_flight_bytes -= _in_flight.front().end_seq - _in_flight.front().seq;
         }
         _in_flight.pop_front();
         acked_anything = true;
@@ -751,11 +887,13 @@ void TcpConnection::on_segment(const Tcp& segment)
         {
             _recv_next = segment.get_sequence_number() + 1; // the peer's SYN consumes one sequence number
             _in_flight.clear(); // our SYN is now acked
+            _unsacked_in_flight_bytes = 0;
 
             _peer_mss = segment.has_mss_option() ? segment.get_mss_option() : DEFAULT_PEER_MSS;
             _effective_mss = std::min(_local_mss, _peer_mss);
             _window_scaling_negotiated = segment.has_window_scale_option();
             _peer_window_scale = _window_scaling_negotiated ? segment.get_window_scale_option() : 0;
+            _sack_permitted = segment.has_sack_permitted_option();
             _timestamps_negotiated = segment.has_timestamp_option();
             if (_timestamps_negotiated)
             {
@@ -777,6 +915,7 @@ void TcpConnection::on_segment(const Tcp& segment)
         if (segment.get_ack() && segment.get_acknowledgement_number() == _send_next)
         {
             _in_flight.clear(); // only the SYN-ACK could have been in flight here
+            _unsacked_in_flight_bytes = 0;
             uint8_t peer_shift = _window_scaling_negotiated ? _peer_window_scale : 0;
             _peer_window = static_cast<uint32_t>(segment.get_window()) << peer_shift;
             _cwnd = _effective_mss;
@@ -881,6 +1020,7 @@ void TcpConnection::on_segment(const Tcp& segment)
                     && _seq_in_receive_window(seq))
                 {
                     _reorder_buffer[seq] = payload;
+                    _last_out_of_order_seq = seq;
                 }
                 _send_pure_ack();
             }
@@ -977,9 +1117,16 @@ void TcpConnection::on_tick()
         return;
     }
 
-    // simplified go-back-one: only the oldest unacked segment is ever
-    // retransmitted on timeout, not every unacked segment (real go-back-N)
-    InFlightSegment& oldest = _in_flight.front();
+    // Simplified go-back-one: only one segment is resent per timeout, not every
+    // unacked one (real go-back-N). With SACK that is the oldest segment the
+    // peer has not reported holding, since resending something already in its
+    // reorder buffer achieves nothing.
+    InFlightSegment* timed_out = _oldest_unsacked_segment();
+    if (timed_out == nullptr)
+    {
+        return; // everything outstanding is held by the peer; nothing to resend
+    }
+    InFlightSegment& oldest = *timed_out;
 
     oldest.retransmit_ticks_remaining -= 1;
     if (oldest.retransmit_ticks_remaining > 0)

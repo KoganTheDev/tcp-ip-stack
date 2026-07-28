@@ -210,7 +210,8 @@ public:
     // negotiation can keep calling this with just peer_isn.
     void accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss = 0,
                               bool peer_supports_window_scaling = false, uint8_t peer_window_scale = 0,
-                              bool peer_supports_timestamps = false, uint32_t peer_timestamp = 0);
+                              bool peer_supports_timestamps = false, uint32_t peer_timestamp = 0,
+                              bool peer_permits_sack = false);
 
     // Active open: sends a bare SYN (no ACK - there's nothing to acknowledge
     // yet) and moves to SYN_SENT. NetworkStack calls this once the peer's
@@ -255,11 +256,24 @@ private:
     // not advance _send_next - see the definition for why that keeps it clear
     // of the retransmit/dup-ack machinery.
     void _send_zero_window_probe();
-    // Bytes outstanding between SND.UNA and SND.NXT - the front and back of
-    // _in_flight are always contiguous in sequence-number space (each entry
-    // starts exactly where the previous one ended), so this is an O(1)
-    // subtraction instead of an O(n) sum over every entry.
-    uint32_t _bytes_in_flight() const;
+    // Bytes genuinely still travelling: sent, not acknowledged, and not named
+    // by a SACK block.
+    //
+    // This used to be an O(1) subtraction of the deque's outer edges, which
+    // worked because every entry was contiguous with the next and all of them
+    // were equally unacknowledged. SACK breaks that: a segment in the middle
+    // can be known to have arrived while its neighbours have not. Counting it
+    // as in flight would leave the sender believing the network holds data it
+    // has already delivered, and so refusing to send more - which is exactly
+    // the stall SACK exists to avoid. A running total keeps it O(1) without
+    // the assumption.
+    uint32_t _bytes_in_flight() const { return _unsacked_in_flight_bytes; }
+
+    // Applies the peer's SACK blocks to the in-flight deque. Returns true if
+    // anything was newly marked, which is what makes a duplicate ack
+    // informative rather than merely repeated.
+    bool _apply_sack_blocks(const Tcp& segment);
+
     // Bytes occupying the receive buffer: out-of-order segments waiting for a
     // gap to fill, plus in-order data the application has not read yet. What is
     // left of RECEIVE_BUFFER_CAPACITY after subtracting this is the window.
@@ -295,12 +309,25 @@ private:
         // already. Age is _tick_count - sent_at_tick, computed only when a
         // segment is actually acked.
         uint64_t sent_at_tick;
+        // Named by a SACK block, so the peer holds it even though the
+        // cumulative ack has not reached it. It stays in this deque because the
+        // window cannot slide past it until everything before it is acked too -
+        // but it must not be counted as still travelling, and must never be the
+        // segment a retransmission picks.
+        bool sacked = false;
         // Karn's algorithm: once a segment has been retransmitted, an ack for
         // it is ambiguous - it could be acking the original or the
         // retransmission, and those imply very different round-trip times.
         // Such a segment never yields an RTT sample.
         bool retransmitted;
     };
+
+    // The oldest in-flight segment the peer has NOT reported holding - the one
+    // a retransmission should actually resend. Without SACK this is always the
+    // front of the deque; with it, the front may already be sitting in the
+    // peer's reorder buffer, and resending that is pure waste. Declared here
+    // rather than with the other helpers because it names the type above.
+    InFlightSegment* _oldest_unsacked_segment();
 
     uint64_t _id;
     uint16_t _local_port;
@@ -316,6 +343,10 @@ private:
     // outstanding). A cumulative ack pops everything it covers from the
     // front; a timeout retransmits only the front entry.
     std::deque<InFlightSegment> _in_flight;
+    // Running total of in-flight bytes not yet named by a SACK block. Kept
+    // incrementally because the alternative - summing the deque on every ack -
+    // is the hot path of the send loop.
+    uint32_t _unsacked_in_flight_bytes;
     std::deque<Bytes> _send_queue; // data waiting for window room
     // Bytes sitting in _send_queue, kept alongside it so send_space_available()
     // is a subtraction rather than a walk over every queued chunk.
@@ -370,6 +401,29 @@ private:
     // --- delayed ACK ---
     bool _ack_pending;              // an in-order segment is awaiting a coalesced ack
     int _ack_delay_ticks_remaining; // countdown that forces a pending ack out on time
+
+    // --- selective acknowledgement (RFC 2018) ---
+    //
+    // Negotiated like the rest: offered always, used only if the peer's SYN
+    // permitted it too.
+    //
+    // The problem it solves is a limit of the acknowledgement number itself.
+    // That number is strictly cumulative - it says "I have everything below
+    // this" and cannot say "and also 2000-3000". So when one segment in a
+    // window is lost, the sender sees the ack stop advancing and learns
+    // nothing about the eight segments behind it that arrived perfectly. With
+    // Reno alone it eventually resends the lot. SACK blocks name what did
+    // arrive, so only the actual holes are retransmitted.
+    bool _sack_permitted;
+    // Where the most recent out-of-order segment landed, so the first reported
+    // block can be the one the peer has not heard about yet.
+    uint32_t _last_out_of_order_seq;
+
+    // The out-of-order ranges this side currently holds, as they would be
+    // reported to the peer. Derived from _reorder_buffer by merging adjacent
+    // entries - the buffer keys segments by exact sequence number, so what is
+    // logically one contiguous run can be several entries in it.
+    std::vector<Tcp::SackBlock> _sack_blocks_to_report() const;
 
     // --- timestamps and PAWS (RFC 7323) ---
     //
