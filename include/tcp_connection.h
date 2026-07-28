@@ -209,7 +209,8 @@ public:
     // itself carried - defaulted so tests that don't care about option
     // negotiation can keep calling this with just peer_isn.
     void accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss = 0,
-                              bool peer_supports_window_scaling = false, uint8_t peer_window_scale = 0);
+                              bool peer_supports_window_scaling = false, uint8_t peer_window_scale = 0,
+                              bool peer_supports_timestamps = false, uint32_t peer_timestamp = 0);
 
     // Active open: sends a bare SYN (no ACK - there's nothing to acknowledge
     // yet) and moves to SYN_SENT. NetworkStack calls this once the peer's
@@ -344,7 +345,11 @@ private:
     // keep fractional precision in pure integer arithmetic - the same trick
     // the BSD implementation uses, and the reason there is no floating point
     // anywhere in this path.
-    uint64_t _tick_count;   // monotonic tick counter, the clock RTT is measured against
+    // Monotonic tick counter, the clock RTT is measured against - and, once
+    // timestamps are negotiated, the value put in TSval. It starts at 1 rather
+    // than 0 so that a zero TSecr unambiguously means "nothing to echo yet"
+    // rather than "echoing the very first moment of the connection".
+    uint64_t _tick_count;
     uint32_t _srtt_scaled;  // smoothed RTT (SRTT), in ticks * RTO_SCALE
     uint32_t _rttvar_scaled; // RTT variation (RTTVAR), in ticks * RTO_SCALE
     bool _has_rtt_sample;   // false until the first measurement seeds the estimator
@@ -365,6 +370,31 @@ private:
     // --- delayed ACK ---
     bool _ack_pending;              // an in-order segment is awaiting a coalesced ack
     int _ack_delay_ticks_remaining; // countdown that forces a pending ack out on time
+
+    // --- timestamps and PAWS (RFC 7323) ---
+    //
+    // Negotiated exactly like window scaling: this side always offers, and the
+    // option is used only if the peer's SYN carried one too, because a peer
+    // that does not understand it would not echo anything back.
+    //
+    // Two things come out of it, and the first is the reason to want it here.
+    //
+    // RTT sampling stops depending on the ack clock. Every segment carries a
+    // fresh reading, and an ack echoes it, so a round trip can be measured from
+    // any acknowledged segment - including a retransmitted one, whose sample
+    // Karn's algorithm otherwise has to discard because there is no telling
+    // which transmission the ack answers. The echo says which. That is exactly
+    // the moment the estimator is currently blind: during loss recovery, when
+    // the path is changing and a fresh measurement matters most.
+    //
+    // The second is PAWS: a segment whose timestamp is older than the newest
+    // one already accepted is a straggler from earlier in the connection, and
+    // is dropped even though its sequence number looks plausible. On a fast
+    // path sequence numbers wrap in seconds, so "plausible sequence number" is
+    // not enough on its own to tell new data from a very old duplicate.
+    bool _timestamps_negotiated;
+    uint32_t _ts_recent;      // newest timestamp received in sequence - echoed back
+    bool _have_ts_recent;
 
     // --- MSS / window-scale negotiation (RFC 7323) ---
     uint16_t _local_mss;

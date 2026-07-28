@@ -79,3 +79,31 @@ TEST(MaximumLegalWindowScaleOptionIsPreservedExactly)
     Tcp parsed(segment.to_bytes());
     test_assert(parsed.get_window_scale_option() == 14, "a shift count of exactly 14 is legal and must survive parsing unchanged");
 }
+
+// Timestamps differ from MSS and window scale in that they appear on every
+// segment, not only the SYN - each one is a fresh clock reading rather than a
+// parameter agreed once.
+TEST(TimestampOptionRoundTrips)
+{
+    Tcp segment(12345, 80, 1000, 2000, 5, 0x10 /* ACK */, 65535, 0, 0);
+    segment.set_timestamp_option(0xAABBCCDD, 0x11223344);
+
+    Tcp parsed(segment.to_bytes());
+    test_assert(parsed.has_timestamp_option(), "the timestamp option should round-trip");
+    test_assert(parsed.get_timestamp_value() == 0xAABBCCDD, "TSval should round-trip exactly");
+    test_assert(parsed.get_timestamp_echo() == 0x11223344, "TSecr should round-trip exactly");
+}
+
+TEST(TimestampCoexistsWithTheSynOptions)
+{
+    Tcp segment(12345, 80, 1000, 0, 5, 0x02 /* SYN */, 65535, 0, 0);
+    segment.set_mss_option(1460);
+    segment.set_window_scale_option(7);
+    segment.set_timestamp_option(99, 0);
+
+    Tcp parsed(segment.to_bytes());
+    test_assert(parsed.get_mss_option() == 1460, "MSS should survive alongside a timestamp");
+    test_assert(parsed.get_window_scale_option() == 7, "window scale should too");
+    test_assert(parsed.get_timestamp_value() == 99, "and the timestamp itself");
+    test_assert(segment.to_bytes().size() % 4 == 0, "the header must stay a whole number of 32-bit words");
+}

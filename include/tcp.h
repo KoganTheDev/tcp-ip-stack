@@ -43,8 +43,8 @@ public:
     // to_bytes() with this set to 0 first) and writes the result back here.
     void set_checksum(uint16_t checksum) { _checksum = checksum; }
 
-    // TCP options (RFC 793 SS3.1 / RFC 7323) - MSS and window scaling only;
-    // SACK/timestamps stay a deliberate scope cut. Both are meaningful only
+    // TCP options (RFC 793 SS3.1 / RFC 7323) - MSS, window scaling and
+    // timestamps; SACK stays a deliberate scope cut. Both are meaningful only
     // on a SYN (RFC 7323: window scaling is used at all only if *both*
     // sides' SYNs carried it) but nothing here enforces that - it's on the
     // caller (TcpConnection) to only set these before sending a SYN.
@@ -58,12 +58,30 @@ public:
     uint8_t get_window_scale_option() const { return _window_scale_option; }
     void set_window_scale_option(uint8_t shift) { _has_window_scale_option = true; _window_scale_option = shift; }
 
+    // RFC 7323 timestamps. Unlike MSS and window scale these appear on EVERY
+    // segment once negotiated, not only on the SYN - they have to, because each
+    // one is a fresh clock reading rather than a one-time parameter.
+    //
+    // TSval is the sender's clock at the moment it built the segment. TSecr is
+    // the most recent TSval it received back, echoed unchanged. That echo is
+    // the whole mechanism: it lets a sender measure a round trip against a
+    // number it chose itself, with no state to keep and nothing to match up.
+    bool has_timestamp_option() const { return _has_timestamp_option; }
+    uint32_t get_timestamp_value() const { return _timestamp_value; }
+    uint32_t get_timestamp_echo() const { return _timestamp_echo; }
+    void set_timestamp_option(uint32_t value, uint32_t echo)
+    {
+        _has_timestamp_option = true;
+        _timestamp_value = value;
+        _timestamp_echo = echo;
+    }
+
     // The exact bytes this segment was parsed from (empty for a segment built
     // to send). The checksum MUST be verified over these, not over to_bytes():
-    // this stack's codec only round-trips the MSS/window-scale options it
-    // models, so re-serializing a real peer's segment that also carried SACK-
-    // permitted or timestamp options would drop them and change the bytes,
-    // failing the checksum on a segment that was actually fine.
+    // this stack's codec only round-trips the options it models, so
+    // re-serializing a real peer's segment that also carried SACK-permitted
+    // would drop it and change the bytes, failing the checksum on a segment
+    // that was actually fine.
     const Bytes& get_received_bytes() const { return _received_bytes; }
 
 private:
@@ -135,6 +153,9 @@ private:
     uint16_t _mss_option = 0;
     bool _has_window_scale_option = false;
     uint8_t _window_scale_option = 0;
+    bool _has_timestamp_option = false;
+    uint32_t _timestamp_value = 0;
+    uint32_t _timestamp_echo = 0;
 
 public:
     // RFC 7323 SS2.3 caps the window scale shift at 14. Enforcing it is not

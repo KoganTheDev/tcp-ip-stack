@@ -114,6 +114,12 @@ void Tcp::_parse()
 			_has_mss_option = true;
 			_mss_option = data.slice_int<uint16_t>(i + 2);
 		}
+		else if (kind == 8 && length == 10)
+		{
+			_has_timestamp_option = true;
+			_timestamp_value = data.slice_int<uint32_t>(i + 2);
+			_timestamp_echo = data.slice_int<uint32_t>(i + 6);
+		}
 		else if (kind == 3 && length == 3)
 		{
 			_has_window_scale_option = true;
@@ -150,6 +156,19 @@ Bytes Tcp::_options_to_bytes()
 		options.append_int<uint8_t>(3); // kind: window scale
 		options.append_int<uint8_t>(3);
 		options.append_int<uint8_t>(this->_window_scale_option);
+	}
+	if (this->_has_timestamp_option)
+	{
+		// Two NOPs first. The option is 10 bytes, so padding it to a 4-byte
+		// boundary is unavoidable; putting the padding in front leaves the two
+		// 32-bit values themselves aligned, which is what every implementation
+		// does and what makes them cheap to read.
+		options.append_int<uint8_t>(1); // NOP
+		options.append_int<uint8_t>(1); // NOP
+		options.append_int<uint8_t>(8); // kind: timestamps
+		options.append_int<uint8_t>(10);
+		options.append_int<uint32_t>(this->_timestamp_value);
+		options.append_int<uint32_t>(this->_timestamp_echo);
 	}
 	while (options.size() % 4 != 0)
 	{

@@ -71,11 +71,12 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
       _state(TcpState::LISTEN),
       _send_next(initial_seq), _recv_next(0),
       _fin_requested(false), _time_wait_ticks_remaining(0), _receive_queued_bytes(0), _send_queued_bytes(0),
-      _tick_count(0), _srtt_scaled(0), _rttvar_scaled(0), _has_rtt_sample(false),
+      _tick_count(1), _srtt_scaled(0), _rttvar_scaled(0), _has_rtt_sample(false),
       _rto_ticks(INITIAL_RTO_TICKS),
       _persist_ticks_remaining(0), _persist_backoff(0),
       _ack_pending(false), _ack_delay_ticks_remaining(0),
       _local_mss(local_mss), _peer_mss(DEFAULT_PEER_MSS), _effective_mss(std::min(local_mss, DEFAULT_PEER_MSS)),
+      _timestamps_negotiated(false), _ts_recent(0), _have_ts_recent(false),
       _window_scaling_negotiated(false), _peer_window_scale(0),
       _peer_window(local_mss), // conservative placeholder until the handshake's real window arrives
       _cwnd(local_mss), _ssthresh(INITIAL_SSTHRESH), _dup_ack_count(0), _in_fast_recovery(false),
@@ -157,11 +158,18 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
     Tcp header = _build_header(full_flags, seq);
     if (flags & FLAG_SYN)
     {
-        // options only ever go on a SYN - this stack always offers both,
-        // whether either ends up actually used depends on whether the peer
-        // offered them too (RFC 7323's negotiation rule)
+        // MSS and window scale are one-time parameters, so they only ever go on
+        // a SYN. This stack always offers all three; whether each ends up used
+        // depends on whether the peer offered it too (RFC 7323's rule).
         header.set_mss_option(_local_mss);
         header.set_window_scale_option(WINDOW_SCALE_SHIFT);
+        header.set_timestamp_option(_tick_count, _have_ts_recent ? _ts_recent : 0);
+    }
+    else if (_timestamps_negotiated)
+    {
+        // Unlike the other two this goes on EVERY segment - each one is a fresh
+        // clock reading, not a parameter agreed once.
+        header.set_timestamp_option(_tick_count, _ts_recent);
     }
     _send_segment(header, payload);
 
@@ -192,7 +200,12 @@ void TcpConnection::_send_pure_ack()
 {
     // an ACK with nothing new to say is never itself acknowledged - it isn't
     // tracked in the window, unlike everything sent through _send_flags
-    _send_segment(_build_header(FLAG_ACK, _send_next), Bytes());
+    Tcp header = _build_header(FLAG_ACK, _send_next);
+    if (_timestamps_negotiated)
+    {
+        header.set_timestamp_option(_tick_count, _ts_recent);
+    }
+    _send_segment(header, Bytes());
     _ack_pending = false;
     _ack_delay_ticks_remaining = 0;
 }
@@ -215,13 +228,20 @@ void TcpConnection::_schedule_or_send_ack()
 }
 
 void TcpConnection::accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss,
-                                         bool peer_supports_window_scaling, uint8_t peer_window_scale)
+                                         bool peer_supports_window_scaling, uint8_t peer_window_scale,
+                                         bool peer_supports_timestamps, uint32_t peer_timestamp)
 {
     _recv_next = peer_isn + 1; // the SYN itself consumes one sequence number
     _peer_mss = peer_mss != 0 ? peer_mss : DEFAULT_PEER_MSS;
     _effective_mss = std::min(_local_mss, _peer_mss);
     _window_scaling_negotiated = peer_supports_window_scaling; // we always send our own option, so it comes down to the peer's
     _peer_window_scale = peer_window_scale;
+    _timestamps_negotiated = peer_supports_timestamps;
+    if (peer_supports_timestamps)
+    {
+        _ts_recent = peer_timestamp;
+        _have_ts_recent = true;
+    }
 
     _transition(TcpState::SYN_RECEIVED);
     _send_flags(FLAG_SYN);
@@ -557,7 +577,21 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         acked_anything = true;
     }
 
-    if (have_rtt_sample)
+    // A timestamp echo beats the ack clock, and beats it precisely where the
+    // ack clock fails. Karn's algorithm has to throw away the sample from a
+    // retransmitted segment because an ack cannot say which transmission it
+    // answers - but an echoed timestamp does say, so the sample is usable. That
+    // is loss recovery: exactly when the path is changing and the estimator
+    // most needs a fresh measurement, and exactly when it currently goes blind.
+    if (_timestamps_negotiated && segment.has_timestamp_option() && acked_anything)
+    {
+        uint32_t echo = segment.get_timestamp_echo();
+        if (echo != 0 && seq_at_or_before(echo, static_cast<uint32_t>(_tick_count)))
+        {
+            _update_rto_from_sample(static_cast<uint32_t>(_tick_count) - echo);
+        }
+    }
+    else if (have_rtt_sample)
     {
         _update_rto_from_sample(rtt_sample_ticks);
     }
@@ -722,6 +756,12 @@ void TcpConnection::on_segment(const Tcp& segment)
             _effective_mss = std::min(_local_mss, _peer_mss);
             _window_scaling_negotiated = segment.has_window_scale_option();
             _peer_window_scale = _window_scaling_negotiated ? segment.get_window_scale_option() : 0;
+            _timestamps_negotiated = segment.has_timestamp_option();
+            if (_timestamps_negotiated)
+            {
+                _ts_recent = segment.get_timestamp_value();
+                _have_ts_recent = true;
+            }
             _peer_window = static_cast<uint32_t>(segment.get_window()) << _peer_window_scale;
             _cwnd = _effective_mss;
             _ssthresh = INITIAL_SSTHRESH;
@@ -749,6 +789,40 @@ void TcpConnection::on_segment(const Tcp& segment)
     if (_state == TcpState::CLOSED)
     {
         return;
+    }
+
+    if (_timestamps_negotiated && segment.has_timestamp_option())
+    {
+        uint32_t their_timestamp = segment.get_timestamp_value();
+
+        // PAWS (RFC 7323 SS5): a timestamp older than the newest already
+        // accepted means this segment is a straggler from earlier in the
+        // connection, however plausible its sequence number looks. On a fast
+        // path the sequence space wraps in seconds, so a very old duplicate can
+        // land squarely inside the current window - sequence numbers alone
+        // cannot tell it from new data, and the timestamp can.
+        //
+        // Compared with the same wraparound-safe subtraction used for sequence
+        // numbers, because this clock wraps too.
+        if (_have_ts_recent && seq_at_or_before(their_timestamp, _ts_recent)
+            && their_timestamp != _ts_recent)
+        {
+            LOG_DEBUG("TcpConnection[" << _id << "] PAWS: dropping a segment whose timestamp "
+                      << their_timestamp << " predates " << _ts_recent);
+            // Still ack it: the peer may simply be out of date, and silence
+            // would leave it retransmitting.
+            _send_pure_ack();
+            return;
+        }
+
+        // Only advance the echo for a segment that arrived in sequence -
+        // echoing a timestamp from a future, out-of-order segment would make
+        // the peer measure a round trip against the wrong moment.
+        if (!_have_ts_recent || segment.get_sequence_number() == _recv_next)
+        {
+            _ts_recent = their_timestamp;
+            _have_ts_recent = true;
+        }
     }
 
     if (segment.get_ack())

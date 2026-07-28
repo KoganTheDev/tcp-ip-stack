@@ -19,6 +19,9 @@ namespace
         uint8_t flags;
         Bytes payload;
         uint16_t window;
+        bool has_timestamp;
+        uint32_t timestamp_value;
+        uint32_t timestamp_echo;
     };
 
     uint8_t flags_of(const Tcp& header)
@@ -65,7 +68,9 @@ namespace
             8080, IPv4Address("10.0.0.1"), 12345, 1000,
             [&sent](const Tcp& header, const Bytes& payload)
             {
-                sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload, header.get_window()});
+                sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload, header.get_window(),
+                                header.has_timestamp_option(), header.get_timestamp_value(),
+                                header.get_timestamp_echo()});
             }
         );
 
@@ -83,7 +88,9 @@ TEST(HandshakeSendsSynAckWithCorrectSeqAndAck)
     TcpConnection connection(8080, IPv4Address("10.0.0.1"), 12345, 1000,
         [&sent](const Tcp& header, const Bytes& payload)
         {
-            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload, header.get_window()});
+            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload, header.get_window(),
+                                header.has_timestamp_option(), header.get_timestamp_value(),
+                                header.get_timestamp_echo()});
         }
     );
 
@@ -105,7 +112,9 @@ TEST(ActiveOpenSendsBareSynThenCompletesHandshake)
     TcpConnection connection(54321, IPv4Address("10.0.0.2"), 8080, 2000,
         [&sent](const Tcp& header, const Bytes& payload)
         {
-            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload, header.get_window()});
+            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload, header.get_window(),
+                                header.has_timestamp_option(), header.get_timestamp_value(),
+                                header.get_timestamp_echo()});
         }
     );
 
@@ -155,7 +164,9 @@ TEST(DataArrivingBeforeCallbackRegisteredIsNotLost)
         8080, IPv4Address("10.0.0.1"), 12345, 1000,
         [&sent](const Tcp& header, const Bytes& payload)
         {
-            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload, header.get_window()});
+            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload, header.get_window(),
+                                header.has_timestamp_option(), header.get_timestamp_value(),
+                                header.get_timestamp_echo()});
         }
     );
     connection->accept_incoming_syn(500);
@@ -647,7 +658,9 @@ TEST(NegotiatedMssCapsSentSegmentSize)
     TcpConnection connection(8080, IPv4Address("10.0.0.1"), 12345, 1000,
         [&sent](const Tcp& header, const Bytes& payload)
         {
-            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload, header.get_window()});
+            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload, header.get_window(),
+                                header.has_timestamp_option(), header.get_timestamp_value(),
+                                header.get_timestamp_echo()});
         }
     );
 
@@ -879,7 +892,9 @@ TEST(CumulativeAckRetiresSegmentsAcrossASequenceNumberWrap)
         8080, IPv4Address("10.0.0.1"), 12345, isn,
         [&sent](const Tcp& header, const Bytes& payload)
         {
-            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload, header.get_window()});
+            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header), payload, header.get_window(),
+                                header.has_timestamp_option(), header.get_timestamp_value(),
+                                header.get_timestamp_echo()});
         }
     );
     // an 8-byte peer MSS keeps the segments small enough to place precisely
@@ -1093,4 +1108,126 @@ TEST(DrainingTheSendQueueMakesRoomAgain)
 
     test_assert(connection->send_space_available() > 0,
                 "once queued data has gone out the space must be reusable - otherwise the connection is writable exactly once");
+}
+
+// --- RFC 7323 timestamps and PAWS ---
+namespace
+{
+    std::unique_ptr<Tcp> make_segment_ts(uint32_t seq, uint32_t ack, uint8_t flags,
+                                         uint32_t tsval, uint32_t tsecr, const Bytes& payload = Bytes())
+    {
+        auto segment = std::make_unique<Tcp>(12345, 8080, seq, ack, 5, flags, 65535, 0, 0);
+        segment->set_timestamp_option(tsval, tsecr);
+        if (!payload.empty())
+        {
+            *segment /= std::make_unique<Raw>(payload);
+        }
+        return segment;
+    }
+
+    // A connection whose peer offered timestamps on its SYN, so they are in use.
+    std::unique_ptr<TcpConnection> make_timestamped_connection(std::vector<RecordedSegment>& sent)
+    {
+        auto connection = std::make_unique<TcpConnection>(
+            8080, IPv4Address("10.0.0.1"), 12345, 1000,
+            [&sent](const Tcp& header, const Bytes& payload)
+            {
+                sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(),
+                                flags_of(header), payload, header.get_window(),
+                                header.has_timestamp_option(), header.get_timestamp_value(),
+                                header.get_timestamp_echo()});
+            }
+        );
+        connection->accept_incoming_syn(500, 1460, false, 0, true, 5000);
+        connection->on_segment(*make_segment_ts(501, 1001, FLAG_ACK, 5001, 0));
+        sent.clear();
+        return connection;
+    }
+}
+
+TEST(TimestampsAreUsedOnlyIfThePeerOfferedThem)
+{
+    std::vector<RecordedSegment> sent;
+    // peer's SYN carried no timestamp, so neither should anything we send after
+    auto connection = make_established_connection(sent);
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes::from_hex("aabb")));
+    connection->on_tick();
+
+    test_assert(!sent.empty(), "an ack should have gone out");
+    test_assert(!sent.back().has_timestamp,
+                "a peer that did not offer timestamps would not echo them, so sending them is pointless - same rule as window scaling");
+}
+
+TEST(EverySegmentCarriesATimestampOnceNegotiated)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_timestamped_connection(sent);
+
+    connection->send(Bytes::from_hex("aabb"));
+    test_assert(!sent.empty() && sent.back().has_timestamp,
+                "a data segment must carry a timestamp - unlike MSS, it is a fresh reading rather than a one-time parameter");
+
+    connection->on_segment(*make_segment_ts(501, 1003, FLAG_ACK, 5100, 0, Bytes::from_hex("ccdd")));
+    connection->on_tick();
+    test_assert(sent.back().has_timestamp, "so must an ack");
+    test_assert(sent.back().timestamp_echo == 5100,
+                "and it must echo the newest timestamp received, which is what lets the peer time its own round trip");
+}
+
+// The payoff. Karn's algorithm has to discard the sample from a retransmitted
+// segment, because an ack cannot say which transmission it answers - and that
+// blinds the estimator during loss recovery, exactly when the path is changing.
+// An echoed timestamp says which, so the sample is usable.
+TEST(TimestampEchoYieldsAnRttSampleEvenAfterARetransmit)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_timestamped_connection(sent);
+
+    connection->send(Bytes::from_hex("aabb"));
+
+    // let it time out and be retransmitted - Karn now refuses the ack-clock sample
+    connection->on_tick();
+    connection->on_tick();
+    connection->on_tick();
+    test_assert(sent.size() == 2, "precondition: the segment was retransmitted");
+    int rto_after_backoff = connection->get_rto_ticks();
+
+    // the peer acks, echoing the timestamp from when we first sent it
+    uint32_t original_send_time = 1; // the tick clock starts at 1, so 0 can mean "no echo"
+    connection->on_segment(*make_segment_ts(501, 1003, FLAG_ACK, 5200, original_send_time));
+
+    test_assert(connection->get_rto_ticks() != rto_after_backoff,
+                "the echo identifies which transmission the ack answers, so a round trip can be measured where Karn's algorithm would have had to discard it");
+}
+
+TEST(PawsDropsASegmentWhoseTimestampPredatesTheNewestSeen)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_timestamped_connection(sent);
+
+    std::vector<Bytes> received;
+    connection->set_data_ready_callback([&received, &connection]() { received.push_back(connection->read()); });
+
+    connection->on_segment(*make_segment_ts(501, 1001, FLAG_ACK, 6000, 0, Bytes::from_hex("aabb")));
+    test_assert(received.size() == 1, "a current segment should be accepted");
+
+    // an old duplicate whose sequence number nonetheless looks plausible
+    connection->on_segment(*make_segment_ts(503, 1001, FLAG_ACK, 5500, 0, Bytes::from_hex("ccdd")));
+
+    test_assert(received.size() == 1,
+                "a segment older than the newest timestamp seen is a straggler from earlier in the connection and must be dropped, however plausible its sequence number - on a fast path the sequence space wraps in seconds");
+}
+
+TEST(PawsStillAcksWhatItDrops)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_timestamped_connection(sent);
+    connection->set_data_ready_callback([&connection]() { connection->read(); });
+
+    connection->on_segment(*make_segment_ts(501, 1001, FLAG_ACK, 6000, 0, Bytes::from_hex("aabb")));
+    sent.clear();
+
+    connection->on_segment(*make_segment_ts(503, 1001, FLAG_ACK, 5500, 0, Bytes::from_hex("ccdd")));
+    test_assert(!sent.empty(),
+                "a dropped segment must still be acked - the peer may simply be out of date, and silence would leave it retransmitting forever");
 }
