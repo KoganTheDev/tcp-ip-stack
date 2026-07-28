@@ -10,12 +10,19 @@ enum IcmpType : uint8_t
     ICMP_ECHO_REPLY = 0,
     ICMP_DESTINATION_UNREACHABLE = 3,
     ICMP_ECHO_REQUEST = 8,
+    ICMP_TIME_EXCEEDED = 11,
 };
 
 enum IcmpCode : uint8_t
 {
     ICMP_CODE_NONE = 0,             // Echo Request/Reply always use this
     ICMP_CODE_PORT_UNREACHABLE = 3, // Destination Unreachable, when the failure was a UDP port with nothing bound
+    // Time Exceeded has two codes, and only the second applies to a host that
+    // does not forward. Code 0 is the TTL running out in transit, which only a
+    // router generates. Code 1 is a datagram whose remaining fragments never
+    // arrived - the timer that ran out is the reassembly timer, not the TTL.
+    ICMP_CODE_TTL_EXCEEDED = 0,
+    ICMP_CODE_FRAGMENT_REASSEMBLY_TIME_EXCEEDED = 1,
 };
 
 // ICMP (RFC 792) - only enough of it to answer a ping (Echo Request/Reply)

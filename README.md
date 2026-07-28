@@ -63,7 +63,10 @@ simultaneous close rather than folding it into `FIN_WAIT_2`. On top of that:
   connection
 
 **IP.** Header parse and serialize, checksum computation and verification, and
-send-side fragmentation for oversized datagrams.
+fragmentation in both directions - splitting oversized outbound datagrams, and
+reassembling inbound ones. Reassembly refuses overlapping fragments rather than
+resolving them, which is the defence against the fragment-overlap evasion class,
+and bounds how much a peer can make it hold for datagrams that never complete.
 
 **ARP.** Request and reply in both directions, with a tick-based TTL refreshed on
 received traffic, so an actively-talking peer never ages out mid-conversation. The table
@@ -80,10 +83,22 @@ hardware and is why promiscuous mode is never needed. See
 Sending to a peer whose MAC is not yet known queues the datagram and kicks off a
 bounded ARP resolution, the same way an active TCP open does.
 
-**ICMP.** Echo Request and Reply (so a real `ping` gets an answer), and Destination
-Unreachable / Port Unreachable both generated and acted upon. Receiving one for a
+**ICMP.** Echo Request and Reply (so a real `ping` gets an answer), Destination
+Unreachable / Port Unreachable both generated and acted upon, and Time Exceeded for a
+datagram whose fragments never all arrived. Receiving a Destination Unreachable for a
 connection's own segment fails that connection immediately instead of letting it grind
 through the full retransmit budget.
+
+**Routing.** A subnet mask, a default gateway, and a route table with longest-prefix
+match. Every send decides whether the destination is on-link, and so resolves the
+destination itself, or off-link, and so resolves the gateway - the distinction between
+the address in the IP header and the address the frame is sent to.
+
+**Flow control that exists rather than being advertised.** Received data waits in a
+queue until the application reads it, so an application that stops reading genuinely
+closes the window and stops the sender. `send()` is bounded too and reports how much it
+accepted, and `listen()` takes a backlog so the accept queue cannot be grown without
+limit by a peer.
 
 ## Deliberately out of scope
 
@@ -92,13 +107,9 @@ These are documented decisions, not gaps that were missed:
 - **No SACK or timestamps.** A lost segment still stalls delivery until a retransmit
   fills the gap. RTT is sampled from the ack clock, so at most once per window rather
   than once per segment.
-- **No next-hop selection, so nothing off-link is reachable.** There is no subnet mask
-  and no gateway: sending ARPs for the destination address itself, so every destination
-  is assumed to be on this segment. Connecting to an address beyond the local network
-  fails. Forwarding is a separate, further step - that is what happens when a route
-  lookup names a different interface than the one a packet arrived on.
-- **No receive-side IP reassembly.** A fragmented inbound packet is detected and
-  dropped with a log line, not silently mishandled.
+- **No forwarding.** A packet addressed to somebody else is dropped rather than passed
+  on. Next-hop selection exists, so this stack can *reach* anything routable, but
+  forwarding additionally needs more than one interface, which it does not have.
 - **`TIME_WAIT` is a short fixed tick budget**, not a real 2\*MSL wait.
 - **ISN generation is RFC 793's clock-driven scheme**, not RFC 6528's unpredictable
   one. Do not put this on a hostile network.
@@ -139,9 +150,9 @@ and applies itself. See its own README for the full reasoning.
 
 ## Testing
 
-98 unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
-estimation, ARP ageing, UDP, ICMP, and the logger, plus a fuzz suite asserting no codec
-crashes on malformed input.
+143 unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
+estimation, flow control, routing, fragment reassembly, ARP ageing, UDP, ICMP, and the
+logger, plus a fuzz suite asserting no codec crashes on malformed input.
 
 Two seams make the untestable parts testable without any OS involvement: `PacketChannel`
 injects a fake frame transport into `NetworkStack`, and `LoopbackChannel` wires two

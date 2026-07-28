@@ -94,6 +94,20 @@ void Ip::from_bytes(const Bytes& data)
         throw EXCEPTION(BaseException, "IP total_length inconsistent with the received frame");
     }
     Bytes payload = data.slice(header_bytes, _total_length - header_bytes);
+
+    // A fragment's payload is a slice of a larger datagram, not a transport
+    // header - only the first fragment even begins with one. Parsing it as
+    // though it were would throw on a short "header" or, worse, succeed on
+    // arbitrary bytes and hand up a segment made of somebody's data. It is kept
+    // opaque; the reassembler puts the pieces back together and the result is
+    // parsed then.
+    bool is_fragment = (this->_flags & IP_FLAG_MORE_FRAGMENTS) != 0 || this->_fragment_offset != 0;
+    if (is_fragment)
+    {
+        this->_next_layer = std::make_unique<Raw>(std::move(payload));
+        return;
+    }
+
     switch (this->_protocol)
     {
     // only one branch runs, so the payload buffer can be moved into whichever

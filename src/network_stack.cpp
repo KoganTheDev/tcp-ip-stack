@@ -11,6 +11,10 @@ namespace
     constexpr uint16_t FIRST_EPHEMERAL_PORT = 49152; // IANA dynamic/private range starts here
     constexpr int ARP_MAX_RETRIES = 3;
     constexpr int ARP_RETRY_TICKS = 4; // with a 500ms NetworkStack tick, ~2s between retries
+    // RFC 791 suggests 15 seconds for reassembly; ~30 ticks at a 500ms tick.
+    // Short on purpose - a partial datagram is memory held for something that
+    // may never arrive.
+    constexpr int FRAGMENT_TIMEOUT_TICKS = 30;
     constexpr int ARP_ENTRY_TTL_TICKS = 120; // ~60s at a 500ms tick - a learned mapping's lifetime while the peer stays silent
 
     constexpr uint8_t FLAG_ACK = 0x10;
@@ -81,7 +85,7 @@ NetworkStack::NetworkStack(std::unique_ptr<PacketChannel> channel, const MacAddr
 
 NetworkStack::NetworkStack(std::unique_ptr<PacketChannel> channel, const InterfaceConfig& config)
     : _channel(std::move(channel)), _config(config),
-      _next_ephemeral_port(FIRST_EPHEMERAL_PORT), _next_ip_id(1), _arp_table(ARP_ENTRY_TTL_TICKS)
+      _next_ephemeral_port(FIRST_EPHEMERAL_PORT), _next_ip_id(1), _arp_table(ARP_ENTRY_TTL_TICKS), _reassembler(FRAGMENT_TIMEOUT_TICKS)
 {
     this->configure_interface(config);
 }
@@ -302,6 +306,16 @@ void NetworkStack::on_timer_tick()
 
     this->_arp_table.age_one_tick();
 
+    // A datagram whose remaining fragments never arrived is dropped, and the
+    // sender told: RFC 792 Time Exceeded, code 1. Without it the peer waits on
+    // something nobody will ever deliver.
+    std::vector<IPv4Address> expired;
+    this->_reassembler.age_one_tick(expired);
+    for (const IPv4Address& source : expired)
+    {
+        this->_send_icmp_fragment_reassembly_time_exceeded(source);
+    }
+
     for (auto it = this->_arp_requests_in_flight.begin(); it != this->_arp_requests_in_flight.end(); )
     {
         it->second.ticks_until_retry -= 1;
@@ -515,21 +529,6 @@ void NetworkStack::_handle_ip(const Ip& ip)
     // (its data/acks arrive as IP frames, not ARP, so nothing else would)
     this->_arp_table.refresh(IPv4Address(ip.get_src_address()));
 
-    // MF set, or a nonzero fragment offset, means this packet is one piece
-    // of a larger one - reassembly isn't implemented. This stack's own TCP
-    // never produces a payload that would need IP-layer fragmentation
-    // (segments stay well under a safe MTU), so the only way a fragment
-    // could arrive is a peer doing it - not exercised by anything this
-    // project talks to. Dropped deliberately and visibly, not silently
-    // mishandled as if it were a complete packet.
-    if (ip.get_ip_flag_m() || ip.get_fragment_offset() != 0)
-    {
-        LOG_WARNING("NetworkStack: dropping a fragmented IP packet from "
-                     << IPv4Address(ip.get_src_address()).to_string()
-                     << " - fragment reassembly is not implemented");
-        return;
-    }
-
     if (!ip.verify_checksum())
     {
         // corrupted header (or genuinely not addressed to us and we
@@ -541,6 +540,65 @@ void NetworkStack::_handle_ip(const Ip& ip)
         return;
     }
 
+    // MF set, or a nonzero fragment offset, means this is one piece of a larger
+    // datagram. Each fragment carries its own header checksum, which is why
+    // that is verified above rather than after reassembly.
+    if (ip.get_ip_flag_m() || ip.get_fragment_offset() != 0)
+    {
+        this->_handle_ip_fragment(ip);
+        return;
+    }
+
+    this->_dispatch_transport(ip);
+}
+
+void NetworkStack::_handle_ip_fragment(const Ip& ip)
+{
+    IPv4Address source(ip.get_src_address());
+
+    // A fragment's payload is deliberately left unparsed by Ip::from_bytes -
+    // only the first one starts with a transport header - so it arrives as an
+    // opaque Raw blob.
+    const Raw* raw = ip.has_next_layer() ? dynamic_cast<const Raw*>(&ip.get_next_layer()) : nullptr;
+    if (raw == nullptr)
+    {
+        return;
+    }
+
+    Bytes datagram;
+    IpReassembler::Result result = this->_reassembler.offer(
+        source, IPv4Address(ip.get_dest_address()), ip.get_identification(), ip.get_protocol(),
+        ip.get_fragment_offset(), ip.get_ip_flag_m(), raw->get_data(), datagram);
+
+    if (result != IpReassembler::Result::Complete)
+    {
+        return; // still waiting on pieces, or refused
+    }
+
+    // Rebuild the datagram as though it had arrived whole and re-parse it, so
+    // the transport layers are constructed exactly as they would have been for
+    // an unfragmented packet. Round-tripping through bytes rather than hand-
+    // building the layer chain is what keeps the two paths identical.
+    Ip reassembled(4, 5, ip.get_type_of_service(), static_cast<uint16_t>(20 + datagram.size()),
+                   ip.get_identification(), 0, 0, ip.get_TTL(), ip.get_protocol(), 0,
+                   ip.get_src_address(), ip.get_dest_address());
+    reassembled /= std::make_unique<Raw>(datagram);
+    reassembled.compute_checksum();
+
+    try
+    {
+        Ip complete(reassembled.to_bytes());
+        this->_dispatch_transport(complete);
+    }
+    catch (const BaseException& e)
+    {
+        LOG_WARNING("NetworkStack: a reassembled datagram from " << source.to_string()
+                    << " did not parse: " << e.what());
+    }
+}
+
+void NetworkStack::_dispatch_transport(const Ip& ip)
+{
     if (!ip.has_next_layer())
     {
         return;
@@ -735,6 +793,13 @@ void NetworkStack::_handle_icmp(const Ip& ip, const Icmp& icmp)
     // mishandled as if it meant something
     LOG_DEBUG("NetworkStack: dropping unhandled ICMP message (type=" << static_cast<int>(icmp.get_type())
               << ", code=" << static_cast<int>(icmp.get_code()) << ") from " << src_ip.to_string());
+}
+
+void NetworkStack::_send_icmp_fragment_reassembly_time_exceeded(const IPv4Address& destination)
+{
+    LOG_DEBUG("NetworkStack: sending ICMP Time Exceeded (fragment reassembly) to " << destination.to_string());
+    Icmp message(IcmpType::ICMP_TIME_EXCEEDED, ICMP_CODE_FRAGMENT_REASSEMBLY_TIME_EXCEEDED, 0, 0, Bytes());
+    this->_send_icmp_message(destination, message, Bytes());
 }
 
 void NetworkStack::_handle_icmp_error(const Icmp& icmp)

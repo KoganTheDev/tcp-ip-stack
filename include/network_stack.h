@@ -12,6 +12,7 @@
 #include "arp_table.h"
 #include "interface_config.h"
 #include "route_table.h"
+#include "ip_reassembler.h"
 #include "network_addresses.h"
 #include "ethernet.h"
 #include "arp.h"
@@ -41,11 +42,12 @@
 //    retry is kicked off, then the datagram is flushed once the reply arrives
 //    (or dropped, fire-and-forget, if resolution gives up). bind_udp()'s
 //    socket can of course still send_to() any already-known peer immediately.
-//  - IP fragmentation is send-side only. An oversized outbound datagram (in
-//    practice only UDP; TCP is MSS-capped) is split per RFC 791 in
-//    _send_ip_packet. There is no receive-side reassembly: an inbound
-//    fragment (MF set, or a nonzero fragment offset) is detected and dropped
-//    with a log line rather than silently mishandled
+//  - IP fragmentation works in both directions. An oversized outbound datagram
+//    (in practice only UDP; TCP is MSS-capped) is split per RFC 791 in
+//    _send_ip_packet, and inbound fragments are put back together by
+//    IpReassembler - which refuses overlapping fragments outright rather than
+//    picking a winner, and bounds everything it holds. See its header for why
+//    both of those matter more than they look.
 //  - next-hop selection exists (see RouteTable and InterfaceConfig): every
 //    send consults a route table to decide whether the destination is on-link,
 //    and so ARPs for the destination itself, or off-link, and so ARPs for the
@@ -198,6 +200,14 @@ private:
     void _handle_frame(const Bytes& frame);
     void _handle_arp(const Arp& arp);
     void _handle_ip(const Ip& ip);
+    // Feeds one fragment to the reassembler and, if that completed a datagram,
+    // rebuilds it and sends it on to _dispatch_transport as though it had
+    // arrived whole.
+    void _handle_ip_fragment(const Ip& ip);
+    // Protocol demux for a complete datagram. Split out of _handle_ip so a
+    // reassembled datagram takes exactly the same path as one that was never
+    // fragmented, rather than a parallel one that could drift from it.
+    void _dispatch_transport(const Ip& ip);
     void _handle_tcp(const Ip& ip, const Tcp& tcp);
     void _handle_udp(const Ip& ip, const Udp& udp);
     void _handle_icmp(const Ip& ip, const Icmp& icmp);
@@ -234,6 +244,11 @@ private:
     // RFC 792: Destination Unreachable/Port Unreachable, for a UDP
     // datagram that arrived at a port nothing is bound to.
     void _send_icmp_port_unreachable(const Ip& ip);
+    // RFC 792 Time Exceeded, code 1: a datagram whose remaining fragments never
+    // arrived, so the reassembly timer ran out. Unlike the other ICMP errors
+    // this stack sends, there is no original packet left to quote back - the
+    // pieces were dropped - so it carries an empty body.
+    void _send_icmp_fragment_reassembly_time_exceeded(const IPv4Address& destination);
     // Handles an *incoming* ICMP error (Destination/Port Unreachable): the
     // message quotes back the IP header + first 8 bytes of the packet that
     // triggered it (RFC 792), which is enough to identify the TCP connection
@@ -268,6 +283,7 @@ private:
     // ArpTable. Aged from on_timer_tick() and refreshed whenever we hear from a
     // peer, so an actively-talking peer never ages out mid-conversation.
     ArpTable _arp_table;
+    IpReassembler _reassembler;
     std::unordered_map<uint16_t, size_t> _listening_ports; // port -> backlog
     std::unordered_map<uint16_t, std::deque<ConnectionKey>> _pending_accepts;
     std::unordered_map<uint16_t, std::unique_ptr<UdpSocket>> _udp_sockets;

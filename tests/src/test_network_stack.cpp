@@ -1038,3 +1038,85 @@ TEST(SynsBeyondTheListenBacklogAreDropped)
     test_assert(syn_ack.is_tcp && syn_ack.syn && syn_ack.ack_flag,
                 "with the queue drained a new SYN must be answered again - the backlog is a limit, not a permanent refusal");
 }
+
+// --- receive-side reassembly, end to end ---
+//
+// Send-side fragmentation existed for a while; this is the other half. Without
+// it a peer that fragments cannot talk to this stack at all - and a peer
+// fragments as soon as a datagram meets a smaller MTU anywhere on the path,
+// which is not something either end chooses.
+namespace
+{
+    // One fragment of a larger UDP datagram. offset_units is the header field,
+    // counted in 8-byte units. The payload is a raw slice, not a UDP header,
+    // for every fragment after the first.
+    Bytes build_ip_fragment(uint8_t protocol, const Bytes& slice, uint16_t offset_units,
+                            bool more_fragments, uint16_t identification)
+    {
+        uint8_t flags = more_fragments ? IP_FLAG_MORE_FRAGMENTS : 0;
+        auto ip = std::make_unique<Ip>(
+            4, 5, 0, static_cast<uint16_t>(20 + slice.size()), identification,
+            flags, offset_units, 64, protocol, 0, PEER_IP.get_address(), LOCAL_IP.get_address());
+        *ip /= std::make_unique<Raw>(slice);
+        ip->compute_checksum();
+
+        Ethernet eth(PEER_MAC, LOCAL_MAC, EtherType::IPv4);
+        eth /= std::move(ip);
+        return eth.to_bytes();
+    }
+}
+
+TEST(FragmentedUdpDatagramIsReassembledAndDelivered)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    std::vector<Bytes> received;
+    UdpSocket* socket = stack->bind_udp(9000);
+    socket->set_datagram_received_callback(
+        [&received](const IPv4Address&, uint16_t, const Bytes& data) { received.push_back(data); });
+
+    // a 24-byte UDP payload, so the whole datagram is 8 + 24 = 32 bytes, split
+    // into two fragments of 16 bytes each (a non-last fragment's payload must
+    // be a multiple of 8)
+    Bytes payload(24u);
+    for (size_t i = 0; i < payload.size(); i++) { payload[i] = static_cast<uint8_t>(i); }
+
+    Udp udp(40000, 9000, static_cast<uint16_t>(8 + payload.size()), 0, Bytes());
+    udp /= std::make_unique<Raw>(payload);
+    Bytes datagram = udp.to_bytes();
+
+    channel->push_inbound(build_ip_fragment(IpProtocol::UDP, datagram.slice(0, 16), 0, true, 77));
+    stack->poll();
+    test_assert(received.empty(), "one fragment is not a datagram - nothing should be delivered yet");
+
+    channel->push_inbound(build_ip_fragment(IpProtocol::UDP, datagram.slice(16), 2, false, 77));
+    stack->poll();
+
+    test_assert(received.size() == 1, "the second fragment should complete the datagram and deliver it");
+    test_assert(received[0].to_hex() == payload.to_hex(),
+                "the reassembled payload must be exactly what was sent, in order");
+}
+
+TEST(AFragmentThatNeverCompletesDrawsIcmpTimeExceeded)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    channel->push_inbound(build_arp_request()); // so the reply can be addressed
+    channel->push_inbound(build_ip_fragment(IpProtocol::UDP, Bytes(16u), 0, true, 99));
+    stack->poll();
+    channel->clear_outbound();
+
+    // tick past the reassembly timeout
+    for (int i = 0; i < 40; i++)
+    {
+        stack->on_timer_tick();
+    }
+
+    IcmpView icmp = find_icmp(channel->outbound_frames());
+    test_assert(icmp.is_icmp, "the sender should be told rather than left waiting on a datagram nobody will deliver");
+    test_assert(icmp.type == IcmpType::ICMP_TIME_EXCEEDED, "it should be ICMP Time Exceeded");
+    test_assert(icmp.code == ICMP_CODE_FRAGMENT_REASSEMBLY_TIME_EXCEEDED,
+                "code 1 - the timer that ran out is the reassembly timer, not the TTL (code 0 is a router's business)");
+}
