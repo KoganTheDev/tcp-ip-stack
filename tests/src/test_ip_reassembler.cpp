@@ -3,6 +3,15 @@
 
 namespace
 {
+    // How much time each call to on_time_passed() reports in these tests.
+    // The stack's timers are in real milliseconds now, so a test that wants to
+    // reach a timeout advances by that timeout rather than counting calls.
+    constexpr uint32_t TEST_TICK_MS = 500;
+    // Long enough that the tests which never mean to hit it cannot, and a
+    // short one for the single test that does.
+    constexpr int TIMEOUT_MS = 30 * static_cast<int>(TEST_TICK_MS);
+    constexpr int SHORT_TIMEOUT_MS = 3 * static_cast<int>(TEST_TICK_MS);
+
     const IPv4Address SRC("10.0.0.1");
     const IPv4Address DST("10.0.0.2");
     constexpr uint8_t PROTO = 17; // UDP
@@ -23,7 +32,7 @@ namespace
 
 TEST(FragmentsReassembleInOrder)
 {
-    IpReassembler reassembler(30);
+    IpReassembler reassembler(TIMEOUT_MS);
     Bytes out;
 
     test_assert(offer(reassembler, 0, true, filled(8, 0xAA), out) == IpReassembler::Result::Incomplete,
@@ -43,7 +52,7 @@ TEST(FragmentsReassembleInOrder)
 // necessarily the order they were sent.
 TEST(FragmentsReassembleOutOfOrder)
 {
-    IpReassembler reassembler(30);
+    IpReassembler reassembler(TIMEOUT_MS);
     Bytes out;
 
     test_assert(offer(reassembler, 2, false, filled(4, 0xCC), out) == IpReassembler::Result::Incomplete,
@@ -62,7 +71,7 @@ TEST(FragmentsReassembleOutOfOrder)
 // different bytes than the target assembled. So no winner is picked.
 TEST(OverlappingFragmentsDestroyTheWholeDatagram)
 {
-    IpReassembler reassembler(30);
+    IpReassembler reassembler(TIMEOUT_MS);
     Bytes out;
 
     offer(reassembler, 0, true, filled(16, 0xAA), out);
@@ -75,7 +84,7 @@ TEST(OverlappingFragmentsDestroyTheWholeDatagram)
 
 TEST(ConflictingFinalFragmentsAreRejected)
 {
-    IpReassembler reassembler(30);
+    IpReassembler reassembler(TIMEOUT_MS);
     Bytes out;
 
     offer(reassembler, 2, false, filled(4, 0xAA), out);          // says the datagram ends at 20
@@ -86,7 +95,7 @@ TEST(ConflictingFinalFragmentsAreRejected)
 
 TEST(FragmentReachingPastTheDeclaredEndIsRejected)
 {
-    IpReassembler reassembler(30);
+    IpReassembler reassembler(TIMEOUT_MS);
     Bytes out;
 
     offer(reassembler, 1, false, filled(8, 0xAA), out);          // datagram ends at 16
@@ -96,7 +105,7 @@ TEST(FragmentReachingPastTheDeclaredEndIsRejected)
 
 TEST(OversizedFragmentIsRejected)
 {
-    IpReassembler reassembler(30);
+    IpReassembler reassembler(TIMEOUT_MS);
     Bytes out;
 
     // 8190 * 8 = 65520, so any real payload pushes past the 65535-byte maximum
@@ -109,7 +118,7 @@ TEST(OversizedFragmentIsRejected)
 // attacker sending only first fragments is asking it to buy memory for them.
 TEST(PendingDatagramsAreCapped)
 {
-    IpReassembler reassembler(30);
+    IpReassembler reassembler(TIMEOUT_MS);
     Bytes out;
 
     for (size_t i = 0; i < IpReassembler::MAX_PENDING_DATAGRAMS; i++)
@@ -126,16 +135,16 @@ TEST(PendingDatagramsAreCapped)
 
 TEST(IncompleteDatagramsExpireAndNameTheirSender)
 {
-    IpReassembler reassembler(3);
+    IpReassembler reassembler(SHORT_TIMEOUT_MS);
     Bytes out;
     offer(reassembler, 0, true, filled(8, 0xAA), out);
 
     std::vector<IPv4Address> expired;
-    reassembler.age_one_tick(expired);
-    reassembler.age_one_tick(expired);
+    reassembler.age(TEST_TICK_MS, expired);
+    reassembler.age(TEST_TICK_MS, expired);
     test_assert(expired.empty() && reassembler.pending_datagrams() == 1, "it should still be waiting before the timeout elapses");
 
-    reassembler.age_one_tick(expired);
+    reassembler.age(TEST_TICK_MS, expired);
     test_assert(reassembler.pending_datagrams() == 0, "a datagram whose fragments never arrived must not be held forever");
     test_assert(expired.size() == 1 && expired[0] == SRC,
                 "the sender must be reported so it can be told - it is otherwise waiting on a datagram nobody will deliver");
@@ -146,7 +155,7 @@ TEST(IncompleteDatagramsExpireAndNameTheirSender)
 // alone would splice unrelated datagrams together.
 TEST(DatagramsAreKeyedByTheFullFourTuple)
 {
-    IpReassembler reassembler(30);
+    IpReassembler reassembler(TIMEOUT_MS);
     Bytes out;
 
     reassembler.offer(SRC, DST, 4242, PROTO, 0, true, filled(8, 0xAA), out);

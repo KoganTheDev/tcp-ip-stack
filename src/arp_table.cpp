@@ -1,7 +1,7 @@
 #include "arp_table.h"
 
-ArpTable::ArpTable(int default_ttl_ticks)
-    : _default_ttl_ticks(default_ttl_ticks)
+ArpTable::ArpTable(int default_ttl_ms)
+    : _default_ttl_ms(default_ttl_ms)
 {
 }
 
@@ -12,7 +12,7 @@ bool ArpTable::learn(const IPv4Address& ip, const MacAddress& mac)
     auto existing = this->_entries.find(ip);
     if (existing != this->_entries.end())
     {
-        existing->second = {mac, this->_default_ttl_ticks, false};
+        existing->second = {mac, this->_default_ttl_ms, false};
         return true;
     }
 
@@ -27,7 +27,7 @@ bool ArpTable::learn(const IPv4Address& ip, const MacAddress& mac)
         return false;
     }
 
-    this->_entries[ip] = {mac, this->_default_ttl_ticks, false};
+    this->_entries[ip] = {mac, this->_default_ttl_ms, false};
     return true;
 }
 
@@ -41,7 +41,7 @@ void ArpTable::refresh(const IPv4Address& ip)
     auto it = this->_entries.find(ip);
     if (it != this->_entries.end() && !it->second.is_static)
     {
-        it->second.ticks_remaining = this->_default_ttl_ticks;
+        it->second.ms_remaining = this->_default_ttl_ms;
     }
 }
 
@@ -66,7 +66,7 @@ void ArpTable::remove(const IPv4Address& ip)
     this->_entries.erase(ip);
 }
 
-void ArpTable::age_one_tick()
+void ArpTable::age(uint32_t elapsed_ms)
 {
     for (auto it = this->_entries.begin(); it != this->_entries.end(); )
     {
@@ -76,8 +76,8 @@ void ArpTable::age_one_tick()
             continue;
         }
 
-        it->second.ticks_remaining -= 1;
-        if (it->second.ticks_remaining <= 0)
+        it->second.ms_remaining -= static_cast<int>(elapsed_ms);
+        if (it->second.ms_remaining <= 0)
         {
             it = this->_entries.erase(it);
         }

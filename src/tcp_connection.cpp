@@ -70,18 +70,24 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
       _local_port(local_port), _remote_ip(remote_ip), _remote_port(remote_port),
       _state(TcpState::LISTEN),
       _send_next(initial_seq), _recv_next(0),
-      _fin_requested(false), _time_wait_ticks_remaining(0), _receive_queued_bytes(0), _send_queued_bytes(0),
-      _tick_count(1), _srtt_scaled(0), _rttvar_scaled(0), _has_rtt_sample(false),
-      _rto_ticks(INITIAL_RTO_TICKS),
-      _persist_ticks_remaining(0), _persist_backoff(0),
-      _ack_pending(false), _ack_delay_ticks_remaining(0),
-      _local_mss(local_mss), _peer_mss(DEFAULT_PEER_MSS), _effective_mss(std::min(local_mss, DEFAULT_PEER_MSS)),
-      _sack_permitted(false), _last_out_of_order_seq(0), _unsacked_in_flight_bytes(0),
+      // Kept in declaration order. Members are initialised in the order they
+      // are declared regardless of the order written here, so any divergence
+      // is a lie about what actually happens - and a real hazard the moment
+      // one member's initialiser reads another.
+      _unsacked_in_flight_bytes(0), _send_queued_bytes(0),
+      _fin_requested(false), _time_wait_ms_remaining(0),
+      _now_ms(1), _srtt_scaled(0), _rttvar_scaled(0), _has_rtt_sample(false),
+      _rto_ms(INITIAL_RTO_MS),
+      _persist_ms_remaining(0), _persist_backoff(0),
+      _ack_pending(false), _ack_delay_ms_remaining(0),
+      _sack_permitted(false), _last_out_of_order_seq(0),
       _timestamps_negotiated(false), _ts_recent(0), _have_ts_recent(false),
+      _local_mss(local_mss), _peer_mss(DEFAULT_PEER_MSS), _effective_mss(std::min(local_mss, DEFAULT_PEER_MSS)),
       _window_scaling_negotiated(false), _peer_window_scale(0),
       _peer_window(local_mss), // conservative placeholder until the handshake's real window arrives
       _cwnd(local_mss), _ssthresh(INITIAL_SSTHRESH), _dup_ack_count(0), _in_fast_recovery(false),
-      _send_segment(std::move(send_segment))
+      _send_segment(std::move(send_segment)),
+      _receive_queued_bytes(0)
 {
 }
 
@@ -210,14 +216,14 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
         // depends on whether the peer offered it too (RFC 7323's rule).
         header.set_mss_option(_local_mss);
         header.set_window_scale_option(WINDOW_SCALE_SHIFT);
-        header.set_timestamp_option(_tick_count, _have_ts_recent ? _ts_recent : 0);
+        header.set_timestamp_option(_now_ms, _have_ts_recent ? _ts_recent : 0);
         header.set_sack_permitted_option();
     }
     else if (_timestamps_negotiated)
     {
         // Unlike the other two this goes on EVERY segment - each one is a fresh
         // clock reading, not a parameter agreed once.
-        header.set_timestamp_option(_tick_count, _ts_recent);
+        header.set_timestamp_option(_now_ms, _ts_recent);
     }
 
     if (_sack_permitted && !(flags & FLAG_SYN))
@@ -234,7 +240,7 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
     // discharges any pending delayed ack - exactly the piggyback delayed ack
     // hopes for
     _ack_pending = false;
-    _ack_delay_ticks_remaining = 0;
+    _ack_delay_ms_remaining = 0;
 
     size_t consumed = payload.size();
     if (flags & FLAG_SYN) consumed += 1;
@@ -246,9 +252,9 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
     entry.end_seq = _send_next;
     entry.flags = full_flags;
     entry.payload = payload;
-    entry.retransmit_ticks_remaining = _rto_ticks;
+    entry.retransmit_ms_remaining = _rto_ms;
     entry.retransmit_attempts = 0;
-    entry.sent_at_tick = _tick_count;
+    entry.sent_at_ms = _now_ms;
     entry.retransmitted = false;
     entry.sacked = false;
     _unsacked_in_flight_bytes += entry.end_seq - entry.seq;
@@ -262,7 +268,7 @@ void TcpConnection::_send_pure_ack()
     Tcp header = _build_header(FLAG_ACK, _send_next);
     if (_timestamps_negotiated)
     {
-        header.set_timestamp_option(_tick_count, _ts_recent);
+        header.set_timestamp_option(_now_ms, _ts_recent);
     }
     if (_sack_permitted)
     {
@@ -277,7 +283,7 @@ void TcpConnection::_send_pure_ack()
     }
     _send_segment(header, Bytes());
     _ack_pending = false;
-    _ack_delay_ticks_remaining = 0;
+    _ack_delay_ms_remaining = 0;
 }
 
 void TcpConnection::_schedule_or_send_ack()
@@ -293,7 +299,7 @@ void TcpConnection::_schedule_or_send_ack()
     else
     {
         _ack_pending = true;
-        _ack_delay_ticks_remaining = DELAYED_ACK_TICKS;
+        _ack_delay_ms_remaining = DELAYED_ACK_MS;
     }
 }
 
@@ -459,15 +465,15 @@ void TcpConnection::_arm_or_disarm_persist()
     bool should_persist = (_peer_window == 0) && !_send_queue.empty() && _in_flight.empty();
     if (should_persist)
     {
-        if (_persist_ticks_remaining == 0) // arm fresh; never restart an already-running timer
+        if (_persist_ms_remaining == 0) // arm fresh; never restart an already-running timer
         {
             _persist_backoff = 0;
-            _persist_ticks_remaining = PERSIST_BASE_TICKS;
+            _persist_ms_remaining = PERSIST_BASE_MS;
         }
     }
     else
     {
-        _persist_ticks_remaining = 0;
+        _persist_ms_remaining = 0;
         _persist_backoff = 0;
     }
 }
@@ -494,17 +500,17 @@ void TcpConnection::_send_zero_window_probe()
     _send_segment(_build_header(FLAG_ACK, _send_next), probe);
 }
 
-void TcpConnection::_update_rto_from_sample(uint32_t rtt_ticks)
+void TcpConnection::_update_rto_from_sample(uint32_t rtt_ms)
 {
-    // A segment sent and acked inside the same tick measures as zero, which
-    // says "faster than this clock can see", not "instant". Clamp to the
-    // clock's own granularity - one tick - so the estimator is never fed a
+    // A segment sent and acked between two calls to on_time_passed() measures
+    // as zero, which says "faster than this clock can see", not "instant".
+    // Clamp to the clock's own granularity so the estimator is never fed a
     // round trip shorter than the shortest one it could actually observe.
-    if (rtt_ticks == 0)
+    if (rtt_ms < RTO_CLOCK_GRANULARITY_MS)
     {
-        rtt_ticks = 1;
+        rtt_ms = RTO_CLOCK_GRANULARITY_MS;
     }
-    uint32_t sample_scaled = rtt_ticks * RTO_SCALE;
+    uint32_t sample_scaled = rtt_ms * RTO_SCALE;
 
     if (!_has_rtt_sample)
     {
@@ -538,22 +544,23 @@ void TcpConnection::_update_rto_from_sample(uint32_t rtt_ticks)
                      + (sample_scaled >> RTT_SMOOTHING_SHIFT);
     }
 
-    // RTO = SRTT + max(G, K * RTTVAR), where G is the clock granularity (one
-    // tick). The max() matters on a very steady path: RTTVAR can converge
-    // toward zero, and without a floor of one granularity the timeout would
-    // collapse onto the mean itself, firing on the first sample that lands a
-    // hair above average.
-    uint32_t variance_term = std::max(RTO_SCALE, RTO_VARIANCE_MULTIPLIER * _rttvar_scaled);
+    // RTO = SRTT + max(G, K * RTTVAR), where G is the clock granularity. The
+    // max() matters on a very steady path: RTTVAR can converge toward zero,
+    // and without a floor of one granularity the timeout would collapse onto
+    // the mean itself, firing on the first sample that lands a hair above
+    // average.
+    uint32_t variance_term = std::max(RTO_CLOCK_GRANULARITY_MS * RTO_SCALE,
+                                      RTO_VARIANCE_MULTIPLIER * _rttvar_scaled);
     uint32_t rto_scaled = _srtt_scaled + variance_term;
 
     // Round up rather than truncate: a timeout is a deadline, and rounding it
     // down would systematically fire early.
     int rto = static_cast<int>((rto_scaled + RTO_SCALE - 1) / RTO_SCALE);
-    _rto_ticks = std::min(std::max(rto, MIN_RTO_TICKS), MAX_RTO_TICKS);
+    _rto_ms = std::min(std::max(rto, MIN_RTO_MS), MAX_RTO_MS);
 
-    LOG_DEBUG("TcpConnection[" << _id << "] rtt sample " << rtt_ticks << " ticks -> srtt "
+    LOG_DEBUG("TcpConnection[" << _id << "] rtt sample " << rtt_ms << " ms -> srtt "
               << (_srtt_scaled / RTO_SCALE) << " rttvar " << (_rttvar_scaled / RTO_SCALE)
-              << " rto " << _rto_ticks);
+              << " rto " << _rto_ms);
 }
 
 bool TcpConnection::_apply_sack_blocks(const Tcp& segment)
@@ -648,7 +655,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
             // *timeout* path can fire moments later for the same segment -
             // collapsing cwnd to one MSS and cancelling fast recovery, a
             // second and much harsher reaction to what is one loss event.
-            oldest.retransmit_ticks_remaining = _rto_ticks;
+            oldest.retransmit_ms_remaining = _rto_ms;
             _ssthresh = std::max(_bytes_in_flight() / 2, static_cast<uint32_t>(2 * _effective_mss));
             _cwnd = _ssthresh + DUP_ACK_FAST_RETRANSMIT_THRESHOLD * static_cast<uint32_t>(_effective_mss);
             _in_fast_recovery = true;
@@ -680,7 +687,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     // (front) first - this is what lets several segments be in flight at
     // once instead of stop-and-wait's exactly one
     bool have_rtt_sample = false;
-    uint32_t rtt_sample_ticks = 0;
+    uint32_t rtt_sample_ms = 0;
 
     while (!_in_flight.empty() && seq_at_or_before(_in_flight.front().end_seq, ack))
     {
@@ -702,7 +709,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         // path as it is now.
         if (!_in_flight.front().retransmitted)
         {
-            rtt_sample_ticks = static_cast<uint32_t>(_tick_count - _in_flight.front().sent_at_tick);
+            rtt_sample_ms = static_cast<uint32_t>(_now_ms - _in_flight.front().sent_at_ms);
             have_rtt_sample = true;
         }
         if (!_in_flight.front().sacked)
@@ -722,14 +729,14 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     if (_timestamps_negotiated && segment.has_timestamp_option() && acked_anything)
     {
         uint32_t echo = segment.get_timestamp_echo();
-        if (echo != 0 && seq_at_or_before(echo, static_cast<uint32_t>(_tick_count)))
+        if (echo != 0 && seq_at_or_before(echo, static_cast<uint32_t>(_now_ms)))
         {
-            _update_rto_from_sample(static_cast<uint32_t>(_tick_count) - echo);
+            _update_rto_from_sample(static_cast<uint32_t>(_now_ms) - echo);
         }
     }
     else if (have_rtt_sample)
     {
-        _update_rto_from_sample(rtt_sample_ticks);
+        _update_rto_from_sample(rtt_sample_ms);
     }
 
     if (!acked_anything)
@@ -782,7 +789,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         if (_state == TcpState::CLOSING)
         {
             _transition(TcpState::TIME_WAIT);
-            _time_wait_ticks_remaining = TIME_WAIT_TICKS;
+            _time_wait_ms_remaining = TIME_WAIT_MS;
             return;
         }
         if (_state == TcpState::LAST_ACK)
@@ -809,7 +816,7 @@ void TcpConnection::_handle_fin(uint32_t fin_seq)
         // resend the ack and restart the wait, without touching sequence
         // state again (it was already consumed by the first FIN)
         _send_pure_ack();
-        _time_wait_ticks_remaining = TIME_WAIT_TICKS;
+        _time_wait_ms_remaining = TIME_WAIT_MS;
         return;
     }
 
@@ -847,7 +854,7 @@ void TcpConnection::_handle_fin(uint32_t fin_seq)
     {
         _send_pure_ack();
         _transition(TcpState::TIME_WAIT);
-        _time_wait_ticks_remaining = TIME_WAIT_TICKS;
+        _time_wait_ms_remaining = TIME_WAIT_MS;
         return;
     }
 
@@ -1058,29 +1065,29 @@ void TcpConnection::on_segment(const Tcp& segment)
     }
 }
 
-void TcpConnection::on_tick()
+void TcpConnection::on_time_passed(uint32_t elapsed_ms)
 {
     if (_state == TcpState::CLOSED)
     {
         // idempotent no-op: in normal operation NetworkStack reaps a CLOSED
-        // connection within the same on_timer_tick() call that closed it,
+        // connection within the same on_time_passed() call that closed it,
         // before any further tick could reach it - this guard just makes
         // that assumption explicit rather than relying on it implicitly, so
-        // a closed connection ticked again (directly, or if reaping is ever
+        // a closed connection driven again (directly, or if reaping is ever
         // skipped) doesn't keep incrementing retransmit_attempts and
         // re-logging "giving up" past the point it already gave up
         return;
     }
 
-    // the clock RTT is measured against - advanced before anything else this
-    // tick, so a segment sent from within this same tick is stamped with the
-    // tick it actually went out on
-    _tick_count += 1;
+    // the clock RTT is measured against - advanced before anything else, so a
+    // segment sent from within this same call is stamped with the moment it
+    // actually went out
+    _now_ms += elapsed_ms;
 
     if (_state == TcpState::TIME_WAIT)
     {
-        _time_wait_ticks_remaining -= 1;
-        if (_time_wait_ticks_remaining <= 0)
+        _time_wait_ms_remaining -= static_cast<int>(elapsed_ms);
+        if (_time_wait_ms_remaining <= 0)
         {
             _transition(TcpState::CLOSED);
         }
@@ -1091,8 +1098,8 @@ void TcpConnection::on_tick()
     // within the delay bound, so the peer's own send window keeps advancing
     if (_ack_pending)
     {
-        _ack_delay_ticks_remaining -= 1;
-        if (_ack_delay_ticks_remaining <= 0)
+        _ack_delay_ms_remaining -= static_cast<int>(elapsed_ms);
+        if (_ack_delay_ms_remaining <= 0)
         {
             _send_pure_ack();
         }
@@ -1104,14 +1111,14 @@ void TcpConnection::on_tick()
         // timer running instead. Persist and retransmit are mutually exclusive
         // (persist is only armed when _in_flight is empty), which is why this
         // lives inside the empty-pipe branch.
-        if (_persist_ticks_remaining > 0)
+        if (_persist_ms_remaining > 0)
         {
-            _persist_ticks_remaining -= 1;
-            if (_persist_ticks_remaining <= 0)
+            _persist_ms_remaining -= static_cast<int>(elapsed_ms);
+            if (_persist_ms_remaining <= 0)
             {
                 _send_zero_window_probe();
                 _persist_backoff = std::min(_persist_backoff + 1, PERSIST_MAX_BACKOFF_SHIFT);
-                _persist_ticks_remaining = PERSIST_BASE_TICKS << _persist_backoff;
+                _persist_ms_remaining = PERSIST_BASE_MS << _persist_backoff;
             }
         }
         return;
@@ -1128,8 +1135,8 @@ void TcpConnection::on_tick()
     }
     InFlightSegment& oldest = *timed_out;
 
-    oldest.retransmit_ticks_remaining -= 1;
-    if (oldest.retransmit_ticks_remaining > 0)
+    oldest.retransmit_ms_remaining -= static_cast<int>(elapsed_ms);
+    if (oldest.retransmit_ms_remaining > 0)
     {
         return;
     }
@@ -1162,17 +1169,17 @@ void TcpConnection::on_tick()
     // scale without needing a sample to tell them so. The backed-off value
     // then *persists* until an unambiguous sample arrives, rather than being
     // recomputed from a now-stale estimator.
-    int rto_before = _rto_ticks;
-    _rto_ticks = std::min(_rto_ticks * 2, MAX_RTO_TICKS);
+    int rto_before = _rto_ms;
+    _rto_ms = std::min(_rto_ms * 2, MAX_RTO_MS);
 
     LOG_DEBUG("TcpConnection[" << _id << "] retransmit timeout at seq=" << oldest.seq
               << " (attempt " << oldest.retransmit_attempts << "/" << MAX_RETRANSMIT_ATTEMPTS
               << "), cwnd " << cwnd_before << " -> " << _cwnd
-              << ", rto " << rto_before << " -> " << _rto_ticks);
+              << ", rto " << rto_before << " -> " << _rto_ms);
 
     _send_segment(_build_header(oldest.flags, oldest.seq), oldest.payload);
     oldest.retransmitted = true; // no RTT sample may ever come from it now
-    oldest.retransmit_ticks_remaining = _rto_ticks;
+    oldest.retransmit_ms_remaining = _rto_ms;
 }
 
 size_t TcpConnection::send_space_available() const

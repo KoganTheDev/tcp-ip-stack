@@ -3,12 +3,17 @@
 #include "logger.h"
 
 #include <sys/timerfd.h>
+#include <ctime>
 #include <unistd.h>
 #include <iostream>
 
 namespace
 {
-    constexpr long RETRANSMIT_TICK_MS = 500;
+    // How often the stack's timers are advanced. This is now purely a polling
+    // cadence - a statement about resolution and wakeup cost, not about the
+    // duration of anything inside the stack. Every timeout in there is
+    // denominated in real milliseconds and is unaffected by changing this.
+    constexpr long TIMER_INTERVAL_MS = 500;
 }
 
 Server::Server(uint16_t port, size_t worker_count, const ChannelOptions& channel_options)
@@ -19,7 +24,7 @@ Server::Server(uint16_t port, size_t worker_count, const ChannelOptions& channel
 Server::Server(uint16_t port, size_t worker_count, OpenedChannel opened)
     : _port(port),
       _network_stack(std::move(opened.channel), opened.config),
-      _epoll(), _completion_queue(), _thread_pool(worker_count), _timer_fd(-1)
+      _epoll(), _completion_queue(), _thread_pool(worker_count), _timer_fd(-1), _last_timer_advance_ms(0)
 {
     this->_network_stack.listen(port);
     this->_epoll.add(this->_network_stack.get_fd(), EPOLLIN | EPOLLET);
@@ -62,6 +67,16 @@ Server::~Server()
     // rather than close.
 }
 
+uint64_t Server::_monotonic_now_ms()
+{
+    timespec now = {};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+    {
+        throw EXCEPTION(SystemException, "clock_gettime(CLOCK_MONOTONIC) failed");
+    }
+    return static_cast<uint64_t>(now.tv_sec) * 1000 + static_cast<uint64_t>(now.tv_nsec) / 1000000;
+}
+
 void Server::_create_retransmit_timer()
 {
     this->_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
@@ -71,8 +86,8 @@ void Server::_create_retransmit_timer()
     }
 
     itimerspec interval = {};
-    interval.it_value.tv_sec = RETRANSMIT_TICK_MS / 1000;
-    interval.it_value.tv_nsec = (RETRANSMIT_TICK_MS % 1000) * 1000000L;
+    interval.it_value.tv_sec = TIMER_INTERVAL_MS / 1000;
+    interval.it_value.tv_nsec = (TIMER_INTERVAL_MS % 1000) * 1000000L;
     interval.it_interval = interval.it_value;
 
     if (timerfd_settime(this->_timer_fd, 0, &interval, nullptr) < 0)
@@ -80,6 +95,7 @@ void Server::_create_retransmit_timer()
         throw EXCEPTION(SystemException, "timerfd_settime() failed");
     }
 
+    this->_last_timer_advance_ms = _monotonic_now_ms();
     this->_epoll.add(this->_timer_fd, EPOLLIN);
 }
 
@@ -110,9 +126,21 @@ void Server::run(const volatile std::sig_atomic_t& stop_flag)
                 uint64_t expirations = 0;
                 while (read(this->_timer_fd, &expirations, sizeof(expirations)) > 0)
                 {
-                    // just draining the expiration counter
+                    // The fd must be drained or it stays readable forever. The
+                    // count it reports is deliberately ignored: it says how
+                    // many intervals elapsed, which is only the same as how
+                    // much time elapsed while the loop keeps up. Measuring the
+                    // clock covers both, including the case where this loop was
+                    // blocked long enough to miss several expirations outright.
                 }
-                this->_network_stack.on_timer_tick();
+
+                uint64_t now_ms = _monotonic_now_ms();
+                uint64_t elapsed_ms = now_ms - this->_last_timer_advance_ms;
+                this->_last_timer_advance_ms = now_ms;
+                if (elapsed_ms > 0)
+                {
+                    this->_network_stack.on_time_passed(static_cast<uint32_t>(elapsed_ms));
+                }
             }
             else if (event.data.fd == this->_completion_queue.get_fd())
             {

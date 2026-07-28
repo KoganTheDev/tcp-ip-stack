@@ -4,6 +4,15 @@
 
 namespace
 {
+    // How much time each call to on_time_passed() reports in these tests.
+    // The stack's timers are in real milliseconds now, so a test that wants to
+    // reach a timeout advances by that timeout rather than counting calls.
+    constexpr uint32_t TEST_TICK_MS = 500;
+    // A TTL of three of those, so the tests below can express "two of three
+    // gone" by aging twice - the same shape they had when the table counted
+    // ticks, now denominated in the milliseconds the table actually uses.
+    constexpr int TTL_MS = 3 * static_cast<int>(TEST_TICK_MS);
+
     const IPv4Address IP_A("10.0.0.1");
     const IPv4Address IP_B("10.0.0.2");
     const MacAddress MAC_A("11:22:33:44:55:66");
@@ -12,7 +21,7 @@ namespace
 
 TEST(ArpTableLearnAndLookup)
 {
-    ArpTable table(3);
+    ArpTable table(TTL_MS);
     test_assert(!table.contains(IP_A), "an unknown IP should not be present");
 
     table.learn(IP_A, MAC_A);
@@ -27,59 +36,59 @@ TEST(ArpTableLearnAndLookup)
 
 TEST(ArpTableDynamicEntryExpiresAfterTtl)
 {
-    ArpTable table(3);
+    ArpTable table(TTL_MS);
     table.learn(IP_A, MAC_A);
 
-    table.age_one_tick();
-    table.age_one_tick();
+    table.age(TEST_TICK_MS);
+    table.age(TEST_TICK_MS);
     test_assert(table.contains(IP_A), "a dynamic entry should survive until its TTL is exhausted");
 
-    table.age_one_tick(); // third tick - TTL of 3 now reached
+    table.age(TEST_TICK_MS); // third tick - TTL of 3 now reached
     test_assert(!table.contains(IP_A), "a dynamic entry should be evicted once its TTL is exhausted");
 }
 
 TEST(ArpTableRefreshResetsTtl)
 {
-    ArpTable table(3);
+    ArpTable table(TTL_MS);
     table.learn(IP_A, MAC_A);
 
-    table.age_one_tick();
-    table.age_one_tick(); // 2 of 3 ticks gone
+    table.age(TEST_TICK_MS);
+    table.age(TEST_TICK_MS); // 2 of 3 ticks gone
     table.refresh(IP_A);  // back to full TTL
 
-    table.age_one_tick();
-    table.age_one_tick();
+    table.age(TEST_TICK_MS);
+    table.age(TEST_TICK_MS);
     test_assert(table.contains(IP_A), "refresh should have reset the TTL, so the entry is still alive");
 
-    table.age_one_tick(); // now 3 ticks since refresh
+    table.age(TEST_TICK_MS); // now 3 ticks since refresh
     test_assert(!table.contains(IP_A), "after a full TTL past the refresh, the entry should expire");
 }
 
 TEST(ArpTableRelearningResetsTtl)
 {
-    ArpTable table(3);
+    ArpTable table(TTL_MS);
     table.learn(IP_A, MAC_A);
-    table.age_one_tick();
-    table.age_one_tick();
+    table.age(TEST_TICK_MS);
+    table.age(TEST_TICK_MS);
 
     table.learn(IP_A, MAC_B); // relearn (e.g. the peer's MAC changed) - resets TTL and MAC
     MacAddress out;
     table.lookup(IP_A, out);
     test_assert(out == MAC_B, "relearning should overwrite the MAC");
 
-    table.age_one_tick();
-    table.age_one_tick();
+    table.age(TEST_TICK_MS);
+    table.age(TEST_TICK_MS);
     test_assert(table.contains(IP_A), "relearning should have reset the TTL");
 }
 
 TEST(ArpTableStaticEntryNeverExpires)
 {
-    ArpTable table(3);
+    ArpTable table(TTL_MS);
     table.add_static(IP_A, MAC_A);
 
     for (int i = 0; i < 100; i++)
     {
-        table.age_one_tick();
+        table.age(TEST_TICK_MS);
     }
     test_assert(table.contains(IP_A), "a static entry must never be aged out");
 
@@ -89,7 +98,7 @@ TEST(ArpTableStaticEntryNeverExpires)
 
 TEST(ArpTableRemove)
 {
-    ArpTable table(3);
+    ArpTable table(TTL_MS);
     table.learn(IP_A, MAC_A);
     table.remove(IP_A);
     test_assert(!table.contains(IP_A), "a removed entry should be gone");
@@ -102,7 +111,7 @@ TEST(ArpTableRemove)
 // stranger - and entries age out on their own, so a full table drains.
 TEST(ArpTableRefusesNewEntriesOnceFull)
 {
-    ArpTable table(60);
+    ArpTable table(60 * static_cast<int>(TEST_TICK_MS));
     const MacAddress MAC("11:22:33:44:55:66");
 
     for (size_t i = 0; i < ArpTable::MAX_ENTRIES; i++)

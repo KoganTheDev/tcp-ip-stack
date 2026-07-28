@@ -57,6 +57,12 @@ private:
     Server(uint16_t port, size_t worker_count, OpenedChannel opened);
 
     void _create_retransmit_timer();
+    // Monotonic milliseconds since an arbitrary origin. Used only for
+    // differences, so the origin does not matter - CLOCK_MONOTONIC is chosen
+    // because it does not jump when the wall clock is stepped or the machine
+    // crosses a leap second, either of which would otherwise be reported to
+    // the stack as a huge or negative interval.
+    static uint64_t _monotonic_now_ms();
     void _handle_new_connections();
 
     // Reads whatever is waiting on a connection and submits it, unless a chunk
@@ -84,6 +90,9 @@ private:
     CompletionQueue _completion_queue;
     ThreadPool _thread_pool;
     int _timer_fd;
+    // When the stack's timers were last advanced, so the next advance can
+    // report the time that actually passed rather than the time intended to.
+    uint64_t _last_timer_advance_ms;
 
     // Connections with a chunk currently in the thread pool. Nothing more is
     // needed, because unread data now stays in the stack's own receive queue

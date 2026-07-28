@@ -10,18 +10,18 @@ namespace
 {
     constexpr uint16_t FIRST_EPHEMERAL_PORT = 49152; // IANA dynamic/private range starts here
     constexpr int ARP_MAX_RETRIES = 3;
-    constexpr int ARP_RETRY_TICKS = 4; // with a 500ms NetworkStack tick, ~2s between retries
-    // RFC 791 suggests 15 seconds for reassembly; ~30 ticks at a 500ms tick.
-    // Short on purpose - a partial datagram is memory held for something that
-    // may never arrive.
-    constexpr int FRAGMENT_TIMEOUT_TICKS = 30;
-    constexpr int ARP_ENTRY_TTL_TICKS = 120;
+    constexpr int ARP_RETRY_MS = 2000;
+    // RFC 791 suggests 15 seconds for reassembly. Short on purpose - a partial
+    // datagram is memory held for something that may never arrive.
+    constexpr int FRAGMENT_TIMEOUT_MS = 15000;
+    // How long a learned mapping survives while the peer stays silent.
+    constexpr int ARP_ENTRY_TTL_MS = 60000;
 
-    // ICMP error budget: a burst of this many, refilled at REFILL per tick.
-    // At a 500ms tick that is a sustained few per second, which is ample for
-    // genuine diagnostics and useless as an amplifier.
+    // ICMP error budget: a burst of this many, refilled at this rate. A few
+    // per second sustained is ample for genuine diagnostics and useless as an
+    // amplifier.
     constexpr int ICMP_ERROR_BURST = 10;
-    constexpr int ICMP_ERROR_REFILL_PER_TICK = 2; // ~60s at a 500ms tick - a learned mapping's lifetime while the peer stays silent
+    constexpr int ICMP_ERROR_REFILL_PER_SECOND = 4;
 
     constexpr uint8_t FLAG_ACK = 0x10;
     constexpr uint8_t FLAG_RST = 0x04;
@@ -91,7 +91,7 @@ NetworkStack::NetworkStack(std::unique_ptr<PacketChannel> channel, const MacAddr
 
 NetworkStack::NetworkStack(std::unique_ptr<PacketChannel> channel, const InterfaceConfig& config)
     : _channel(std::move(channel)), _config(config),
-      _next_ephemeral_port(FIRST_EPHEMERAL_PORT), _next_ip_id(1), _arp_table(ARP_ENTRY_TTL_TICKS), _reassembler(FRAGMENT_TIMEOUT_TICKS), _icmp_error_tokens(ICMP_ERROR_BURST)
+      _next_ephemeral_port(FIRST_EPHEMERAL_PORT), _next_ip_id(1), _arp_table(ARP_ENTRY_TTL_MS), _reassembler(FRAGMENT_TIMEOUT_MS), _icmp_error_tokens_scaled(ICMP_ERROR_BURST * MS_PER_SECOND)
 {
     this->configure_interface(config);
 }
@@ -294,32 +294,36 @@ bool NetworkStack::poll()
     return fully_drained;
 }
 
-void NetworkStack::on_timer_tick()
+void NetworkStack::on_time_passed(uint32_t elapsed_ms)
 {
     for (auto& entry : this->_connections)
     {
         try
         {
-            entry.second->on_tick();
+            entry.second->on_time_passed(elapsed_ms);
         }
         catch (const std::exception& e)
         {
-            LOG_ERROR("NetworkStack: on_tick failed for a connection: " << e.what());
+            LOG_ERROR("NetworkStack: on_time_passed failed for a connection: " << e.what());
         }
     }
 
     this->_reap_closed_connections();
 
-    this->_arp_table.age_one_tick();
+    this->_arp_table.age(elapsed_ms);
 
-    this->_icmp_error_tokens = std::min(this->_icmp_error_tokens + ICMP_ERROR_REFILL_PER_TICK,
-                                        ICMP_ERROR_BURST);
+    // Refill proportionally to the time that actually passed, so the budget is
+    // a real rate per second rather than a rate per call - otherwise a caller
+    // polling twice as often would get twice the ICMP allowance.
+    this->_icmp_error_tokens_scaled = std::min(
+        this->_icmp_error_tokens_scaled + static_cast<int>(elapsed_ms) * ICMP_ERROR_REFILL_PER_SECOND,
+        ICMP_ERROR_BURST * MS_PER_SECOND);
 
     // A datagram whose remaining fragments never arrived is dropped, and the
     // sender told: RFC 792 Time Exceeded, code 1. Without it the peer waits on
     // something nobody will ever deliver.
     std::vector<IPv4Address> expired;
-    this->_reassembler.age_one_tick(expired);
+    this->_reassembler.age(elapsed_ms, expired);
     for (const IPv4Address& source : expired)
     {
         this->_send_icmp_fragment_reassembly_time_exceeded(source);
@@ -327,8 +331,8 @@ void NetworkStack::on_timer_tick()
 
     for (auto it = this->_arp_requests_in_flight.begin(); it != this->_arp_requests_in_flight.end(); )
     {
-        it->second.ticks_until_retry -= 1;
-        if (it->second.ticks_until_retry > 0)
+        it->second.ms_until_retry -= static_cast<int>(elapsed_ms);
+        if (it->second.ms_until_retry > 0)
         {
             ++it;
             continue;
@@ -356,7 +360,7 @@ void NetworkStack::on_timer_tick()
         }
 
         this->_send_arp_request(it->first);
-        it->second.ticks_until_retry = ARP_RETRY_TICKS;
+        it->second.ms_until_retry = ARP_RETRY_MS;
         ++it;
     }
 }
@@ -840,11 +844,11 @@ void NetworkStack::_handle_icmp(const Ip& ip, const Icmp& icmp)
 
 bool NetworkStack::_may_send_icmp_error()
 {
-    if (this->_icmp_error_tokens <= 0)
+    if (this->_icmp_error_tokens_scaled < MS_PER_SECOND)
     {
         return false;
     }
-    this->_icmp_error_tokens -= 1;
+    this->_icmp_error_tokens_scaled -= MS_PER_SECOND;
     return true;
 }
 
@@ -963,7 +967,7 @@ void NetworkStack::_handle_icmp_error(const Icmp& icmp)
     {
         LOG_DEBUG("NetworkStack: failing a TCP connection on an ICMP error"
                   " (it was going to time out otherwise)");
-        connection->fail(); // -> CLOSED, reaped on the next poll()/on_timer_tick() pass
+        connection->fail(); // -> CLOSED, reaped on the next poll()/on_time_passed() pass
     }
 }
 
@@ -1040,7 +1044,7 @@ void NetworkStack::_ensure_arp_resolution(const IPv4Address& ip)
     }
 
     this->_send_arp_request(ip);
-    this->_arp_requests_in_flight[ip] = {ARP_MAX_RETRIES, ARP_RETRY_TICKS};
+    this->_arp_requests_in_flight[ip] = {ARP_MAX_RETRIES, ARP_RETRY_MS};
 }
 
 void NetworkStack::_fail_pending_outbound_connects(const IPv4Address& ip)

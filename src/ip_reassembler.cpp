@@ -20,8 +20,8 @@ size_t IpReassembler::KeyHash::operator()(const Key& key) const
     return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3);
 }
 
-IpReassembler::IpReassembler(int timeout_ticks)
-    : _buffered_bytes(0), _timeout_ticks(timeout_ticks)
+IpReassembler::IpReassembler(int timeout_ms)
+    : _buffered_bytes(0), _timeout_ms(timeout_ms)
 {
 }
 
@@ -61,7 +61,7 @@ IpReassembler::Result IpReassembler::offer(
             return Result::Rejected;
         }
         Partial fresh;
-        fresh.ticks_remaining = this->_timeout_ticks;
+        fresh.ms_remaining = this->_timeout_ms;
         fresh.source = source;
         existing = this->_partials.emplace(key, std::move(fresh)).first;
     }
@@ -182,12 +182,12 @@ void IpReassembler::_drop(const Key& key)
     this->_partials.erase(it);
 }
 
-void IpReassembler::age_one_tick(std::vector<IPv4Address>& expired_sources)
+void IpReassembler::age(uint32_t elapsed_ms, std::vector<IPv4Address>& expired_sources)
 {
     for (auto it = this->_partials.begin(); it != this->_partials.end(); )
     {
-        it->second.ticks_remaining -= 1;
-        if (it->second.ticks_remaining <= 0)
+        it->second.ms_remaining -= static_cast<int>(elapsed_ms);
+        if (it->second.ms_remaining <= 0)
         {
             LOG_WARNING("IpReassembler: a partial datagram from " << it->second.source.to_string()
                         << " timed out with " << it->second.received_bytes << " bytes buffered");

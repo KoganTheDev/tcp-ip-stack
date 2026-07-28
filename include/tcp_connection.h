@@ -41,15 +41,9 @@ enum class TcpState
 // close instead of folding it into `FIN_WAIT_2`.
 //
 // Still deliberately out of scope (documented, not accidental):
-//  - no SACK or timestamps options - a lost segment still stalls delivery
-//    until it's retransmitted and fills the gap. RTT *is* sampled live (see
-//    the RTO block below), but only from the ack clock, not from a
-//    timestamp option, so at most one sample per window rather than one
-//    per segment
-//  - TIME_WAIT lasts a fixed, short number of timer ticks
-//    (TIME_WAIT_TICKS), not the real 2*MSL - long enough to catch an
-//    immediately-retransmitted duplicate FIN, not long enough to guarantee
-//    catching one after a real network's worth of delay
+//  - SACK reports and honours blocks, but recovery is not full RFC 6675:
+//    there is no pipe estimate driving transmission during recovery, and no
+//    rescue retransmission. The scoreboard both would need does exist
 //  - ISN generation is RFC 793's clock-driven scheme, not RFC 6528's
 //    unpredictable one
 //  - the reorder buffer stores exact-sequence-keyed segments, not merged
@@ -85,10 +79,30 @@ public:
     // belong to this connection.
     void on_segment(const Tcp& segment);
 
-    // Drives the retransmission timer - call this once per NetworkStack timer
-    // tick regardless of connection state; a no-op unless a segment is
-    // waiting on an ACK.
-    void on_tick();
+    // Drives every timer on the connection. The caller reports how much real
+    // time has passed since it last called, in milliseconds.
+    //
+    // This used to be on_tick(), advancing each countdown by exactly one, with
+    // the duration of a tick defined in the *application* (a 500 ms timerfd in
+    // the epoll server). Two things were wrong with that.
+    //
+    // The stack's timers are specified in real time - RFC 6298 says the first
+    // RTO is one second, RFC 1122 caps a delayed ack at 500 ms - and none of
+    // those numbers can be honoured by a counter whose unit is defined
+    // somewhere the stack cannot see. Changing the application's timer to
+    // 100 ms silently divided every timeout in here by five, with nothing
+    // anywhere to catch it.
+    //
+    // The subtler problem is that a tick counter conflates "how often am I
+    // polled" with "how much time has passed", and those are different
+    // questions. If the event loop stalls for two seconds - a slow syscall, an
+    // overloaded machine - exactly one tick arrives, and the stack concludes
+    // 500 ms elapsed. Timers then run late by however overloaded the box was,
+    // which is the worst possible moment for a retransmission to be late.
+    // Reporting elapsed time instead means one call after that stall advances
+    // everything by the full 2000 ms, and the caller is free to poll at any
+    // cadence, regular or not.
+    void on_time_passed(uint32_t elapsed_ms);
 
     // Application-facing API. send() before ESTABLISHED or after the peer's
     // FIN silently does nothing - there is no error channel back to the
@@ -120,13 +134,13 @@ public:
     TcpState get_state() const { return _state; }
     bool is_closed() const { return _state == TcpState::CLOSED; }
 
-    // The current retransmission timeout, in timer ticks - what a freshly
+    // The current retransmission timeout in milliseconds - what a freshly
     // sent segment will wait before being retransmitted. Starts at
-    // INITIAL_RTO_TICKS and thereafter tracks the measured round-trip time
+    // INITIAL_RTO_MS and thereafter tracks the measured round-trip time
     // (see _update_rto_from_sample). Exposed for tests and for anyone
     // wanting to observe the estimator; nothing in the stack's own data
     // path reads it from outside.
-    int get_rto_ticks() const { return _rto_ticks; }
+    int get_rto_ms() const { return _rto_ms; }
 
     // Lowers the largest segment this side will send, in response to learning
     // the path cannot carry what was negotiated - an ICMP Fragmentation Needed
@@ -281,10 +295,10 @@ private:
     // The window this side would advertise right now.
     uint32_t _advertised_window() const;
     // Folds one round-trip measurement into the smoothed RTT/variance pair
-    // and recomputes _rto_ticks from them (RFC 6298's estimator, Jacobson &
+    // and recomputes _rto_ms from them (RFC 6298's estimator, Jacobson &
     // Karels' algorithm). Called only with an *unambiguous* sample - see
     // Karn's algorithm at the call site in _handle_ack().
-    void _update_rto_from_sample(uint32_t rtt_ticks);
+    void _update_rto_from_sample(uint32_t rtt_ms);
     // RFC 793 SS3.3's sequence-number acceptability test, done with unsigned
     // wraparound arithmetic (seq - _recv_next) so it's correct across a
     // sequence-number wraparound the same way real TCP's modular arithmetic
@@ -300,15 +314,15 @@ private:
         uint32_t end_seq;
         uint8_t flags;
         Bytes payload;
-        int retransmit_ticks_remaining;
+        int retransmit_ms_remaining;
         int retransmit_attempts;
-        // The connection's tick counter when this segment first went out.
-        // Storing the absolute tick rather than an age counter keeps ticking
-        // O(1): on_tick() would otherwise have to walk the whole window every
-        // tick just to age each entry, and this window is walked often enough
-        // already. Age is _tick_count - sent_at_tick, computed only when a
+        // The connection's clock when this segment first went out. Storing the
+        // absolute moment rather than an age counter keeps timekeeping O(1):
+        // on_time_passed() would otherwise have to walk the whole window on
+        // every call just to age each entry, and this window is walked often
+        // enough already. Age is _now_ms - sent_at_ms, computed only when a
         // segment is actually acked.
-        uint64_t sent_at_tick;
+        uint64_t sent_at_ms;
         // Named by a SACK block, so the peer holds it even though the
         // cumulative ack has not reached it. It stays in this deque because the
         // window cannot slide past it until everything before it is acked too -
@@ -357,7 +371,7 @@ private:
 
     // counts down while in TIME_WAIT; reset if a duplicate FIN arrives
     // (meaning our ack for it was likely lost)
-    int _time_wait_ticks_remaining;
+    int _time_wait_ms_remaining;
 
     // --- RTT estimation / adaptive RTO (RFC 6298, Jacobson & Karels) ---
     // A fixed retransmission timeout can only be wrong in one of two
@@ -376,31 +390,34 @@ private:
     // keep fractional precision in pure integer arithmetic - the same trick
     // the BSD implementation uses, and the reason there is no floating point
     // anywhere in this path.
-    // Monotonic tick counter, the clock RTT is measured against - and, once
-    // timestamps are negotiated, the value put in TSval. It starts at 1 rather
-    // than 0 so that a zero TSecr unambiguously means "nothing to echo yet"
-    // rather than "echoing the very first moment of the connection".
-    uint64_t _tick_count;
-    uint32_t _srtt_scaled;  // smoothed RTT (SRTT), in ticks * RTO_SCALE
-    uint32_t _rttvar_scaled; // RTT variation (RTTVAR), in ticks * RTO_SCALE
+    // Monotonic millisecond clock, summed from what on_time_passed() reports.
+    // This is what RTT is measured against and, once timestamps are
+    // negotiated, the value put in TSval - a millisecond clock sits squarely
+    // inside RFC 7323's required 1 ms to 1 s per tick, which a counter of
+    // application timer ticks only did by luck. It starts at 1 rather than 0
+    // so a zero TSecr unambiguously means "nothing to echo yet" rather than
+    // "echoing the very first moment of the connection".
+    uint64_t _now_ms;
+    uint32_t _srtt_scaled;  // smoothed RTT (SRTT), in ms * RTO_SCALE
+    uint32_t _rttvar_scaled; // RTT variation (RTTVAR), in ms * RTO_SCALE
     bool _has_rtt_sample;   // false until the first measurement seeds the estimator
-    // The live timeout, in whole ticks. Doubled on every retransmission
+    // The live timeout, in whole milliseconds. Doubled on every retransmission
     // (Karn's second half: back off, and keep the backed-off value rather
     // than recomputing it from an estimator no valid sample can currently
     // update) and recomputed from SRTT/RTTVAR on the next unambiguous sample.
-    int _rto_ticks;
+    int _rto_ms;
 
     // --- zero-window persist timer ---
-    // ticks until the next zero-window probe, or 0 when the persist timer is
-    // disarmed. Unlike the retransmit timer this never gives up: a peer with a
+    // milliseconds until the next zero-window probe, or 0 when the persist
+    // timer is disarmed. Unlike the retransmit timer this never gives up: a peer with a
     // full receive buffer is healthy, just not ready, so probing continues
     // (with exponential backoff) until the window reopens.
-    int _persist_ticks_remaining;
-    int _persist_backoff; // shift applied to PERSIST_BASE_TICKS, capped at PERSIST_MAX_BACKOFF_SHIFT
+    int _persist_ms_remaining;
+    int _persist_backoff; // shift applied to PERSIST_BASE_MS, capped at PERSIST_MAX_BACKOFF_SHIFT
 
     // --- delayed ACK ---
     bool _ack_pending;              // an in-order segment is awaiting a coalesced ack
-    int _ack_delay_ticks_remaining; // countdown that forces a pending ack out on time
+    int _ack_delay_ms_remaining; // countdown that forces a pending ack out on time
 
     // --- selective acknowledgement (RFC 2018) ---
     //
@@ -495,12 +512,17 @@ private:
     static constexpr uint8_t WINDOW_SCALE_SHIFT = 1; // this stack's advertised shift
     static constexpr uint32_t INITIAL_SSTHRESH = 65536; // effectively "no ceiling yet" until a real loss recalibrates it
     static constexpr int DUP_ACK_FAST_RETRANSMIT_THRESHOLD = 3;
+    // Every constant below is in milliseconds, and means what the RFC that
+    // specifies it says it means. That is the whole point of taking elapsed
+    // time from the caller rather than counting its ticks.
+    //
     // RFC 6298 rule 2.1: before any RTT has been measured there is nothing to
-    // derive a timeout from, so the first one is simply a fixed conservative
-    // guess. Every segment sent after the first ack comes back uses a
-    // measured value instead.
-    static constexpr int INITIAL_RTO_TICKS = 3;
-    // Fixed-point shift for _srtt_scaled/_rttvar_scaled: eighths of a tick.
+    // derive a timeout from, so the first one is a fixed conservative guess -
+    // the RFC's own one second. Every segment sent after the first ack comes
+    // back uses a measured value instead.
+    static constexpr int INITIAL_RTO_MS = 1000;
+    // Fixed-point shift for _srtt_scaled/_rttvar_scaled: eighths of a
+    // millisecond.
     static constexpr uint32_t RTO_SCALE = 8;
     // RFC 6298's alpha = 1/8 and beta = 1/4, as right-shifts. Powers of two
     // are not an approximation chosen for speed - the original algorithm
@@ -510,17 +532,54 @@ private:
     // RFC 6298's K: how many deviations above the smoothed mean the timeout
     // sits. Four is what makes ordinary jitter unable to reach it.
     static constexpr uint32_t RTO_VARIANCE_MULTIPLIER = 4;
-    // A timeout below one tick could never be observed by a tick-driven timer
-    // in the first place; two gives the estimator a floor with some headroom.
-    static constexpr int MIN_RTO_TICKS = 2;
-    // Caps the exponential backoff, so a connection to a black hole stops
-    // doubling rather than growing without bound.
-    static constexpr int MAX_RTO_TICKS = 60;
+    // Assumed resolution of the caller's clock, and so the smallest
+    // difference in timing this connection can actually resolve. It is the G
+    // term in RFC 6298's RTO formula: the variance floor exists because on a
+    // very steady path RTTVAR converges toward zero, and without a floor the
+    // timeout would collapse onto the mean and fire on the first sample
+    // landing a hair above average.
+    static constexpr uint32_t RTO_CLOCK_GRANULARITY_MS = 100;
+    // RFC 6298 rule 2.4 says round a computed RTO up to one second, then
+    // immediately notes that this is about 1980s clock granularity rather than
+    // anything about the network. Linux uses 200 ms and so does this, because
+    // a one-second floor on a datacentre path makes every loss cost a second
+    // of idle time to recover from. Deviating from the RFC deliberately, and
+    // writing down why, is the point of putting it here.
+    static constexpr int MIN_RTO_MS = 200;
+    // RFC 6298 rule 2.5 permits an upper bound provided it is at least 60
+    // seconds. Caps the exponential backoff so a connection to a black hole
+    // stops doubling rather than growing without bound.
+    static constexpr int MAX_RTO_MS = 60000;
     static constexpr int MAX_RETRANSMIT_ATTEMPTS = 5;
-    static constexpr int TIME_WAIT_TICKS = 4;
-    static constexpr int PERSIST_BASE_TICKS = 2;        // first probe ~1 tick-interval after the window shuts
-    static constexpr int PERSIST_MAX_BACKOFF_SHIFT = 5; // cap the probe interval at 32 * PERSIST_BASE_TICKS
-    static constexpr int DELAYED_ACK_TICKS = 1;         // hold an in-order ack at most this long (RFC 1122: <=500ms)
+
+    // TIME_WAIT lasts twice the maximum segment lifetime, and the doubling is
+    // the whole argument: one MSL for a segment this side sent to die out of
+    // the network, and one more for a reply it might still provoke. Leaving
+    // early risks two distinct things. A duplicate FIN arriving after the
+    // socket is gone gets an RST rather than the ack the peer is waiting for,
+    // so a clean close looks like a failure to the other end. Worse, a new
+    // connection reusing the same four-tuple can be handed a straggler from
+    // the old one whose sequence number happens to fall inside the new
+    // window - silent data corruption rather than a visible error.
+    //
+    // RFC 793 puts MSL at 2 minutes, making TIME_WAIT 4 minutes. That number
+    // was chosen for a network whose diameter was measured in satellite hops,
+    // and holding per-connection state for 4 minutes after close is a real
+    // cost on a busy server - it is exactly what makes a restarted service
+    // fail to rebind. Linux uses a fixed 60 seconds; this follows it, which is
+    // 30 seconds of assumed MSL, and says so rather than pretending to the
+    // RFC's figure. Previously this was 4 ticks - 2 seconds - which was not an
+    // approximation of 2*MSL so much as an unrelated number.
+    static constexpr int ASSUMED_MSL_MS = 30000;
+    static constexpr int TIME_WAIT_MS = 2 * ASSUMED_MSL_MS;
+
+    // First probe one initial-RTO after the window shuts, then exponential
+    // backoff capped by the shift below (32 s).
+    static constexpr int PERSIST_BASE_MS = 1000;
+    static constexpr int PERSIST_MAX_BACKOFF_SHIFT = 5;
+    // RFC 1122 4.2.3.2 makes 500 ms a hard ceiling on holding an ack back.
+    // 200 ms is what Linux settled on and leaves margin under the ceiling.
+    static constexpr int DELAYED_ACK_MS = 200;
 };
 
 // Clock-driven ISN generator (RFC 793 style: not cryptographically

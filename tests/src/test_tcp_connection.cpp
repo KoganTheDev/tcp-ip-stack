@@ -7,10 +7,35 @@
 
 namespace
 {
+    // How much time each call to on_time_passed() reports in these tests.
+    // The stack's timers are in real milliseconds now, so a test that wants to
+    // reach a timeout advances by that timeout rather than counting calls.
+    constexpr uint32_t TEST_TICK_MS = 500;
+
+    // The stack's own timing constants, restated here so these tests read as
+    // statements about behaviour rather than about arithmetic. They are
+    // private to TcpConnection on purpose - exposing them just to test them
+    // would make every one of them API.
+    constexpr uint32_t INITIAL_RTO_MS = 1000;  // RFC 6298 rule 2.1
+    constexpr uint32_t TIME_WAIT_MS = 60000;   // 2 * an assumed 30 s MSL
+
     constexpr uint8_t FLAG_ACK = 0x10;
     constexpr uint8_t FLAG_RST = 0x04;
     constexpr uint8_t FLAG_SYN = 0x02;
     constexpr uint8_t FLAG_FIN = 0x01;
+
+    // Advances a connection's clock by a real duration, in steps no larger
+    // than the interval a real caller would poll at - so anything due partway
+    // through still fires partway through, in the order production would see.
+    void advance_ms(TcpConnection& connection, uint32_t total_ms)
+    {
+        while (total_ms > 0)
+        {
+            uint32_t step = total_ms < TEST_TICK_MS ? total_ms : TEST_TICK_MS;
+            connection.on_time_passed(step);
+            total_ms -= step;
+        }
+    }
 
     struct RecordedSegment
     {
@@ -214,7 +239,7 @@ TEST(InboundDataTriggersCallbackAndAcksCorrectly)
     // delayed ACK: a single in-order segment's ack is held, not sent at once
     test_assert(sent.empty(), "an in-order segment's ack should be delayed, not sent immediately");
 
-    connection->on_tick(); // the delay timer fires
+    connection->on_time_passed(TEST_TICK_MS); // the delay timer fires
     test_assert(sent.size() == 1, "the delayed ack should be flushed on the next tick");
     test_assert(sent[0].flags == FLAG_ACK, "the flushed ack should be a pure ACK");
     test_assert(sent[0].ack == 501 + payload.size(), "the ack should advance past the received payload");
@@ -252,7 +277,7 @@ TEST(DelayedAckIsPiggybackedOnOutgoingData)
     test_assert(sent[0].payload.to_hex() == "6f6b", "the segment should carry our data");
     test_assert(sent[0].ack == 506, "the data segment should piggyback the pending ack (RCV.NXT)");
 
-    connection->on_tick();
+    connection->on_time_passed(TEST_TICK_MS);
     test_assert(sent.size() == 1, "no delayed ack should fire after it was already piggybacked");
 }
 
@@ -313,9 +338,9 @@ TEST(RetransmitsUnackedSegmentAfterTimeout)
 
     // RETRANSMIT_TIMEOUT_TICKS is 3 (see tcp_connection.cpp) - tick past it
     // with no ack in between
-    connection->on_tick();
-    connection->on_tick();
-    connection->on_tick();
+    connection->on_time_passed(TEST_TICK_MS);
+    connection->on_time_passed(TEST_TICK_MS);
+    connection->on_time_passed(TEST_TICK_MS);
 
     test_assert(sent.size() == 2, "an unacked segment should be retransmitted after enough ticks with no ack");
     test_assert(sent[1].seq == sent[0].seq, "the retransmission must reuse the original sequence number");
@@ -337,7 +362,7 @@ TEST(GivesUpAndClosesAfterMaxRetransmitAttempts)
     int ticks = 0;
     while (connection->get_state() != TcpState::CLOSED && ticks < 1000)
     {
-        connection->on_tick();
+        connection->on_time_passed(TEST_TICK_MS);
         ticks++;
     }
 
@@ -361,14 +386,13 @@ TEST(OurCloseThenPeerFinMovesToTimeWaitThenCloses)
     connection->on_segment(*make_incoming_segment(501, sent[0].seq + 1, FLAG_ACK | FLAG_FIN));
     test_assert(connection->get_state() == TcpState::TIME_WAIT, "peer's FIN in FIN_WAIT_2 should move to TIME_WAIT, not CLOSED directly");
 
-    // TIME_WAIT_TICKS is 4 (see tcp_connection.cpp) - stay open for that many ticks
-    connection->on_tick();
-    connection->on_tick();
-    connection->on_tick();
-    test_assert(connection->get_state() == TcpState::TIME_WAIT, "should remain in TIME_WAIT until its tick budget is exhausted");
+    // TIME_WAIT runs for a real 2*MSL, so almost all of it must pass with the
+    // connection still held open - that holding is the entire mechanism.
+    advance_ms(*connection, TIME_WAIT_MS - TEST_TICK_MS);
+    test_assert(connection->get_state() == TcpState::TIME_WAIT, "should remain in TIME_WAIT for the whole 2*MSL, not merely for a few timer calls");
 
-    connection->on_tick();
-    test_assert(connection->get_state() == TcpState::CLOSED, "should close once the TIME_WAIT tick budget is exhausted");
+    advance_ms(*connection, TEST_TICK_MS);
+    test_assert(connection->get_state() == TcpState::CLOSED, "should close once a full 2*MSL has elapsed");
 }
 
 TEST(DuplicateFinDuringTimeWaitReAcksAndRestartsWait)
@@ -385,16 +409,16 @@ TEST(DuplicateFinDuringTimeWaitReAcksAndRestartsWait)
 
     // burn down most of the wait budget, then a duplicate FIN arrives -
     // as if our ack for the first one was lost and the peer retransmitted
-    connection->on_tick();
-    connection->on_tick();
-    connection->on_tick();
+    connection->on_time_passed(TEST_TICK_MS);
+    connection->on_time_passed(TEST_TICK_MS);
+    connection->on_time_passed(TEST_TICK_MS);
     connection->on_segment(*make_incoming_segment(501, sent[0].seq + 1, FLAG_ACK | FLAG_FIN));
 
     test_assert(sent.size() == sent_before_duplicate + 1, "a duplicate FIN in TIME_WAIT should be re-acked");
     test_assert(connection->get_state() == TcpState::TIME_WAIT, "a duplicate FIN should not itself close the connection");
 
     // the wait should have restarted - one more tick should NOT be enough to close
-    connection->on_tick();
+    connection->on_time_passed(TEST_TICK_MS);
     test_assert(connection->get_state() == TcpState::TIME_WAIT, "the wait timer should have restarted, not continued from before the duplicate");
 }
 
@@ -466,9 +490,9 @@ TEST(RetransmitTimeoutCollapsesCongestionWindowToOneSegment)
     auto connection = make_established_connection(sent);
 
     connection->send(Bytes::from_hex("6f6b"));
-    connection->on_tick();
-    connection->on_tick();
-    connection->on_tick(); // RETRANSMIT_TIMEOUT_TICKS is 3
+    connection->on_time_passed(TEST_TICK_MS);
+    connection->on_time_passed(TEST_TICK_MS);
+    connection->on_time_passed(TEST_TICK_MS); // RETRANSMIT_TIMEOUT_TICKS is 3
     test_assert(sent.size() == 2, "the timeout should have triggered exactly one retransmission");
 
     // with cwnd collapsed back to one MSS (536 bytes) and 2 bytes already
@@ -516,10 +540,8 @@ TEST(RetransmitOnlyRetransmitsOldestSegmentInWindow)
     connection->send(Bytes(536));
     test_assert(sent.size() == 2, "two full segments should be in flight at once under the 2-MSS window");
 
-    // RETRANSMIT_TIMEOUT_TICKS is 3 - tick past it with neither acked
-    connection->on_tick();
-    connection->on_tick();
-    connection->on_tick();
+    // let the initial RTO elapse with neither acked
+    advance_ms(*connection, INITIAL_RTO_MS);
 
     test_assert(sent.size() == 3, "only one retransmission should happen per timeout, not one per in-flight segment");
     test_assert(sent[2].seq == sent[0].seq, "the retransmission must be of the oldest (first) unacked segment, not the newer one");
@@ -624,9 +646,9 @@ TEST(ZeroWindowStallsThenPersistProbesUntilWindowReopens)
     test_assert(connection->get_state() == TcpState::ESTABLISHED, "a shut window must not close the connection");
 
     // PERSIST_BASE_TICKS is 2 - the first probe fires on the second tick
-    connection->on_tick();
+    connection->on_time_passed(TEST_TICK_MS);
     test_assert(sent.empty(), "the persist timer must not probe before its interval elapses");
-    connection->on_tick();
+    connection->on_time_passed(TEST_TICK_MS);
     test_assert(sent.size() == 1, "the persist timer should send a probe once its interval elapses");
     test_assert(sent[0].payload.size() == 1, "a zero-window probe carries exactly one byte");
     test_assert(sent[0].seq == 1001, "the probe sits at SND.NXT (our next unsent sequence number)");
@@ -635,7 +657,7 @@ TEST(ZeroWindowStallsThenPersistProbesUntilWindowReopens)
     // (MAX_RETRANSMIT_ATTEMPTS is 5). Tick far past that many probes.
     for (int i = 0; i < 100; i++)
     {
-        connection->on_tick();
+        connection->on_time_passed(TEST_TICK_MS);
     }
     test_assert(connection->get_state() == TcpState::ESTABLISHED,
         "the persist timer must probe indefinitely, never closing the connection the way retransmit does");
@@ -679,7 +701,7 @@ TEST(NegotiatedMssCapsSentSegmentSize)
 // --- RTT estimation / adaptive RTO (RFC 6298 + Karn's algorithm) ---
 //
 // These drive the estimator through the tick clock rather than wall time:
-// on_tick() is the only clock TcpConnection has, so "a 2-tick round trip"
+// on_time_passed(TEST_TICK_MS) is the only clock TcpConnection has, so "a 2-tick round trip"
 // means send, tick twice, then deliver the ack.
 
 TEST(RtoStartsAtTheFixedInitialValueBeforeAnySample)
@@ -689,7 +711,8 @@ TEST(RtoStartsAtTheFixedInitialValueBeforeAnySample)
 
     // RFC 6298 rule 2.1: with no measurement yet there is nothing to derive a
     // timeout from, so it must be the fixed conservative default
-    test_assert(connection->get_rto_ticks() == 3, "RTO should start at the fixed initial value before any RTT sample");
+    test_assert(connection->get_rto_ms() == static_cast<int>(INITIAL_RTO_MS),
+                "RTO should start at RFC 6298's one second before any RTT sample");
 }
 
 TEST(RtoAdaptsToAMeasuredRoundTrip)
@@ -700,15 +723,14 @@ TEST(RtoAdaptsToAMeasuredRoundTrip)
     connection->send(Bytes::from_hex("6f6b"));
     test_assert(sent.size() == 1, "send() should produce one segment");
 
-    // two ticks, staying under the initial 3-tick RTO so the segment is never
+    // 800 ms, staying under the initial 1 s RTO so the segment is never
     // retransmitted - the sample must stay unambiguous for Karn to accept it
-    connection->on_tick();
-    connection->on_tick();
+    advance_ms(*connection, 800);
     connection->on_segment(*make_incoming_segment(501, 1003, FLAG_ACK));
 
-    // first sample: SRTT = 2 ticks, RTTVAR = 1 tick, so
-    // RTO = SRTT + 4*RTTVAR = 6 - measurably adapted, not the default
-    test_assert(connection->get_rto_ticks() == 6, "RTO should be recomputed from the measured round trip, not left at the default");
+    // first sample (RFC 6298 rule 2.2): SRTT = 800 ms, RTTVAR = half of it,
+    // so RTO = SRTT + 4*RTTVAR = 2400 ms - measurably adapted, not the default
+    test_assert(connection->get_rto_ms() == 2400, "RTO should be recomputed from the measured round trip, not left at the default");
 }
 
 TEST(RtoConvergesAsRoundTripsStayConsistent)
@@ -720,18 +742,19 @@ TEST(RtoConvergesAsRoundTripsStayConsistent)
     uint32_t our_seq = 1001;
     int rto_after_first_sample = 0;
 
-    // six consecutive round trips, every one taking exactly 2 ticks
+    // six consecutive round trips, every one taking exactly 800 ms - under the
+    // initial RTO throughout, so no retransmission ever makes a sample
+    // ambiguous and every round genuinely feeds the estimator
     for (int round = 0; round < 6; round++)
     {
         connection->send(Bytes::from_hex("6f6b"));
-        connection->on_tick();
-        connection->on_tick();
+        advance_ms(*connection, 800);
         our_seq += 2;
         connection->on_segment(*make_incoming_segment(peer_seq, our_seq, FLAG_ACK));
 
         if (round == 0)
         {
-            rto_after_first_sample = connection->get_rto_ticks();
+            rto_after_first_sample = connection->get_rto_ms();
         }
     }
 
@@ -739,9 +762,9 @@ TEST(RtoConvergesAsRoundTripsStayConsistent)
     // the initial RTO overshoots. As identical samples keep arriving the
     // variance term decays and the timeout settles closer to the true round
     // trip - it must come down, and must never fall below the measured RTT.
-    int settled = connection->get_rto_ticks();
+    int settled = connection->get_rto_ms();
     test_assert(settled < rto_after_first_sample, "RTO should converge downward as repeated samples show a steady path");
-    test_assert(settled >= 2, "RTO must never settle below the measured 2-tick round trip");
+    test_assert(settled >= 800, "RTO must never settle below the measured 800 ms round trip");
 }
 
 TEST(RtoBacksOffExponentiallyOnConsecutiveTimeouts)
@@ -751,22 +774,17 @@ TEST(RtoBacksOffExponentiallyOnConsecutiveTimeouts)
 
     connection->send(Bytes::from_hex("6f6b"));
 
-    // first timeout at the initial 3-tick RTO
-    connection->on_tick();
-    connection->on_tick();
-    connection->on_tick();
+    // first timeout at the initial 1 s RTO
+    advance_ms(*connection, INITIAL_RTO_MS);
     test_assert(sent.size() == 2, "the segment should be retransmitted once the initial RTO elapses");
-    test_assert(connection->get_rto_ticks() == 6, "RTO should double on the first timeout");
+    test_assert(connection->get_rto_ms() == 2000, "RTO should double on the first timeout");
 
-    // second timeout now takes the doubled 6 ticks, not 3
-    for (int i = 0; i < 5; i++)
-    {
-        connection->on_tick();
-    }
+    // the second timeout now takes the doubled 2 s, not the original 1 s
+    advance_ms(*connection, 1500);
     test_assert(sent.size() == 2, "the next retransmission must wait the full backed-off RTO, not the original one");
-    connection->on_tick();
+    advance_ms(*connection, 500);
     test_assert(sent.size() == 3, "the segment should be retransmitted again once the backed-off RTO elapses");
-    test_assert(connection->get_rto_ticks() == 12, "RTO should double again on the second consecutive timeout");
+    test_assert(connection->get_rto_ms() == 4000, "RTO should double again on the second consecutive timeout");
 }
 
 TEST(KarnsAlgorithmRejectsTheAmbiguousSampleFromARetransmittedSegment)
@@ -776,18 +794,16 @@ TEST(KarnsAlgorithmRejectsTheAmbiguousSampleFromARetransmittedSegment)
 
     connection->send(Bytes::from_hex("6f6b"));
 
-    connection->on_tick();
-    connection->on_tick();
-    connection->on_tick();
+    advance_ms(*connection, INITIAL_RTO_MS);
     test_assert(sent.size() == 2, "the segment should have been retransmitted");
-    test_assert(connection->get_rto_ticks() == 6, "RTO should have backed off on the timeout");
+    test_assert(connection->get_rto_ms() == 2000, "RTO should have backed off on the timeout");
 
     // Now the peer acks. This ack cannot be attributed to either transmission,
     // so it must produce no RTT sample at all - the backed-off RTO has to
-    // survive it untouched. (Were the sample taken, the 3-tick age of the
-    // original transmission would seed the estimator and move the RTO to 10.)
+    // survive it untouched. (Were the sample taken, the 1000 ms age of the
+    // original transmission would seed the estimator and move the RTO to 3000.)
     connection->on_segment(*make_incoming_segment(501, 1003, FLAG_ACK));
-    test_assert(connection->get_rto_ticks() == 6, "an ack for a retransmitted segment is ambiguous and must not update the RTO");
+    test_assert(connection->get_rto_ms() == 2000, "an ack for a retransmitted segment is ambiguous and must not update the RTO");
 }
 
 TEST(RtoIsRecomputedFromTheFirstUnambiguousSampleAfterABackoff)
@@ -797,20 +813,18 @@ TEST(RtoIsRecomputedFromTheFirstUnambiguousSampleAfterABackoff)
 
     // force a timeout so the RTO is backed off and the estimator is still unseeded
     connection->send(Bytes::from_hex("6f6b"));
-    connection->on_tick();
-    connection->on_tick();
-    connection->on_tick();
+    advance_ms(*connection, INITIAL_RTO_MS);
     connection->on_segment(*make_incoming_segment(501, 1003, FLAG_ACK));
-    test_assert(connection->get_rto_ticks() == 6, "precondition: RTO backed off and Karn rejected the ambiguous sample");
+    test_assert(connection->get_rto_ms() == 2000, "precondition: RTO backed off and Karn rejected the ambiguous sample");
 
-    // a fresh segment, never retransmitted, acked after a single tick - this
-    // one is unambiguous, so it seeds the estimator and replaces the
-    // backed-off value rather than being ignored
+    // a fresh segment, never retransmitted, acked after 500 ms - this one is
+    // unambiguous, so it seeds the estimator and replaces the backed-off value
+    // rather than being ignored. SRTT = 500, RTTVAR = 250, RTO = 1500.
     connection->send(Bytes::from_hex("6f6b"));
-    connection->on_tick();
+    advance_ms(*connection, 500);
     connection->on_segment(*make_incoming_segment(501, 1005, FLAG_ACK));
 
-    test_assert(connection->get_rto_ticks() == 3, "a clean sample after a backoff should recompute the RTO from the measured round trip");
+    test_assert(connection->get_rto_ms() == 1500, "a clean sample after a backoff should recompute the RTO from the measured round trip");
 }
 
 // A FIN only consumes a sequence number if it sits exactly at RCV.NXT. A
@@ -925,7 +939,7 @@ TEST(CumulativeAckRetiresSegmentsAcrossASequenceNumberWrap)
     // retransmit anything or eventually tear the connection down
     for (int i = 0; i < 60; i++)
     {
-        connection->on_tick();
+        connection->on_time_passed(TEST_TICK_MS);
     }
     test_assert(sent.size() == 3, "a cumulative ack that wrapped past 2^32 must retire both segments - any retransmission means the loop compared sequence numbers non-modularly");
     test_assert(connection->get_state() == TcpState::ESTABLISHED, "the connection must survive a sequence-number wraparound, not die after MAX_RETRANSMIT_ATTEMPTS");
@@ -945,19 +959,20 @@ TEST(FastRetransmitRestartsTheRetransmitTimer)
     test_assert(sent.size() == 1, "send() should produce one segment");
     uint32_t snd_una = sent[0].seq;
 
-    // burn most of the initial 3-tick RTO before the duplicate acks arrive
-    connection->on_tick();
-    connection->on_tick();
-    test_assert(sent.size() == 1, "two ticks should not yet have reached the timeout");
+    // burn most of the initial 1 s RTO before the duplicate acks arrive,
+    // leaving only 200 ms on the clock
+    advance_ms(*connection, 800);
+    test_assert(sent.size() == 1, "800 ms should not yet have reached the 1 s timeout");
 
     connection->on_segment(*make_incoming_segment(501, snd_una, FLAG_ACK));
     connection->on_segment(*make_incoming_segment(501, snd_una, FLAG_ACK));
     connection->on_segment(*make_incoming_segment(501, snd_una, FLAG_ACK));
     test_assert(sent.size() == 2, "the 3rd duplicate ack should trigger a fast retransmit");
 
-    // one more tick would have hit the un-reset countdown's last tick
-    connection->on_tick();
-    test_assert(sent.size() == 2, "the timer must have been restarted by the fast retransmit, so a single further tick cannot trigger a timeout retransmit of the same segment");
+    // 500 ms more would have run out the un-reset 200 ms remainder; against a
+    // restarted full RTO it is not close
+    advance_ms(*connection, 500);
+    test_assert(sent.size() == 2, "the timer must have been restarted by the fast retransmit, so a further 500 ms cannot trigger a timeout retransmit of the same segment");
 }
 
 // --- flow control that actually exists ---
@@ -987,7 +1002,7 @@ TEST(UnreadDataShrinksTheAdvertisedWindow)
     test_assert(connection->bytes_available() >= 70000, "unread data should be sitting in the receive queue");
 
     // force an ack out so the advertised window is observable on the wire
-    connection->on_tick();
+    connection->on_time_passed(TEST_TICK_MS);
     test_assert(!sent.empty(), "the delayed ack should have gone out by now");
     test_assert(sent.back().window < 65535,
                 "the advertised window must shrink to account for data the application has not read - before the receive queue existed it stayed wide open, because delivery advanced RCV.NXT and handed the bytes away in one step");
@@ -1007,7 +1022,7 @@ TEST(ReadingReopensTheWindowAndTellsThePeer)
         seq += 1000;
     }
 
-    connection->on_tick();
+    connection->on_time_passed(TEST_TICK_MS);
     test_assert(!sent.empty() && sent.back().window == 0,
                 "with the receive buffer full of unread data the advertised window must be zero - this is the sender being told to stop");
 
@@ -1151,7 +1166,7 @@ TEST(TimestampsAreUsedOnlyIfThePeerOfferedThem)
     // peer's SYN carried no timestamp, so neither should anything we send after
     auto connection = make_established_connection(sent);
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes::from_hex("aabb")));
-    connection->on_tick();
+    connection->on_time_passed(TEST_TICK_MS);
 
     test_assert(!sent.empty(), "an ack should have gone out");
     test_assert(!sent.back().has_timestamp,
@@ -1168,7 +1183,7 @@ TEST(EverySegmentCarriesATimestampOnceNegotiated)
                 "a data segment must carry a timestamp - unlike MSS, it is a fresh reading rather than a one-time parameter");
 
     connection->on_segment(*make_segment_ts(501, 1003, FLAG_ACK, 5100, 0, Bytes::from_hex("ccdd")));
-    connection->on_tick();
+    connection->on_time_passed(TEST_TICK_MS);
     test_assert(sent.back().has_timestamp, "so must an ack");
     test_assert(sent.back().timestamp_echo == 5100,
                 "and it must echo the newest timestamp received, which is what lets the peer time its own round trip");
@@ -1186,17 +1201,17 @@ TEST(TimestampEchoYieldsAnRttSampleEvenAfterARetransmit)
     connection->send(Bytes::from_hex("aabb"));
 
     // let it time out and be retransmitted - Karn now refuses the ack-clock sample
-    connection->on_tick();
-    connection->on_tick();
-    connection->on_tick();
+    connection->on_time_passed(TEST_TICK_MS);
+    connection->on_time_passed(TEST_TICK_MS);
+    connection->on_time_passed(TEST_TICK_MS);
     test_assert(sent.size() == 2, "precondition: the segment was retransmitted");
-    int rto_after_backoff = connection->get_rto_ticks();
+    int rto_after_backoff = connection->get_rto_ms();
 
     // the peer acks, echoing the timestamp from when we first sent it
     uint32_t original_send_time = 1; // the tick clock starts at 1, so 0 can mean "no echo"
     connection->on_segment(*make_segment_ts(501, 1003, FLAG_ACK, 5200, original_send_time));
 
-    test_assert(connection->get_rto_ticks() != rto_after_backoff,
+    test_assert(connection->get_rto_ms() != rto_after_backoff,
                 "the echo identifies which transmission the ack answers, so a round trip can be measured where Karn's algorithm would have had to discard it");
 }
 
@@ -1279,7 +1294,6 @@ TEST(SackIsUsedOnlyIfThePeerPermittedIt)
     connection->on_segment(*make_incoming_segment(600, 1001, FLAG_ACK, Bytes::from_hex("aabb")));
 
     test_assert(!sent.empty(), "an out-of-order segment should draw an immediate duplicate ack");
-    Tcp parsed(Bytes()); // placeholder to keep the type in scope
     test_assert(sent.back().flags == FLAG_ACK, "it should be a pure ack");
 }
 
@@ -1396,4 +1410,66 @@ TEST(RetransmissionSkipsSegmentsThePeerAlreadyHolds)
                 "it must resend the segment the peer has NOT reported holding");
     test_assert(sent.back().seq != first_seq,
                 "and must not resend the one it just said it holds - that is the waste SACK exists to prevent");
+}
+
+// --- timers denominated in real time, not in calls ---
+//
+// Every timeout in the stack used to be a count of on_tick() calls, with the
+// duration of a call defined in the application. Two separate things were
+// wrong with that, and these cover both.
+
+// The first: how often the caller polls must not change how long a timeout is.
+// Under the old scheme it changed it proportionally - halving the application's
+// timer interval halved every RTO in the stack, silently.
+TEST(TimeoutsMeasureElapsedTimeNotTheNumberOfCalls)
+{
+    std::vector<RecordedSegment> fine_sent;
+    auto fine = make_established_connection(fine_sent);
+    std::vector<RecordedSegment> coarse_sent;
+    auto coarse = make_established_connection(coarse_sent);
+
+    fine->send(Bytes::from_hex("6f6b"));
+    coarse->send(Bytes::from_hex("6f6b"));
+
+    // the same 900 ms of real time, reported in 100 ms pieces to one connection
+    // and in 300 ms pieces to the other: nine calls against three
+    for (int i = 0; i < 9; i++)
+    {
+        fine->on_time_passed(100);
+    }
+    for (int i = 0; i < 3; i++)
+    {
+        coarse->on_time_passed(300);
+    }
+    test_assert(fine_sent.size() == 1 && coarse_sent.size() == 1,
+                "neither should have retransmitted yet - 900 ms is short of the 1 s initial RTO, at any polling rate");
+
+    // and the same 100 ms more, which crosses the RTO for both
+    fine->on_time_passed(100);
+    coarse->on_time_passed(100);
+    test_assert(fine_sent.size() == 2 && coarse_sent.size() == 2,
+                "both should retransmit at 1 s of elapsed time regardless of how many calls it took to get there");
+}
+
+// The second, and the reason a plain "tick duration" constant handed to the
+// stack would not have been enough: a caller that falls behind must be able to
+// say so. If the event loop stalls - a slow syscall, an overloaded machine -
+// the timer fd reports several expirations at once, and a stack that counts
+// calls concludes one interval passed. Retransmissions then run late by
+// exactly however overloaded the machine was, which is the worst possible
+// moment for them to be late.
+TEST(ASingleLateCallCatchesUpOnEverythingItSleptThrough)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->send(Bytes::from_hex("6f6b"));
+    test_assert(sent.size() == 1, "send() should produce one segment");
+
+    // one call, reporting a two-second stall. That is two full initial RTOs.
+    connection->on_time_passed(2000);
+
+    test_assert(sent.size() == 2,
+                "a single call reporting more than an RTO of elapsed time must fire the retransmission immediately, not one RTO's worth of calls later");
+    test_assert(connection->get_rto_ms() == 2000, "and must back the RTO off exactly once, for the one timeout that expired");
 }

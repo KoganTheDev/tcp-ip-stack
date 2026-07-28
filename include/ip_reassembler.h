@@ -38,7 +38,7 @@
 class IpReassembler
 {
 public:
-    explicit IpReassembler(int timeout_ticks);
+    explicit IpReassembler(int timeout_ms);
 
     // What offer() decided about a fragment.
     enum class Result
@@ -59,7 +59,7 @@ public:
     // source address of each expired one is appended to expired_sources, so the
     // caller can send an ICMP Time Exceeded to each - this class knows nothing
     // about ICMP and should not.
-    void age_one_tick(std::vector<IPv4Address>& expired_sources);
+    void age(uint32_t elapsed_ms, std::vector<IPv4Address>& expired_sources);
 
     size_t pending_datagrams() const { return _partials.size(); }
     size_t buffered_bytes() const { return _buffered_bytes; }
@@ -99,7 +99,7 @@ private:
         size_t total_length = 0;           // known once the last fragment arrives
         bool have_last = false;
         size_t received_bytes = 0;
-        int ticks_remaining = 0;
+        int ms_remaining = 0;
         IPv4Address source;
     };
 
@@ -109,5 +109,5 @@ private:
 
     std::unordered_map<Key, Partial, KeyHash> _partials;
     size_t _buffered_bytes;
-    int _timeout_ticks;
+    int _timeout_ms;
 };

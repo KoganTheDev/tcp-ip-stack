@@ -21,6 +21,11 @@
 // the stack wrote back out. No TAP device, no root, no real sockets.
 namespace
 {
+    // How much time each call to on_time_passed() reports in these tests.
+    // The stack's timers are in real milliseconds now, so a test that wants to
+    // reach a timeout advances by that timeout rather than counting calls.
+    constexpr uint32_t TEST_TICK_MS = 500;
+
     const MacAddress LOCAL_MAC("aa:bb:cc:dd:ee:ff");
     const MacAddress PEER_MAC("11:22:33:44:55:66");
     const IPv4Address LOCAL_IP("10.0.0.2");
@@ -563,7 +568,7 @@ TEST(ArpEntryExpiresWhenPeerGoesSilentAndIsReArped)
     // ARP_ENTRY_TTL_TICKS is 120 - tick well past it with no traffic from the peer
     for (int i = 0; i < 130; i++)
     {
-        stack->on_timer_tick();
+        stack->on_time_passed(TEST_TICK_MS);
     }
 
     channel->clear_outbound();
@@ -593,7 +598,7 @@ TEST(ReceivedIpTrafficKeepsArpEntryFresh)
     {
         channel->push_inbound(build_udp(40000, 8080, Bytes::from_hex("00")));
         stack->poll();
-        stack->on_timer_tick();
+        stack->on_time_passed(TEST_TICK_MS);
     }
 
     channel->clear_outbound();
@@ -633,7 +638,7 @@ TEST(TwoStacksHandshakeExchangeDataAndHalfClose)
         for (int i = 0; i < 12; i++)
         {
             stack_a.poll(); stack_b.poll();
-            stack_a.on_timer_tick(); stack_b.on_timer_tick();
+            stack_a.on_time_passed(TEST_TICK_MS); stack_b.on_time_passed(TEST_TICK_MS);
         }
     };
 
@@ -1111,7 +1116,7 @@ TEST(AFragmentThatNeverCompletesDrawsIcmpTimeExceeded)
     // tick past the reassembly timeout
     for (int i = 0; i < 40; i++)
     {
-        stack->on_timer_tick();
+        stack->on_time_passed(TEST_TICK_MS);
     }
 
     IcmpView icmp = find_icmp(channel->outbound_frames());
@@ -1299,7 +1304,7 @@ TEST(GeneratedIcmpErrorsAreRateLimited)
 
     // the budget refills over time rather than being spent once and gone
     channel->clear_outbound();
-    for (int i = 0; i < 20; i++) { stack->on_timer_tick(); }
+    for (int i = 0; i < 20; i++) { stack->on_time_passed(TEST_TICK_MS); }
     channel->push_inbound(build_udp(40000, 9999, Bytes::from_hex("aa")));
     stack->poll();
 

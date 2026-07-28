@@ -68,7 +68,7 @@ reassembling inbound ones. Reassembly refuses overlapping fragments rather than
 resolving them, which is the defence against the fragment-overlap evasion class,
 and bounds how much a peer can make it hold for datagrams that never complete.
 
-**ARP.** Request and reply in both directions, with a tick-based TTL refreshed on
+**ARP.** Request and reply in both directions, with a time-based TTL refreshed on
 received traffic, so an actively-talking peer never ages out mid-conversation. The table
 is bounded, and the stack only learns from ARP that targets its own address, so a shared
 segment cannot fill it or overwrite mappings it is using.
@@ -94,6 +94,14 @@ match. Every send decides whether the destination is on-link, and so resolves th
 destination itself, or off-link, and so resolves the gateway - the distinction between
 the address in the IP header and the address the frame is sent to.
 
+**Timers in real time, not in polling cycles.** The stack takes elapsed milliseconds
+from its caller (`on_time_passed`) rather than counting timer ticks, so every timeout in
+it means what its RFC says it means no matter how often, or how regularly, the
+application gets round to calling. The distinction is not academic: a tick counter
+conflates "how often am I polled" with "how much time has passed", so an event loop that
+stalls for two seconds delivers one tick and the stack concludes half a second went by -
+retransmissions then run late by exactly however overloaded the machine was.
+
 **Flow control that exists rather than being advertised.** Received data waits in a
 queue until the application reads it, so an application that stops reading genuinely
 closes the window and stops the sender. `send()` is bounded too and reports how much it
@@ -104,17 +112,20 @@ limit by a peer.
 
 These are documented decisions, not gaps that were missed:
 
-- **No SACK or timestamps.** A lost segment still stalls delivery until a retransmit
-  fills the gap. RTT is sampled from the ack clock, so at most once per window rather
-  than once per segment.
+- **SACK is reported and honoured, but recovery is not full RFC 6675.** There is no
+  pipe estimate driving transmission during recovery, and no rescue retransmission.
+  The scoreboard both would need does exist.
 - **No forwarding.** A packet addressed to somebody else is dropped rather than passed
   on. Next-hop selection exists, so this stack can *reach* anything routable, but
   forwarding additionally needs more than one interface, which it does not have.
-- **`TIME_WAIT` is a short fixed tick budget**, not a real 2\*MSL wait.
 - **ISN generation is RFC 793's clock-driven scheme**, not RFC 6528's unpredictable
   one. Do not put this on a hostile network.
 - **The reorder buffer keys exact sequence numbers** rather than merging overlapping
   ranges, so a partially overlapping segment is kept or dropped whole.
+- **`TIME_WAIT` assumes a 30-second MSL**, so it runs for 60 seconds rather than RFC
+  793's 4 minutes. Linux makes the same call, for the same reason: the RFC's figure was
+  calibrated for a network whose delays no longer exist, and holding per-connection
+  state that long is a real cost on a busy server.
 
 ## Building
 

@@ -64,7 +64,7 @@
 // itself - a peer's own ARP request for our IP already teaches us its
 // mapping before its SYN even arrives. Active-open (connect()) doesn't have
 // that luxury: it sends its own ARP request and retries a bounded number of
-// times (see ARP_MAX_RETRIES/ARP_RETRY_TICKS in network_stack.cpp), queuing
+// times (see ARP_MAX_RETRIES/ARP_RETRY_MS in network_stack.cpp), queuing
 // the pending SYN until resolution succeeds or giving up and failing the
 // connection.
 class NetworkStack
@@ -122,7 +122,7 @@ public:
     // Pops one ESTABLISHED connection waiting on this port, or nullptr if
     // none are ready. The returned pointer is owned by NetworkStack for the
     // connection's whole lifetime - it stays valid until the connection
-    // reaches CLOSED and gets reaped by poll()/on_timer_tick().
+    // reaches CLOSED and gets reaped by poll()/on_time_passed().
     TcpConnection* accept(uint16_t port);
 
     // Actively opens a connection to remote_ip:remote_port from a freshly
@@ -193,8 +193,15 @@ public:
     static constexpr int POLL_FRAME_BUDGET = 64;
 
     // Drives every open connection's retransmission timer. Call this once
-    // per NetworkStack-level timer tick (a timerfd in the caller).
-    void on_timer_tick();
+    // Drives every timer in the stack - retransmission, ARP retry and expiry,
+    // fragment reassembly timeout, ICMP budget refill - from the amount of
+    // real time the caller reports has passed since it last called.
+    //
+    // Elapsed milliseconds rather than a tick count, so that every timeout in
+    // here means what its RFC says it means regardless of how often, or how
+    // regularly, the caller gets round to calling. See
+    // TcpConnection::on_time_passed() for the full argument.
+    void on_time_passed(uint32_t elapsed_ms);
 
 private:
     struct ConnectionKey
@@ -227,7 +234,7 @@ private:
     // Wires a connection's state-change notification to push its id onto
     // _pending_reap_ids the instant it reaches CLOSED - never erases
     // directly here. This fires synchronously from inside the connection's
-    // own on_segment()/on_tick()/close(), which is still on the call stack;
+    // own on_segment()/on_time_passed()/close(), which is still on the call stack;
     // erasing (destroying) the object at that point would be a
     // use-after-free the moment control returned to that still-running
     // method. The actual erase happens later, safely, in
@@ -311,8 +318,8 @@ private:
     uint16_t _next_ephemeral_port;
     uint16_t _next_ip_id; // identification stamped on a fragmented packet's fragments
 
-    // Learned (and static) IP->MAC mappings with tick-based expiry - see
-    // ArpTable. Aged from on_timer_tick() and refreshed whenever we hear from a
+    // Learned (and static) IP->MAC mappings with time-based expiry - see
+    // ArpTable. Aged from on_time_passed() and refreshed whenever we hear from a
     // peer, so an actively-talking peer never ages out mid-conversation.
     ArpTable _arp_table;
     IpReassembler _reassembler;
@@ -321,7 +328,14 @@ private:
     // the timer up to a burst. A burst is allowed on purpose - errors normally
     // arrive in clusters, and refusing the second of two is unhelpful - but the
     // sustained rate is what an attacker would otherwise choose.
-    int _icmp_error_tokens;
+    //
+    // Held scaled by MS_PER_SECOND so a partial second of elapsed time refills
+    // a fraction of a token instead of truncating to none. Refilling per call
+    // rather than per unit of time would make the sustained rate depend on how
+    // often the caller polls, which is the same bug this whole change exists
+    // to remove - a caller polling twice as fast would get twice the budget.
+    static constexpr int MS_PER_SECOND = 1000;
+    int _icmp_error_tokens_scaled;
     EchoReplyFn _on_echo_reply;
     std::unordered_map<uint16_t, size_t> _listening_ports; // port -> backlog
     std::unordered_map<uint16_t, std::deque<ConnectionKey>> _pending_accepts;
@@ -334,7 +348,7 @@ private:
     std::unordered_map<uint64_t, ConnectionKey> _connections_by_id;
     // ids that reached CLOSED since the last reap pass - see
     // _watch_for_close()'s comment for why this exists instead of scanning
-    // every connection on every poll()/on_timer_tick()
+    // every connection on every poll()/on_time_passed()
     std::deque<uint64_t> _pending_reap_ids;
 
     // outbound connect() calls waiting on ARP resolution for a given IP,
@@ -342,7 +356,7 @@ private:
     struct ArpRequestState
     {
         int retries_remaining;
-        int ticks_until_retry;
+        int ms_until_retry;
     };
     std::unordered_map<IPv4Address, std::vector<ConnectionKey>> _pending_outbound_connects;
     std::unordered_map<IPv4Address, ArpRequestState> _arp_requests_in_flight;
