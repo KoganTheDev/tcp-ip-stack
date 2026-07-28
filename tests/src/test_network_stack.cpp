@@ -997,3 +997,44 @@ TEST(BroadcastIsSentWithoutResolutionAndAcceptedInbound)
 
     test_assert(received.size() == 1, "a broadcast datagram must be accepted even though it is not addressed to our own IP");
 }
+
+// The accept queue was unbounded, which is where a SYN flood lands: a remote
+// peer could grow it, and the connection table with it, for the cost of one
+// packet each. A bound is also what makes the SYN-cookie conversation coherent -
+// cookies are the fallback for when the limit is hit, not a substitute for
+// having one.
+TEST(SynsBeyondTheListenBacklogAreDropped)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    stack->listen(80, 1); // room for exactly one connection awaiting accept()
+
+    channel->push_inbound(build_arp_request()); // teach the peer's MAC
+    stack->poll();
+
+    // first connection completes its handshake and sits in the accept queue
+    channel->clear_outbound();
+    channel->push_inbound(build_tcp(FLAG_SYN, 1000, 0, 40000, 80));
+    stack->poll();
+    uint32_t isn = find_tcp(channel->outbound_frames()).seq;
+    channel->push_inbound(build_tcp(FLAG_ACK, 1001, isn + 1, 40000, 80));
+    stack->poll();
+
+    // a second SYN arrives while that one is still unaccepted
+    channel->clear_outbound();
+    channel->push_inbound(build_tcp(FLAG_SYN, 2000, 0, 40001, 80));
+    stack->poll();
+
+    test_assert(channel->outbound_frames().empty(),
+                "a SYN beyond the backlog must be dropped silently - not answered with a SYN-ACK, and not RST either, so the peer's own retransmission can succeed once the application drains");
+
+    // once the application accepts, there is room again
+    test_assert(stack->accept(80) != nullptr, "the queued connection should still be acceptable");
+    channel->clear_outbound();
+    channel->push_inbound(build_tcp(FLAG_SYN, 3000, 0, 40002, 80));
+    stack->poll();
+
+    TcpView syn_ack = find_tcp(channel->outbound_frames());
+    test_assert(syn_ack.is_tcp && syn_ack.syn && syn_ack.ack_flag,
+                "with the queue drained a new SYN must be answered again - the backlog is a limit, not a permanent refusal");
+}

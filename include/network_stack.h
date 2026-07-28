@@ -46,20 +46,16 @@
 //    _send_ip_packet. There is no receive-side reassembly: an inbound
 //    fragment (MF set, or a nonzero fragment offset) is detected and dropped
 //    with a log line rather than silently mishandled
-//  - no next-hop selection, and therefore no reaching anything off-link.
-//    _resolve_mac() ARPs for the destination address itself, so every
-//    destination is assumed to be on this segment; there is no subnet mask
-//    and no gateway. A connect() to an address beyond the local network
-//    would ARP for that address, hear nothing, and fail.
+//  - next-hop selection exists (see RouteTable and InterfaceConfig): every
+//    send consults a route table to decide whether the destination is on-link,
+//    and so ARPs for the destination itself, or off-link, and so ARPs for the
+//    gateway. That is what lets this stack reach anything beyond its own
+//    segment.
 //
-//    Note this is a real limitation, not an inapplicable one. An earlier
-//    version of this comment argued routing was meaningless with a single
-//    interface because there was "nothing to choose between" - that is
-//    wrong. Even with one interface there is a choice on every send: is the
-//    destination on-link (ARP for it) or off-link (ARP for the gateway)?
-//    That decision is a route lookup over a table that happens to be small.
-//    Forwarding is a separate, later thing: it is what happens when the
-//    lookup names a *different* interface than the packet arrived on.
+//    What does NOT exist is forwarding. A packet addressed to someone else is
+//    dropped, not passed on. Forwarding is the separate step of accepting such
+//    a packet and re-sending it, which additionally needs more than one
+//    interface - this class still owns exactly one channel.
 //
 // Passive-open (listen()/accept()) never needs to resolve a peer's MAC
 // itself - a peer's own ARP request for our IP already teaches us its
@@ -103,7 +99,22 @@ public:
     int get_fd() const;
 
     // Marks a port as accepting new connections.
-    void listen(uint16_t port);
+    //
+    // backlog bounds how many completed-but-not-yet-accepted connections may
+    // wait on this port. Once it is full, further SYNs are dropped rather than
+    // answered, so the peer's own SYN retransmission retries later and gets in
+    // if the application has drained by then. Dropping is deliberately gentler
+    // than answering with a RST, which would abort a connection the peer had
+    // every reason to expect to succeed.
+    //
+    // The queue was previously unbounded, which is where a SYN flood lands: a
+    // remote peer could grow it, and the connection table with it, for the cost
+    // of one packet each. A bound is also what makes SYN cookies meaningful -
+    // cookies are the fallback for when this limit is hit, not a replacement
+    // for having one.
+    void listen(uint16_t port, size_t backlog = DEFAULT_LISTEN_BACKLOG);
+
+    static constexpr size_t DEFAULT_LISTEN_BACKLOG = 128;
 
     // Pops one ESTABLISHED connection waiting on this port, or nullptr if
     // none are ready. The returned pointer is owned by NetworkStack for the
@@ -257,7 +268,7 @@ private:
     // ArpTable. Aged from on_timer_tick() and refreshed whenever we hear from a
     // peer, so an actively-talking peer never ages out mid-conversation.
     ArpTable _arp_table;
-    std::unordered_map<uint16_t, bool> _listening_ports;
+    std::unordered_map<uint16_t, size_t> _listening_ports; // port -> backlog
     std::unordered_map<uint16_t, std::deque<ConnectionKey>> _pending_accepts;
     std::unordered_map<uint16_t, std::unique_ptr<UdpSocket>> _udp_sockets;
     std::unordered_map<ConnectionKey, std::unique_ptr<TcpConnection>, ConnectionKeyHash> _connections;

@@ -128,9 +128,9 @@ int NetworkStack::get_fd() const
     return this->_channel->get_fd();
 }
 
-void NetworkStack::listen(uint16_t port)
+void NetworkStack::listen(uint16_t port, size_t backlog)
 {
-    this->_listening_ports[port] = true;
+    this->_listening_ports[port] = backlog;
 }
 
 TcpConnection* NetworkStack::accept(uint16_t port)
@@ -239,7 +239,7 @@ UdpSocket* NetworkStack::bind_udp(uint16_t port)
 void NetworkStack::_watch_for_close(TcpConnection& connection)
 {
     uint64_t connection_id = connection.get_id();
-    connection.set_state_changed_callback([this, connection_id](TcpState new_state)
+    connection.add_state_changed_callback([this, connection_id](TcpState new_state)
     {
         if (new_state == TcpState::CLOSED)
         {
@@ -602,8 +602,26 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
         return;
     }
 
-    bool is_new_connection_request = tcp.get_syn()
-        && this->_listening_ports.find(tcp.get_dest_port()) != this->_listening_ports.end();
+    auto listening_it = this->_listening_ports.find(tcp.get_dest_port());
+    bool is_new_connection_request = tcp.get_syn() && listening_it != this->_listening_ports.end();
+
+    if (is_new_connection_request)
+    {
+        // Refuse once the accept queue is full. Silently, on purpose: the peer
+        // retransmits its SYN, and if the application has accepted something by
+        // then the retry succeeds. A RST here would tell it to give up on a
+        // connection that was only ever refused because we were briefly behind.
+        auto pending_it = this->_pending_accepts.find(tcp.get_dest_port());
+        size_t queued = pending_it == this->_pending_accepts.end() ? 0 : pending_it->second.size();
+        if (queued >= listening_it->second)
+        {
+            LOG_WARNING("NetworkStack: dropping a SYN for port " << tcp.get_dest_port()
+                        << " - the accept queue is full (" << queued << "/" << listening_it->second
+                        << "). The application is not accepting fast enough, or this is a SYN flood.");
+            return;
+        }
+    }
+
     if (!is_new_connection_request)
     {
         if (!tcp.get_rst())

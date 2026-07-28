@@ -4,6 +4,7 @@
 #include <functional>
 #include <deque>
 #include <map>
+#include <vector>
 
 #include "bytes.h"
 #include "network_addresses.h"
@@ -94,7 +95,25 @@ public:
     // caller by design; check get_state() first. Payloads larger than the
     // negotiated effective MSS are split into multiple segments - the caller
     // doesn't need to chunk anything itself.
-    void send(const Bytes& data);
+    // Queues data for transmission and returns how much was accepted, which
+    // may be less than offered and may be zero.
+    //
+    // It used to return void and queue without bound, which is the same bug as
+    // the receive side had, pointed the other way: an application writing
+    // faster than the network drains grew the queue until memory ran out, with
+    // no way to know it was doing so. A short return is the signal to stop and
+    // wait for writable() - the send-side equivalent of the peer closing its
+    // window on us.
+    size_t send(const Bytes& data);
+
+    // Room left in the send queue. Zero means the next send() accepts nothing.
+    size_t send_space_available() const;
+    bool writable() const { return send_space_available() > 0; }
+
+    // Bytes handed to send() that the peer has not acknowledged yet - queued
+    // here or in flight. The answer to "has my data actually gone", which
+    // nothing could previously ask.
+    size_t bytes_unacked() const;
     // Half-closes our side: sends a FIN and starts the shutdown sequence.
     void close();
 
@@ -152,12 +171,23 @@ public:
     // Bytes waiting to be read. The application's share of the receive buffer.
     size_t bytes_available() const { return _receive_queued_bytes; }
 
+    // How much this connection will queue on the send side before send()
+    // starts accepting less than it is offered. The application's writes are
+    // bounded by this, the network's pace by the peer's window - the two are
+    // deliberately separate.
+    static constexpr size_t SEND_BUFFER_CAPACITY = 131072; // 128 KiB
+
     // How much this connection will hold on the receive side before the
     // advertised window reaches zero and the peer is told to stop. Public
     // because it is the number an application needs to reason about how much
     // it can afford not to read.
     static constexpr uint32_t RECEIVE_BUFFER_CAPACITY = 131072; // 128 KiB
-    void set_state_changed_callback(StateChangedFn callback) { _on_state_changed = std::move(callback); }
+    // Subscribes to state changes. Additive, not a single slot: NetworkStack
+    // installs its own here to know when a connection has finished closing and
+    // can be reaped, so a single slot meant an application that registered one
+    // silently replaced that and leaked every connection it made. Two
+    // subscribers with different concerns is the normal case, not an edge one.
+    void add_state_changed_callback(StateChangedFn callback) { _on_state_changed.push_back(std::move(callback)); }
 
     // Called by NetworkStack immediately after constructing this object for
     // a freshly-received SYN: sends the SYN-ACK and moves to SYN_RECEIVED.
@@ -273,6 +303,9 @@ private:
     // front; a timeout retransmits only the front entry.
     std::deque<InFlightSegment> _in_flight;
     std::deque<Bytes> _send_queue; // data waiting for window room
+    // Bytes sitting in _send_queue, kept alongside it so send_space_available()
+    // is a subtraction rather than a walk over every queued chunk.
+    size_t _send_queued_bytes;
     // close() called while something was still in flight or queued -
     // deferred until both drain, instead of clobbering in-flight state
     bool _fin_requested;
@@ -345,7 +378,7 @@ private:
 
     SendSegmentFn _send_segment;
     DataReadyFn _on_data_ready;
-    StateChangedFn _on_state_changed;
+    std::vector<StateChangedFn> _on_state_changed;
     // In-order data that has been acknowledged to the peer but not yet read by
     // the application. This is what the advertised window is a window onto: it
     // is counted as occupied, so it shrinks the window while it sits here, and

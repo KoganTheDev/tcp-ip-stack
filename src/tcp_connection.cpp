@@ -70,7 +70,7 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
       _local_port(local_port), _remote_ip(remote_ip), _remote_port(remote_port),
       _state(TcpState::LISTEN),
       _send_next(initial_seq), _recv_next(0),
-      _fin_requested(false), _time_wait_ticks_remaining(0), _receive_queued_bytes(0),
+      _fin_requested(false), _time_wait_ticks_remaining(0), _receive_queued_bytes(0), _send_queued_bytes(0),
       _tick_count(0), _srtt_scaled(0), _rttvar_scaled(0), _has_rtt_sample(false),
       _rto_ticks(INITIAL_RTO_TICKS),
       _persist_ticks_remaining(0), _persist_backoff(0),
@@ -87,9 +87,14 @@ void TcpConnection::_transition(TcpState new_state)
 {
     LOG_DEBUG("TcpConnection[" << _id << "] " << state_name(_state) << " -> " << state_name(new_state));
     _state = new_state;
-    if (_on_state_changed)
+
+    // Iterate a copy: a subscriber is entitled to react by doing something that
+    // registers another, and growing the vector mid-iteration would invalidate
+    // the iterator underneath us.
+    std::vector<StateChangedFn> subscribers = _on_state_changed;
+    for (const StateChangedFn& subscriber : subscribers)
     {
-        _on_state_changed(new_state);
+        subscriber(new_state);
     }
 }
 
@@ -323,6 +328,7 @@ void TcpConnection::_send_queued_while_window_allows()
 
         Bytes next_chunk = std::move(_send_queue.front());
         _send_queue.pop_front();
+        _send_queued_bytes -= next_chunk.size();
         _send_flags(0, next_chunk);
     }
 
@@ -929,19 +935,38 @@ void TcpConnection::on_tick()
     oldest.retransmit_ticks_remaining = _rto_ticks;
 }
 
-void TcpConnection::send(const Bytes& data)
+size_t TcpConnection::send_space_available() const
+{
+    return _send_queued_bytes < SEND_BUFFER_CAPACITY ? SEND_BUFFER_CAPACITY - _send_queued_bytes : 0;
+}
+
+size_t TcpConnection::bytes_unacked() const
+{
+    return _send_queued_bytes + _bytes_in_flight();
+}
+
+size_t TcpConnection::send(const Bytes& data)
 {
     if (_state != TcpState::ESTABLISHED && _state != TcpState::CLOSE_WAIT)
     {
-        return;
+        return 0;
+    }
+
+    // Take only what there is room for. Silently accepting everything and
+    // queueing it was unbounded growth with no signal to the application that
+    // it was outrunning the network.
+    size_t accepted = std::min(data.size(), send_space_available());
+    if (accepted == 0)
+    {
+        return 0;
     }
 
     // split anything larger than the negotiated effective MSS - the
     // application shouldn't have to know what that negotiated value is
     size_t offset = 0;
-    while (offset < data.size())
+    while (offset < accepted)
     {
-        size_t chunk_size = std::min<size_t>(_effective_mss, data.size() - offset);
+        size_t chunk_size = std::min<size_t>(_effective_mss, accepted - offset);
         Bytes chunk = data.slice(offset, chunk_size);
 
         // Nagle (RFC 896): a sub-MSS segment waits while earlier data is still
@@ -956,6 +981,7 @@ void TcpConnection::send(const Bytes& data)
         if (!_send_queue.empty() || nagle_holds
             || _bytes_in_flight() + chunk.size() > std::min(_cwnd, _peer_window))
         {
+            _send_queued_bytes += chunk.size();
             _send_queue.push_back(std::move(chunk));
         }
         else
@@ -969,6 +995,7 @@ void TcpConnection::send(const Bytes& data)
     // if a zero window forced everything to queue with nothing in flight, the
     // persist timer is what will eventually unstick it
     _arm_or_disarm_persist();
+    return accepted;
 }
 
 void TcpConnection::close()

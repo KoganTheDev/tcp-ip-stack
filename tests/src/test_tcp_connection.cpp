@@ -1018,3 +1018,79 @@ TEST(ReadTakesInOrderAndCanBePartial)
     test_assert(connection->read().to_hex() == "bb", "the rest should come back in order on the next read");
     test_assert(connection->read().empty(), "reading an empty queue should return nothing rather than blocking or faulting");
 }
+
+// --- state-change notification is additive ---
+//
+// It used to be a single slot, and NetworkStack already occupies it with the
+// hook that tells it a connection has finished closing and can be reaped. An
+// application that registered its own silently replaced that, so its
+// connections were never reaped. Two subscribers with different concerns is the
+// normal case here, not an edge one.
+
+TEST(EveryStateChangeSubscriberIsNotified)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    std::vector<TcpState> first;
+    std::vector<TcpState> second;
+    connection->add_state_changed_callback([&first](TcpState s) { first.push_back(s); });
+    connection->add_state_changed_callback([&second](TcpState s) { second.push_back(s); });
+
+    connection->close();
+
+    test_assert(first.size() == 1 && first[0] == TcpState::FIN_WAIT_1, "the first subscriber should see the transition");
+    test_assert(second.size() == 1 && second[0] == TcpState::FIN_WAIT_1,
+                "the second subscriber must see it too - registering one must not replace another");
+}
+
+// --- send-side backpressure ---
+//
+// send() returned void and queued without bound, which is the receive side's
+// old bug pointed the other way: an application writing faster than the network
+// drains grew the queue until memory ran out, with no way to know.
+
+TEST(SendAcceptsOnlyWhatFitsAndReportsHowMuch)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    size_t offered = TcpConnection::SEND_BUFFER_CAPACITY * 2;
+    size_t accepted = connection->send(Bytes(static_cast<unsigned int>(offered)));
+
+    test_assert(accepted > 0, "some of it should be accepted");
+    test_assert(accepted < offered, "send() must not accept more than the send buffer can hold");
+    test_assert(accepted == TcpConnection::SEND_BUFFER_CAPACITY,
+                "it should accept exactly the buffer's worth and report that, so the caller knows what is left to retry");
+}
+
+TEST(SendReportsZeroAndUnwritableWhenTheQueueIsFull)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    // a zero peer window means nothing can drain, so everything accepted queues
+    connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 0));
+    connection->send(Bytes(static_cast<unsigned int>(TcpConnection::SEND_BUFFER_CAPACITY)));
+
+    test_assert(!connection->writable(), "with the queue full the connection must report itself unwritable");
+    test_assert(connection->send(Bytes::from_hex("aabb")) == 0,
+                "a send with no room must accept nothing and say so, rather than queueing without bound");
+    test_assert(connection->bytes_unacked() > 0, "the queued data should be reported as still unacknowledged");
+}
+
+TEST(DrainingTheSendQueueMakesRoomAgain)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 0));
+    connection->send(Bytes(static_cast<unsigned int>(TcpConnection::SEND_BUFFER_CAPACITY)));
+    test_assert(connection->send_space_available() == 0, "precondition: the queue is full");
+
+    // the peer reopens its window, which lets queued data go out
+    connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 65535));
+
+    test_assert(connection->send_space_available() > 0,
+                "once queued data has gone out the space must be reusable - otherwise the connection is writable exactly once");
+}
