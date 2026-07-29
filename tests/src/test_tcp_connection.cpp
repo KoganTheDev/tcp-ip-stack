@@ -1473,3 +1473,152 @@ TEST(ASingleLateCallCatchesUpOnEverythingItSleptThrough)
                 "a single call reporting more than an RTO of elapsed time must fire the retransmission immediately, not one RTO's worth of calls later");
     test_assert(connection->get_rto_ms() == 2000, "and must back the RTO off exactly once, for the one timeout that expired");
 }
+
+// --- keepalive (RFC 1122 4.2.3.6) -------------------------------------------
+
+namespace
+{
+    constexpr uint32_t KEEPALIVE_IDLE_MS = 2 * 60 * 60 * 1000; // RFC 1122's floor
+    constexpr uint32_t KEEPALIVE_PROBE_INTERVAL_MS = 75000;
+    constexpr int KEEPALIVE_MAX_PROBES = 9;
+
+    // A keepalive probe as this stack sends it: a bare ack one byte behind
+    // SND.NXT, carrying nothing. Our ISN is 1000, so SND.NXT after the
+    // handshake is 1001 and the probe sits at 1000.
+    bool is_keepalive_probe(const RecordedSegment& segment)
+    {
+        return segment.flags == FLAG_ACK && segment.payload.empty() && segment.seq == 1000;
+    }
+
+    size_t count_keepalive_probes(const std::vector<RecordedSegment>& sent)
+    {
+        size_t probes = 0;
+        for (const RecordedSegment& segment : sent)
+        {
+            if (is_keepalive_probe(segment))
+            {
+                probes++;
+            }
+        }
+        return probes;
+    }
+}
+
+TEST(KeepaliveIsOffByDefault)
+{
+    // RFC 1122 4.2.3.6 says it MUST default to off, and the reason is not
+    // politeness: probing a connection that nobody wants to use turns a
+    // survivable partition into a dropped connection.
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    test_assert(!connection->keepalive_enabled(), "keepalive should be off unless asked for");
+
+    advance_ms(*connection, KEEPALIVE_IDLE_MS + KEEPALIVE_PROBE_INTERVAL_MS);
+
+    test_assert(sent.empty(), "an idle connection must stay silent with keepalive off");
+    test_assert(connection->get_state() == TcpState::ESTABLISHED, "and must stay open");
+}
+
+TEST(KeepaliveProbesAnIdleConnectionOnceTheIdleTimerExpires)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->set_keepalive(true);
+
+    advance_ms(*connection, KEEPALIVE_IDLE_MS - 1000);
+    test_assert(sent.empty(), "nothing should go out before the idle timer expires");
+
+    advance_ms(*connection, 2000);
+
+    test_assert(sent.size() == 1, "exactly one probe should follow the idle timer");
+    test_assert(is_keepalive_probe(sent[0]),
+                "the probe must be a bare ack one byte behind SND.NXT - the only segment that "
+                "compels a reply without moving the stream");
+}
+
+TEST(HearingAnythingFromThePeerRestartsTheIdleTimer)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->set_keepalive(true);
+
+    advance_ms(*connection, KEEPALIVE_IDLE_MS - 1000);
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK));
+    sent.clear();
+
+    // Almost the full idle interval again: without the reset this would be
+    // well past two probes' worth of time.
+    advance_ms(*connection, KEEPALIVE_IDLE_MS - 1000);
+
+    test_assert(count_keepalive_probes(sent) == 0,
+                "a segment from the peer means the connection is not idle");
+}
+
+TEST(AnAnsweredProbeStopsTheProbingAndResetsTheCount)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->set_keepalive(true);
+
+    advance_ms(*connection, KEEPALIVE_IDLE_MS + 1000);
+    test_assert(count_keepalive_probes(sent) == 1, "the first probe should have gone out");
+
+    // The peer answers, which is the entire point of picking a sequence number
+    // it has already acknowledged.
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK));
+    sent.clear();
+
+    // Several probe intervals later there must still be nothing, because the
+    // connection is back to idle-timing rather than probe-timing.
+    advance_ms(*connection, KEEPALIVE_PROBE_INTERVAL_MS * 4);
+
+    test_assert(count_keepalive_probes(sent) == 0, "an answered probe must stop the probing");
+    test_assert(connection->get_state() == TcpState::ESTABLISHED, "and must not close anything");
+}
+
+TEST(AnUnansweredKeepaliveEventuallyClosesTheConnection)
+{
+    // The case the mechanism exists for: a peer whose machine was switched
+    // off. Nothing else in TCP will ever tell this side about it.
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->set_keepalive(true);
+
+    advance_ms(*connection, KEEPALIVE_IDLE_MS + 1000);
+    advance_ms(*connection, KEEPALIVE_PROBE_INTERVAL_MS * (KEEPALIVE_MAX_PROBES - 1) + 1000);
+
+    test_assert(count_keepalive_probes(sent) == static_cast<size_t>(KEEPALIVE_MAX_PROBES),
+                "it should give up only after the full probe budget, sent " +
+                std::to_string(count_keepalive_probes(sent)));
+    test_assert(connection->get_state() == TcpState::ESTABLISHED,
+                "the last probe still deserves an interval to be answered in");
+
+    advance_ms(*connection, KEEPALIVE_PROBE_INTERVAL_MS + 1000);
+
+    test_assert(connection->get_state() == TcpState::CLOSED,
+                "an unanswered probe budget means the peer is gone");
+}
+
+TEST(KeepaliveLeavesAPeerWithAShutWindowAlone)
+{
+    // A peer advertising a zero window is demonstrably alive - it is answering
+    // persist probes, it just has nowhere to put anything. Counting that as
+    // idle would tear the connection down for the crime of reading slowly,
+    // which is the exact opposite of what flow control is for.
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->set_keepalive(true);
+
+    connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 0));
+    connection->send(Bytes("data waiting on a window that never opens"));
+    sent.clear();
+
+    advance_ms(*connection, KEEPALIVE_IDLE_MS + KEEPALIVE_PROBE_INTERVAL_MS * KEEPALIVE_MAX_PROBES);
+
+    test_assert(connection->get_state() == TcpState::ESTABLISHED,
+                "a peer with a shut window must not be declared dead");
+    test_assert(count_keepalive_probes(sent) == 0,
+                "persist owns this connection's timing, not keepalive");
+    test_assert(!sent.empty(), "persist should still be probing throughout");
+}

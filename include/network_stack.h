@@ -14,6 +14,7 @@
 #include "interface_config.h"
 #include "route_table.h"
 #include "ip_reassembler.h"
+#include "isn_generator.h"
 #include "network_addresses.h"
 #include "ethernet.h"
 #include "arp.h"
@@ -323,6 +324,12 @@ private:
     // peer, so an actively-talking peer never ages out mid-conversation.
     ArpTable _arp_table;
     IpReassembler _reassembler;
+
+    // One per stack, so its secret is drawn once and shared by every
+    // connection - a per-connection generator would mean a per-connection
+    // secret, which is the same as no secret at all for an attacker who only
+    // needs to predict the connection in front of them.
+    IsnGenerator _isn_generator;
 
     // Token bucket over generated ICMP errors: one token per error, refilled on
     // the timer up to a burst. A burst is allowed on purpose - errors normally

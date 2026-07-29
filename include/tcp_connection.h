@@ -47,8 +47,6 @@ enum class TcpState
 //  - SACK reports and honours blocks, but recovery is not full RFC 6675:
 //    there is no pipe estimate driving transmission during recovery, and no
 //    rescue retransmission. The scoreboard both would need does exist
-//  - ISN generation is RFC 793's clock-driven scheme, not RFC 6528's
-//    unpredictable one
 //  - the reorder buffer stores exact-sequence-keyed segments, not merged
 //    ranges - an incoming segment that partially overlaps one already
 //    buffered doesn't get stitched together, just kept or dropped whole
@@ -137,6 +135,21 @@ public:
     size_t bytes_unacked() const;
     // Half-closes our side: sends a FIN and starts the shutdown sequence.
     void close();
+
+    // Turns keepalive on or off. Off is the default, and RFC 1122 4.2.3.6 is
+    // unusually blunt about why: a keepalive can drop a connection that is
+    // perfectly healthy but merely partitioned for a few minutes, it costs
+    // bandwidth on an otherwise silent link, and on a per-packet-billed
+    // network it costs money. TCP has no requirement to notice a peer that has
+    // gone away while neither side wants to send anything, so an implementation
+    // that never probes is not a broken one.
+    //
+    // What makes it worth having anyway is the case the RFC also names: a
+    // server holding per-connection resources for a client whose machine was
+    // switched off. Nothing else in TCP will ever tell it. So the mechanism
+    // exists here, defaulted off, and the application decides.
+    void set_keepalive(bool enabled);
+    bool keepalive_enabled() const { return _keepalive_enabled; }
 
     TcpState get_state() const { return _state; }
     bool is_closed() const { return _state == TcpState::CLOSED; }
@@ -432,6 +445,29 @@ private:
     bool _ack_pending;              // an in-order segment is awaiting a coalesced ack
     int _ack_delay_ms_remaining; // countdown that forces a pending ack out on time
 
+    // --- keepalive (RFC 1122 4.2.3.6) ---
+    //
+    // The probe itself is the interesting part, because the obvious approaches
+    // are both wrong. A segment carrying a new byte would corrupt the stream.
+    // An empty segment at SND.NXT is valid but need not be acknowledged, so
+    // silence would prove nothing. So the probe is deliberately sent one byte
+    // *behind* SND.NXT - data the peer acknowledged long ago. The peer sees an
+    // old duplicate, and RFC 793's rules oblige it to answer with an ack
+    // stating what it really expects. A wrong-looking segment is the point:
+    // it is the only thing that compels a reply without moving the stream.
+    bool _keepalive_enabled;
+    int _keepalive_idle_ms_remaining;   // time left before the first probe
+    int _keepalive_probe_ms_remaining;  // time left before the next probe, once probing
+    int _keepalive_probes_sent;         // consecutive unanswered probes
+    void _send_keepalive_probe();
+    // Drives both keepalive countdowns. Called from on_time_passed() only when
+    // the pipe is empty and persist is not running - see the call site.
+    void _run_keepalive(uint32_t elapsed_ms);
+    // Rearms the idle timer and forgets any probing in progress. Called on
+    // every segment received: hearing anything at all from the peer is the
+    // definition of the connection not being idle.
+    void _reset_keepalive();
+
     // --- selective acknowledgement (RFC 2018) ---
     //
     // Negotiated like the rest: offered always, used only if the peer's SYN
@@ -602,8 +638,17 @@ private:
     // RFC 1122 4.2.3.2 makes 500 ms a hard ceiling on holding an ack back.
     // 200 ms is what Linux settled on and leaves margin under the ceiling.
     static constexpr int DELAYED_ACK_MS = 200;
-};
 
-// Clock-driven ISN generator (RFC 793 style: not cryptographically
-// unpredictable like RFC 6528's MD5-based scheme - documented simplification).
-uint32_t generate_initial_sequence_number();
+    // RFC 1122 4.2.3.6 sets a hard floor: "the interval MUST be configurable
+    // and MUST default to no less than two hours". The number is not a
+    // performance tuning choice, it is a correctness one - probe more often
+    // and a transient partition, which TCP is supposed to ride out, starts
+    // killing healthy connections instead. Linux uses exactly this figure.
+    static constexpr int KEEPALIVE_IDLE_MS = 2 * 60 * 60 * 1000; // 2 hours
+    // Once probing has started the peer is already suspect, so the retry
+    // interval is short. 75 s and 9 probes are Linux's numbers, giving a
+    // little over 11 minutes between the first unanswered probe and giving up
+    // - long enough that a router reboot does not count as a dead peer.
+    static constexpr int KEEPALIVE_PROBE_INTERVAL_MS = 75000;
+    static constexpr int KEEPALIVE_MAX_PROBES = 9;
+};

@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <ctime>
 
 namespace
 {
@@ -49,16 +48,6 @@ namespace
     }
 }
 
-uint32_t generate_initial_sequence_number()
-{
-    // RFC 793's original clock-driven scheme, not RFC 6528's MD5-based one -
-    // good enough for a from-scratch learning stack, not for resisting
-    // sequence-number-prediction attacks
-    static std::atomic<uint32_t> counter{0};
-    uint32_t clock_component = static_cast<uint32_t>(std::time(nullptr)) * 250000u;
-    return clock_component + counter.fetch_add(64000u);
-}
-
 namespace
 {
     std::atomic<uint64_t> g_next_connection_id{1};
@@ -81,6 +70,8 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
       _rto_ms(INITIAL_RTO_MS),
       _persist_ms_remaining(0), _persist_backoff(0),
       _ack_pending(false), _ack_delay_ms_remaining(0),
+      _keepalive_enabled(false), _keepalive_idle_ms_remaining(KEEPALIVE_IDLE_MS),
+      _keepalive_probe_ms_remaining(0), _keepalive_probes_sent(0),
       _sack_permitted(false), _last_out_of_order_seq(0),
       _timestamps_negotiated(false), _ts_recent(0), _have_ts_recent(false),
       _local_mss(local_mss), _peer_mss(DEFAULT_PEER_MSS), _effective_mss(std::min(local_mss, DEFAULT_PEER_MSS)),
@@ -506,6 +497,76 @@ void TcpConnection::_send_zero_window_probe()
     _send_segment(_build_header(FLAG_ACK, _send_next), probe);
 }
 
+void TcpConnection::set_keepalive(bool enabled)
+{
+    _keepalive_enabled = enabled;
+    _reset_keepalive();
+}
+
+void TcpConnection::_reset_keepalive()
+{
+    _keepalive_idle_ms_remaining = KEEPALIVE_IDLE_MS;
+    _keepalive_probe_ms_remaining = 0;
+    _keepalive_probes_sent = 0;
+}
+
+void TcpConnection::_send_keepalive_probe()
+{
+    // One byte behind SND.NXT, and carrying nothing. See the header for why
+    // that is the only sequence number that works: it is old data the peer has
+    // already acknowledged, so it cannot disturb the stream, and it looks
+    // enough like a duplicate that RFC 793 obliges the peer to answer.
+    //
+    // Like the zero-window probe next door, it is deliberately not recorded in
+    // _in_flight and does not advance _send_next. It is not a transmission,
+    // and entangling it with the retransmit timer would mean a dead peer got
+    // torn down by whichever of the two mechanisms happened to notice first,
+    // with a different timeout and a different log line each time.
+    LOG_DEBUG("TcpConnection[" << _id << "] keepalive probe " << (_keepalive_probes_sent + 1)
+              << "/" << KEEPALIVE_MAX_PROBES << " at seq=" << (_send_next - 1));
+    _send_segment(_build_header(FLAG_ACK, _send_next - 1), Bytes());
+    _keepalive_probes_sent += 1;
+    _keepalive_probe_ms_remaining = KEEPALIVE_PROBE_INTERVAL_MS;
+}
+
+void TcpConnection::_run_keepalive(uint32_t elapsed_ms)
+{
+    // ESTABLISHED only. In every other state some other timer already owns the
+    // question of how long to wait - TIME_WAIT counts down 2*MSL, a half-close
+    // is the application's business, and anything before ESTABLISHED is the
+    // retransmit timer's. Adding a second opinion would just mean two answers
+    // to "when do we give up".
+    if (!_keepalive_enabled || _state != TcpState::ESTABLISHED)
+    {
+        return;
+    }
+
+    if (_keepalive_probes_sent > 0)
+    {
+        _keepalive_probe_ms_remaining -= static_cast<int>(elapsed_ms);
+        if (_keepalive_probe_ms_remaining > 0)
+        {
+            return;
+        }
+
+        if (_keepalive_probes_sent >= KEEPALIVE_MAX_PROBES)
+        {
+            LOG_WARNING("TcpConnection[" << _id << "] peer unresponsive after "
+                        << _keepalive_probes_sent << " keepalive probes - closing");
+            _transition(TcpState::CLOSED);
+            return;
+        }
+        _send_keepalive_probe();
+        return;
+    }
+
+    _keepalive_idle_ms_remaining -= static_cast<int>(elapsed_ms);
+    if (_keepalive_idle_ms_remaining <= 0)
+    {
+        _send_keepalive_probe();
+    }
+}
+
 void TcpConnection::_update_rto_from_sample(uint32_t rtt_ms)
 {
     // A segment sent and acked between two calls to on_time_passed() measures
@@ -877,6 +938,11 @@ void TcpConnection::_handle_fin(uint32_t fin_seq)
 
 void TcpConnection::on_segment(const Tcp& segment)
 {
+    // Anything at all from the peer means the connection is not idle - even a
+    // segment this stack is about to reject. Whether it was well-formed is a
+    // different question from whether the peer is still there.
+    _reset_keepalive();
+
     if (segment.get_rst())
     {
         bool past_handshake = _state == TcpState::ESTABLISHED || _state == TcpState::FIN_WAIT_1
@@ -1128,7 +1194,14 @@ void TcpConnection::on_time_passed(uint32_t elapsed_ms)
                 _persist_backoff = std::min(_persist_backoff + 1, PERSIST_MAX_BACKOFF_SHIFT);
                 _persist_ms_remaining = PERSIST_BASE_MS << _persist_backoff;
             }
+            // Persist and keepalive must not both run. A peer with a shut
+            // window is demonstrably alive - it is answering probes, it just
+            // has nowhere to put anything - so counting that as idle would
+            // tear down a connection for the crime of being slow to read.
+            return;
         }
+
+        _run_keepalive(elapsed_ms);
         return;
     }
 

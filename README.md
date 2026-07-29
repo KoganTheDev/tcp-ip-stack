@@ -61,6 +61,14 @@ simultaneous close rather than folding it into `FIN_WAIT_2`. On top of that:
 - A zero-window persist timer, whose probe byte is intentionally kept outside the
   in-flight window so it cannot trip the retransmit give-up or the duplicate-ack
   machinery
+- **Unpredictable initial sequence numbers** (RFC 6528): `ISN = M + F(4-tuple, secret)`,
+  with a SipHash-2-4 keyed PRF for `F`. The clock term keeps successive connections on
+  one 4-tuple ordered, exactly as RFC 793 intended; the keyed term means an attacker who
+  can watch ISNs for their own 4-tuple learns nothing about anybody else's - which is the
+  hole Morris described in 1985 and Mitnick used in 1994
+- **Keepalive** (RFC 1122 4.2.3.6), off by default as the RFC requires, probing one byte
+  *behind* SND.NXT because that is the only segment that compels a reply without moving
+  the stream
 - Checksum verification on receive, over the bytes *as received* rather than a
   re-serialization, and RFC 793 section 3.4 RST generation for segments matching no
   connection
@@ -132,8 +140,6 @@ These are documented decisions, not gaps that were missed:
 - **No forwarding.** A packet addressed to somebody else is dropped rather than passed
   on. Next-hop selection exists, so this stack can *reach* anything routable, but
   forwarding additionally needs more than one interface, which it does not have.
-- **ISN generation is RFC 793's clock-driven scheme**, not RFC 6528's unpredictable
-  one. Do not put this on a hostile network.
 - **The reorder buffer keys exact sequence numbers** rather than merging overlapping
   ranges, so a partially overlapping segment is kept or dropped whole.
 - **`TIME_WAIT` assumes a 30-second MSL**, so it runs for 60 seconds rather than RFC
@@ -175,10 +181,10 @@ and applies itself. See its own README for the full reasoning.
 
 ## Testing
 
-178 unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
-estimation, congestion control, flow control, routing, fragment reassembly, ARP ageing,
-UDP, ICMP, and the logger, plus a fuzz suite asserting no codec crashes on malformed
-input.
+192 unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
+estimation, congestion control, flow control, keepalive, ISN generation, routing,
+fragment reassembly, ARP ageing, UDP, ICMP, and the logger, plus a fuzz suite asserting
+no codec crashes on malformed input.
 
 Two seams make the untestable parts testable without any OS involvement: `PacketChannel`
 injects a fake frame transport into `NetworkStack`, and `LoopbackChannel` wires two

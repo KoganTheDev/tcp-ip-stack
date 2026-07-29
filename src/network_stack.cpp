@@ -180,7 +180,8 @@ TcpConnection* NetworkStack::connect(const IPv4Address& remote_ip, uint16_t remo
     ConnectionKey key{remote_ip, remote_port, local_port};
 
     auto connection = std::make_unique<TcpConnection>(
-        local_port, remote_ip, remote_port, generate_initial_sequence_number(),
+        local_port, remote_ip, remote_port,
+        this->_isn_generator.generate(this->_config.ip, local_port, remote_ip, remote_port),
         [this, remote_ip](const Tcp& header, const Bytes& payload)
         {
             this->_send_tcp_segment(remote_ip, header, payload);
@@ -712,7 +713,8 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
     LOG_DEBUG("NetworkStack: accepting new connection from " << remote_ip.to_string() << ":" << key.remote_port
               << " on port " << key.local_port);
     auto connection = std::make_unique<TcpConnection>(
-        key.local_port, remote_ip, key.remote_port, generate_initial_sequence_number(),
+        key.local_port, remote_ip, key.remote_port,
+        this->_isn_generator.generate(this->_config.ip, key.local_port, remote_ip, key.remote_port),
         [this, remote_ip](const Tcp& header, const Bytes& payload)
         {
             this->_send_tcp_segment(remote_ip, header, payload);
