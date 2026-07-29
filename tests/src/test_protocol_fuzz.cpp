@@ -6,6 +6,7 @@
 #include "tcp.h"
 #include "udp.h"
 #include "icmp.h"
+#include "dhcp.h"
 
 #include <random>
 
@@ -109,4 +110,15 @@ TEST(TruncatedButPlausibleHeadersDoNotCrash)
             // expected for most truncation lengths
         }
     }
+}
+
+TEST(DhcpFromBytesNeverCrashesOnGarbage)
+{
+    // The one parser here that runs before this host has an address at all,
+    // on datagrams from any source, with nothing in the protocol
+    // authenticating any of it - and whose options are tag/length/value with
+    // an attacker-chosen length. 512 rather than 128 so the generator can
+    // actually reach past the 240-byte fixed header into the options, which
+    // is the part worth fuzzing.
+    fuzz_from_bytes<Dhcp>(512);
 }

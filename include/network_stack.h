@@ -15,6 +15,7 @@
 #include "route_table.h"
 #include "ip_reassembler.h"
 #include "isn_generator.h"
+#include "dhcp_client.h"
 #include "network_addresses.h"
 #include "ethernet.h"
 #include "arp.h"
@@ -94,6 +95,21 @@ public:
     // protocol has to operate from before it has anything to configure.
     void configure_interface(const InterfaceConfig& config);
     const InterfaceConfig& interface_config() const { return _config; }
+
+    // Starts a DHCP client on this interface and lets it configure the stack.
+    //
+    // It binds UDP port 68, sends a DISCOVER, and calls configure_interface()
+    // itself once a lease is granted - address, mask, gateway and MTU all
+    // arrive together, which is why the reconfigurable InterfaceConfig had to
+    // exist before this could. Losing the lease reconfigures back to no
+    // address, which genuinely stops the stack answering for one rather than
+    // leaving it using an address that now belongs to somebody else.
+    //
+    // Returns the client so an application can observe its state; the stack
+    // owns it. Calling this twice returns the same client rather than starting
+    // a second bidding war for an address.
+    DhcpClient* start_dhcp();
+    DhcpClient* dhcp_client() const { return _dhcp_client.get(); }
 
     // Routes beyond the two derived from the interface. Use this for a route
     // to a network reachable through some router other than the default.
@@ -330,6 +346,10 @@ private:
     // secret, which is the same as no secret at all for an attacker who only
     // needs to predict the connection in front of them.
     IsnGenerator _isn_generator;
+
+    // Null until start_dhcp(). Owned here rather than by the application
+    // because it reconfigures the interface, which is this class's state.
+    std::unique_ptr<DhcpClient> _dhcp_client;
 
     // Token bucket over generated ICMP errors: one token per error, refilled on
     // the timer up to a burst. A burst is allowed on purpose - errors normally

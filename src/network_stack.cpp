@@ -226,6 +226,69 @@ TcpConnection* NetworkStack::find_connection(uint64_t id) const
     return connection_it != this->_connections.end() ? connection_it->second.get() : nullptr;
 }
 
+DhcpClient* NetworkStack::start_dhcp()
+{
+    if (this->_dhcp_client)
+    {
+        return this->_dhcp_client.get();
+    }
+
+    UdpSocket* socket = this->bind_udp(DhcpClient::CLIENT_PORT);
+
+    this->_dhcp_client = std::make_unique<DhcpClient>(
+        this->_config.mac,
+        [socket](const IPv4Address& dest, const Bytes& payload)
+        {
+            socket->send_to(dest, DhcpClient::SERVER_PORT, payload);
+        },
+        // The transaction id is the only thing tying a reply to a request
+        // here, so it gets the same treatment as a TCP ISN and comes from the
+        // same keyed generator rather than from a counter.
+        this->_isn_generator.offset_for(this->_config.ip, DhcpClient::CLIENT_PORT,
+                                        limited_broadcast_address(), DhcpClient::SERVER_PORT)
+    );
+
+    socket->set_datagram_received_callback(
+        [this](const IPv4Address&, uint16_t src_port, const Bytes& data)
+        {
+            if (src_port != DhcpClient::SERVER_PORT)
+            {
+                return;
+            }
+            this->_dhcp_client->on_datagram(data);
+        }
+    );
+
+    this->_dhcp_client->set_lease_acquired_callback(
+        [this](const DhcpLease& lease)
+        {
+            InterfaceConfig config = this->_config;
+            config.ip = lease.ip;
+            config.prefix_length = lease.prefix_length();
+            config.gateway = lease.gateway;
+            config.mtu = lease.mtu;
+            this->configure_interface(config);
+        }
+    );
+
+    this->_dhcp_client->set_lease_lost_callback(
+        [this]()
+        {
+            // Back to having no address at all, not to whatever was configured
+            // before. Continuing to use an address whose lease has gone risks
+            // a second host being handed the same one, and two hosts answering
+            // for one address is a worse failure than having none.
+            InterfaceConfig config = this->_config;
+            config.ip = IPv4Address();
+            config.gateway = IPv4Address();
+            this->configure_interface(config);
+        }
+    );
+
+    this->_dhcp_client->start();
+    return this->_dhcp_client.get();
+}
+
 UdpSocket* NetworkStack::bind_udp(uint16_t port)
 {
     auto existing_it = this->_udp_sockets.find(port);
@@ -310,6 +373,11 @@ void NetworkStack::on_time_passed(uint32_t elapsed_ms)
     }
 
     this->_reap_closed_connections();
+
+    if (this->_dhcp_client)
+    {
+        this->_dhcp_client->on_time_passed(elapsed_ms);
+    }
 
     this->_arp_table.age(elapsed_ms);
 

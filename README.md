@@ -100,6 +100,25 @@ datagram whose fragments never all arrived. Receiving a Destination Unreachable 
 connection's own segment fails that connection immediately instead of letting it grind
 through the full retransmit budget.
 
+**DHCP.** A full client (RFC 2131): DISCOVER, OFFER, REQUEST, ACK, then T1 renewal, T2
+rebinding and lease expiry. It configures the stack itself - address, mask, gateway and
+MTU arrive together and go straight into `configure_interface()`, which is why that had
+to be reconfigurable before this could exist.
+
+The two round trips are not redundant, and the three timers are not one timer with
+decoration. The REQUEST is *broadcast* even though the client has already chosen a
+server, because that is how the servers whose offers were declined learn to release the
+addresses they had reserved. And T1 (unicast to the granting server) is separate from T2
+(broadcast to any server) so that a dead DHCP server is a degradation rather than an
+outage: the client keeps working for seven eighths of a lease while the network gets a
+chance to notice.
+
+Its parser is the most exposed one in the stack - tag/length/value with an
+attacker-chosen length, accepted from any source, before the host even has an address,
+with nothing in the protocol authenticating any of it. The fuzz suite points at it for
+exactly that reason, and every option accessor is total: a wrong-sized option reads as
+absent rather than as whatever is next in memory.
+
 **Routing.** A subnet mask, a default gateway, and a route table with longest-prefix
 match. Every send decides whether the destination is on-link, and so resolves the
 destination itself, or off-link, and so resolves the gateway - the distinction between
@@ -181,10 +200,10 @@ and applies itself. See its own README for the full reasoning.
 
 ## Testing
 
-192 unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
-estimation, congestion control, flow control, keepalive, ISN generation, routing,
-fragment reassembly, ARP ageing, UDP, ICMP, and the logger, plus a fuzz suite asserting
-no codec crashes on malformed input.
+215 unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
+estimation, congestion control, flow control, keepalive, ISN generation, DHCP lease
+acquisition and renewal, routing, fragment reassembly, ARP ageing, UDP, ICMP, and the
+logger, plus a fuzz suite asserting no codec crashes on malformed input.
 
 Two seams make the untestable parts testable without any OS involvement: `PacketChannel`
 injects a fake frame transport into `NetworkStack`, and `LoopbackChannel` wires two
