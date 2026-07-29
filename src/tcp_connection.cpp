@@ -65,7 +65,8 @@ namespace
 }
 
 TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port,
-                              uint32_t initial_seq, SendSegmentFn send_segment, uint16_t local_mss)
+                              uint32_t initial_seq, SendSegmentFn send_segment, uint16_t local_mss,
+                              CongestionControlAlgorithm algorithm)
     : _id(g_next_connection_id.fetch_add(1)),
       _local_port(local_port), _remote_ip(remote_ip), _remote_port(remote_port),
       _state(TcpState::LISTEN),
@@ -85,10 +86,15 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
       _local_mss(local_mss), _peer_mss(DEFAULT_PEER_MSS), _effective_mss(std::min(local_mss, DEFAULT_PEER_MSS)),
       _window_scaling_negotiated(false), _peer_window_scale(0),
       _peer_window(local_mss), // conservative placeholder until the handshake's real window arrives
-      _cwnd(local_mss), _ssthresh(INITIAL_SSTHRESH), _dup_ack_count(0), _in_fast_recovery(false),
+      _congestion(make_congestion_control(algorithm)), _dup_ack_count(0), _in_fast_recovery(false),
       _send_segment(std::move(send_segment)),
       _receive_queued_bytes(0)
 {
+    // Seeded with the MSS this side advertises, which is all that is known
+    // before the handshake. on_established() re-seeds it with the negotiated
+    // effective MSS - a window is a count of segments in disguise, so one
+    // measured in the wrong segment size is the wrong window.
+    _congestion->on_established(local_mss);
 }
 
 void TcpConnection::_transition(TcpState new_state)
@@ -429,7 +435,7 @@ void TcpConnection::_send_queued_while_window_allows()
 {
     while (!_send_queue.empty())
     {
-        uint32_t effective_window = std::min(_cwnd, _peer_window);
+        uint32_t effective_window = std::min(_congestion->window(), _peer_window);
         if (_bytes_in_flight() + _send_queue.front().size() > effective_window)
         {
             break;
@@ -641,7 +647,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
                 return; // everything outstanding is already held by the peer
             }
             InFlightSegment& oldest = *target;
-            uint32_t cwnd_before = _cwnd;
+            uint32_t cwnd_before = _congestion->window();
             _send_segment(_build_header(oldest.flags, oldest.seq), oldest.payload);
             // Karn again: this segment has now been sent twice, so the ack
             // that eventually retires it can't be attributed to either
@@ -656,11 +662,10 @@ void TcpConnection::_handle_ack(const Tcp& segment)
             // collapsing cwnd to one MSS and cancelling fast recovery, a
             // second and much harsher reaction to what is one loss event.
             oldest.retransmit_ms_remaining = _rto_ms;
-            _ssthresh = std::max(_bytes_in_flight() / 2, static_cast<uint32_t>(2 * _effective_mss));
-            _cwnd = _ssthresh + DUP_ACK_FAST_RETRANSMIT_THRESHOLD * static_cast<uint32_t>(_effective_mss);
+            _congestion->on_fast_retransmit(_bytes_in_flight(), DUP_ACK_FAST_RETRANSMIT_THRESHOLD, _now_ms);
             _in_fast_recovery = true;
             LOG_DEBUG("TcpConnection[" << _id << "] fast retransmit at seq=" << oldest.seq
-                      << " (3 duplicate acks), cwnd " << cwnd_before << " -> " << _cwnd);
+                      << " (3 duplicate acks), cwnd " << cwnd_before << " -> " << _congestion->window());
         }
         else if (_in_fast_recovery || sack_advanced)
         {
@@ -671,7 +676,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
             // A SACK that named something new is the same signal made
             // explicit - it does not merely suggest a segment arrived, it says
             // which - so it opens room even outside fast recovery.
-            _cwnd += _effective_mss;
+            _congestion->on_recovery_inflate();
             _send_queued_while_window_allows();
         }
         return;
@@ -763,20 +768,21 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         // the retransmit that triggered fast recovery is now confirmed
         // received - deflate back to ssthresh rather than keep the
         // inflated window fast recovery was using
-        _cwnd = _ssthresh;
+        _congestion->on_recovery_end();
         _in_fast_recovery = false;
-    }
-    else if (_cwnd < _ssthresh)
-    {
-        _cwnd += bytes_acked; // slow start: exponential growth, roughly doubles cwnd every RTT
     }
     else
     {
-        // congestion avoidance: the standard approximation of "+1 MSS per
-        // RTT" without tracking RTTs directly - each ack grows cwnd by
-        // MSS * (bytes_acked / cwnd), which sums to about one MSS per
-        // window's worth of acks
-        _cwnd += std::max<uint32_t>(1, (static_cast<uint32_t>(_effective_mss) * bytes_acked) / _cwnd);
+        // Slow start versus congestion avoidance, and the growth law in
+        // either, is the algorithm's decision now - see congestion_control.h
+        // for where that seam is and why it is there.
+        //
+        // The smoothed RTT is unscaled on the way in, and is 0 until the
+        // estimator has its first sample, which CUBIC reads as "no lookahead
+        // yet". There is no second copy of the estimator behind the interface:
+        // RFC 6298's is right here and there is no reason for two.
+        uint32_t srtt_ms = _has_rtt_sample ? _srtt_scaled / RTO_SCALE : 0;
+        _congestion->on_ack(bytes_acked, _bytes_in_flight(), srtt_ms, _now_ms);
     }
 
     if (fin_acked)
@@ -908,8 +914,9 @@ void TcpConnection::on_segment(const Tcp& segment)
                 _have_ts_recent = true;
             }
             _peer_window = static_cast<uint32_t>(segment.get_window()) << _peer_window_scale;
-            _cwnd = _effective_mss;
-            _ssthresh = INITIAL_SSTHRESH;
+            // The MSS is only now negotiated, and the window is denominated in
+            // it, so this is where congestion control actually starts.
+            _congestion->on_established(_effective_mss);
 
             _transition(TcpState::ESTABLISHED);
             _send_pure_ack(); // completes the 3-way handshake
@@ -925,8 +932,9 @@ void TcpConnection::on_segment(const Tcp& segment)
             _unsacked_in_flight_bytes = 0;
             uint8_t peer_shift = _window_scaling_negotiated ? _peer_window_scale : 0;
             _peer_window = static_cast<uint32_t>(segment.get_window()) << peer_shift;
-            _cwnd = _effective_mss;
-            _ssthresh = INITIAL_SSTHRESH;
+            // The MSS is only now negotiated, and the window is denominated in
+            // it, so this is where congestion control actually starts.
+            _congestion->on_established(_effective_mss);
             _transition(TcpState::ESTABLISHED);
         }
         return;
@@ -1150,13 +1158,12 @@ void TcpConnection::on_time_passed(uint32_t elapsed_ms)
         return;
     }
 
-    // classic Reno's "slow start restart": a timeout means no acks at all
-    // got through (unlike fast retransmit's duplicate acks, which mean
-    // *something* is still arriving) - a harsher signal, so cwnd collapses
-    // all the way back to one segment instead of just deflating to ssthresh
-    uint32_t cwnd_before = _cwnd;
-    _ssthresh = std::max(_bytes_in_flight() / 2, static_cast<uint32_t>(2 * _effective_mss));
-    _cwnd = _effective_mss;
+    // A timeout means no acks at all got through, unlike fast retransmit's
+    // duplicate acks, which mean *something* is still arriving. Both
+    // algorithms treat that as the harsher signal; how much harsher is theirs
+    // to decide.
+    uint32_t cwnd_before = _congestion->window();
+    _congestion->on_retransmit_timeout(_bytes_in_flight(), _now_ms);
     _in_fast_recovery = false;
     _dup_ack_count = 0;
 
@@ -1174,7 +1181,7 @@ void TcpConnection::on_time_passed(uint32_t elapsed_ms)
 
     LOG_DEBUG("TcpConnection[" << _id << "] retransmit timeout at seq=" << oldest.seq
               << " (attempt " << oldest.retransmit_attempts << "/" << MAX_RETRANSMIT_ATTEMPTS
-              << "), cwnd " << cwnd_before << " -> " << _cwnd
+              << "), cwnd " << cwnd_before << " -> " << _congestion->window()
               << ", rto " << rto_before << " -> " << _rto_ms);
 
     _send_segment(_build_header(oldest.flags, oldest.seq), oldest.payload);
@@ -1226,7 +1233,7 @@ size_t TcpConnection::send(const Bytes& data)
         // otherwise a later, smaller chunk could jump ahead of an earlier
         // one still waiting on window room and arrive out of order
         if (!_send_queue.empty() || nagle_holds
-            || _bytes_in_flight() + chunk.size() > std::min(_cwnd, _peer_window))
+            || _bytes_in_flight() + chunk.size() > std::min(_congestion->window(), _peer_window))
         {
             _send_queued_bytes += chunk.size();
             _send_queue.push_back(std::move(chunk));

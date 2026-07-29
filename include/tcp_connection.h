@@ -4,9 +4,11 @@
 #include <functional>
 #include <deque>
 #include <map>
+#include <memory>
 #include <vector>
 
 #include "bytes.h"
+#include "congestion_control.h"
 #include "network_addresses.h"
 #include "tcp.h"
 
@@ -33,8 +35,9 @@ enum class TcpState
 // resolves the peer's MAC, and writes bytes to the TUN device.
 //
 // Implements: the 3-way handshake, a receiver-advertised + congestion-
-// controlled sliding window (classic Reno - slow start, congestion
-// avoidance, fast retransmit/fast recovery on 3 duplicate ACKs), out-of-order
+// controlled sliding window (slow start, congestion avoidance, fast
+// retransmit/fast recovery on 3 duplicate ACKs, with the growth and decrease
+// policy itself pluggable - Reno or CUBIC, see congestion_control.h), out-of-order
 // reassembly bounded by a fixed receive-buffer capacity, MSS and window-scale
 // option negotiation (RFC 7323's rule: scaling is used at all only if *both*
 // SYNs carried the option), and a real `CLOSING` state for simultaneous
@@ -71,9 +74,13 @@ public:
     // single shared generator across connections. local_mss is what this
     // side advertises in its own MSS option - defaulted so existing callers
     // (and tests) that don't care about a non-default MTU keep working
-    // unchanged.
+    // unchanged. algorithm selects the congestion control, defaulting to CUBIC
+    // for the same reason Linux does: it is what the peers on the other end of
+    // these connections are almost certainly running, and a stack whose default
+    // loses to its own peers is not a useful default.
     TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port,
-                  uint32_t initial_seq, SendSegmentFn send_segment, uint16_t local_mss = DEFAULT_LOCAL_MSS);
+                  uint32_t initial_seq, SendSegmentFn send_segment, uint16_t local_mss = DEFAULT_LOCAL_MSS,
+                  CongestionControlAlgorithm algorithm = CongestionControlAlgorithm::CUBIC);
 
     // Feeds in a segment already verified (checksum, IP addresses, ports) to
     // belong to this connection.
@@ -141,6 +148,12 @@ public:
     // wanting to observe the estimator; nothing in the stack's own data
     // path reads it from outside.
     int get_rto_ms() const { return _rto_ms; }
+
+    // The congestion window in bytes, and which algorithm is computing it.
+    // Same rationale as get_rto_ms(): observable from outside, read from
+    // outside by nothing in the data path.
+    uint32_t get_congestion_window() const { return _congestion->window(); }
+    const char* get_congestion_control_name() const { return _congestion->name(); }
 
     // Lowers the largest segment this side will send, in response to learning
     // the path cannot carry what was negotiated - an ICMP Fragmentation Needed
@@ -484,9 +497,15 @@ private:
     // RECEIVE_BUFFER_CAPACITY via _receive_buffer_occupied()
     std::map<uint32_t, Bytes> _reorder_buffer;
 
-    // --- congestion control (classic Reno, RFC 5681) ---
-    uint32_t _cwnd; // congestion window, in bytes
-    uint32_t _ssthresh; // slow start / congestion avoidance boundary, in bytes
+    // --- congestion control ---
+    //
+    // The window itself, and the policy that moves it, live behind
+    // CongestionControl (see congestion_control.h for where that seam is and
+    // why). What stays here is loss *detection*: counting duplicate acks and
+    // tracking whether fast recovery is in progress are statements about the
+    // sequence space, which the algorithm knows nothing about. It is told what
+    // happened; it never works it out.
+    std::unique_ptr<CongestionControl> _congestion;
     uint32_t _dup_ack_count;
     bool _in_fast_recovery;
 
@@ -510,8 +529,11 @@ private:
     static constexpr uint16_t DEFAULT_LOCAL_MSS = 1460; // 1500 (typical Ethernet MTU) - 20 (IP) - 20 (TCP)
     static constexpr uint16_t DEFAULT_PEER_MSS = 536; // RFC 793's fallback when a peer's SYN carries no MSS option
     static constexpr uint8_t WINDOW_SCALE_SHIFT = 1; // this stack's advertised shift
-    static constexpr uint32_t INITIAL_SSTHRESH = 65536; // effectively "no ceiling yet" until a real loss recalibrates it
-    static constexpr int DUP_ACK_FAST_RETRANSMIT_THRESHOLD = 3;
+    // Three, not two, and not one. One or two duplicate acks are what ordinary
+    // reordering looks like - the network delivered a later segment first, and
+    // the missing one is still on its way. Three in a row is the point at which
+    // every real implementation stops believing that.
+    static constexpr uint32_t DUP_ACK_FAST_RETRANSMIT_THRESHOLD = 3;
     // Every constant below is in milliseconds, and means what the RFC that
     // specifies it says it means. That is the whole point of taking elapsed
     // time from the caller rather than counting its ticks.

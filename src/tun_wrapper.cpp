@@ -37,7 +37,11 @@ void TunWrapper::stop()
 
 std::string TunWrapper::_open_device(const std::string &device_path)
 {
-    struct ifreq ifr = {0};
+    // {} rather than {0}: ifreq's second member is a union, and naming a single
+    // zero initialises only the first member of the first field, which
+    // -Wmissing-field-initializers correctly calls out. An empty brace list
+    // value-initialises the whole struct, which is what was meant.
+    struct ifreq ifr = {};
     int fd, err;
 
     fd = open(device_path.c_str(), O_RDWR);

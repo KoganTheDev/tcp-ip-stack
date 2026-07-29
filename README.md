@@ -43,8 +43,11 @@ graph TD
 simultaneous close rather than folding it into `FIN_WAIT_2`. On top of that:
 
 - A sliding window bounded by `min(cwnd, peer's advertised window)`, in bytes
-- Classic Reno congestion control (RFC 5681): slow start, congestion avoidance, and
-  fast retransmit / fast recovery on three duplicate ACKs
+- Slow start, congestion avoidance, and fast retransmit / fast recovery on three
+  duplicate ACKs (RFC 5681) - with the growth and decrease policy itself behind an
+  interface, and **two implementations: classic Reno and CUBIC** (RFC 8312), the latter
+  the default because it is what Linux has run since 2006 and so what the peers on the
+  other end of these connections are actually running
 - **Adaptive retransmission timeout** (RFC 6298): round-trip time is sampled from the
   ack clock and smoothed with Jacobson and Karels' estimator, tracking both the mean
   and its variation, with Karn's algorithm rejecting the ambiguous samples that come
@@ -101,6 +104,17 @@ application gets round to calling. The distinction is not academic: a tick count
 conflates "how often am I polled" with "how much time has passed", so an event loop that
 stalls for two seconds delivers one tick and the stack concludes half a second went by -
 retransmissions then run late by exactly however overloaded the machine was.
+
+**Congestion control as a policy, not as the protocol.** Until it was pulled behind an
+interface, `TcpConnection` knew that a window halved on loss and grew by one MSS per RTT
+- which are Reno's answers, not TCP's. The seam sits where the two algorithms actually
+disagree, which is only two places: how far the window is cut on congestion, and how it
+grows past `ssthresh`. Slow start, the fast-recovery bookkeeping and the
+timeout-is-worse-than-duplicate-acks distinction are RFC 5681's and are shared. Linux's
+`tcp_congestion_ops` draws the line in the same place for the same reason. CUBIC is what
+proves the seam was cut correctly rather than shaped around Reno: its window is a cubic
+function of *real time since the last congestion event*, a quantity this stack could not
+express at all until its timers stopped counting the application's polling cycles.
 
 **Flow control that exists rather than being advertised.** Received data waits in a
 queue until the application reads it, so an application that stops reading genuinely
@@ -161,9 +175,10 @@ and applies itself. See its own README for the full reasoning.
 
 ## Testing
 
-143 unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
-estimation, flow control, routing, fragment reassembly, ARP ageing, UDP, ICMP, and the
-logger, plus a fuzz suite asserting no codec crashes on malformed input.
+178 unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
+estimation, congestion control, flow control, routing, fragment reassembly, ARP ageing,
+UDP, ICMP, and the logger, plus a fuzz suite asserting no codec crashes on malformed
+input.
 
 Two seams make the untestable parts testable without any OS involvement: `PacketChannel`
 injects a fake frame transport into `NetworkStack`, and `LoopbackChannel` wires two
