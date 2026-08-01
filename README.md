@@ -209,7 +209,37 @@ docker run --rm -it --cap-add=NET_ADMIN --device=/dev/net/tun \
     -v "$PWD:/work" -w /work gcc:latest bash
 ```
 
-## The application on top
+## The applications on top
+
+[`http-get/`](http-get/) is the demonstrator: a one-shot HTTP client that starts with **no
+address at all** and does the entire job itself.
+
+```
+$ sudo http-get --transport nic --device vhttp0 --dhcp demo.stacktest:8080/index.html
+interface vhttp0  mac e2:79:f3:b4:3b:8e
+DHCP     discovering...
+DHCP     10.9.1.56/24  gateway 10.9.1.1  lease 120s
+DNS via  10.9.1.1
+DNS      resolving demo.stacktest...
+DNS      demo.stacktest is 192.168.88.10
+TCP      connecting to 192.168.88.10:8080...
+TCP      established
+HTTP     GET /index.html
+HTTP     24 bytes of body
+
+HTTP/1.0 200 OK
+...
+```
+
+Every line there is this project's own code: the DHCP exchange, the DNS query, the ARP
+for the gateway (the server is off-link, so the frame goes to the router while the IP
+header names the server), the handshake, and the half-close. The kernel's only
+involvement is an `AF_PACKET` socket handing over raw Ethernet frames. `curl` does this
+in one line - the point is that this is the same line with everything underneath it made
+visible.
+
+It runs in CI against real `dnsmasq` and a real HTTP server, neither of which has ever
+heard of this codebase.
 
 [`epoll-server/`](epoll-server/) is a multithreaded TCP echo server built on this
 stack. It is more interesting than it sounds, because replacing kernel sockets changes

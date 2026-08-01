@@ -18,7 +18,7 @@ jobs:
       matrix:
         cxx: [g++, clang++]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install clang
         if: matrix.cxx == 'clang++'
@@ -39,7 +39,7 @@ jobs:
     name: strict warnings
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build with -Wall -Wextra -Werror
         run: |
           make run_tests CXXFLAGS="-std=c++17 -Wall -Wextra -Werror -g \
@@ -71,13 +71,39 @@ jobs:
     name: veth integration
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install network tooling
         run: |
           sudo apt-get update
           sudo apt-get install -y iproute2 ethtool iputils-ping netcat-openbsd
       - name: Drive the stack over a veth pair against the kernel
         run: sudo scripts/veth_test.sh
+
+  # The whole stack at once, against server software that has never heard of it.
+  # veth_test.sh above proves the stack talks to the kernel; this proves it does
+  # the entire job an application actually needs - starting with no address at
+  # all, taking a lease from a real dnsmasq, resolving a name against that same
+  # dnsmasq, routing off-link via the gateway it was handed, and fetching a
+  # document from a real HTTP server.
+  #
+  # Independent implementations on the other end is the point. Two copies of the
+  # same bug agree with each other, which is exactly how the checksum bug in the
+  # README passed a full unit suite.
+  demonstrator:
+    name: http-get end to end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install network tooling and servers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 ethtool dnsmasq python3
+          # Ubuntu's dnsmasq package starts a system-wide instance on install,
+          # which would hold port 53. The test runs its own in a namespace.
+          sudo systemctl stop dnsmasq 2>/dev/null || true
+          sudo systemctl disable dnsmasq 2>/dev/null || true
+      - name: Fetch a URL over the stack - DHCP, DNS, routing, TCP, HTTP
+        run: sudo scripts/http_get_test.sh
 
   # Unit tests confirm behavior; sanitizers confirm the behavior was not
   # reached through undefined behavior. Both bugs fixed in the commit that
@@ -108,6 +134,6 @@ jobs:
     # single-threaded. Revisit once there are threaded tests for it to bite on.
     continue-on-error: ${{ matrix.sanitizer == 'tsan' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Run the suite under ${{ matrix.sanitizer }}
         run: make ${{ matrix.sanitizer }}
