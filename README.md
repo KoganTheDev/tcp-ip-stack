@@ -119,6 +119,27 @@ with nothing in the protocol authenticating any of it. The fuzz suite points at 
 exactly that reason, and every option accessor is total: a wrong-sized option reads as
 absent rather than as whatever is next in memory.
 
+**DNS.** A stub resolver (RFC 1034/1035): A records over UDP, CNAME chasing, retry
+across multiple servers, and a bounded TTL-respecting cache. Servers come from the DHCP
+lease's option 6, so name resolution configures itself along with the address.
+
+Two things here are worth more than the request/response plumbing. **Name compression**
+is the format's one genuinely dangerous feature - a label byte with its top two bits set
+is not a label but a 14-bit offset back into the same attacker-controlled buffer, which
+is the source of essentially every DNS parser CVE. The defence is layered: a pointer must
+point strictly *backwards* (so a cycle is impossible by construction, not merely bounded),
+the jump count is capped, and the decompressed name is capped at 255 bytes. Deleting both
+of the first two makes the parser hang on a 14-byte datagram, which the test suite
+demonstrates.
+
+**And the query is made hard to guess.** A DNS answer is an unauthenticated datagram and
+whoever replies first wins, so an off-path attacker who can predict a query can poison
+the cache. Both unknowns get real entropy from keyed SipHash streams: the transaction id,
+and the UDP source port - a fresh random one per query rather than one fixed port, which
+is what takes the attacker from 16 bits of guessing to ~32. That is the gap Kaminsky's
+2008 work made unignorable. The two streams keep *independent* state, because sharing it
+would collapse the two guesses back into one.
+
 **Routing.** A subnet mask, a default gateway, and a route table with longest-prefix
 match. Every send decides whether the destination is on-link, and so resolves the
 destination itself, or off-link, and so resolves the gateway - the distinction between
@@ -200,10 +221,11 @@ and applies itself. See its own README for the full reasoning.
 
 ## Testing
 
-215 unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
+244 unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
 estimation, congestion control, flow control, keepalive, ISN generation, DHCP lease
-acquisition and renewal, routing, fragment reassembly, ARP ageing, UDP, ICMP, and the
-logger, plus a fuzz suite asserting no codec crashes on malformed input.
+acquisition and renewal, DNS parsing and anti-spoofing, routing, fragment reassembly,
+ARP ageing, UDP, ICMP, and the logger, plus a fuzz suite asserting no codec crashes on
+malformed input.
 
 Two seams make the untestable parts testable without any OS involvement: `PacketChannel`
 injects a fake frame transport into `NetworkStack`, and `LoopbackChannel` wires two

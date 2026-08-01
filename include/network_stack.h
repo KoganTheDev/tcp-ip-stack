@@ -16,6 +16,7 @@
 #include "ip_reassembler.h"
 #include "isn_generator.h"
 #include "dhcp_client.h"
+#include "dns_resolver.h"
 #include "network_addresses.h"
 #include "ethernet.h"
 #include "arp.h"
@@ -110,6 +111,17 @@ public:
     // a second bidding war for an address.
     DhcpClient* start_dhcp();
     DhcpClient* dhcp_client() const { return _dhcp_client.get(); }
+
+    // Resolves a hostname to IPv4 addresses, calling back exactly once.
+    //
+    // The resolver is created on first use and binds a fresh random UDP source
+    // port per query rather than one well-known port - see DnsResolver for why
+    // that doubling of an attacker's guessing work is the single most valuable
+    // thing a stub resolver does. Servers come from the DHCP lease if there is
+    // one, or from set_dns_servers().
+    void resolve(const std::string& name, DnsResolver::ResolvedFn callback);
+    void set_dns_servers(const std::vector<IPv4Address>& servers);
+    DnsResolver* dns_resolver() const { return _dns_resolver.get(); }
 
     // Routes beyond the two derived from the interface. Use this for a route
     // to a network reachable through some router other than the default.
@@ -350,6 +362,12 @@ private:
     // Null until start_dhcp(). Owned here rather than by the application
     // because it reconfigures the interface, which is this class's state.
     std::unique_ptr<DhcpClient> _dhcp_client;
+
+    // Created on first resolve() or set_dns_servers(). Owns no socket of its
+    // own: each query gets a UdpSocket bound to that query's random source
+    // port, which is what makes the port unguessable per query.
+    std::unique_ptr<DnsResolver> _dns_resolver;
+    DnsResolver& _ensure_dns_resolver();
 
     // Token bucket over generated ICMP errors: one token per error, refilled on
     // the timer up to a burst. A burst is allowed on purpose - errors normally

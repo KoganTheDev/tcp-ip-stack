@@ -226,6 +226,51 @@ TcpConnection* NetworkStack::find_connection(uint64_t id) const
     return connection_it != this->_connections.end() ? connection_it->second.get() : nullptr;
 }
 
+DnsResolver& NetworkStack::_ensure_dns_resolver()
+{
+    if (this->_dns_resolver)
+    {
+        return *this->_dns_resolver;
+    }
+
+    this->_dns_resolver = std::make_unique<DnsResolver>(
+        [this](const IPv4Address& server, uint16_t source_port, const Bytes& payload)
+        {
+            // A socket per query, on the port the resolver chose. Binding one
+            // fixed port for all DNS would hand an off-path attacker 16 bits
+            // of the answer for free - the exact weakness Kaminsky's 2008 work
+            // made unignorable.
+            UdpSocket* socket = this->bind_udp(source_port);
+            socket->set_datagram_received_callback(
+                [this, source_port](const IPv4Address& src, uint16_t src_port, const Bytes& data)
+                {
+                    if (this->_dns_resolver)
+                    {
+                        this->_dns_resolver->on_datagram(src, src_port, source_port, data);
+                    }
+                }
+            );
+            socket->send_to(server, DnsResolver::SERVER_PORT, payload);
+        },
+        // Same keyed generator the TCP ISNs use. The transaction id and the
+        // source port are the only two things an attacker has to guess, so
+        // they get real entropy rather than a counter.
+        this->_isn_generator.offset_for(this->_config.ip, DnsResolver::SERVER_PORT,
+                                        this->_config.gateway, DnsResolver::SERVER_PORT)
+    );
+    return *this->_dns_resolver;
+}
+
+void NetworkStack::set_dns_servers(const std::vector<IPv4Address>& servers)
+{
+    this->_ensure_dns_resolver().set_servers(servers);
+}
+
+void NetworkStack::resolve(const std::string& name, DnsResolver::ResolvedFn callback)
+{
+    this->_ensure_dns_resolver().resolve(name, std::move(callback));
+}
+
 DhcpClient* NetworkStack::start_dhcp()
 {
     if (this->_dhcp_client)
@@ -268,6 +313,14 @@ DhcpClient* NetworkStack::start_dhcp()
             config.gateway = lease.gateway;
             config.mtu = lease.mtu;
             this->configure_interface(config);
+
+            // Option 6 arrived with the lease, so the resolver is configured
+            // by the same exchange that configured the interface - which is
+            // what "plug it in and it works" actually requires.
+            if (!lease.dns_servers.empty())
+            {
+                this->set_dns_servers(lease.dns_servers);
+            }
         }
     );
 
@@ -377,6 +430,11 @@ void NetworkStack::on_time_passed(uint32_t elapsed_ms)
     if (this->_dhcp_client)
     {
         this->_dhcp_client->on_time_passed(elapsed_ms);
+    }
+
+    if (this->_dns_resolver)
+    {
+        this->_dns_resolver->on_time_passed(elapsed_ms);
     }
 
     this->_arp_table.age(elapsed_ms);

@@ -7,6 +7,7 @@
 #include "udp.h"
 #include "icmp.h"
 #include "dhcp.h"
+#include "dns.h"
 
 #include <random>
 
@@ -121,4 +122,14 @@ TEST(DhcpFromBytesNeverCrashesOnGarbage)
     // actually reach past the 240-byte fixed header into the options, which
     // is the part worth fuzzing.
     fuzz_from_bytes<Dhcp>(512);
+}
+
+TEST(DnsFromBytesNeverCrashesOnGarbage)
+{
+    // Name compression makes this the most dangerous parser in the stack: a
+    // label byte can be a 14-bit offset back into the same buffer, chosen by
+    // whoever sent the datagram. Random bytes hit that path constantly - about
+    // one label byte in four has both top bits set - so this is a real test of
+    // the backwards-only rule and the jump cap rather than a formality.
+    fuzz_from_bytes<Dns>(512);
 }
