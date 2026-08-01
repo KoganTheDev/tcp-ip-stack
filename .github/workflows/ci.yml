@@ -45,6 +45,40 @@ jobs:
           make run_tests CXXFLAGS="-std=c++17 -Wall -Wextra -Werror -g \
             -Wno-missing-field-initializers -Wno-unused-parameter"
 
+      # epoll-server was outside this job until now, which left the only
+      # threaded code in the project as the only code not held to -Werror.
+      # It compiles the shared stack sources a second time with its own flags,
+      # so this also catches anything that is only a warning in its
+      # translation-unit set.
+      - name: Build epoll-server with -Wall -Wextra -Werror
+        working-directory: epoll-server
+        run: |
+          make CXXFLAGS="-std=c++17 -Wall -Wextra -Werror -pthread -MMD -MP \
+            -Wno-missing-field-initializers -Wno-unused-parameter \
+            -I./include -I../include"
+
+  # The test the unit suite structurally cannot be. Every unit test drives two
+  # instances of THIS stack, which agree with each other by construction - and
+  # that is exactly how the checksum bug in the README survived a fully passing
+  # suite: both sides computed it over a re-serialization, and the kernel does
+  # not. Only a real kernel on the other end of a real socket catches that
+  # class, so it belongs in CI rather than in a paragraph telling people to run
+  # it by hand.
+  #
+  # No TAP device or container privilege needed: veth pairs, network namespaces
+  # and AF_PACKET all work on a hosted runner under sudo.
+  integration:
+    name: veth integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install network tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 ethtool iputils-ping netcat-openbsd
+      - name: Drive the stack over a veth pair against the kernel
+        run: sudo scripts/veth_test.sh
+
   # Unit tests confirm behavior; sanitizers confirm the behavior was not
   # reached through undefined behavior. Both bugs fixed in the commit that
   # introduced this workflow (a missing virtual destructor on a class deleted

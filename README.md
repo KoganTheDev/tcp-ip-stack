@@ -234,7 +234,9 @@ half-close.
 
 The one component that cannot be unit tested is the `AF_PACKET` transport, since it is
 nothing but syscalls. It has an integration test instead, driving the whole stack over a
-veth pair against a peer in its own network namespace:
+veth pair against a peer in its own network namespace. **This runs in CI on every push** -
+it is the only test in the project with a real kernel on the other end, which is exactly
+the class of bug the unit suite cannot reach (see "Verified against a real kernel" below).
 
 ```sh
 sudo scripts/veth_test.sh    # needs root, iproute2, ethtool, ping, nc
@@ -246,7 +248,9 @@ make asan    # AddressSanitizer + UBSan + leak detection
 make tsan    # ThreadSanitizer
 ```
 
-ASan, UBSan, and leak detection are clean, and CI runs them on every push. They are
+ASan, UBSan, and leak detection are clean, and CI runs them on every push, alongside
+both compilers, a `-Werror` build of the stack *and* of `epoll-server`, and the veth
+integration test above. They are
 worth more here than the pass/fail of the tests: two real bugs, a missing virtual
 destructor on a class deleted through a base pointer and enums assigned from wire data
 without a fixed underlying type, were both found this way while the entire suite was
