@@ -1379,3 +1379,56 @@ TEST(EchoRequestIsSentAndItsReplyReported)
                 "identifier and sequence come back untouched, which is how a reply is matched to its request");
     test_assert(replies[0].payload.to_hex() == "cafe", "and the payload verbatim, which is what lets a ping time a round trip");
 }
+
+TEST(APingFromAnUnresolvedPeerArpsForItInsteadOfThrowing)
+{
+    // The test above primes the ARP table with a request from the peer before
+    // pinging, which is the common case and hid this for a long time. Here the
+    // echo request is the FIRST thing the stack ever hears from this peer.
+    //
+    // Every other send path queues and waits for ARP; ICMP used to throw, and
+    // because the reply is generated while handling an inbound frame, the
+    // exception unwound into _handle_frame's catch and was logged as a
+    // malformed frame. The ping simply went unanswered. http-get found it on
+    // its first run, when a DNS query and dnsmasq's ping raced the same ARP
+    // exchange.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    channel->push_inbound(build_icmp_echo_request(0x00010001, Bytes::from_hex("41")));
+    stack->poll();
+
+    test_assert(!find_icmp(channel->outbound_frames()).is_icmp,
+                "no reply can be sent to a peer whose MAC is unknown");
+
+    ArpView request = find_arp(channel->outbound_frames());
+    test_assert(request.is_arp && request.op == ArpOperation::REQUEST,
+                "but the stack must ARP for it, so the next ping can be answered");
+    test_assert(request.target_ip == PEER_IP.to_string(),
+                "and ARP for the peer that pinged us");
+}
+
+TEST(ThePingAfterResolutionIsAnswered)
+{
+    // The other half: dropping the first ping is only acceptable because the
+    // resolution it kicks off makes the next one work, and ping re-sends every
+    // second. If this failed, the drop above would be a real loss of function
+    // rather than a one-packet delay.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    channel->push_inbound(build_icmp_echo_request(0x00010001, Bytes::from_hex("41")));
+    stack->poll();
+    channel->clear_outbound();
+
+    // The peer answers our ARP request by asking its own question, which is
+    // what teaches us its mapping.
+    channel->push_inbound(build_arp_request());
+    channel->push_inbound(build_icmp_echo_request(0x00010002, Bytes::from_hex("42")));
+    stack->poll();
+
+    IcmpView reply = find_icmp(channel->outbound_frames());
+    test_assert(reply.is_icmp && reply.type == IcmpType::ICMP_ECHO_REPLY,
+                "once the mapping is known the ping must be answered");
+    test_assert(reply.payload.to_hex() == "42", "with the right payload");
+}

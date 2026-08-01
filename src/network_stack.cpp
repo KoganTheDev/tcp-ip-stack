@@ -575,8 +575,13 @@ void NetworkStack::_handle_frame(const Bytes& frame)
     }
     catch (const BaseException& e)
     {
-        // malformed frame - drop it, same as a real NIC/driver would
-        LOG_WARNING("NetworkStack: dropping unparseable frame: " << e.what());
+        // Usually a malformed frame, dropped the same way a real NIC or driver
+        // would. Not always, though: anything thrown while *responding* to a
+        // frame - a send failing, say - unwinds to here too, and calling that
+        // an unparseable frame sent one real bug (an ICMP reply with no ARP
+        // entry for its next hop) looking like a peer problem for a while. The
+        // wording says what is actually known.
+        LOG_WARNING("NetworkStack: dropped a frame while handling it: " << e.what());
     }
 }
 
@@ -1414,6 +1419,42 @@ void NetworkStack::_send_udp_datagram(const IPv4Address& dest_ip, const Udp& hea
 
 void NetworkStack::_send_icmp_message(const IPv4Address& dest_ip, const Icmp& header, const Bytes& payload)
 {
+    // Resolve first, and give up if the next hop is unknown.
+    //
+    // Every other send path in this stack queues and waits for ARP. ICMP
+    // deliberately does not, and the difference is not an oversight in either
+    // direction:
+    //
+    //  - An echo reply that arrives after the round trip it was answering has
+    //    timed out is worse than no reply, and `ping` re-sends every second, so
+    //    the next request is answered as soon as ARP completes. Nothing is lost
+    //    but the first one.
+    //  - ICMP errors are advisory by definition and RFC 1122 permits dropping
+    //    them outright.
+    //  - A queue here would be fed by unsolicited packets from anyone, which is
+    //    unbounded memory growth driven by a remote party - the same shape the
+    //    ICMP error budget next door exists to prevent.
+    //
+    // What this replaces is worse than any of those: _resolve_mac() throws, and
+    // for a reply generated while handling an inbound frame the exception
+    // unwound into _handle_frame's catch and was logged as a malformed frame.
+    // So a ping from a peer this stack had not yet ARPed for was answered with
+    // silence and a misleading warning. Found by http-get on its first run,
+    // where a DNS query and dnsmasq's ping raced the same ARP exchange.
+    // Broadcast is excluded because it needs no entry: _resolve_mac() answers
+    // it with the broadcast MAC without consulting the table at all. Note
+    // _next_hop_for() already reports an on-link destination as its own next
+    // hop, so this one check covers both the neighbour and the via-gateway case.
+    IPv4Address next_hop = this->_next_hop_for(dest_ip);
+    if (!is_broadcast_address(next_hop, this->_config) && !this->_arp_table.contains(next_hop))
+    {
+        LOG_DEBUG("NetworkStack: dropping an ICMP message to " << dest_ip.to_string()
+                  << " - no ARP entry for next hop " << next_hop.to_string()
+                  << "; resolving it for next time");
+        this->_ensure_arp_resolution(next_hop);
+        return;
+    }
+
     // Icmp can't be copied (same ProtocolLayer reason as Tcp/Udp) - rebuild
     // a fresh one from header's fields instead
     Icmp message(header.get_type(), header.get_code(), 0, header.get_rest_of_header(), payload);
