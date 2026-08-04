@@ -100,7 +100,7 @@ public:
     // be absent to begin with, which is the state an address-configuration
     // protocol has to operate from before it has anything to configure.
     void configure_interface(const InterfaceConfig& config);
-    const InterfaceConfig& interface_config() const { return _config; }
+    const InterfaceConfig& interface_config() const { return _primary().config; }
 
     // Starts a DHCP client on this interface and lets it configure the stack.
     //
@@ -357,19 +357,80 @@ private:
     void _ensure_arp_resolution(const IPv4Address& ip);
     void _fail_pending_outbound_connects(const IPv4Address& ip);
 
-    std::unique_ptr<PacketChannel> _channel;
-    InterfaceConfig _config;
-    // Derived from _config by configure_interface(), plus anything added
-    // explicitly via add_route(). Consulted on every send to decide which
-    // address to resolve to a MAC.
+    // A UDP datagram whose send had to wait on ARP resolution - enough to
+    // rebuild it once the peer's MAC is known. Keyed (in Interface, below) by
+    // the next hop the send was waiting on, the same key connect() queues its
+    // pending SYNs under.
+    struct PendingDatagram
+    {
+        // The datagram's real destination, which is NOT the key this is stored
+        // under. The map is keyed by next hop, because that is whose ARP reply
+        // releases it - but the packet still has to be addressed to where it
+        // was actually going.
+        IPv4Address destination;
+        uint16_t src_port;
+        uint16_t dest_port;
+        Bytes payload;
+    };
+
+    // Everything that belongs to one link rather than to the host.
+    //
+    // The split is not arbitrary: a MAC, an address, an MTU and an ARP cache are
+    // all properties of a particular piece of wire, and answering for one link's
+    // address on another - or resolving a neighbour against the wrong cache - is
+    // how a multi-interface stack goes subtly wrong rather than obviously wrong.
+    //
+    // The pending-ARP maps live here for the same reason, and it is the one that
+    // was actually dangerous. They are keyed by bare IP; with a single shared
+    // map, a reply arriving on one interface would release traffic queued for a
+    // neighbour of the same address on another. That would compile, run, and be
+    // wrong only sometimes.
+    struct Interface
+    {
+        Interface(std::unique_ptr<PacketChannel> ch, const InterfaceConfig& cfg, int arp_ttl_ms)
+            : channel(std::move(ch)), config(cfg), arp_table(arp_ttl_ms) {}
+
+        std::unique_ptr<PacketChannel> channel;
+        InterfaceConfig config;
+        // Learned (and static) IP->MAC mappings with time-based expiry - see
+        // ArpTable. Aged from on_time_passed() and refreshed whenever we hear
+        // from a peer, so an actively-talking peer never ages out mid-conversation.
+        ArpTable arp_table;
+
+        struct ArpRequestState
+        {
+            int retries_remaining;
+            int ms_until_retry;
+        };
+        std::unordered_map<IPv4Address, ArpRequestState> arp_requests_in_flight;
+        std::unordered_map<IPv4Address, std::vector<ConnectionKey>> pending_outbound_connects;
+        std::unordered_map<IPv4Address, std::vector<PendingDatagram>> pending_outbound_datagrams;
+    };
+
+    // The interface a single-homed stack has. Every site that still says
+    // "primary" is one that has not yet been told which link it is working on -
+    // which is correct for a host, where there is only one answer, and is what
+    // the forwarding work has to replace one call site at a time.
+    Interface& _primary() { return *this->_interfaces.front(); }
+    const Interface& _primary() const { return *this->_interfaces.front(); }
+
+    // Held by pointer so an Interface's address is stable: the channel, the ARP
+    // table and the pending maps are all referred to across a poll(), and a
+    // vector reallocating on add_interface() would invalidate every one.
+    std::vector<std::unique_ptr<Interface>> _interfaces;
+
+    // One table for the whole host, with each route naming the interface to send
+    // by. Routing is a host-wide decision even when the links are not - that is
+    // precisely what makes it possible to receive on one interface and send on
+    // another.
     RouteTable _routes;
     uint16_t _next_ephemeral_port;
     uint16_t _next_ip_id; // identification stamped on a fragmented packet's fragments
 
-    // Learned (and static) IP->MAC mappings with time-based expiry - see
-    // ArpTable. Aged from on_time_passed() and refreshed whenever we hear from a
-    // peer, so an actively-talking peer never ages out mid-conversation.
-    ArpTable _arp_table;
+    // Shared across interfaces, which is safe because it is keyed by
+    // (source, destination, id, protocol) - a fragment's identity does not
+    // depend on which link carried it, and a datagram fragmented across two
+    // paths still reassembles correctly.
     IpReassembler _reassembler;
 
     // One per stack, so its secret is drawn once and shared by every
@@ -415,30 +476,4 @@ private:
     // every connection on every poll()/on_time_passed()
     std::deque<uint64_t> _pending_reap_ids;
 
-    // outbound connect() calls waiting on ARP resolution for a given IP,
-    // and the retry state of the ARP request itself
-    struct ArpRequestState
-    {
-        int retries_remaining;
-        int ms_until_retry;
-    };
-    std::unordered_map<IPv4Address, std::vector<ConnectionKey>> _pending_outbound_connects;
-    std::unordered_map<IPv4Address, ArpRequestState> _arp_requests_in_flight;
-
-    // A UDP datagram whose send had to wait on ARP resolution - enough to
-    // rebuild it once the peer's MAC is known. Keyed (in the map below) by the
-    // destination IP the send was waiting on, the same key connect() queues
-    // its pending SYNs under.
-    struct PendingDatagram
-    {
-        // The datagram's real destination, which is NOT the key this is stored
-        // under. The map is keyed by next hop, because that is whose ARP reply
-        // releases it - but the packet still has to be addressed to where it
-        // was actually going.
-        IPv4Address destination;
-        uint16_t src_port;
-        uint16_t dest_port;
-        Bytes payload;
-    };
-    std::unordered_map<IPv4Address, std::vector<PendingDatagram>> _pending_outbound_datagrams;
 };

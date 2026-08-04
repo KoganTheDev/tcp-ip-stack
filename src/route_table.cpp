@@ -15,7 +15,8 @@ namespace
     }
 }
 
-void RouteTable::add(const IPv4Address& destination, uint8_t prefix_length, const IPv4Address& next_hop)
+void RouteTable::add(const IPv4Address& destination, uint8_t prefix_length, const IPv4Address& next_hop,
+                     size_t interface_index)
 {
     if (prefix_length > 32)
     {
@@ -33,11 +34,12 @@ void RouteTable::add(const IPv4Address& destination, uint8_t prefix_length, cons
         if (existing.prefix_length == prefix_length && existing.destination == network)
         {
             existing.next_hop = next_hop; // replace rather than accumulate duplicates
+            existing.interface_index = interface_index;
             return;
         }
     }
 
-    this->_routes.push_back({network, prefix_length, next_hop});
+    this->_routes.push_back({network, prefix_length, next_hop, interface_index});
 }
 
 void RouteTable::remove(const IPv4Address& destination, uint8_t prefix_length)
@@ -59,6 +61,13 @@ void RouteTable::clear()
 }
 
 bool RouteTable::lookup(const IPv4Address& destination, IPv4Address& out_next_hop) const
+{
+    size_t ignored = 0;
+    return this->lookup(destination, out_next_hop, ignored);
+}
+
+bool RouteTable::lookup(const IPv4Address& destination, IPv4Address& out_next_hop,
+                        size_t& out_interface_index) const
 {
     uint32_t target = ipv4_to_uint32(destination);
 
@@ -87,5 +96,6 @@ bool RouteTable::lookup(const IPv4Address& destination, IPv4Address& out_next_ho
     // A zero next hop marks a directly-reachable network: the destination is a
     // neighbour, so it is its own next hop. Anything else names a router.
     out_next_hop = (best->next_hop == IPv4Address()) ? destination : best->next_hop;
+    out_interface_index = best->interface_index;
     return true;
 }

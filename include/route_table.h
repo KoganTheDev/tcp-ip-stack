@@ -18,10 +18,11 @@
 // a router that is willing to carry it onward. A route lookup is what tells the
 // two apart.
 //
-// It is worth being precise about what this is not. Having a route table does
-// not make this a router - it makes it a host that knows where its exit is.
-// Forwarding is the separate step of accepting a packet addressed to someone
-// else and passing it on, which additionally requires more than one interface.
+// A route also names the interface to send by. With one interface that is
+// always the same answer and the field looks redundant; with several it is the
+// other half of the question, and the half a host never has to ask. Deciding
+// *which link* a packet leaves by is what separates forwarding from merely
+// knowing where the exit is.
 class RouteTable
 {
 public:
@@ -33,12 +34,23 @@ public:
         // directly reachable, so resolve the destination itself - that is what
         // makes a connected network different from a gateway route.
         IPv4Address next_hop;
+        // Which interface to send by. Defaulted so every existing caller keeps
+        // meaning what it meant when there was only one.
+        size_t interface_index = 0;
     };
 
     // Adds a route, replacing any existing one for the same destination and
     // prefix. destination is masked to prefix_length on the way in, so callers
     // cannot install a route whose network address disagrees with its own mask.
-    void add(const IPv4Address& destination, uint8_t prefix_length, const IPv4Address& next_hop);
+    //
+    // The key is destination+prefix only, so two routes to one prefix by
+    // different interfaces cannot coexist - there is no equal-cost multipath
+    // here, and a second add() for the same prefix replaces rather than joins.
+    // That is a real limitation and a deliberate one: ECMP needs a hash over the
+    // flow to keep a connection's packets on one path, and that is a different
+    // project.
+    void add(const IPv4Address& destination, uint8_t prefix_length, const IPv4Address& next_hop,
+             size_t interface_index = 0);
 
     void remove(const IPv4Address& destination, uint8_t prefix_length);
     void clear();
@@ -53,6 +65,12 @@ public:
     // it is the gateway. Returns false when no route matches, which is a real
     // answer meaning unreachable, not an error.
     bool lookup(const IPv4Address& destination, IPv4Address& out_next_hop) const;
+
+    // As above, and also reports which interface to send by. The two-argument
+    // form is kept because most callers genuinely do not care - a host with one
+    // link has nothing to choose.
+    bool lookup(const IPv4Address& destination, IPv4Address& out_next_hop,
+                size_t& out_interface_index) const;
 
     const std::vector<Route>& routes() const { return _routes; }
     size_t size() const { return _routes.size(); }
