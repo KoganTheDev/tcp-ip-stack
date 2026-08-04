@@ -23,6 +23,13 @@ namespace
     constexpr int ICMP_ERROR_BURST = 10;
     constexpr int ICMP_ERROR_REFILL_PER_SECOND = 4;
 
+    // Fixed offsets into an IPv4 header, used by the forwarding path, which
+    // edits the packet in place rather than reparsing and re-emitting it.
+    constexpr size_t ETHERNET_HEADER_SIZE = 14; // no VLAN tags are parsed or emitted
+    constexpr size_t IP_HEADER_SIZE = 20;       // this stack never emits IP options
+    constexpr size_t TTL_OFFSET = 8;
+    constexpr size_t CHECKSUM_OFFSET = 10;
+
     constexpr uint8_t FLAG_ACK = 0x10;
     constexpr uint8_t FLAG_RST = 0x04;
     constexpr uint8_t FLAG_SYN = 0x02;
@@ -674,7 +681,10 @@ void NetworkStack::_handle_frame(size_t ingress, const Bytes& frame)
         {
             if (const Ip* ip = dynamic_cast<const Ip*>(&ethernet.get_next_layer()))
             {
-                this->_handle_ip(ingress, *ip);
+                // The Ethernet header is a fixed 14 bytes here - this stack neither
+                // emits nor parses VLAN tags - so what follows it is the IP
+                // packet as received, which forwarding needs verbatim.
+                this->_handle_ip(ingress, *ip, frame.slice(ETHERNET_HEADER_SIZE));
             }
         }
     }
@@ -764,7 +774,7 @@ void NetworkStack::_handle_arp(size_t ingress, const Arp& arp)
     interface.channel->write(reply.to_bytes());
 }
 
-void NetworkStack::_handle_ip(size_t ingress, const Ip& ip)
+void NetworkStack::_handle_ip(size_t ingress, const Ip& ip, const Bytes& ip_bytes)
 {
     // Ours if it names our address, or if it is a broadcast for this segment.
     // Broadcast has to be accepted separately because it is by definition not
@@ -790,7 +800,19 @@ void NetworkStack::_handle_ip(size_t ingress, const Ip& ip)
     }
     if (!addressed_to_us && !is_broadcast_address(destination, this->_interfaces.at(ingress)->config))
     {
-        return; // someone else's packet - this stack does not forward
+        // Somebody else's packet. Forwarding is the whole of what separates a
+        // router from a host, and it is exactly this branch: a host returns
+        // here, a router passes it on.
+        //
+        // Broadcast is never forwarded, whatever the setting. A broadcast is
+        // scoped to its segment by definition, and relaying one onto another
+        // network is the amplification vector directed broadcasts were
+        // eventually banned from being routed for.
+        if (this->_forwarding_enabled)
+        {
+            this->_forward_ip(ingress, ip, ip_bytes);
+        }
+        return;
     }
 
     // hearing from a peer proves it's still alive at its cached MAC - keep that
@@ -1393,6 +1415,119 @@ void NetworkStack::_fail_pending_outbound_connects(size_t interface_index, const
     interface.pending_outbound_connects.erase(pending_it);
 }
 
+void NetworkStack::_forward_ip(size_t ingress, const Ip& ip, const Bytes& ip_bytes)
+{
+    IPv4Address source(ip.get_src_address());
+    IPv4Address destination(ip.get_dest_address());
+
+    // Worth knowing about the packet that reaches here: the receive path has
+    // already parsed it all the way to L4, because Ip::from_bytes builds a Tcp,
+    // Udp or Icmp for the payload. So a transit packet whose transport header
+    // this stack's codecs reject is dropped during parsing and never reaches
+    // forwarding at all.
+    //
+    // A real router does not do that - it looks at the IP header and nothing
+    // else, which is why it can forward protocols it has never heard of. This
+    // one refuses to relay what it cannot parse, which is a deviation and is
+    // documented as one in the README rather than pretended away. Fixing it
+    // means deferring transport parsing until after the forwarding decision,
+    // which is a change to the codec rather than to this function.
+    //
+    // A corrupt header must not be forwarded - the destination it names cannot
+    // be trusted, so passing it on would be sending a packet somewhere nobody
+    // asked for. Checked here rather than relying on the caller because the
+    // caller's own check happens after this branch.
+    if (!ip.verify_checksum())
+    {
+        LOG_WARNING("NetworkStack: refusing to forward a packet from " << source.to_string()
+                    << " with a bad header checksum");
+        return;
+    }
+
+    // RFC 1812 5.3.1: decrement, and if the result is zero the packet dies here
+    // and the sender is told. TTL is a hop budget, and this is what makes a
+    // routing loop terminate instead of circulating a packet forever - and what
+    // makes traceroute work, since each expiry names the hop that discarded it.
+    uint8_t ttl = ip.get_TTL();
+    if (ttl <= 1)
+    {
+        LOG_DEBUG("NetworkStack: TTL expired forwarding a packet from " << source.to_string()
+                  << " to " << destination.to_string() << " - reporting Time Exceeded");
+        this->_send_icmp_time_exceeded(ip);
+        return;
+    }
+
+    IPv4Address next_hop;
+    size_t egress = 0;
+    if (!this->_route_for(destination, next_hop, egress))
+    {
+        LOG_DEBUG("NetworkStack: no route to " << destination.to_string()
+                  << " - reporting Destination Unreachable");
+        this->_send_icmp_net_unreachable(ip);
+        return;
+    }
+
+    // Never forward back out of the link it came in on. The sender is on that
+    // segment and can reach the next hop itself, so bouncing it back is pure
+    // waste - and with two routers on one segment it is how a packet ends up
+    // ping-ponging between them until the TTL runs out. A real router sends an
+    // ICMP Redirect here to tell the sender about the better first hop; this
+    // one just declines, which is the safe half of that behaviour.
+    if (egress == ingress)
+    {
+        LOG_DEBUG("NetworkStack: not forwarding a packet from " << source.to_string()
+                  << " back out of the interface it arrived on");
+        return;
+    }
+
+    // The packet goes back out byte-for-byte apart from the TTL and the
+    // checksum that covers it. Rebuilding it from the parsed form would be
+    // wrong, not merely wasteful: the TCP codec models only the options it
+    // understands, so a real SYN carrying SACK-permitted or timestamps would be
+    // re-emitted shorter than it arrived - silently corrupting a connection this
+    // stack is only supposed to be relaying. Everything else is preserved too,
+    // including identification and the fragment fields, since a forwarded
+    // fragment must still reassemble with its siblings at the destination.
+    if (ip_bytes.size() < IP_HEADER_SIZE)
+    {
+        return; // cannot happen after a successful parse; not worth trusting
+    }
+    Bytes forwarded = ip_bytes;
+    forwarded[TTL_OFFSET] = static_cast<byte_t>(ttl - 1);
+    forwarded[CHECKSUM_OFFSET] = 0;
+    forwarded[CHECKSUM_OFFSET + 1] = 0;
+    uint16_t checksum = internet_checksum(forwarded.slice(0, IP_HEADER_SIZE));
+    forwarded[CHECKSUM_OFFSET] = static_cast<byte_t>(checksum >> 8);
+    forwarded[CHECKSUM_OFFSET + 1] = static_cast<byte_t>(checksum & 0xff);
+
+    const Interface& out = *this->_interfaces.at(egress);
+    MacAddress dest_mac;
+    if (!out.arp_table.lookup(next_hop, dest_mac))
+    {
+        // Dropped rather than queued, deliberately. A router queueing every
+        // packet whose next hop is unresolved is holding memory on behalf of
+        // traffic that is not even its own, which is a remote party's decision
+        // to make about this host's memory. The sender will retransmit, and by
+        // then the resolution this kicks off has completed.
+        LOG_DEBUG("NetworkStack: dropping a forwarded packet to " << destination.to_string()
+                  << " - next hop " << next_hop.to_string() << " is not resolved yet");
+        this->_ensure_arp_resolution(egress, next_hop);
+        return;
+    }
+
+    // The source address is NOT rewritten. A router forwards; it does not
+    // translate. The packet keeps naming its original sender all the way to the
+    // destination, which is what lets the reply come back and what makes a
+    // traceroute show every hop rather than just the last one.
+    Ethernet out_frame(out.config.mac, dest_mac, EtherType::IPv4);
+    out_frame /= std::make_unique<Raw>(forwarded);
+    out.channel->write(out_frame.to_bytes());
+
+    LOG_DEBUG("NetworkStack: forwarded a packet from " << source.to_string()
+              << " to " << destination.to_string() << " via interface " << egress
+              << " (ttl " << static_cast<int>(ttl) << " -> " << static_cast<int>(ttl - 1) << ")");
+}
+
 bool NetworkStack::_is_broadcast_for_any_interface(const IPv4Address& ip) const
 {
     for (const auto& interface : this->_interfaces)
@@ -1714,6 +1849,47 @@ void NetworkStack::_send_icmp_message(const IPv4Address& dest_ip, const Icmp& he
     Icmp message(header.get_type(), header.get_code(), 0, header.get_rest_of_header(), payload);
     message.compute_checksum(); // no pseudo-header, no transport_checksum() - see Icmp's own class comment
     this->_send_ip_packet(dest_ip, IpProtocol::ICMP, message.to_bytes());
+}
+
+namespace
+{
+    // RFC 792: an error carries the offending IP header plus the first 8 bytes
+    // of its payload - enough for the sender to identify the flow (the ports
+    // for TCP/UDP, the identifier and sequence for an echo) without the router
+    // having to understand the protocol it is reporting on.
+    constexpr size_t ICMP_QUOTED_BYTES = 28;
+}
+
+void NetworkStack::_send_icmp_time_exceeded(const Ip& ip)
+{
+    if (!this->_may_send_icmp_error())
+    {
+        LOG_DEBUG("NetworkStack: suppressing an ICMP Time Exceeded - error budget exhausted");
+        return;
+    }
+
+    IPv4Address remote_ip(ip.get_src_address());
+    Bytes original = const_cast<Ip&>(ip).to_bytes();
+    Bytes embedded = original.slice(0, std::min<size_t>(ICMP_QUOTED_BYTES, original.size()));
+
+    Icmp header(IcmpType::ICMP_TIME_EXCEEDED, ICMP_CODE_TTL_EXCEEDED, 0, 0, Bytes());
+    this->_send_icmp_message(remote_ip, header, embedded);
+}
+
+void NetworkStack::_send_icmp_net_unreachable(const Ip& ip)
+{
+    if (!this->_may_send_icmp_error())
+    {
+        LOG_DEBUG("NetworkStack: suppressing an ICMP Net Unreachable - error budget exhausted");
+        return;
+    }
+
+    IPv4Address remote_ip(ip.get_src_address());
+    Bytes original = const_cast<Ip&>(ip).to_bytes();
+    Bytes embedded = original.slice(0, std::min<size_t>(ICMP_QUOTED_BYTES, original.size()));
+
+    Icmp header(IcmpType::ICMP_DESTINATION_UNREACHABLE, ICMP_CODE_NET_UNREACHABLE, 0, 0, Bytes());
+    this->_send_icmp_message(remote_ip, header, embedded);
 }
 
 void NetworkStack::_send_icmp_port_unreachable(const Ip& ip)

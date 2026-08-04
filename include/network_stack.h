@@ -144,6 +144,16 @@ public:
     // poll them all, since a frame arriving on one wakes only that fd.
     std::vector<int> interface_fds() const;
 
+    // Turns this stack from a host into a router: packets addressed to somebody
+    // else are passed on rather than dropped.
+    //
+    // Off by default, deliberately. Having two interfaces does not mean wanting
+    // to relay between them - on a machine that straddles two networks,
+    // forwarding without being asked for it is how a firewall becomes a bridge.
+    // Linux takes the same position with net.ipv4.ip_forward.
+    void set_forwarding(bool enabled) { _forwarding_enabled = enabled; }
+    bool forwarding() const { return _forwarding_enabled; }
+
     // Routes beyond the two derived from the interface. Use this for a route
     // to a network reachable through some router other than the default.
     //
@@ -295,7 +305,15 @@ private:
     // invites someone to start trusting it.
     void _handle_frame(size_t ingress, const Bytes& frame);
     void _handle_arp(size_t ingress, const Arp& arp);
-    void _handle_ip(size_t ingress, const Ip& ip);
+    // ip_bytes is the IP packet exactly as it arrived, header included. Only
+    // forwarding uses it, and it has to: a forwarded packet must go back out
+    // byte-for-byte apart from the TTL, and re-serializing the parsed form
+    // would not do that. The TCP codec models only the options it understands,
+    // so a real SYN carrying SACK-permitted or timestamps comes back shorter
+    // than it went in - which is the same re-serialization trap that made every
+    // inbound checksum fail before the receive path was fixed to verify over
+    // the bytes as received.
+    void _handle_ip(size_t ingress, const Ip& ip, const Bytes& ip_bytes);
     // Feeds one fragment to the reassembler and, if that completed a datagram,
     // rebuilds it and sends it on to _dispatch_transport as though it had
     // arrived whole.
@@ -346,6 +364,20 @@ private:
     // RFC 792: Destination Unreachable/Port Unreachable, for a UDP
     // datagram that arrived at a port nothing is bound to.
     void _send_icmp_port_unreachable(const Ip& ip);
+    // The two errors only a router generates, both quoting the packet that
+    // caused them so the sender can tell which of its flows died.
+    //
+    // Time Exceeded code 0 - the TTL ran out in transit. ICMP_CODE_TTL_EXCEEDED
+    // has been declared since ICMP was written here and deliberately unused,
+    // because only a forwarding node can produce it; code 1, for a reassembly
+    // timeout, is the one a host emits. This is what makes traceroute work:
+    // each probe is sent with a TTL one larger than the last, and the hop that
+    // discards it names itself by replying.
+    void _send_icmp_time_exceeded(const Ip& ip);
+    // Destination Unreachable code 0 - no route. Distinct from the port
+    // unreachable a host sends: that one means "this machine, wrong port", this
+    // one means "I have no idea how to reach that network at all".
+    void _send_icmp_net_unreachable(const Ip& ip);
     // Consumes one token from the ICMP error budget, returning false when there
     // is none. Errors are generated in response to received traffic, so without
     // a bound a peer sets the rate at which this stack emits them - and can aim
@@ -395,6 +427,17 @@ private:
     // up on interface 0, and answering it would still make this host an
     // amplifier for interface 1's segment.
     bool _is_broadcast_for_any_interface(const IPv4Address& ip) const;
+
+    // Passes a packet addressed to somebody else on towards its destination.
+    // Returns having either sent it, or reported why it could not - a router
+    // that drops silently is a router nobody can debug.
+    void _forward_ip(size_t ingress, const Ip& ip, const Bytes& ip_bytes);
+    // Whether this stack forwards at all. Off by default: a host that starts
+    // relaying other people's traffic because it happens to have two interfaces
+    // is a surprise, and on a machine bridging two networks it is a security
+    // hole rather than a feature. Linux makes the same choice with
+    // net.ipv4.ip_forward.
+    bool _forwarding_enabled = false;
     MacAddress _resolve_mac(size_t interface_index, const IPv4Address& ip) const;
 
     uint16_t _allocate_ephemeral_port();

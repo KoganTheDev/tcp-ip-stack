@@ -1856,3 +1856,280 @@ TEST(APollBudgetSpentRoundRobinDoesNotStarveAQuietInterface)
     test_assert(second->inbound_remaining() == 0,
                 "the quiet interface's frame must have been read despite the flood on the other");
 }
+
+// --- forwarding: the thing that makes this a router rather than a host ------
+
+namespace
+{
+    // A host beyond the second interface, reachable only through this stack.
+    const IPv4Address BEHIND_US("192.168.5.77");
+
+    // A packet from PEER_IP (on interface 0's network) to a destination that is
+    // somebody else's, arriving on interface 0 with our MAC at L2 - which is
+    // what a host does when it has picked this stack as its gateway.
+    // The payload is a REAL UDP datagram, not arbitrary bytes. The receive path
+    // parses transit traffic all the way to L4 before the forwarding decision is
+    // made (see _forward_ip), so a packet whose transport header does not parse
+    // is dropped rather than forwarded. A test using two loose bytes would be
+    // testing that limitation rather than the forwarding.
+    Bytes build_transit_packet(const IPv4Address& destination, uint8_t ttl,
+                               const Bytes& body = Bytes::from_hex("d0d0"),
+                               const IPv4Address& source = PEER_IP)
+    {
+        Udp udp(4444, 5555, static_cast<uint16_t>(8 + body.size()), 0, Bytes());
+        if (!body.empty())
+        {
+            udp /= std::make_unique<Raw>(body);
+        }
+        Bytes payload = udp.to_bytes();
+
+        auto ip = std::make_unique<Ip>(
+            4, 5, 0, static_cast<uint16_t>(20 + payload.size()), 0x1234,
+            0, 0, ttl, IpProtocol::UDP, 0,
+            source.get_address(), destination.get_address());
+        *ip /= std::make_unique<Raw>(payload);
+        ip->compute_checksum();
+
+        Ethernet eth(PEER_MAC, LOCAL_MAC, EtherType::IPv4);
+        eth /= std::move(ip);
+        return eth.to_bytes();
+    }
+
+    // Drives a two-interface stack that knows both its neighbours and is
+    // willing to forward.
+    std::unique_ptr<NetworkStack> make_router(FakePacketChannel*& first, FakePacketChannel*& second)
+    {
+        auto stack = make_two_interface_stack(first, second);
+        stack->set_forwarding(true);
+
+        first->push_inbound(build_arp_request());
+        second->push_inbound(build_arp_request_from_second_peer());
+        stack->poll();
+
+        // The host behind us is reached via the second interface's neighbour.
+        stack->add_route(BEHIND_US, 32, SECOND_PEER_IP, 1);
+
+        first->clear_outbound();
+        second->clear_outbound();
+        return stack;
+    }
+
+    // Fields copied out, not a pointer returned - the same shape as ArpView and
+    // IcmpView above, and for the same reason. The first version of this helper
+    // returned a `const Ip*` into a locally-parsed Ethernet, which is destroyed
+    // when the loop iteration ends: a dangling pointer that read as plausible
+    // garbage and made two assertions fail for reasons that had nothing to do
+    // with the code under test.
+    struct IpView
+    {
+        bool found = false;
+        uint8_t ttl = 0;
+        uint16_t identification = 0;
+        bool checksum_ok = false;
+        std::string source;
+        uint16_t src_port = 0, dest_port = 0;
+        Bytes body;
+    };
+
+    IpView find_ip_to(const std::vector<Bytes>& frames, const IPv4Address& destination)
+    {
+        for (const Bytes& frame : frames)
+        {
+            Ethernet eth(frame);
+            if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer()) continue;
+            const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
+            if (!ip || !(IPv4Address(ip->get_dest_address()) == destination)) continue;
+
+            IpView v;
+            v.found = true;
+            v.ttl = ip->get_TTL();
+            v.identification = ip->get_identification();
+            v.checksum_ok = ip->verify_checksum();
+            v.source = IPv4Address(ip->get_src_address()).to_string();
+            if (ip->has_next_layer())
+            {
+                if (const Udp* udp = dynamic_cast<const Udp*>(&ip->get_next_layer()))
+                {
+                    v.src_port = udp->get_src_port();
+                    v.dest_port = udp->get_dest_port();
+                    if (udp->has_next_layer())
+                    {
+                        if (const Raw* raw = dynamic_cast<const Raw*>(&udp->get_next_layer()))
+                        {
+                            v.body = raw->get_data();
+                        }
+                    }
+                }
+            }
+            return v;
+        }
+        return IpView();
+    }
+}
+
+TEST(APacketForSomebodyElseIsNotForwardedByDefault)
+{
+    // Two interfaces do not make a router. A machine that starts relaying other
+    // hosts' traffic because it happens to straddle two networks is a surprise
+    // at best and a hole in a firewall at worst - Linux takes the same position
+    // with net.ipv4.ip_forward.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_two_interface_stack(first, second);
+    stack->add_route(BEHIND_US, 32, SECOND_PEER_IP, 1);
+    second->push_inbound(build_arp_request_from_second_peer());
+    stack->poll();
+    first->clear_outbound();
+    second->clear_outbound();
+
+    test_assert(!stack->forwarding(), "forwarding must be off unless asked for");
+
+    first->push_inbound(build_transit_packet(BEHIND_US, 64));
+    stack->poll();
+
+    test_assert(!find_ip_to(second->outbound_frames(), BEHIND_US).found,
+                "a host must drop a packet addressed to somebody else");
+}
+
+TEST(ARouterForwardsTransitTrafficOutTheRightInterface)
+{
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_router(first, second);
+
+    first->push_inbound(build_transit_packet(BEHIND_US, 64));
+    stack->poll();
+
+    test_assert(find_ip_to(second->outbound_frames(), BEHIND_US).found,
+                "the packet must go out of the interface its route names");
+    test_assert(!find_ip_to(first->outbound_frames(), BEHIND_US).found,
+                "and not back out of the one it arrived on");
+}
+
+TEST(ForwardingDecrementsTheTtl)
+{
+    // A hop budget that is not spent is not a budget. This is what makes a
+    // routing loop terminate instead of circulating a packet forever.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_router(first, second);
+
+    first->push_inbound(build_transit_packet(BEHIND_US, 64));
+    stack->poll();
+
+    IpView forwarded = find_ip_to(second->outbound_frames(), BEHIND_US);
+    test_assert(forwarded.found, "the packet should have been forwarded");
+    test_assert(forwarded.ttl == 63,
+                "TTL must be decremented on the way through, got " +
+                std::to_string(forwarded.ttl));
+    test_assert(forwarded.checksum_ok,
+                "and the header checksum recomputed - the TTL it covers just changed");
+}
+
+TEST(ForwardingPreservesTheSourceAddressAndThePayload)
+{
+    // A router forwards; it does not translate. The packet keeps naming its
+    // original sender all the way to the destination, which is what lets the
+    // reply come back and what makes traceroute show every hop.
+    //
+    // The payload matters just as much: a forwarded packet goes back out
+    // byte-for-byte apart from the TTL. Rebuilding it from the parsed form
+    // would silently shorten a TCP segment carrying options this codec does not
+    // model - corrupting a connection this stack is only supposed to relay.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_router(first, second);
+
+    Bytes payload = Bytes::from_hex("00112233445566778899aabbccddeeff");
+    first->push_inbound(build_transit_packet(BEHIND_US, 64, payload));
+    stack->poll();
+
+    IpView forwarded = find_ip_to(second->outbound_frames(), BEHIND_US);
+    test_assert(forwarded.found, "the packet should have been forwarded");
+    test_assert(forwarded.source == PEER_IP.to_string(),
+                "the source must still be the original sender, not this router");
+    test_assert(forwarded.identification == 0x1234,
+                "identification must survive, or a forwarded fragment cannot reassemble");
+    test_assert(forwarded.src_port == 4444 && forwarded.dest_port == 5555,
+                "the transport header must be untouched - a router does not translate");
+    test_assert(forwarded.body.to_hex() == payload.to_hex(),
+                "and the body must survive byte for byte, not re-serialized from a parse");
+}
+
+TEST(ATtlThatRunsOutDrawsTimeExceededRatherThanSilence)
+{
+    // This is traceroute's whole mechanism: each probe carries a TTL one larger
+    // than the last, and the hop that discards it names itself by replying.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_router(first, second);
+
+    first->push_inbound(build_transit_packet(BEHIND_US, 1));
+    stack->poll();
+
+    test_assert(!find_ip_to(second->outbound_frames(), BEHIND_US).found,
+                "an expired packet must not be forwarded");
+
+    IcmpView reply = find_icmp(first->outbound_frames());
+    test_assert(reply.is_icmp, "the sender must be told, on the interface it can be reached by");
+    test_assert(reply.type == IcmpType::ICMP_TIME_EXCEEDED, "with Time Exceeded");
+    test_assert(reply.code == ICMP_CODE_TTL_EXCEEDED,
+                "code 0 - the TTL ran out in transit, which only a router reports; "
+                "code 1 is a host's reassembly timeout");
+}
+
+TEST(APacketWithNoRouteDrawsNetUnreachable)
+{
+    // Distinct from the port unreachable a host sends: that means "this
+    // machine, wrong port", this means "I have no idea how to reach that
+    // network at all".
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_router(first, second);
+
+    first->push_inbound(build_transit_packet(IPv4Address("203.0.113.9"), 64));
+    stack->poll();
+
+    IcmpView reply = find_icmp(first->outbound_frames());
+    test_assert(reply.is_icmp, "the sender must be told");
+    test_assert(reply.type == IcmpType::ICMP_DESTINATION_UNREACHABLE, "with Destination Unreachable");
+    test_assert(reply.code == ICMP_CODE_NET_UNREACHABLE, "code 0 - no route to that network");
+}
+
+TEST(APacketIsNotForwardedBackOutTheInterfaceItArrivedOn)
+{
+    // The sender is already on that segment and can reach the next hop itself,
+    // so bouncing it back is pure waste - and with two routers on one segment it
+    // is how a packet ping-pongs between them until its TTL runs out.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_router(first, second);
+
+    // Aimed at PEER_IP specifically, because make_router() has already taught
+    // interface 0 that neighbour. An unknown address would be dropped for want
+    // of an ARP entry and the test would pass however broken the guard was -
+    // which is exactly what the first version of it did.
+    first->push_inbound(build_transit_packet(PEER_IP, 64, Bytes::from_hex("d0d0"),
+                                             IPv4Address("10.0.0.77")));
+    stack->poll();
+
+    test_assert(!find_ip_to(first->outbound_frames(), PEER_IP).found,
+                "a packet must not be forwarded back out of the link it came in on");
+}
+
+TEST(ABroadcastIsNeverForwarded)
+{
+    // A broadcast is scoped to its segment by definition. Relaying one onto
+    // another network is the amplification vector directed broadcasts were
+    // eventually banned from being routed for.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_router(first, second);
+
+    const IPv4Address second_broadcast("192.168.5.255");
+    first->push_inbound(build_transit_packet(second_broadcast, 64));
+    stack->poll();
+
+    test_assert(!find_ip_to(second->outbound_frames(), second_broadcast).found,
+                "a broadcast must not cross onto another segment");
+}

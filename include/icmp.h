@@ -16,6 +16,11 @@ enum IcmpType : uint8_t
 enum IcmpCode : uint8_t
 {
     ICMP_CODE_NONE = 0,             // Echo Request/Reply always use this
+    // Destination Unreachable, code 0: no route to that network at all. Only a
+    // forwarding node can say this - a host either knows its gateway or does
+    // not send. Distinct from the port unreachable below, which means "this
+    // machine, wrong port".
+    ICMP_CODE_NET_UNREACHABLE = 0,
     ICMP_CODE_PORT_UNREACHABLE = 3, // Destination Unreachable, when the failure was a UDP port with nothing bound
     // Destination Unreachable, but the destination is fine - the packet was
     // too big for some link on the way and had DF set, so a router could not

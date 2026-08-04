@@ -58,6 +58,18 @@ public:
     bool get_ip_flag_m() const { return (_flags & IP_FLAG_MORE_FRAGMENTS) != 0; }
     uint16_t get_fragment_offset() const { return _fragment_offset; }
     uint8_t get_TTL() const { return _TTL; }
+    // The one mutable field, and it exists for exactly one caller: forwarding.
+    // A router must decrement TTL on every packet it passes on, which is what
+    // makes a routing loop terminate rather than circulate forever - and it is
+    // what makes traceroute work, since each expiry reports the hop that
+    // discarded it.
+    //
+    // The checksum covers the header, so it MUST be recomputed after this.
+    // RFC 1141 describes an incremental update that adjusts the existing
+    // checksum by the delta instead; recomputing the whole 20 bytes is a few
+    // more additions and cannot drift out of step with the header, which is
+    // the failure the incremental form invites.
+    void set_TTL(uint8_t ttl) { _TTL = ttl; }
     uint8_t get_protocol() const { return _protocol; }
     uint16_t get_header_checksum() const { return _header_checksum; }
     const Bytes& get_src_address() const { return _src_address; }
