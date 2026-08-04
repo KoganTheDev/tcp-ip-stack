@@ -1439,15 +1439,16 @@ namespace
     // whole point here, since the bug being tested is the receive path using
     // this interface's address instead of the one on the wire.
     Bytes wrap_ip_to(uint8_t protocol, const Bytes& segment, const IPv4Address& destination,
-                     const MacAddress& dest_mac)
+                     const MacAddress& dest_mac, const IPv4Address& source = PEER_IP,
+                     const MacAddress& source_mac = PEER_MAC)
     {
         auto ip = std::make_unique<Ip>(
             4, 5, 0, static_cast<uint16_t>(20 + segment.size()), 0,
-            0, 0, 64, protocol, 0, PEER_IP.get_address(), destination.get_address());
+            0, 0, 64, protocol, 0, source.get_address(), destination.get_address());
         *ip /= std::make_unique<Raw>(segment);
         ip->compute_checksum();
 
-        Ethernet eth(PEER_MAC, dest_mac, EtherType::IPv4);
+        Ethernet eth(source_mac, dest_mac, EtherType::IPv4);
         eth /= std::move(ip);
         return eth.to_bytes();
     }
@@ -1722,4 +1723,136 @@ TEST(AnArpRequestCarriesTheIdentityOfTheLinkItLeavesBy)
                 "the request must carry that interface's address as the sender");
     test_assert(request.sender_mac == SECOND_MAC.to_string(),
                 "and that interface's MAC");
+}
+
+namespace
+{
+    // An ICMP echo request aimed at a broadcast address, arriving on the second
+    // interface - the shape of a smurf attack, where the source is spoofed to
+    // the victim's address so every reply lands on them.
+    Bytes build_broadcast_echo_request(const IPv4Address& destination, const MacAddress& dest_mac,
+                                       const IPv4Address& source, const MacAddress& source_mac)
+    {
+        Icmp icmp(IcmpType::ICMP_ECHO_REQUEST, ICMP_CODE_NONE, 0, 0x00010001, Bytes::from_hex("41"));
+        icmp.compute_checksum();
+        return wrap_ip_to(IpProtocol::ICMP, icmp.to_bytes(), destination, dest_mac, source, source_mac);
+    }
+}
+
+TEST(ABroadcastPingIsRefusedOnEveryInterfaceNotJustTheFirst)
+{
+    // Adding a second interface briefly reopened the smurf hole. The L3 accept
+    // filter is correctly per-link, so a ping to 192.168.5.255 arriving on that
+    // link was accepted - and the guard then checked the address against the
+    // PRIMARY interface's network, for which 192.168.5.255 is not a broadcast
+    // at all. So it was answered.
+    //
+    // A guard has to span at least as much as the rule that admits the packet.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_two_interface_stack(first, second);
+
+    // Teach the second interface its neighbour FIRST. Without this the reply
+    // would be dropped for want of an ARP entry and the test would pass however
+    // broken the guard was - which is exactly what it did on the first attempt.
+    second->push_inbound(build_arp_request_from_second_peer());
+    stack->poll();
+    first->clear_outbound();
+    second->clear_outbound();
+
+    second->push_inbound(build_broadcast_echo_request(IPv4Address("192.168.5.255"),
+                                                      MacAddress::BROADCAST,
+                                                      SECOND_PEER_IP, SECOND_PEER_MAC));
+    stack->poll();
+
+    test_assert(!find_icmp(second->outbound_frames()).is_icmp,
+                "a ping to the second interface's directed broadcast must not be answered - "
+                "answering makes this host an amplifier for that segment");
+    test_assert(!find_icmp(first->outbound_frames()).is_icmp,
+                "and nothing should go out of the other interface either");
+}
+
+TEST(ABroadcastPingToThePrimarysNetworkIsStillRefused)
+{
+    // The case that always worked, kept so the fix cannot be "check the other
+    // interface instead of the first one".
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_two_interface_stack(first, second);
+
+    first->push_inbound(build_arp_request()); // so a reply would be deliverable
+    stack->poll();
+    first->clear_outbound();
+
+    first->push_inbound(build_broadcast_echo_request(IPv4Address("10.0.0.255"),
+                                                     MacAddress::BROADCAST,
+                                                     PEER_IP, PEER_MAC));
+    stack->poll();
+
+    test_assert(!find_icmp(first->outbound_frames()).is_icmp,
+                "a ping to the primary's directed broadcast must still be refused");
+}
+
+TEST(AUnicastPingIsStillAnswered)
+{
+    // And the guard must not have become "refuse every ping".
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    channel->push_inbound(build_arp_request());
+    channel->push_inbound(build_icmp_echo_request(0x00010001, Bytes::from_hex("41")));
+    stack->poll();
+
+    IcmpView reply = find_icmp(channel->outbound_frames());
+    test_assert(reply.is_icmp && reply.type == IcmpType::ICMP_ECHO_REPLY,
+                "an ordinary unicast ping must still get a reply");
+}
+
+TEST(ThePollBudgetIsSharedAcrossInterfacesNotMultipliedByThem)
+{
+    // The budget exists so a fast sender cannot starve the caller's timer work.
+    // A per-interface budget scales that bound with the number of links, which
+    // is the same starvation it was added to prevent - three interfaces would
+    // mean three times as long before poll() returned.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_two_interface_stack(first, second);
+
+    // Flood both interfaces well past the budget.
+    for (int i = 0; i < 200; i++)
+    {
+        first->push_inbound(build_arp_request());
+        second->push_inbound(build_arp_request_from_second_peer());
+    }
+
+    size_t before = first->inbound_remaining() + second->inbound_remaining();
+    bool drained = stack->poll();
+    size_t after = first->inbound_remaining() + second->inbound_remaining();
+    size_t consumed = before - after;
+
+    test_assert(!drained, "poll() must report that frames are still queued");
+    test_assert(consumed <= 64,
+                "one poll() must not exceed the shared frame budget - consumed " +
+                std::to_string(consumed));
+}
+
+TEST(APollBudgetSpentRoundRobinDoesNotStarveAQuietInterface)
+{
+    // The other half, and the reason the budget is spent round-robin rather
+    // than interface-by-interface: a saturated link must not consume the whole
+    // budget and leave a quiet one unread until it happens to go idle.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_two_interface_stack(first, second);
+
+    for (int i = 0; i < 500; i++)
+    {
+        first->push_inbound(build_arp_request()); // the busy link
+    }
+    second->push_inbound(build_arp_request_from_second_peer()); // one lonely frame
+
+    stack->poll();
+
+    test_assert(second->inbound_remaining() == 0,
+                "the quiet interface's frame must have been read despite the flood on the other");
 }

@@ -456,36 +456,51 @@ bool NetworkStack::poll()
 {
     bool fully_drained = true;
 
-    // The budget is per interface rather than shared, so a busy link cannot
-    // starve a quiet one. Shared, one interface saturating the budget would
-    // mean the others were never read at all - which on a router is the
-    // difference between congestion on one link and a blackout on the rest.
-    for (size_t ingress = 0; ingress < this->_interfaces.size(); ingress++)
+    // ONE budget for the whole call, spent round-robin across the interfaces.
+    //
+    // The budget exists to stop a fast sender starving the caller's timer work,
+    // and a per-interface budget would quietly scale that bound with the number
+    // of links - three interfaces would mean three times as long before poll()
+    // returned, which is the same starvation the bound was added to prevent.
+    // Round-robin is what keeps a busy link from eating the whole shared budget
+    // and blacking out the quiet ones, so both properties hold at once.
+    std::vector<bool> drained(this->_interfaces.size(), false);
+    size_t still_draining = this->_interfaces.size();
+
+    for (int processed = 0; processed < POLL_FRAME_BUDGET && still_draining > 0; )
     {
-        Interface& interface = *this->_interfaces[ingress];
-        for (int processed = 0; ; processed++)
+        for (size_t ingress = 0; ingress < this->_interfaces.size(); ingress++)
         {
+            if (drained[ingress])
+            {
+                continue;
+            }
             if (processed >= POLL_FRAME_BUDGET)
             {
-                // Frames may still be queued. Say so rather than looping, so the
-                // caller can service its timer and completion work before coming
-                // back - and it must come back, since an edge-triggered fd will
-                // not notify again for what is already waiting.
-                fully_drained = false;
                 break;
             }
 
+            Interface& interface = *this->_interfaces[ingress];
             // Sized from the interface rather than a fixed 2048: enough for the
-            // largest frame this MTU can produce, plus an Ethernet header and room
-            // for a VLAN tag that is not parsed but can still arrive.
+            // largest frame this MTU can produce, plus an Ethernet header and
+            // room for a VLAN tag that is not parsed but can still arrive.
             Bytes frame = interface.channel->read(static_cast<unsigned int>(interface.config.mtu) + 18);
             if (frame.empty())
             {
-                break; // no more frames available on this interface right now
+                drained[ingress] = true;
+                still_draining--;
+                continue;
             }
             this->_handle_frame(ingress, frame);
+            processed++;
         }
     }
+
+    // Frames may still be queued on some interface. Say so rather than looping,
+    // so the caller can service its timer and completion work before coming
+    // back - and it must come back, since an edge-triggered fd will not notify
+    // again for what is already waiting.
+    fully_drained = (still_draining == 0);
 
     this->_reap_closed_connections();
     return fully_drained;
@@ -1045,8 +1060,15 @@ void NetworkStack::_handle_icmp(const Ip& ip, const Icmp& icmp)
         // amplifier pointed at it - the smurf attack. This only became
         // reachable when broadcast started being accepted at all, and a
         // broadcast ping is not a diagnostic anyone needs.
+        //
+        // Checked against EVERY interface, not the primary one. Adding a second
+        // interface briefly reopened this: a ping to 192.168.5.255 arriving on
+        // that link passed the L3 filter (which is correctly per-link) and then
+        // failed the guard, because 192.168.5.255 is not a broadcast address for
+        // the primary's 10.0.0.0/24. The guard has to span at least as much as
+        // the accept rule does, or it is not a guard.
         IPv4Address destination(ip.get_dest_address());
-        if (is_broadcast_address(destination, this->_primary().config))
+        if (this->_is_broadcast_for_any_interface(destination))
         {
             LOG_WARNING("NetworkStack: ignoring an ICMP echo request sent to the broadcast address "
                         << destination.to_string() << " from " << src_ip.to_string()
@@ -1237,7 +1259,7 @@ IPv4Address NetworkStack::_next_hop_for(const IPv4Address& destination) const
     // Broadcast is never routed and never resolved - it goes to every host on
     // the segment by definition, so it is its own next hop and the caller sends
     // it to the broadcast MAC without asking ARP anything.
-    if (is_broadcast_address(destination, this->_primary().config))
+    if (this->_is_broadcast_for_any_interface(destination))
     {
         return destination;
     }
@@ -1259,8 +1281,9 @@ bool NetworkStack::_route_for(const IPv4Address& destination, IPv4Address& out_n
                               size_t& out_interface_index) const
 {
     // Broadcast never routes - it is its own next hop on the link it is sent
-    // from, which for a host is the only link there is.
-    if (is_broadcast_address(destination, this->_primary().config))
+    // from. Recognised across every interface, so a directed broadcast for a
+    // non-primary link is not mistaken for a unicast address that needs ARP.
+    if (this->_is_broadcast_for_any_interface(destination))
     {
         out_next_hop = destination;
         out_interface_index = 0;
@@ -1368,6 +1391,18 @@ void NetworkStack::_fail_pending_outbound_connects(size_t interface_index, const
     }
 
     interface.pending_outbound_connects.erase(pending_it);
+}
+
+bool NetworkStack::_is_broadcast_for_any_interface(const IPv4Address& ip) const
+{
+    for (const auto& interface : this->_interfaces)
+    {
+        if (is_broadcast_address(ip, interface->config))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 IPv4Address NetworkStack::_source_address_for(const IPv4Address& dest_ip) const
@@ -1552,7 +1587,7 @@ void NetworkStack::_send_or_queue_udp(const IPv4Address& dest_ip, const Udp& hea
     // no neighbour to ask. Sending it straight out is what lets a stack with no
     // address of its own talk at all, which address-configuration protocols
     // depend on.
-    if (is_broadcast_address(dest_ip, this->_primary().config))
+    if (this->_is_broadcast_for_any_interface(dest_ip))
     {
         this->_send_udp_datagram(dest_ip, header, payload);
         return;

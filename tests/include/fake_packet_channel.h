@@ -34,6 +34,10 @@ public:
 
     // Test helpers.
     void push_inbound(const Bytes& frame) { this->_inbound.push_back(frame); }
+    // How many pushed frames have not been read yet. Lets a test observe how
+    // much one poll() actually consumed, which is the only way to check a
+    // frame budget from outside.
+    size_t inbound_remaining() const { return this->_inbound.size(); }
     const std::vector<Bytes>& outbound_frames() const { return this->_outbound; }
     void clear_outbound() { this->_outbound.clear(); }
 

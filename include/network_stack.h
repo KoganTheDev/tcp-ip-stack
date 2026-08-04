@@ -385,6 +385,16 @@ private:
     // header and the transport pseudo-header checksums, so that the two cannot
     // be computed from different answers - see its definition.
     IPv4Address _source_address_for(const IPv4Address& destination) const;
+    // True if this address is the limited broadcast, or the directed broadcast
+    // of ANY of this stack's links.
+    //
+    // Per-interface would be more precise and is the wrong trade here. The
+    // question these callers are really asking is "would treating this as a
+    // unicast destination be a mistake", and the safe answer spans every link:
+    // a directed broadcast for interface 1 is still a broadcast when it turns
+    // up on interface 0, and answering it would still make this host an
+    // amplifier for interface 1's segment.
+    bool _is_broadcast_for_any_interface(const IPv4Address& ip) const;
     MacAddress _resolve_mac(size_t interface_index, const IPv4Address& ip) const;
 
     uint16_t _allocate_ephemeral_port();
