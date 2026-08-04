@@ -128,9 +128,29 @@ public:
     void set_dns_servers(const std::vector<IPv4Address>& servers);
     DnsResolver* dns_resolver() const { return _dns_resolver.get(); }
 
+    // Adds a second (or third) link, and returns its index for use with
+    // add_route(). The first is supplied to the constructor; this is what turns
+    // a host into something that can forward between links.
+    //
+    // The new interface gets its own ARP table and its own pending-resolution
+    // state, and its connected route is added automatically, the same way the
+    // constructor's is.
+    size_t add_interface(std::unique_ptr<PacketChannel> channel, const InterfaceConfig& config);
+
+    size_t interface_count() const { return _interfaces.size(); }
+    const InterfaceConfig& interface_config(size_t index) const { return _interfaces.at(index)->config; }
+    // One fd per interface. get_fd() is the single-interface convenience and
+    // still means "the first one"; an application driving several links has to
+    // poll them all, since a frame arriving on one wakes only that fd.
+    std::vector<int> interface_fds() const;
+
     // Routes beyond the two derived from the interface. Use this for a route
     // to a network reachable through some router other than the default.
-    void add_route(const IPv4Address& destination, uint8_t prefix_length, const IPv4Address& next_hop);
+    //
+    // interface_index names the link to send by, which only matters once there
+    // is more than one.
+    void add_route(const IPv4Address& destination, uint8_t prefix_length, const IPv4Address& next_hop,
+                   size_t interface_index = 0);
     const RouteTable& routes() const { return _routes; }
 
     int get_fd() const;
@@ -264,9 +284,18 @@ private:
         size_t operator()(const ConnectionKey& key) const;
     };
 
-    void _handle_frame(const Bytes& frame);
-    void _handle_arp(const Arp& arp);
-    void _handle_ip(const Ip& ip);
+    // The handlers down to _handle_ip carry the interface the frame arrived on,
+    // and it is not decoration: an ARP request must be answered with the
+    // identity of the link it came in on, a neighbour must be learned into that
+    // link's cache, and the L2 and L3 address filters are both per-link.
+    //
+    // It stops there deliberately. Transport demux is by 4-tuple and a reply's
+    // egress comes from a route lookup, so nothing below _handle_ip has any use
+    // for the arrival interface - and a parameter passed only to be ignored
+    // invites someone to start trusting it.
+    void _handle_frame(size_t ingress, const Bytes& frame);
+    void _handle_arp(size_t ingress, const Arp& arp);
+    void _handle_ip(size_t ingress, const Ip& ip);
     // Feeds one fragment to the reassembler and, if that completed a datagram,
     // rebuilds it and sends it on to _dispatch_transport as though it had
     // arrived whole.
@@ -347,15 +376,24 @@ private:
     // anything else - the distinction between the address in the IP header and
     // the address the frame is sent to.
     IPv4Address _next_hop_for(const IPv4Address& destination) const;
-    MacAddress _resolve_mac(const IPv4Address& ip) const;
+    // Route lookup that also answers "by which link". Returns false when there
+    // is no route at all - which with several interfaces is the only honest
+    // answer, since there is no interface to guess.
+    bool _route_for(const IPv4Address& destination, IPv4Address& out_next_hop,
+                    size_t& out_interface_index) const;
+    // The address a packet to this destination will carry. Used by both the IP
+    // header and the transport pseudo-header checksums, so that the two cannot
+    // be computed from different answers - see its definition.
+    IPv4Address _source_address_for(const IPv4Address& destination) const;
+    MacAddress _resolve_mac(size_t interface_index, const IPv4Address& ip) const;
 
     uint16_t _allocate_ephemeral_port();
-    void _send_arp_request(const IPv4Address& target_ip);
+    void _send_arp_request(size_t interface_index, const IPv4Address& target_ip);
     // Sends an ARP request for ip and registers its retry state, unless one is
     // already in flight for that ip - shared by connect() and UDP sends to a
     // peer whose MAC isn't cached yet.
-    void _ensure_arp_resolution(const IPv4Address& ip);
-    void _fail_pending_outbound_connects(const IPv4Address& ip);
+    void _ensure_arp_resolution(size_t interface_index, const IPv4Address& ip);
+    void _fail_pending_outbound_connects(size_t interface_index, const IPv4Address& ip);
 
     // A UDP datagram whose send had to wait on ARP resolution - enough to
     // rebuild it once the peer's MAC is known. Keyed (in Interface, below) by

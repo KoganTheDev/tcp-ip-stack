@@ -1556,3 +1556,170 @@ TEST(UnbindUdpReleasesThePortAndTheSocketWithIt)
     UdpSocket* second = stack->bind_udp(4444);
     test_assert(second != nullptr, "the port must be bindable again after release");
 }
+
+// --- multiple interfaces ----------------------------------------------------
+
+namespace
+{
+    // A stack with two links: 10.0.0.2/24 on if0 and 192.168.5.1/24 on if1.
+    // Deliberately different networks, because the whole question a second
+    // interface introduces is which one a packet leaves by.
+    const MacAddress SECOND_MAC("aa:bb:cc:00:00:02");
+    const IPv4Address SECOND_IP("192.168.5.1");
+    const IPv4Address SECOND_PEER_IP("192.168.5.9");
+    const MacAddress SECOND_PEER_MAC("11:22:33:00:00:09");
+
+    std::unique_ptr<NetworkStack> make_two_interface_stack(FakePacketChannel*& out_first,
+                                                           FakePacketChannel*& out_second)
+    {
+        auto first = std::make_unique<FakePacketChannel>();
+        out_first = first.get();
+
+        InterfaceConfig config;
+        config.mac = LOCAL_MAC;
+        config.ip = LOCAL_IP;
+        config.prefix_length = 24;
+        auto stack = std::make_unique<NetworkStack>(std::move(first), config);
+
+        auto second = std::make_unique<FakePacketChannel>();
+        out_second = second.get();
+
+        InterfaceConfig second_config;
+        second_config.mac = SECOND_MAC;
+        second_config.ip = SECOND_IP;
+        second_config.prefix_length = 24;
+        stack->add_interface(std::move(second), second_config);
+
+        return stack;
+    }
+
+    // An ARP request from a peer on the second link, which is what teaches the
+    // stack that peer's MAC on that interface.
+    Bytes build_arp_request_from_second_peer()
+    {
+        Ethernet eth(SECOND_PEER_MAC, MacAddress::BROADCAST, EtherType::ARP);
+        eth /= std::make_unique<Arp>(SECOND_PEER_MAC, SECOND_PEER_IP, SECOND_IP);
+        return eth.to_bytes();
+    }
+}
+
+TEST(APacketLeavesByTheInterfaceItsRouteNames)
+{
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_two_interface_stack(first, second);
+
+    // Teach the second interface its neighbour, then send to it.
+    second->push_inbound(build_arp_request_from_second_peer());
+    stack->poll();
+    first->clear_outbound();
+    second->clear_outbound();
+
+    UdpSocket* socket = stack->bind_udp(7000);
+    socket->send_to(SECOND_PEER_IP, 7001, Bytes::from_hex("aabb"));
+
+    test_assert(contains_udp(second->outbound_frames()),
+                "a datagram for 192.168.5.9 must go out of the interface that network is on");
+    test_assert(!contains_udp(first->outbound_frames()),
+                "and must not go out of the other one");
+}
+
+TEST(TheSourceAddressIsTheEgressInterfacesOwn)
+{
+    // The subtle one, and the reason this test was written before the code.
+    //
+    // The source address feeds the IP header AND both transport pseudo-header
+    // checksums. If the header carries the egress interface's address while the
+    // checksum was computed over the primary's - or the other way round - the
+    // packet looks perfectly correct in a local capture and is discarded by
+    // every peer that verifies it.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_two_interface_stack(first, second);
+
+    second->push_inbound(build_arp_request_from_second_peer());
+    stack->poll();
+    second->clear_outbound();
+
+    UdpSocket* socket = stack->bind_udp(7000);
+    socket->send_to(SECOND_PEER_IP, 7001, Bytes::from_hex("aabb"));
+
+    bool checked = false;
+    for (const Bytes& frame : second->outbound_frames())
+    {
+        Ethernet eth(frame);
+        if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer()) continue;
+        const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
+        if (!ip || ip->get_protocol() != IpProtocol::UDP) continue;
+
+        test_assert(eth.get_src() == SECOND_MAC,
+                    "the frame must carry the egress interface's MAC, not the primary's");
+        test_assert(IPv4Address(ip->get_src_address()) == SECOND_IP,
+                    "the IP header must carry the egress interface's address, not the primary's");
+
+        // And the checksum must have been computed over that same address.
+        // This is the assertion that catches the two falling out of step, and
+        // it verifies exactly the way _handle_udp does on the receiving side:
+        // a correct checksum makes the sum over the pseudo-header come to zero.
+        const Udp* udp = dynamic_cast<const Udp*>(&ip->get_next_layer());
+        test_assert(udp != nullptr, "the datagram should parse as UDP");
+        Bytes segment = const_cast<Udp*>(udp)->to_bytes();
+        test_assert(transport_checksum(SECOND_IP, SECOND_PEER_IP, IpProtocol::UDP, segment) == 0,
+                    "the UDP checksum must verify against the egress source address - "
+                    "if it does not, the packet is discarded by every peer while looking "
+                    "correct in a local capture");
+        checked = true;
+    }
+    test_assert(checked, "a UDP datagram should have gone out of the second interface");
+}
+
+TEST(EachInterfaceResolvesAgainstItsOwnArpTable)
+{
+    // The hazard that was silently wrong rather than uncompilable: the
+    // pending-ARP maps are keyed by bare IP, so one shared set of them would let
+    // a reply arriving on one link release traffic queued for a same-addressed
+    // neighbour on another.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_two_interface_stack(first, second);
+
+    // Only the second interface hears from its peer.
+    second->push_inbound(build_arp_request_from_second_peer());
+    stack->poll();
+    first->clear_outbound();
+    second->clear_outbound();
+
+    // A send to an address on the FIRST interface's network must still have to
+    // resolve - the second interface's cache says nothing about it.
+    UdpSocket* socket = stack->bind_udp(7000);
+    socket->send_to(PEER_IP, 7001, Bytes::from_hex("aabb"));
+
+    ArpView request = find_arp(first->outbound_frames());
+    test_assert(request.is_arp && request.op == ArpOperation::REQUEST,
+                "the first interface must ARP for its own neighbour");
+    test_assert(request.target_ip == PEER_IP.to_string(), "for the right address");
+    test_assert(!find_arp(second->outbound_frames()).is_arp,
+                "and the second interface must not be asked about it");
+}
+
+TEST(AnArpRequestCarriesTheIdentityOfTheLinkItLeavesBy)
+{
+    // A request carrying the wrong sender address gets its reply sent to a
+    // network the asker is not on. Every field here is per-interface.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_two_interface_stack(first, second);
+    first->clear_outbound();
+    second->clear_outbound();
+
+    UdpSocket* socket = stack->bind_udp(7000);
+    socket->send_to(SECOND_PEER_IP, 7001, Bytes::from_hex("aabb"));
+
+    ArpView request = find_arp(second->outbound_frames());
+    test_assert(request.is_arp && request.op == ArpOperation::REQUEST,
+                "the second interface should ARP for its neighbour");
+    test_assert(request.sender_ip == SECOND_IP.to_string(),
+                "the request must carry that interface's address as the sender");
+    test_assert(request.sender_mac == SECOND_MAC.to_string(),
+                "and that interface's MAC");
+}
