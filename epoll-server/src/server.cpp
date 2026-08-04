@@ -27,9 +27,30 @@ Server::Server(uint16_t port, size_t worker_count, OpenedChannel opened)
       _epoll(), _completion_queue(), _thread_pool(worker_count), _timer_fd(-1), _last_timer_advance_ms(0)
 {
     this->_network_stack.listen(port);
-    this->_epoll.add(this->_network_stack.get_fd(), EPOLLIN | EPOLLET);
+    // One fd per interface. A frame arriving on one link wakes only that link's
+    // fd, so registering just the first would leave every other interface
+    // unread - and the stack drains all of them on any poll(), so the loop does
+    // not need to know which one woke it.
+    for (int fd : this->_network_stack.interface_fds())
+    {
+        this->_epoll.add(fd, EPOLLIN | EPOLLET);
+        this->_stack_fds.insert(fd);
+    }
     this->_epoll.add(this->_completion_queue.get_fd(), EPOLLIN | EPOLLET);
     this->_create_retransmit_timer();
+}
+
+size_t Server::add_interface(const ChannelOptions& channel_options)
+{
+    OpenedChannel opened = open_channel(channel_options);
+    size_t index = this->_network_stack.add_interface(std::move(opened.channel), opened.config);
+
+    // Register the new fd with the reactor, or frames arriving on it would only
+    // ever be picked up by chance when some other fd happened to wake the loop.
+    int fd = this->_network_stack.interface_fds().at(index);
+    this->_epoll.add(fd, EPOLLIN | EPOLLET);
+    this->_stack_fds.insert(fd);
+    return index;
 }
 
 Server::~Server()
@@ -115,7 +136,7 @@ void Server::run(const volatile std::sig_atomic_t& stop_flag)
         bool polled_this_round = false;
         for (const epoll_event& event : events)
         {
-            if (event.data.fd == this->_network_stack.get_fd())
+            if (this->_stack_fds.count(event.data.fd) != 0)
             {
                 stack_has_more_frames = !this->_network_stack.poll();
                 polled_this_round = true;

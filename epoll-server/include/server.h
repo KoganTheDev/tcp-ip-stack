@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <set>
 #include <csignal>
 #include <unordered_map>
 #include <unordered_set>
@@ -40,6 +41,15 @@ public:
     // channel_options selects the transport: a TAP device (the default, and
     // what this has always used) or an AF_PACKET socket on a real NIC.
     Server(uint16_t port, size_t worker_count, const ChannelOptions& channel_options);
+
+    // Adds a second link and turns forwarding on, so the same process is both a
+    // TCP server on its own address and a router between two segments. Both at
+    // once is the point: a router is not a special kind of program, it is a
+    // stack with more than one interface and permission to relay.
+    //
+    // Must be called before run(). Returns the new interface's index.
+    size_t add_interface(const ChannelOptions& channel_options);
+    void set_forwarding(bool enabled) { _network_stack.set_forwarding(enabled); }
 
     // Stops the workers and applies whatever they already computed, before any
     // member of this object starts being destroyed. See the definition.
@@ -89,6 +99,10 @@ private:
     // code rather than a property of the declaration order below.
     CompletionQueue _completion_queue;
     ThreadPool _thread_pool;
+    // Every interface's fd, so the reactor can tell "the stack woke me" from
+    // "the timer or a completion woke me" without asking which link it was -
+    // poll() drains them all regardless.
+    std::set<int> _stack_fds;
     int _timer_fd;
     // When the stack's timers were last advanced, so the next advance can
     // report the time that actually passed rather than the time intended to.

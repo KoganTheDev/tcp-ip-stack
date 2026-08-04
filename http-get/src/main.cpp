@@ -354,17 +354,32 @@ int main(int argc, char** argv)
                 return 1;
             }
 
-            pollfd fds = {stack.get_fd(), POLLIN, 0};
+            // One entry per interface. This client only ever opens one, but
+            // asking the stack rather than assuming keeps it correct if it is
+            // ever pointed at a multi-homed configuration - and a frame arriving
+            // on one link wakes only that link's fd.
+            std::vector<pollfd> fds;
+            for (int fd : stack.interface_fds())
+            {
+                fds.push_back(pollfd{fd, POLLIN, 0});
+            }
+
             // A short wait rather than a blocking one: the stack's timers are
             // driven by this loop, so it has to come back regularly even when
             // nothing arrives. 50 ms is well under every timeout the stack has.
-            int ready = ::poll(&fds, 1, 50);
+            int ready = ::poll(fds.data(), static_cast<nfds_t>(fds.size()), 50);
             if (ready < 0 && errno != EINTR)
             {
                 throw EXCEPTION(SystemException, "poll failed");
             }
 
-            if (ready > 0 && (fds.revents & POLLIN))
+            bool readable = false;
+            for (const pollfd& entry : fds)
+            {
+                readable = readable || (entry.revents & POLLIN) != 0;
+            }
+
+            if (ready > 0 && readable)
             {
                 // poll() returning false means it hit its frame budget with
                 // more already queued. The fd is edge-triggered, so there is no

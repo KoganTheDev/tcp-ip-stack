@@ -151,8 +151,26 @@ is what takes the attacker from 16 bits of guessing to ~32. That is the gap Kami
 2008 work made unignorable. The two streams keep *independent* state, because sharing it
 would collapse the two guesses back into one.
 
+**Forwarding - a network element, not just a host.** With more than one interface and
+`--second-device`, the stack relays packets between segments: TTL decrement, header
+checksum recomputed, re-encapsulated out the link the route names. It shows up in a
+`traceroute` as a hop, because expiring a TTL draws ICMP Time Exceeded **code 0** - the
+code only a forwarding node can produce, as distinct from the code 1 a host sends for a
+reassembly timeout. No route draws Net Unreachable.
+
+Off by default: two interfaces do not mean wanting to relay between them, and on a
+machine straddling two networks, forwarding nobody asked for is how a firewall quietly
+becomes a bridge. Linux takes the same position with `net.ipv4.ip_forward`.
+
+A forwarded packet goes out byte-for-byte apart from the TTL and its checksum. That is
+not an optimisation - rebuilding it from the parsed form would silently shorten a TCP
+segment carrying options this codec does not model, corrupting a connection the stack is
+only supposed to be relaying. The source address is not rewritten either: a router
+forwards, it does not translate, which is what lets the reply come back and what makes
+every hop visible to a traceroute.
+
 **Routing.** A subnet mask, a default gateway, and a route table with longest-prefix
-match. Every send decides whether the destination is on-link, and so resolves the
+match, each route naming the interface to send by. Every send decides whether the destination is on-link, and so resolves the
 destination itself, or off-link, and so resolves the gateway - the distinction between
 the address in the IP header and the address the frame is sent to.
 
@@ -188,9 +206,18 @@ These are documented decisions, not gaps that were missed:
 - **SACK recovery is not full RFC 6675.** The blocks themselves are sent and honoured
   (see above); what is missing is the pipe estimate driving transmission during recovery,
   and rescue retransmission. The scoreboard both would need does exist.
-- **No forwarding.** A packet addressed to somebody else is dropped rather than passed
-  on. Next-hop selection exists, so this stack can *reach* anything routable, but
-  forwarding additionally needs more than one interface, which it does not have.
+- **A forwarded packet is parsed to L4 before the forwarding decision is made.** The
+  receive path builds a `Tcp`/`Udp`/`Icmp` for every payload, so transit traffic this
+  stack's codecs reject is dropped during parsing rather than relayed. A real router
+  reads the IP header and nothing else, which is why it can carry protocols it has never
+  heard of. Fixing it means deferring transport parsing until after the decision - a
+  codec change, not a forwarding one.
+- **No ECMP.** A route is keyed by destination and prefix, so two routes to one prefix by
+  different interfaces cannot coexist. Equal-cost multipath needs a per-flow hash to keep
+  a connection's packets on one path, which is a different project.
+- **No ICMP Redirect.** When a packet would go back out the interface it arrived on, this
+  stack declines to forward it rather than telling the sender about the better first hop.
+  That is the safe half of the behaviour.
 - **The reorder buffer keys exact sequence numbers** rather than merging overlapping
   ranges, so a partially overlapping segment is kept or dropped whole.
 - **`TIME_WAIT` assumes a 30-second MSL**, so it runs for 60 seconds rather than RFC
@@ -262,7 +289,7 @@ and applies itself. See its own README for the full reasoning.
 
 ## Testing
 
-263 unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
+280 unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
 estimation, congestion control, flow control, keepalive, ISN generation, DHCP lease
 acquisition and renewal, DNS parsing and anti-spoofing, routing, fragment reassembly,
 ARP ageing, UDP, ICMP, the thread pool and completion queue, and the logger, plus a fuzz
@@ -280,8 +307,17 @@ it is the only test in the project with a real kernel on the other end, which is
 the class of bug the unit suite cannot reach (see "Verified against a real kernel" below).
 
 ```sh
-sudo scripts/veth_test.sh    # needs root, iproute2, ethtool, ping, nc
+sudo scripts/veth_test.sh       # one segment: the stack as a host
+sudo scripts/router_test.sh     # two segments: the stack as a router between them
+sudo scripts/http_get_test.sh   # DHCP + DNS + routing + TCP, against real servers
 ```
+
+`router_test.sh` is the one that proves forwarding. Two namespaces sit either side of the
+stack with no route to each other except through it, and the host kernel owns no address
+on either network - so every packet that crosses is one this stack forwarded itself. A
+TCP connection between the two real kernels traverses it intact, `traceroute` names the
+stack as a hop, and the same process still terminates its own connections on both links
+while relaying between them.
 
 ```sh
 make test

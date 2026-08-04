@@ -63,10 +63,12 @@
 //    gateway. That is what lets this stack reach anything beyond its own
 //    segment.
 //
-//    What does NOT exist is forwarding. A packet addressed to someone else is
-//    dropped, not passed on. Forwarding is the separate step of accepting such
-//    a packet and re-sending it, which additionally needs more than one
-//    interface - this class still owns exactly one channel.
+//  - forwarding exists too, once there is more than one interface and
+//    set_forwarding() has been called. A packet addressed to someone else has
+//    its TTL decremented and goes back out the link its route names, byte for
+//    byte otherwise. That is the whole difference between a host and a router,
+//    and it is off by default because having two interfaces is not the same as
+//    wanting to relay between them.
 //
 // Passive-open (listen()/accept()) never needs to resolve a peer's MAC
 // itself - a peer's own ARP request for our IP already teaches us its

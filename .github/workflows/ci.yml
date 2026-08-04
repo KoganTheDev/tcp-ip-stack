@@ -79,6 +79,24 @@ jobs:
       - name: Drive the stack over a veth pair against the kernel
         run: sudo scripts/veth_test.sh
 
+  # The stack as a network element rather than a host: two segments that cannot
+  # reach each other except through it, with a real Linux TCP stack at each end.
+  # The host kernel owns no address on either network, so every packet that
+  # crosses is one this stack forwarded itself - it is not enough to show
+  # traffic arriving, it has to be traffic that could not have arrived any other
+  # way.
+  router:
+    name: router forwarding
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install network tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 ethtool netcat-openbsd iputils-ping traceroute
+      - name: Forward between two segments, and show up in a traceroute
+        run: sudo scripts/router_test.sh
+
   # The whole stack at once, against server software that has never heard of it.
   # veth_test.sh above proves the stack talks to the kernel; this proves it does
   # the entire job an application actually needs - starting with no address at

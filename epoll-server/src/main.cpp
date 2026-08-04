@@ -25,6 +25,12 @@ namespace
         uint16_t port = 8080;
         size_t worker_count = 4;
         ChannelOptions channel;
+        // A second link, and permission to relay between the two. Absent unless
+        // asked for: having two interfaces is not the same as wanting to
+        // forward, and turning it on by accident is how a host becomes a bridge
+        // nobody meant to build.
+        bool router_mode = false;
+        ChannelOptions second_channel;
     };
 
     void print_usage(const char* program)
@@ -47,6 +53,17 @@ namespace
             "                          interface's real hardware address for nic\n"
             "  --port N              TCP port to listen on (default 8080)\n"
             "  --workers N           thread pool size (default 4)\n"
+            "\n"
+            "Router mode - a second interface, and permission to relay between them:\n"
+            "  --second-device NAME  interface name for the second link (implies nic)\n"
+            "  --second-ip A.B.C.D   address this stack answers for on that link\n"
+            "  --second-prefix N     its prefix length (default 24)\n"
+            "\n"
+            "  Any of those turns forwarding on. The server still terminates its own\n"
+            "  TCP connections on both links while relaying transit traffic between\n"
+            "  them - a router is not a special kind of program, it is a stack with\n"
+            "  more than one interface and permission to pass packets on.\n"
+            "\n"
             "  -h, --help            this message\n"
             "\n"
             "With --transport nic, --ip must be an address NOTHING else on the segment\n"
@@ -128,6 +145,23 @@ namespace
                 {
                     config.port = static_cast<uint16_t>(std::stoi(next_value(i, "--port")));
                 }
+                else if (flag == "--second-device")
+                {
+                    config.router_mode = true;
+                    config.second_channel.transport = Transport::RawNic;
+                    config.second_channel.device = next_value(i, "--second-device");
+                }
+                else if (flag == "--second-ip")
+                {
+                    config.router_mode = true;
+                    config.second_channel.local_ip = IPv4Address(next_value(i, "--second-ip"));
+                }
+                else if (flag == "--second-prefix")
+                {
+                    config.router_mode = true;
+                    config.second_channel.prefix_length =
+                        static_cast<uint8_t>(std::stoi(next_value(i, "--second-prefix")));
+                }
                 else if (flag == "--workers")
                 {
                     config.worker_count = static_cast<size_t>(std::stoi(next_value(i, "--workers")));
@@ -196,6 +230,17 @@ int main(int argc, char** argv)
         std::signal(SIGPIPE, SIG_IGN); // defensive - nothing here writes to a raw kernel socket
 
         Server server(config.port, config.worker_count, config.channel);
+
+        if (config.router_mode)
+        {
+            server.add_interface(config.second_channel);
+            server.set_forwarding(true);
+            LOG_INFO("epoll-server router mode: second interface "
+                     << config.second_channel.device
+                     << " ip=" << config.second_channel.local_ip.to_string()
+                     << "/" << static_cast<int>(config.second_channel.prefix_length)
+                     << " - forwarding enabled");
+        }
 
         // One line stating everything that was actually resolved, including the
         // MAC the factory picked. Worth its weight the first time something on
