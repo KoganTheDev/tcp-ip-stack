@@ -15,7 +15,7 @@
 
 # Include all directories recursively under "include"
 INCLUDES = -I./include
-TEST_INCLUDES = -I./include -I./tests/include
+TEST_INCLUDES = -I./include -I./tests/include -I./epoll-server/include
 
 HEADERS = $(wildcard ./include/*.h)
 TEST_HEADERS = $(wildcard ./tests/include/*.h)
@@ -24,13 +24,25 @@ TEST_HEADERS = $(wildcard ./tests/include/*.h)
 SRC = $(wildcard ./src/*.cpp)
 TEST_SRC = $(wildcard ./tests/src/*.cpp)
 
+# The two pieces of epoll-server that are testable without a network device.
+# They are named explicitly rather than wildcarded because the rest of that
+# program (server.cpp, main.cpp) needs a channel and an event loop, and pulling
+# main() into the test runner would not link.
+#
+# They are here at all because the tsan job was decorative for as long as the
+# whole suite was single-threaded: it built and linked, and proved nothing. This
+# is the threaded code, and it needs no TAP device or privilege - only eventfd,
+# which works anywhere Linux does.
+THREADED_SRC = ./epoll-server/src/thread_pool.cpp ./epoll-server/src/completion_queue.cpp
+
 # Object files corresponding to the source files
 OBJ = $(SRC:./src/%.cpp=./bin/%.o)
-TEST_OBJ = $(OBJ) $(TEST_SRC:./tests/src/%.cpp=./tests/bin/%.o)
+THREADED_OBJ = $(THREADED_SRC:./epoll-server/src/%.cpp=./bin/%.o)
+TEST_OBJ = $(OBJ) $(THREADED_OBJ) $(TEST_SRC:./tests/src/%.cpp=./tests/bin/%.o)
 
 # Compiler and flags
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -g
+CXXFLAGS = -std=c++17 -Wall -g -pthread
 
 # Output executable
 TEST_TARGET = run_tests
@@ -47,6 +59,10 @@ test: $(TEST_TARGET)
 bin/%.o: src/%.cpp $(HEADERS)
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+bin/%.o: epoll-server/src/%.cpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $(TEST_INCLUDES) -c $< -o $@
 
 tests/bin/%.o: tests/src/%.cpp $(HEADERS) $(TEST_HEADERS)
 	@mkdir -p tests/bin
@@ -65,7 +81,7 @@ tests/bin/%.o: tests/src/%.cpp $(HEADERS) $(TEST_HEADERS)
 # nothing.
 asan:
 	$(MAKE) clean
-	$(MAKE) $(TEST_TARGET) CXXFLAGS="-std=c++17 -Wall -g -O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all"
+	$(MAKE) $(TEST_TARGET) CXXFLAGS="-std=c++17 -Wall -g -pthread -O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all"
 	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ./$(TEST_TARGET)
 
 # TSan needs a specific virtual-memory layout and disables ASLR itself to get
@@ -84,7 +100,7 @@ asan:
 #   docker run --security-opt seccomp=unconfined ...
 tsan:
 	$(MAKE) clean
-	$(MAKE) $(TEST_TARGET) CXXFLAGS="-std=c++17 -Wall -g -O1 -fno-omit-frame-pointer -fsanitize=thread"
+	$(MAKE) $(TEST_TARGET) CXXFLAGS="-std=c++17 -Wall -g -pthread -O1 -fno-omit-frame-pointer -fsanitize=thread"
 	@if setarch $$(uname -m) -R true >/dev/null 2>&1; then \
 	    echo "tsan: ASLR can be disabled, running under setarch -R"; \
 	    TSAN_OPTIONS=halt_on_error=1 setarch $$(uname -m) -R ./$(TEST_TARGET); \

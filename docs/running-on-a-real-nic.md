@@ -51,7 +51,24 @@ thing than a real NIC: veth does no MAC filtering, so every frame on the link is
 delivered and the stack's own L2 destination filter is what has to reject the
 irrelevant ones.
 
-## Picking a safe address
+## Let DHCP pick the address
+
+The simplest and safest option is not to pick one at all. The stack has a DHCP client, so
+it can take a lease the same way any other host on the segment does - which by definition
+cannot collide with anything, because the server is the thing that hands out addresses:
+
+```sh
+sudo http-get --transport nic --device eth0 --dhcp example.com/
+```
+
+That brings the netmask, the default gateway and the DNS servers with it, so nothing below
+has to be chosen by hand.
+
+Note this is `http-get` only for now - `epoll-server` still takes its address from
+`--ip`/`--prefix`/`--gateway`, because a server wants a stable address anyway. So the
+manual route below is what you need for it, and for any segment with no DHCP server.
+
+## Picking a safe address by hand
 
 1. Find the subnet and gateway:
    ```sh

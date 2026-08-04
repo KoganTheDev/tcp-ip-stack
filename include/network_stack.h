@@ -27,15 +27,20 @@
 #include "udp_socket.h"
 #include "icmp.h"
 
-// Ties Ethernet/Arp/Ip/Tcp together over a TAP device into something an
-// application can listen()/accept()/connect() on - the same shape as a
-// kernel socket API, entirely in userspace. This class is the part that
-// actually moves bytes: ARP resolution, IP encapsulation and checksums, and
-// reading/writing the TAP fd. TcpConnection (already built) owns the
-// protocol state machine; this owns identity, delivery, and the connection
-// table.
+// Ties Ethernet/Arp/Ip/Tcp/Udp/Icmp together over a PacketChannel - a TAP
+// device or an AF_PACKET socket, indistinguishable from here - into something
+// an application can listen()/accept()/connect() on, the same shape as a kernel
+// socket API and entirely in userspace. This class is the part that actually
+// moves bytes: ARP resolution, IP encapsulation and checksums, and reading and
+// writing the channel. TcpConnection owns the TCP state machine; this owns
+// identity, delivery, and the connection table.
 //
 // Scope:
+//  - address configuration and name resolution are owned here too: start_dhcp()
+//    runs a DhcpClient whose lease is applied straight through
+//    configure_interface(), and resolve() runs a DnsResolver that takes its
+//    servers from that same lease. Both are driven by on_time_passed() along
+//    with every other timer
 //  - TCP, UDP, and a small slice of ICMP: replying to an Echo Request
 //    (ping) with an Echo Reply, and sending Destination Unreachable/Port
 //    Unreachable for a UDP datagram to a port nothing is bound to. Every
@@ -168,13 +173,28 @@ public:
     // holding the TcpConnection* itself across that gap risks it dangling.
     TcpConnection* find_connection(uint64_t id) const;
 
-    // Binds a UdpSocket to a local port and returns it, owned by
-    // NetworkStack for the rest of this object's lifetime (unlike a
-    // TcpConnection, a UDP socket never gets reaped - there's no CLOSED
-    // state, since there's no connection to close). Calling this twice for
-    // the same port returns the same socket rather than creating a second
-    // one bound to the same port.
+    // Binds a UdpSocket to a local port and returns it, owned by NetworkStack.
+    // Calling this twice for the same port returns the same socket rather than
+    // creating a second one bound to it.
     UdpSocket* bind_udp(uint16_t port);
+
+    // Releases a port bound by bind_udp(). Any datagram arriving for it
+    // afterwards is treated as arriving at an unbound port, which means an ICMP
+    // Port Unreachable - the same answer as if it had never been bound.
+    //
+    // This did not exist at first, on the reasoning that a UDP socket has no
+    // CLOSED state to be reaped from, so binding one for the process lifetime
+    // was harmless. DNS broke that assumption: the resolver takes a fresh
+    // random source port for every query (the Kaminsky defence - see
+    // DnsResolver), so "bound for the lifetime of the process" turned into one
+    // permanently-held socket per name ever looked up, each holding a live
+    // callback, on a map consulted for every inbound datagram. A long-running
+    // process leaked; the demonstrator did not, because it resolves once and
+    // exits, which is exactly why this went unnoticed.
+    //
+    // Returns false if nothing was bound there, so a double release is
+    // observable rather than silent.
+    bool unbind_udp(uint16_t port);
 
     // Sends an ICMP Echo Request - a ping. identifier and sequence are echoed
     // back untouched by the peer, which is how a reply is matched to the
@@ -221,7 +241,6 @@ public:
     // pass, small enough to bound how long the timer can be starved.
     static constexpr int POLL_FRAME_BUDGET = 64;
 
-    // Drives every open connection's retransmission timer. Call this once
     // Drives every timer in the stack - retransmission, ARP retry and expiry,
     // fragment reassembly timeout, ICMP budget refill - from the amount of
     // real time the caller reports has passed since it last called.

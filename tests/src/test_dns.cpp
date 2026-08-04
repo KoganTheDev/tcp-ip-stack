@@ -2,6 +2,7 @@
 #include "dns.h"
 #include "dns_resolver.h"
 
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <string>
@@ -580,4 +581,94 @@ TEST(ResolvingWithNoServersConfiguredFailsImmediately)
 
     test_assert(calls == 1, "the callback must fire even with nowhere to ask");
     test_assert(sent.empty(), "and nothing should go on the wire");
+}
+
+TEST(AQueryThatGivesUpStillReleasesItsPort)
+{
+    // The failure path matters as much as the success path: a name that never
+    // resolves must not leave its socket behind, or a host with a dead DNS
+    // server leaks faster than one with a working one.
+    std::vector<uint16_t> bound;
+    std::vector<uint16_t> released;
+
+    DnsResolver resolver(
+        [&bound](const IPv4Address&, uint16_t source_port, const Bytes&)
+        {
+            // Retransmissions reuse the port they already hold, which mirrors
+            // bind_udp() returning the existing socket rather than a second one.
+            if (std::find(bound.begin(), bound.end(), source_port) == bound.end())
+            {
+                bound.push_back(source_port);
+            }
+        },
+        0xBEEFCAFE);
+    resolver.set_release_port_callback([&released](uint16_t port) { released.push_back(port); });
+    resolver.set_servers({SERVER, OTHER_SERVER});
+
+    resolver.resolve("nowhere.example.com",
+                     [](const std::string&, const std::vector<IPv4Address>&) {});
+    test_assert(bound.size() == 1, "one port taken");
+    test_assert(released.empty(), "and not released while the query is still trying");
+
+    for (int i = 0; i < 6; i++)
+    {
+        resolver.on_time_passed(2100); // exhaust both servers
+    }
+
+    test_assert(!resolver.busy(), "the query should have given up");
+    test_assert(released.size() == bound.size(),
+                "every port taken must be released exactly once - " +
+                std::to_string(bound.size()) + " taken, " +
+                std::to_string(released.size()) + " released");
+    test_assert(released[0] == bound[0], "and it must be the port that was taken");
+}
+
+TEST(AResolvedQueryReleasesItsPortToo)
+{
+    ResolverHarness h;
+    std::vector<uint16_t> released;
+    h.resolver.set_release_port_callback([&released](uint16_t port) { released.push_back(port); });
+
+    h.resolver.resolve("example.com", h.recorder());
+    uint16_t port = h.last().source_port;
+    h.reply(good_response(h.last().message->get_id(), "example.com"));
+
+    test_assert(h.callbacks == 1, "the query should have been answered");
+    test_assert(released.size() == 1, "and its port released exactly once");
+    test_assert(released[0] == port, "the port it used");
+}
+
+TEST(AnAliasChaseReleasesTheFirstPortBeforeTakingASecond)
+{
+    // The CNAME path abandons its port for a fresh one mid-query. That is the
+    // other place a port stops being used, and it is easy to miss because the
+    // caller is still waiting.
+    ResolverHarness h;
+    std::vector<uint16_t> released;
+    h.resolver.set_release_port_callback([&released](uint16_t port) { released.push_back(port); });
+
+    h.resolver.resolve("www.example.com", h.recorder());
+    uint16_t first_port = h.last().source_port;
+
+    MessageBuilder b(h.last().message->get_id(), 0x8180, 1, 1);
+    b.name("www.example.com");
+    b.question_tail();
+    b.pointer(static_cast<uint16_t>(Dns::HEADER_SIZE));
+    b.wire.append_int<uint16_t>(DNS_TYPE_CNAME);
+    b.wire.append_int<uint16_t>(DNS_CLASS_IN);
+    b.wire.append_int<uint32_t>(300);
+    Bytes target;
+    {
+        MessageBuilder inner(0, 0, 0, 0);
+        inner.wire = Bytes();
+        inner.name("example.com");
+        target = inner.wire;
+    }
+    b.wire.append_int<uint16_t>(static_cast<uint16_t>(target.size()));
+    b.wire.insert(b.wire.end(), target.begin(), target.end());
+    h.reply(b.wire);
+
+    test_assert(released.size() == 1, "the abandoned port must be released as the alias is chased");
+    test_assert(released[0] == first_port, "specifically the first one");
+    test_assert(h.last().source_port != first_port, "and a fresh one taken");
 }

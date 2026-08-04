@@ -59,5 +59,15 @@ void CompletionQueue::drain_and_run()
         {
             LOG_ERROR("CompletionQueue: task threw: " << e.what());
         }
+        catch (...)
+        {
+            // These run on the REACTOR thread, so an escaping exception does
+            // not merely lose one completion - it unwinds out of the event loop
+            // and takes the whole server with it. ThreadPool has caught both
+            // forms since it was written; this file caught only std::exception,
+            // which left a narrow but real path to std::terminate on the one
+            // thread that cannot afford to die.
+            LOG_ERROR("CompletionQueue: task threw a non-standard exception");
+        }
     }
 }

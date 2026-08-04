@@ -258,6 +258,16 @@ DnsResolver& NetworkStack::_ensure_dns_resolver()
         this->_isn_generator.offset_for(this->_config.ip, DnsResolver::SERVER_PORT,
                                         this->_config.gateway, DnsResolver::SERVER_PORT)
     );
+
+    // The other half of "a fresh port per query". Without this the sockets
+    // bound above accumulate one per lookup, forever - see unbind_udp().
+    this->_dns_resolver->set_release_port_callback(
+        [this](uint16_t source_port)
+        {
+            this->unbind_udp(source_port);
+        }
+    );
+
     return *this->_dns_resolver;
 }
 
@@ -361,6 +371,11 @@ UdpSocket* NetworkStack::bind_udp(uint16_t port)
     UdpSocket* socket_ptr = socket.get();
     this->_udp_sockets[port] = std::move(socket);
     return socket_ptr;
+}
+
+bool NetworkStack::unbind_udp(uint16_t port)
+{
+    return this->_udp_sockets.erase(port) > 0;
 }
 
 void NetworkStack::_watch_for_close(TcpConnection& connection)
@@ -781,8 +796,14 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
     // to_bytes() on a real peer's SYN (which also carries SACK-permitted and
     // timestamp options) would emit a different, shorter option set and fail
     // the checksum on a segment that was actually valid.
+    // Same rule as the UDP path: the destination comes from the IP header. TCP
+    // is safe either way, because a segment only reaches here if it was
+    // addressed to this stack's own address - but relying on that means the two
+    // paths look identical and only one of them is correct, which is how the
+    // UDP one stayed wrong.
+    IPv4Address dest_ip(ip.get_dest_address());
     const Bytes& segment_bytes = tcp.get_received_bytes();
-    if (transport_checksum(src_ip, this->_config.ip, IpProtocol::TCP, segment_bytes) != 0)
+    if (transport_checksum(src_ip, dest_ip, IpProtocol::TCP, segment_bytes) != 0)
     {
         // corrupted segment - dropped silently, same as a real kernel stack;
         // no RST, since we can't trust the header enough to safely answer it
@@ -880,8 +901,21 @@ void NetworkStack::_handle_udp(const Ip& ip, const Udp& udp)
     // UDP's checksum is optional (RFC 768) - a sender that didn't compute
     // one sends exactly 0, which is what "skip verification" means here;
     // any other value is a real checksum and must self-verify like TCP's
+    // The pseudo-header destination is the one from the IP header, NOT this
+    // interface's address. They differ whenever the datagram was broadcast, and
+    // _handle_ip accepts broadcast as well as unicast - so verifying against
+    // _config.ip checks the sum against an address the sender never used.
+    //
+    // This was wrong and passed anyway, which is the interesting part: the only
+    // broadcast this stack receives in practice is DHCP to 255.255.255.255, and
+    // 0xFFFF is the additive identity in one's-complement arithmetic, so an
+    // all-ones destination and the unconfigured 0.0.0.0 produce the same sum.
+    // A directed broadcast (10.0.0.255), or a DHCP server that ignores the
+    // broadcast flag and unicasts its OFFER to the offered address, would both
+    // have been dropped as corrupt.
+    IPv4Address dest_ip(ip.get_dest_address());
     Bytes segment_bytes = const_cast<Udp&>(udp).to_bytes();
-    if (udp.get_checksum() != 0 && transport_checksum(src_ip, this->_config.ip, IpProtocol::UDP, segment_bytes) != 0)
+    if (udp.get_checksum() != 0 && transport_checksum(src_ip, dest_ip, IpProtocol::UDP, segment_bytes) != 0)
     {
         LOG_WARNING("NetworkStack: dropping a UDP datagram with a bad checksum from " << src_ip.to_string());
         return;

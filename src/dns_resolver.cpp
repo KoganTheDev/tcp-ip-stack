@@ -161,13 +161,25 @@ void DnsResolver::_send_query(Pending& query)
     }
 }
 
+void DnsResolver::_release(uint16_t source_port)
+{
+    this->_pending.erase(source_port);
+    if (this->_release_port)
+    {
+        this->_release_port(source_port);
+    }
+}
+
 void DnsResolver::_finish(Pending& query, const std::vector<IPv4Address>& addresses)
 {
     std::string name = query.name;
     std::vector<ResolvedFn> callbacks = std::move(query.callbacks);
     uint16_t port = query.source_port;
 
-    this->_pending.erase(port);
+    // Released before the callbacks run, not after: a callback is entitled to
+    // start another resolve(), and that one must be free to draw this port
+    // again rather than find it still held by the query that just ended.
+    this->_release(port);
 
     for (const ResolvedFn& callback : callbacks)
     {
@@ -311,8 +323,10 @@ void DnsResolver::on_datagram(const IPv4Address& source, uint16_t source_port,
         LOG_DEBUG("DnsResolver: " << query.name << " is an alias for " << alias);
         // A fresh transaction: new id, new port, new entropy. Reusing them
         // would hand an attacker who saw the first query the second one free.
+        // A fresh transaction means a fresh port, so the old one is finished
+        // with even though the caller is still waiting.
         Pending next = std::move(query);
-        this->_pending.erase(destination_port);
+        this->_release(destination_port);
 
         next.name = alias;
         next.transaction_id = this->_next_transaction_id();

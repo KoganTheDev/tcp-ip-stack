@@ -56,6 +56,17 @@ simultaneous close rather than folding it into `FIN_WAIT_2`. On top of that:
   determines the advertised window
 - MSS and window scale negotiation (RFC 7323), including the rule that scaling applies
   only if *both* SYNs carried the option
+- **Timestamps and PAWS** (RFC 7323): a round-trip sample from every segment rather than
+  one per window, which restores RTT measurement *during* loss recovery - exactly when
+  Karn's algorithm otherwise blinds the estimator - and rejects an old duplicate whose
+  sequence number looks plausible because the space has wrapped
+- **Selective acknowledgement** (RFC 2018), both directions. The cumulative ack can say
+  "I have everything below this" and nothing else, so one lost segment hides the eight
+  behind it that arrived perfectly; SACK names what did arrive, so only the holes are
+  resent
+- **Keepalive** (RFC 1122 4.2.3.6), off by default as the RFC requires, probing one byte
+  *behind* SND.NXT because that is the only segment that compels a reply without moving
+  the stream
 - Delayed ACK and Nagle's algorithm, deliberately guarded against their well-known
   pathological interaction
 - A zero-window persist timer, whose probe byte is intentionally kept outside the
@@ -174,9 +185,9 @@ limit by a peer.
 
 These are documented decisions, not gaps that were missed:
 
-- **SACK is reported and honoured, but recovery is not full RFC 6675.** There is no
-  pipe estimate driving transmission during recovery, and no rescue retransmission.
-  The scoreboard both would need does exist.
+- **SACK recovery is not full RFC 6675.** The blocks themselves are sent and honoured
+  (see above); what is missing is the pipe estimate driving transmission during recovery,
+  and rescue retransmission. The scoreboard both would need does exist.
 - **No forwarding.** A packet addressed to somebody else is dropped rather than passed
   on. Next-hop selection exists, so this stack can *reach* anything routable, but
   forwarding additionally needs more than one interface, which it does not have.
@@ -251,19 +262,19 @@ and applies itself. See its own README for the full reasoning.
 
 ## Testing
 
-244 unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
+263 unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
 estimation, congestion control, flow control, keepalive, ISN generation, DHCP lease
 acquisition and renewal, DNS parsing and anti-spoofing, routing, fragment reassembly,
-ARP ageing, UDP, ICMP, and the logger, plus a fuzz suite asserting no codec crashes on
-malformed input.
+ARP ageing, UDP, ICMP, the thread pool and completion queue, and the logger, plus a fuzz
+suite asserting no codec crashes on malformed input.
 
 Two seams make the untestable parts testable without any OS involvement: `PacketChannel`
 injects a fake frame transport into `NetworkStack`, and `LoopbackChannel` wires two
 complete stacks back to back through a real ARP exchange, handshake, data transfer, and
 half-close.
 
-The one component that cannot be unit tested is the `AF_PACKET` transport, since it is
-nothing but syscalls. It has an integration test instead, driving the whole stack over a
+The components that cannot be unit tested are the ones that are nothing but syscalls -
+the `AF_PACKET` and TAP transports, and the channel factory that opens them. It has an integration test instead, driving the whole stack over a
 veth pair against a peer in its own network namespace. **This runs in CI on every push** -
 it is the only test in the project with a real kernel on the other end, which is exactly
 the class of bug the unit suite cannot reach (see "Verified against a real kernel" below).
@@ -286,8 +297,11 @@ destructor on a class deleted through a base pointer and enums assigned from wir
 without a fixed underlying type, were both found this way while the entire suite was
 passing.
 
-`make tsan` currently proves less, because the unit tests are single-threaded. The
-threaded code lives in `epoll-server`, and exercising it needs a TAP device. Note also
+`make tsan` proves something now, though it did not for a long time: while every test in
+the suite was single-threaded, ThreadSanitizer could only observe sequential code and a
+clean run meant nothing. The threaded code - `epoll-server`'s thread pool and completion
+queue - is now built into the test runner and exercised under real contention, which
+needs no TAP device and no privilege, only `eventfd`. Note also
 that TSan aborts at startup ("incompatible memory layout", exit 66) wherever it cannot
 disable ASLR. `make tsan` disables it via `setarch -R` when permitted; under Docker's
 default seccomp profile the `personality()` syscall is blocked, so run it with:

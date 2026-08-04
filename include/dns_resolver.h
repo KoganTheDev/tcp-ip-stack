@@ -60,10 +60,25 @@ public:
     // exactly once per resolve() call, whatever happens.
     using ResolvedFn = std::function<void(const std::string& name,
                                           const std::vector<IPv4Address>& addresses)>;
+    // "I am finished with this source port." Whoever bound a socket for it in
+    // SendFn should tear that socket down.
+    //
+    // This exists because a fresh port per query - the Kaminsky defence that
+    // makes this resolver worth having - is also a fresh *socket* per query,
+    // and without a matching release every name ever looked up leaks one. The
+    // entropy and the cleanup are two halves of the same decision, so the
+    // interface carries both rather than leaving the second to whoever
+    // remembers.
+    using ReleasePortFn = std::function<void(uint16_t source_port)>;
 
     // random_seed feeds both the transaction ids and the source ports. See the
     // class comment for why a counter would defeat the whole exercise.
     DnsResolver(SendFn send, uint32_t random_seed);
+
+    // Optional. Without it the resolver still works and still uses a fresh port
+    // per query - it just never tells anyone when a port is finished with, which
+    // is what leaked a socket per lookup before this existed.
+    void set_release_port_callback(ReleasePortFn callback) { _release_port = std::move(callback); }
 
     // The servers to ask, in order of preference. Normally set from the DHCP
     // lease's option 6.
@@ -107,6 +122,10 @@ private:
     };
 
     void _send_query(Pending& query);
+    // Drops a query's entry and tells the owner its port is free. Every path
+    // that stops using a port goes through here, so there is exactly one place
+    // that can forget to release one.
+    void _release(uint16_t source_port);
     void _finish(Pending& query, const std::vector<IPv4Address>& addresses);
     // Advances to the next server, or gives up if they are all exhausted.
     void _retry_or_fail(Pending& query);
@@ -114,6 +133,7 @@ private:
     uint16_t _next_source_port();
 
     SendFn _send;
+    ReleasePortFn _release_port;
     // Two independent state words, not one shared one. They started as a
     // single word with two different hash keys, and that was wrong: a keyed
     // hash gives you unrelated *outputs*, but if both streams advance the same

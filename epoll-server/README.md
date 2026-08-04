@@ -58,6 +58,11 @@ TCP port 8080. `Ctrl+C`/`SIGTERM` shut it down cleanly.
                       nic: an AF_PACKET socket on a real interface
 --device PATH|NAME    TAP device path, or interface name for nic (default /dev/net/tun)
 --ip A.B.C.D          address this stack answers for (default 10.0.0.2)
+--prefix N            network prefix length, so 24 means 255.255.255.0 (default
+                        24). Decides which destinations are neighbours and which
+                        go via the gateway
+--gateway A.B.C.D     next hop for anything off the local network. Without one,
+                        only the local segment is reachable
 --mac AA:BB:...       override the MAC. Defaults to a fixed locally administered
                         address for tap, and to the interface's real hardware
                         address for nic

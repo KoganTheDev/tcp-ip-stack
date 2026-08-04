@@ -1432,3 +1432,127 @@ TEST(ThePingAfterResolutionIsAnswered)
                 "once the mapping is known the ping must be answered");
     test_assert(reply.payload.to_hex() == "42", "with the right payload");
 }
+
+namespace
+{
+    // Same as wrap_ip, but the caller chooses the IP destination - which is the
+    // whole point here, since the bug being tested is the receive path using
+    // this interface's address instead of the one on the wire.
+    Bytes wrap_ip_to(uint8_t protocol, const Bytes& segment, const IPv4Address& destination,
+                     const MacAddress& dest_mac)
+    {
+        auto ip = std::make_unique<Ip>(
+            4, 5, 0, static_cast<uint16_t>(20 + segment.size()), 0,
+            0, 0, 64, protocol, 0, PEER_IP.get_address(), destination.get_address());
+        *ip /= std::make_unique<Raw>(segment);
+        ip->compute_checksum();
+
+        Ethernet eth(PEER_MAC, dest_mac, EtherType::IPv4);
+        eth /= std::move(ip);
+        return eth.to_bytes();
+    }
+
+    // A UDP datagram carrying a REAL checksum, computed over the pseudo-header
+    // the sender would actually use. Every other UDP test in this file sends
+    // checksum 0 ("not computed"), which is why none of them could reach the
+    // bug this exercises.
+    Bytes build_checksummed_udp_to(const IPv4Address& destination, const MacAddress& dest_mac,
+                                   uint16_t src_port, uint16_t dest_port, const Bytes& payload)
+    {
+        Udp udp(src_port, dest_port, static_cast<uint16_t>(8 + payload.size()), 0, Bytes());
+        if (!payload.empty())
+        {
+            udp /= std::make_unique<Raw>(payload);
+        }
+        Bytes with_zero_checksum = udp.to_bytes();
+        uint16_t checksum = transport_checksum(PEER_IP, destination, IpProtocol::UDP, with_zero_checksum);
+
+        Udp final_udp(src_port, dest_port, static_cast<uint16_t>(8 + payload.size()), checksum, Bytes());
+        if (!payload.empty())
+        {
+            final_udp /= std::make_unique<Raw>(payload);
+        }
+        return wrap_ip_to(IpProtocol::UDP, final_udp.to_bytes(), destination, dest_mac);
+    }
+}
+
+TEST(ADirectedBroadcastWithARealChecksumIsAccepted)
+{
+    // The pseudo-header destination has to come from the IP header, not from
+    // this interface's address. They are the same for unicast and different for
+    // every broadcast, and _handle_ip accepts broadcast - so verifying against
+    // _config.ip checks the sum against an address the sender never used.
+    //
+    // It passed anyway for a long time because the only broadcast this stack
+    // actually receives is DHCP to 255.255.255.255, and 0xFFFF is the additive
+    // identity in one's-complement arithmetic - so all-ones and the
+    // unconfigured 0.0.0.0 happen to produce the same sum. 10.0.0.255 does not.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    bool received = false;
+    UdpSocket* socket = stack->bind_udp(9999);
+    socket->set_datagram_received_callback(
+        [&received](const IPv4Address&, uint16_t, const Bytes&) { received = true; });
+
+    channel->push_inbound(build_checksummed_udp_to(
+        IPv4Address("10.0.0.255"), MacAddress::BROADCAST, 5000, 9999, Bytes::from_hex("cafe")));
+    stack->poll();
+
+    test_assert(received, "a directed broadcast with a correct checksum must be delivered, "
+                          "not dropped for failing a check against the wrong destination");
+}
+
+TEST(AUnicastDatagramWithARealChecksumStillVerifies)
+{
+    // The other half: taking the destination from the header must not break the
+    // ordinary case, where it equals this interface's address.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    bool received = false;
+    UdpSocket* socket = stack->bind_udp(9999);
+    socket->set_datagram_received_callback(
+        [&received](const IPv4Address&, uint16_t, const Bytes&) { received = true; });
+
+    channel->push_inbound(build_checksummed_udp_to(
+        LOCAL_IP, LOCAL_MAC, 5000, 9999, Bytes::from_hex("cafe")));
+    stack->poll();
+
+    test_assert(received, "a correctly checksummed unicast datagram must still be delivered");
+}
+
+TEST(ACorruptedChecksumIsStillRejected)
+{
+    // And the check must still actually check something.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    bool received = false;
+    UdpSocket* socket = stack->bind_udp(9999);
+    socket->set_datagram_received_callback(
+        [&received](const IPv4Address&, uint16_t, const Bytes&) { received = true; });
+
+    Bytes frame = build_checksummed_udp_to(LOCAL_IP, LOCAL_MAC, 5000, 9999, Bytes::from_hex("cafe"));
+    frame[frame.size() - 3] = static_cast<byte_t>(frame[frame.size() - 3] ^ 0xff);
+    channel->push_inbound(frame);
+    stack->poll();
+
+    test_assert(!received, "a datagram whose payload was altered must fail the checksum");
+}
+
+TEST(UnbindUdpReleasesThePortAndTheSocketWithIt)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    UdpSocket* first = stack->bind_udp(4444);
+    test_assert(first != nullptr, "bind should return a socket");
+    test_assert(stack->bind_udp(4444) == first, "binding twice returns the same socket");
+
+    test_assert(stack->unbind_udp(4444), "unbinding a bound port reports success");
+    test_assert(!stack->unbind_udp(4444), "unbinding it twice reports that nothing was there");
+
+    UdpSocket* second = stack->bind_udp(4444);
+    test_assert(second != nullptr, "the port must be bindable again after release");
+}

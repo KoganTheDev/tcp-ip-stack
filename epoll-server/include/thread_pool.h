@@ -17,7 +17,11 @@ public:
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
 
-    void submit(std::function<void()> task);
+    // Returns false if the task was refused, which happens only after
+    // shutdown(). The bool is not decoration: without it a refusal and a
+    // silently-queued-forever task look identical from the outside, so nothing
+    // could tell the two apart - including a test.
+    bool submit(std::function<void()> task);
 
     // Stops accepting work, lets the workers drain whatever is already queued,
     // and joins them. Idempotent, and called by the destructor - so an owner

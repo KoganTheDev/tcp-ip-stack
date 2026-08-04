@@ -41,7 +41,7 @@ void ThreadPool::shutdown()
     }
 }
 
-void ThreadPool::submit(std::function<void()> task)
+bool ThreadPool::submit(std::function<void()> task)
 {
     // Push and signal under the same lock. Signalling after unlocking is a
     // valid idiom too (the task was queued under the lock), but keeping the
@@ -49,8 +49,26 @@ void ThreadPool::submit(std::function<void()> task)
     // "notify with no lock held" hazard - the per-submit cost is negligible on
     // this path.
     std::lock_guard<std::mutex> lock(this->_queue_mutex);
+
+    // After shutdown the workers are gone, so anything queued here would sit in
+    // _tasks forever and never run. Dropping it is not better than that in
+    // itself - what is better is that it SAYS so. Silently accepting work that
+    // will never happen is the failure mode where an application believes a
+    // response was sent and the peer waits for it until it times out.
+    //
+    // Checked rather than assumed: Server happens to join before anything else
+    // can submit (see ~Server), so today this is unreachable. That is a property
+    // of one caller's ordering, not of the pool, and it is exactly the kind of
+    // invariant that holds until someone adds a second caller.
+    if (this->_stopping.load())
+    {
+        LOG_WARNING("ThreadPool: task submitted after shutdown - dropping it");
+        return false;
+    }
+
     this->_tasks.push(std::move(task));
     this->_condition.notify_one();
+    return true;
 }
 
 void ThreadPool::_worker_loop()

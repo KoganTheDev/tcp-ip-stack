@@ -40,8 +40,10 @@ enum class TcpState
 // policy itself pluggable - Reno or CUBIC, see congestion_control.h), out-of-order
 // reassembly bounded by a fixed receive-buffer capacity, MSS and window-scale
 // option negotiation (RFC 7323's rule: scaling is used at all only if *both*
-// SYNs carried the option), and a real `CLOSING` state for simultaneous
-// close instead of folding it into `FIN_WAIT_2`.
+// SYNs carried the option), RFC 7323 timestamps with PAWS, RFC 2018 selective
+// acknowledgement in both directions, RFC 1122 keepalive (off by default), and a
+// real `CLOSING` state for simultaneous close instead of folding it into
+// `FIN_WAIT_2`.
 //
 // Still deliberately out of scope (documented, not accidental):
 //  - SACK reports and honours blocks, but recovery is not full RFC 6675:
