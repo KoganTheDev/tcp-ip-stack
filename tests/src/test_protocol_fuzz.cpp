@@ -8,6 +8,7 @@
 #include "icmp.h"
 #include "dhcp.h"
 #include "dns.h"
+#include "ipv6.h"
 
 #include <random>
 
@@ -132,4 +133,13 @@ TEST(DnsFromBytesNeverCrashesOnGarbage)
     // one label byte in four has both top bits set - so this is a real test of
     // the backwards-only rule and the jump cap rather than a formality.
     fuzz_from_bytes<Dns>(512);
+}
+
+TEST(Ipv6FromBytesNeverCrashesOnGarbage)
+{
+    // The extension-header chain is v6's equivalent of DNS name compression:
+    // each header names the next, so a crafted packet can present a chain that
+    // loops or runs past the buffer. Random bytes reach that walk constantly,
+    // since roughly one next-header value in eight is an extension type.
+    fuzz_from_bytes<Ipv6>(256);
 }
