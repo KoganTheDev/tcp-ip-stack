@@ -9,6 +9,7 @@
 #include "dhcp.h"
 #include "dns.h"
 #include "ipv6.h"
+#include "icmpv6.h"
 
 #include <random>
 
@@ -142,4 +143,27 @@ TEST(Ipv6FromBytesNeverCrashesOnGarbage)
     // loops or runs past the buffer. Random bytes reach that walk constantly,
     // since roughly one next-header value in eight is an extension type.
     fuzz_from_bytes<Ipv6>(256);
+}
+
+TEST(Icmpv6FromBytesNeverCrashesOnGarbage)
+{
+    // NDP rides on this, so it parses unsolicited packets from anyone on the
+    // link - and its option walk is the loop a zero-length option would spin
+    // forever in. from_bytes() alone does not walk the options, so the accessor
+    // is exercised here too.
+    std::mt19937 rng(FUZZ_SEED);
+    for (int i = 0; i < FUZZ_ITERATIONS; i++)
+    {
+        Bytes data = random_bytes(rng, 128);
+        try
+        {
+            Icmpv6 message(data);
+            message.get_options();          // the bounded walk
+            message.get_target_address();   // total accessors on a short body
+            message.get_link_layer_option(NDP_OPTION_SOURCE_LINK_LAYER);
+        }
+        catch (const BaseException&)
+        {
+        }
+    }
 }
