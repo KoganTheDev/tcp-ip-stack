@@ -169,6 +169,37 @@ only supposed to be relaying. The source address is not rewritten either: a rout
 forwards, it does not translate, which is what lets the reply come back and what makes
 every hop visible to a traceroute.
 
+**IPv6, and NDP as ARP redesigned.** `IPv6Address` with RFC 5952 canonical formatting,
+the fixed 40-byte header with a bounded extension-header walk, ICMPv6 with the v6
+pseudo-header checksum, the full RFC 4861 neighbour cache, and DAD plus SLAAC.
+
+The reason this is worth having next to the v4 code rather than instead of it is that the
+two can be read against each other. `ArpTable` is a map with a TTL: an entry is present or
+expired, and "expired" is decided by a clock that has no idea whether the mapping still
+works - so a neighbour that changed its MAC keeps being used until the timer runs out,
+while one that has not moved in an hour is discarded and re-resolved for nothing.
+
+The neighbour cache replaces the clock with a question - *is this neighbour still
+reachable?* - and answers it from evidence the stack already had. A TCP connection making
+forward progress is proof the neighbour is receiving. That is what upper-layer
+confirmation means, and it is the biggest idea in NDP: reachability is not a timer, it is
+something the layers above already know and were previously throwing away.
+
+Two states are easy to misread. **STALE** is not an error and not expiring - it is a
+mapping believed but unverified, used exactly as freely as REACHABLE, and it has no timer
+at all. What moves it on is *sending* to it. **DELAY** exists solely to avoid probing for
+something a TCP ack is about to prove.
+
+Three more things NDP got right that ARP could not. A solicitation goes to the target's
+**solicited-node multicast** group rather than to the whole segment, so every other NIC
+filters it out in hardware instead of waking its host - and because the v6 multicast to
+Ethernet mapping is arithmetic rather than a lookup, resolving a neighbour needs no prior
+resolution. Every NDP message must arrive with a **hop limit of 255**, which proves it was
+never forwarded, because a router would have decremented it. And **SLAAC** lets a host
+come up with no server at all: it computes its own link-local address from its MAC, asks
+for a router, and forms a global address from the advertised prefix - with **DAD** going
+and checking, which is the half that makes the other half safe.
+
 **Routing.** A subnet mask, a default gateway, and a route table with longest-prefix
 match, each route naming the interface to send by. Every send decides whether the destination is on-link, and so resolves the
 destination itself, or off-link, and so resolves the gateway - the distinction between
@@ -212,6 +243,15 @@ These are documented decisions, not gaps that were missed:
   reads the IP header and nothing else, which is why it can carry protocols it has never
   heard of. Fixing it means deferring transport parsing until after the decision - a
   codec change, not a forwarding one.
+- **IPv6 carries no TCP or UDP.** The addressing, the header, ICMPv6, the neighbour cache
+  and autoconfiguration are all built and tested, but `NetworkStack` is still IPv4-only on
+  the data path: `ConnectionKey`, the route table and the send path are not generalised
+  over address family. That is a deliberate stopping point rather than an oversight - the
+  design content of IPv6 is in NDP and autoconfiguration, and making TCP dual-stack is
+  mostly a mechanical widening of every call site the router work just touched.
+- **No RFC 4941 temporary addresses.** SLAAC derives the interface identifier from the MAC,
+  so a host is trackable across networks by the bottom 64 bits of its address. Privacy
+  addresses are the fix and are not implemented.
 - **No ECMP.** A route is keyed by destination and prefix, so two routes to one prefix by
   different interfaces cannot coexist. Equal-cost multipath needs a per-flow hash to keep
   a connection's packets on one path, which is a different project.
@@ -289,11 +329,12 @@ and applies itself. See its own README for the full reasoning.
 
 ## Testing
 
-280 unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
+350 unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
 estimation, congestion control, flow control, keepalive, ISN generation, DHCP lease
-acquisition and renewal, DNS parsing and anti-spoofing, routing, fragment reassembly,
-ARP ageing, UDP, ICMP, the thread pool and completion queue, and the logger, plus a fuzz
-suite asserting no codec crashes on malformed input.
+acquisition and renewal, DNS parsing and anti-spoofing, routing, forwarding, fragment
+reassembly, ARP ageing, IPv6 addressing and headers, the NDP neighbour cache, DAD and
+SLAAC, UDP, ICMP, the thread pool and completion queue, and the logger, plus a fuzz suite
+asserting no codec crashes on malformed input.
 
 Two seams make the untestable parts testable without any OS involvement: `PacketChannel`
 injects a fake frame transport into `NetworkStack`, and `LoopbackChannel` wires two

@@ -42,6 +42,22 @@ struct NdpOption
     Bytes value; // the option body, with the type and length bytes removed
 };
 
+// A Prefix Information option (RFC 4861 section 4.6.2) - the payload of SLAAC.
+struct NdpPrefixInformation
+{
+    IPv6Address prefix;
+    uint8_t prefix_length = 0;
+    // The A flag. Without it the prefix is on-link information only and must
+    // NOT be used to form an address, which is how a network says "these
+    // addresses are handed out by DHCPv6, do not invent your own".
+    bool autonomous = false;
+    // The L flag: addresses in this prefix are on-link, reachable without a
+    // router.
+    bool on_link = false;
+    uint32_t valid_lifetime = 0;
+    uint32_t preferred_lifetime = 0;
+};
+
 // ICMPv6 (RFC 4443), including the NDP messages that ride on it.
 //
 // Two things make it more than "ICMP with bigger addresses".
@@ -98,12 +114,31 @@ public:
     bool get_solicited_flag() const;
     bool get_override_flag() const;
 
-    std::vector<NdpOption> get_options() const;
+    // Options start at different offsets in different messages, which is
+    // exactly the sort of detail one shared walker gets wrong: a neighbour
+    // message has 4 reserved bytes and a 16-byte target before its options, a
+    // router advertisement has 12 bytes of its own fields. Passing the offset
+    // in makes the difference impossible to forget.
+    std::vector<NdpOption> get_options(size_t options_offset = NEIGHBOUR_OPTIONS_OFFSET) const;
     // The link-layer address from a source or target link-layer option, or an
     // empty MAC if the message carried none. A solicitation normally carries
     // the source option - which is what lets the answer be unicast instead of
     // requiring a second resolution in the other direction.
     MacAddress get_link_layer_option(uint8_t option_type) const;
+
+    // --- router advertisement ----------------------------------------------
+    //
+    // Its own fields sit where a neighbour message keeps its target, so these
+    // deliberately do not share accessors with the ones above.
+    uint8_t get_ra_hop_limit() const;
+    // Nonzero means this router is willing to be a default gateway; zero means
+    // it is answering for its prefixes only and must not be installed as one.
+    uint16_t get_router_lifetime() const;
+    // The M flag: addresses come from DHCPv6, not from SLAAC.
+    bool get_managed_flag() const;
+    std::vector<NdpPrefixInformation> get_prefix_information() const;
+
+    static Bytes build_router_solicitation(const MacAddress& source_mac);
 
     // Builds a Neighbour Solicitation for `target`, optionally advertising the
     // sender's own link-layer address.
@@ -116,6 +151,12 @@ public:
                                                bool router, bool solicited, bool override_cache);
 
     static constexpr size_t HEADER_SIZE = 4; // type, code, checksum
+    // Where options begin in a neighbour solicitation or advertisement: 4 bytes
+    // of flags or reserved, then the 16-byte target.
+    static constexpr size_t NEIGHBOUR_OPTIONS_OFFSET = 20;
+    // And in a router advertisement: hop limit, flags, router lifetime,
+    // reachable time, retransmit timer.
+    static constexpr size_t ROUTER_ADVERTISEMENT_OPTIONS_OFFSET = 12;
     // RFC 4861 section 3.1: every NDP message must arrive with this hop limit,
     // and it is what makes an off-link forgery impossible - a router would have
     // decremented it.

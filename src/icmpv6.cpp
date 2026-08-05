@@ -10,7 +10,6 @@ namespace
     // A neighbour message's body: 4 bytes of flags or reserved, then the
     // 16-byte target, then options.
     constexpr size_t NEIGHBOUR_TARGET_OFFSET = 4;
-    constexpr size_t NEIGHBOUR_OPTIONS_OFFSET = 20;
 
     // Every NDP option is type, length-in-8-byte-units, value. A length of zero
     // is invalid precisely because it would let a parser walk forever without
@@ -92,15 +91,15 @@ bool Icmpv6::get_override_flag() const
     return !this->_body.empty() && (this->_body[0] & 0x20) != 0;
 }
 
-std::vector<NdpOption> Icmpv6::get_options() const
+std::vector<NdpOption> Icmpv6::get_options(size_t options_offset) const
 {
     std::vector<NdpOption> options;
-    if (this->_body.size() <= NEIGHBOUR_OPTIONS_OFFSET)
+    if (this->_body.size() <= options_offset)
     {
         return options;
     }
 
-    size_t offset = NEIGHBOUR_OPTIONS_OFFSET;
+    size_t offset = options_offset;
     while (offset + 2 <= this->_body.size())
     {
         uint8_t type = this->_body[offset];
@@ -141,6 +140,50 @@ MacAddress Icmpv6::get_link_layer_option(uint8_t option_type) const
     return MacAddress();
 }
 
+uint8_t Icmpv6::get_ra_hop_limit() const
+{
+    return this->_body.empty() ? 0 : this->_body[0];
+}
+
+uint16_t Icmpv6::get_router_lifetime() const
+{
+    if (this->_body.size() < 4)
+    {
+        return 0;
+    }
+    return this->_body.slice_int<uint16_t>(2);
+}
+
+bool Icmpv6::get_managed_flag() const
+{
+    return this->_body.size() >= 2 && (this->_body[1] & 0x80) != 0;
+}
+
+std::vector<NdpPrefixInformation> Icmpv6::get_prefix_information() const
+{
+    std::vector<NdpPrefixInformation> prefixes;
+    for (const NdpOption& option : this->get_options(ROUTER_ADVERTISEMENT_OPTIONS_OFFSET))
+    {
+        // A prefix option is 32 bytes total, so 30 after the type and length.
+        // Anything shorter is truncated and cannot be read - checked rather
+        // than assumed, because this arrives unsolicited from the link.
+        if (option.type != NDP_OPTION_PREFIX_INFORMATION || option.value.size() < 30)
+        {
+            continue;
+        }
+
+        NdpPrefixInformation prefix;
+        prefix.prefix_length = option.value[0];
+        prefix.on_link = (option.value[1] & 0x80) != 0;
+        prefix.autonomous = (option.value[1] & 0x40) != 0;
+        prefix.valid_lifetime = option.value.slice_int<uint32_t>(2);
+        prefix.preferred_lifetime = option.value.slice_int<uint32_t>(6);
+        prefix.prefix = IPv6Address(option.value.slice(14, 16));
+        prefixes.push_back(prefix);
+    }
+    return prefixes;
+}
+
 namespace
 {
     // A link-layer option is type, length 1 (meaning 8 bytes total), then the
@@ -152,6 +195,14 @@ namespace
         const Bytes& address = mac.get_address();
         body.insert(body.end(), address.begin(), address.end());
     }
+}
+
+Bytes Icmpv6::build_router_solicitation(const MacAddress& source_mac)
+{
+    Bytes body;
+    body.append_int<uint32_t>(0); // reserved
+    append_link_layer_option(body, NDP_OPTION_SOURCE_LINK_LAYER, source_mac);
+    return body;
 }
 
 Bytes Icmpv6::build_neighbour_solicitation(const IPv6Address& target,
