@@ -753,7 +753,7 @@ void NetworkStack::_handle_arp(size_t ingress, const Arp& arp)
         interface.pending_outbound_connects.erase(pending_it);
     }
 
-    this->_flush_pending_outbound_datagrams(sender_ip);
+    this->_flush_pending_outbound_datagrams(ingress, sender_ip);
 
     // the target was already confirmed to be us above, so only a REQUEST is
     // left to distinguish - a REPLY needs no answer
@@ -1758,15 +1758,24 @@ void NetworkStack::_send_or_queue_udp(const IPv4Address& dest_ip, const Udp& hea
     this->_ensure_arp_resolution(egress, next_hop);
 }
 
-void NetworkStack::_flush_pending_outbound_datagrams(const IPv4Address& ip)
+void NetworkStack::_flush_pending_outbound_datagrams(size_t index, const IPv4Address& ip)
 {
-    auto pending_it = this->_primary().pending_outbound_datagrams.find(ip);
-    if (pending_it == this->_primary().pending_outbound_datagrams.end())
+    // The queue lives on the interface the datagrams were routed out of, which
+    // is the same interface whose ARP reply is releasing them (see
+    // _send_or_queue_udp) - not necessarily the primary.
+    Interface& interface = *this->_interfaces.at(index);
+    auto pending_it = interface.pending_outbound_datagrams.find(ip);
+    if (pending_it == interface.pending_outbound_datagrams.end())
     {
         return;
     }
 
-    for (const PendingDatagram& pending : pending_it->second)
+    // Take the list out before sending, so nothing a send does to the map can
+    // invalidate what is being iterated.
+    std::vector<PendingDatagram> pending_list = std::move(pending_it->second);
+    interface.pending_outbound_datagrams.erase(pending_it);
+
+    for (const PendingDatagram& pending : pending_list)
     {
         uint16_t length = static_cast<uint16_t>(8 + pending.payload.size());
         Udp header(pending.src_port, pending.dest_port, length, 0, Bytes());
@@ -1774,7 +1783,6 @@ void NetworkStack::_flush_pending_outbound_datagrams(const IPv4Address& ip)
         // the destination it was queued for
         this->_send_udp_datagram(pending.destination, header, pending.payload);
     }
-    this->_primary().pending_outbound_datagrams.erase(pending_it);
 }
 
 void NetworkStack::_send_udp_datagram(const IPv4Address& dest_ip, const Udp& header, const Bytes& payload)

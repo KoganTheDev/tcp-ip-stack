@@ -2133,3 +2133,26 @@ TEST(ABroadcastIsNeverForwarded)
     test_assert(!find_ip_to(second->outbound_frames(), second_broadcast).found,
                 "a broadcast must not cross onto another segment");
 }
+
+TEST(UdpQueuedOnASecondInterfaceIsFlushedWhenThatInterfaceResolves)
+{
+    // The datagram waits on the egress interface's queue, and the ARP reply
+    // that releases it arrives on that same interface. Flushing only the
+    // primary's queue strands it there for good: the reply also cleared the
+    // in-flight request, so the give-up path that would have dropped it never
+    // runs either - it is neither sent nor freed.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_two_interface_stack(first, second);
+
+    UdpSocket* socket = stack->bind_udp(7000);
+    socket->send_to(SECOND_PEER_IP, 7001, Bytes::from_hex("aabb")); // peer MAC not known yet
+    test_assert(!contains_udp(second->outbound_frames()), "nothing can go out before resolution");
+
+    second->clear_outbound();
+    second->push_inbound(build_arp_request_from_second_peer());
+    stack->poll();
+
+    test_assert(contains_udp(second->outbound_frames()),
+                "the queued datagram must leave once the second interface learns the peer's MAC");
+}

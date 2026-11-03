@@ -357,7 +357,7 @@ private:
     void _send_or_queue_udp(const IPv4Address& dest_ip, const Udp& header, const Bytes& payload);
     void _send_udp_datagram(const IPv4Address& dest_ip, const Udp& header, const Bytes& payload);
     // Flushes every datagram queued for ip once its MAC has just been learned.
-    void _flush_pending_outbound_datagrams(const IPv4Address& ip);
+    void _flush_pending_outbound_datagrams(size_t index, const IPv4Address& ip);
     // Rebuilds a fresh Icmp from header's type/code/rest_of_header (same
     // non-copyable-ProtocolLayer reason as _send_tcp_segment/
     // _send_udp_datagram), attaches payload, computes the checksum, and
