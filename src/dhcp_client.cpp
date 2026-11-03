@@ -247,6 +247,15 @@ void DhcpClient::_apply_ack(const Dhcp& message)
     granted.server = message.get_option_address(DHCP_OPTION_SERVER_IDENTIFIER);
     granted.dns_servers = message.get_option_address_list(DHCP_OPTION_DNS_SERVER);
     granted.mtu = message.get_option_uint16(DHCP_OPTION_INTERFACE_MTU, 1500);
+    // RFC 2132 5.1: the minimum legal value is 68, the smallest MTU IPv4
+    // permits. A smaller one is a broken or hostile server - taken as given it
+    // would make max_ip_payload() zero and spin the fragmentation loop forever.
+    if (granted.mtu < 68)
+    {
+        LOG_WARNING("DhcpClient: ignoring illegal interface MTU " << granted.mtu
+                    << " (minimum is 68), keeping 1500");
+        granted.mtu = 1500;
+    }
     granted.lease_seconds = message.get_option_uint32(DHCP_OPTION_LEASE_TIME, 0);
 
     std::vector<IPv4Address> routers = message.get_option_address_list(DHCP_OPTION_ROUTER);

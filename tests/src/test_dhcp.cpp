@@ -491,3 +491,39 @@ TEST(EachAttemptUsesAFreshTransactionId)
     test_assert(harness.current_xid() != bound_xid,
                 "restarting acquisition must not reuse the previous transaction id");
 }
+
+TEST(AnInterfaceMtuBelowTheIpv4MinimumIsIgnored)
+{
+    // RFC 2132 5.1: option 26's minimum legal value is 68, the smallest MTU
+    // IPv4 allows (RFC 791). Anything less would leave the stack unable to fit
+    // even a header plus 8 bytes of payload in a fragment - below 28 the
+    // fragmentation loop gets a zero-sized chunk and never advances.
+    ClientHarness harness;
+    harness.client.start();
+    harness.client.on_datagram(build_reply(DHCP_OFFER, harness.current_xid(), CLIENT_MAC));
+
+    Dhcp ack(build_reply(DHCP_ACK, harness.current_xid(), CLIENT_MAC));
+    Bytes mtu;
+    mtu.append_int<uint16_t>(24);
+    ack.set_option(DHCP_OPTION_INTERFACE_MTU, mtu);
+    harness.client.on_datagram(ack.to_bytes());
+
+    test_assert(harness.acquired.size() == 1, "the lease itself is still usable");
+    test_assert(harness.acquired[0].mtu == 1500, "an illegal MTU falls back to the default");
+}
+
+TEST(ALegalInterfaceMtuIsTaken)
+{
+    ClientHarness harness;
+    harness.client.start();
+    harness.client.on_datagram(build_reply(DHCP_OFFER, harness.current_xid(), CLIENT_MAC));
+
+    Dhcp ack(build_reply(DHCP_ACK, harness.current_xid(), CLIENT_MAC));
+    Bytes mtu;
+    mtu.append_int<uint16_t>(1400);
+    ack.set_option(DHCP_OPTION_INTERFACE_MTU, mtu);
+    harness.client.on_datagram(ack.to_bytes());
+
+    test_assert(harness.acquired.size() == 1 && harness.acquired[0].mtu == 1400,
+                "a legal MTU is used as given");
+}
