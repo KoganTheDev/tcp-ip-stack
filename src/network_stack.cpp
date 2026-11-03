@@ -1011,7 +1011,10 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
             tcp.get_sequence_number(),
             tcp.has_mss_option() ? tcp.get_mss_option() : 0,
             tcp.has_window_scale_option(),
-            tcp.has_window_scale_option() ? tcp.get_window_scale_option() : 0
+            tcp.has_window_scale_option() ? tcp.get_window_scale_option() : 0,
+            tcp.has_timestamp_option(),
+            tcp.has_timestamp_option() ? tcp.get_timestamp_value() : 0,
+            tcp.has_sack_permitted_option()
         );
     }
     catch (const std::exception& e)
@@ -1657,8 +1660,9 @@ void NetworkStack::_send_tcp_segment(const IPv4Address& dest_ip, const Tcp& head
                 header.get_window(), 0, header.get_urgent_ptr());
 
     // options aren't copied by the constructor above (rebuilt from getters,
-    // same reason as the flags) - carry them over explicitly so a SYN's
-    // MSS/window-scale options actually make it onto the wire
+    // same reason as the flags) - carry every one the codec models over
+    // explicitly, or it silently never reaches the wire. Each option added to
+    // Tcp must be added here too.
     if (header.has_mss_option())
     {
         segment.set_mss_option(header.get_mss_option());
@@ -1666,6 +1670,18 @@ void NetworkStack::_send_tcp_segment(const IPv4Address& dest_ip, const Tcp& head
     if (header.has_window_scale_option())
     {
         segment.set_window_scale_option(header.get_window_scale_option());
+    }
+    if (header.has_timestamp_option())
+    {
+        segment.set_timestamp_option(header.get_timestamp_value(), header.get_timestamp_echo());
+    }
+    if (header.has_sack_permitted_option())
+    {
+        segment.set_sack_permitted_option();
+    }
+    if (!header.get_sack_blocks().empty())
+    {
+        segment.set_sack_blocks(header.get_sack_blocks());
     }
 
     if (!payload.empty())

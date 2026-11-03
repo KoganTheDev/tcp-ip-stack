@@ -195,7 +195,11 @@ Tcp TcpConnection::_build_header(uint8_t flags, uint32_t seq) const
     // RFC 7323: if window scaling wasn't negotiated, this side must
     // advertise its window unscaled too - the peer has no way to know our
     // shift otherwise, since it's only exchanged on the SYN
-    uint8_t our_shift = _window_scaling_negotiated ? WINDOW_SCALE_SHIFT : 0;
+    // The window on a SYN or SYN-ACK is never scaled (RFC 7323 2.2) - the
+    // shift only takes effect once both SYNs have been exchanged. On a passive
+    // open _window_scaling_negotiated is already true when the SYN-ACK is
+    // built, so it is not enough on its own.
+    uint8_t our_shift = (_window_scaling_negotiated && !(flags & FLAG_SYN)) ? WINDOW_SCALE_SHIFT : 0;
     uint32_t window_value = std::min<uint32_t>(available >> our_shift, 0xFFFFu);
 
     return Tcp(_local_port, _remote_port, seq, _recv_next, 5, flags, static_cast<uint16_t>(window_value), 0, 0);
@@ -209,12 +213,26 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
     if (flags & FLAG_SYN)
     {
         // MSS and window scale are one-time parameters, so they only ever go on
-        // a SYN. This stack always offers all three; whether each ends up used
-        // depends on whether the peer offered it too (RFC 7323's rule).
+        // a SYN. An active open offers everything; whether each ends up used
+        // depends on whether the peer offered it too (RFC 7323's rule). A
+        // SYN-ACK is the other half of that rule: it may only carry window
+        // scale, timestamps or SACK-permitted if the peer's SYN did (RFC 7323
+        // 1.3, RFC 2018 2), and accept_incoming_syn has already recorded which
+        // ones that was. MSS is the exception - it may always be sent.
+        bool is_syn_ack = (full_flags & FLAG_ACK) != 0;
         header.set_mss_option(_local_mss);
-        header.set_window_scale_option(WINDOW_SCALE_SHIFT);
-        header.set_timestamp_option(_now_ms, _have_ts_recent ? _ts_recent : 0);
-        header.set_sack_permitted_option();
+        if (!is_syn_ack || _window_scaling_negotiated)
+        {
+            header.set_window_scale_option(WINDOW_SCALE_SHIFT);
+        }
+        if (!is_syn_ack || _timestamps_negotiated)
+        {
+            header.set_timestamp_option(_now_ms, _have_ts_recent ? _ts_recent : 0);
+        }
+        if (!is_syn_ack || _sack_permitted)
+        {
+            header.set_sack_permitted_option();
+        }
     }
     else if (_timestamps_negotiated)
     {

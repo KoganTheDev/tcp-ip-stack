@@ -144,7 +144,9 @@ namespace
     struct ArpView { bool is_arp = false; ArpOperation op = ArpOperation::REQUEST;
                      std::string sender_mac, sender_ip, target_ip; };
     struct TcpView { bool is_tcp = false; uint16_t src_port = 0, dest_port = 0;
-                     uint32_t seq = 0, ack = 0; bool syn = false, ack_flag = false, rst = false; };
+                     uint32_t seq = 0, ack = 0; bool syn = false, ack_flag = false, rst = false;
+                     uint16_t window = 0; bool has_timestamp = false, has_sack_permitted = false,
+                     has_window_scale = false; uint32_t ts_echo = 0; };
     struct IcmpView { bool is_icmp = false; uint8_t type = 0, code = 0; Bytes payload; };
 
     ArpView view_arp(const Bytes& frame)
@@ -179,6 +181,11 @@ namespace
         v.syn = tcp->get_syn();
         v.ack_flag = tcp->get_ack();
         v.rst = tcp->get_rst();
+        v.window = tcp->get_window();
+        v.has_timestamp = tcp->has_timestamp_option();
+        v.ts_echo = tcp->get_timestamp_echo();
+        v.has_sack_permitted = tcp->has_sack_permitted_option();
+        v.has_window_scale = tcp->has_window_scale_option();
         return v;
     }
 
@@ -2188,4 +2195,50 @@ TEST(ForwardingAPacketWithIpOptionsRecomputesTheChecksumOverTheWholeHeader)
     test_assert(forwarded.found, "an optioned packet should be accepted and forwarded");
     test_assert(forwarded.ttl == 63, "with its TTL decremented");
     test_assert(forwarded.checksum_ok, "and a checksum that covers the options too");
+}
+
+TEST(ASynAckOnTheWireEchoesEveryOptionThePeerOffered)
+{
+    // The connection builds timestamp and SACK-permitted options, but the copy
+    // the stack makes on the way to the wire used to carry only MSS and window
+    // scale - so neither RFC 7323 timestamps nor RFC 2018 SACK could ever be
+    // negotiated with a real peer.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    stack->listen(80);
+    channel->push_inbound(build_arp_request());
+
+    // MSS 1460, SACK-permitted, timestamps (TSval 0x11223344, TSecr 0), NOP,
+    // window scale 7 - the layout Linux sends.
+    Bytes options = Bytes::from_hex("020405b4" "0402" "080a1122334400000000" "01" "030307");
+    channel->push_inbound(build_tcp_with_options(FLAG_SYN, 2000, 0, 40000, 80, options));
+    stack->poll();
+
+    TcpView syn_ack = find_tcp(channel->outbound_frames());
+    test_assert(syn_ack.syn && syn_ack.ack_flag, "the SYN should draw a SYN-ACK");
+    test_assert(syn_ack.has_window_scale, "window scale, offered by the peer, is echoed");
+    test_assert(syn_ack.has_sack_permitted, "SACK-permitted, offered by the peer, is echoed");
+    test_assert(syn_ack.has_timestamp, "a timestamp, offered by the peer, is echoed");
+    test_assert(syn_ack.ts_echo == 0x11223344, "and its TSecr echoes the peer's TSval");
+}
+
+TEST(ASynAckCarriesNoOptionThePeerDidNotOffer)
+{
+    // RFC 7323 1.3 and RFC 2018 2: window scale, timestamps and SACK-permitted
+    // may appear on a SYN-ACK only if the SYN carried them. A peer that never
+    // offered them cannot be assumed to parse them.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    stack->listen(80);
+    channel->push_inbound(build_arp_request());
+
+    Bytes options = Bytes::from_hex("020405b4"); // MSS only
+    channel->push_inbound(build_tcp_with_options(FLAG_SYN, 2000, 0, 40000, 80, options));
+    stack->poll();
+
+    TcpView syn_ack = find_tcp(channel->outbound_frames());
+    test_assert(syn_ack.syn && syn_ack.ack_flag, "the SYN should draw a SYN-ACK");
+    test_assert(!syn_ack.has_window_scale, "no window scale on a SYN-ACK to a peer that offered none");
+    test_assert(!syn_ack.has_sack_permitted, "no SACK-permitted on a SYN-ACK to a peer that offered none");
+    test_assert(!syn_ack.has_timestamp, "no timestamp on a SYN-ACK to a peer that offered none");
 }
