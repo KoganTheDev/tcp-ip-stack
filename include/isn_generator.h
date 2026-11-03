@@ -53,14 +53,14 @@ public:
     // is back to guessing a clock.
     IsnGenerator(uint64_t key_low, uint64_t key_high);
 
-    uint32_t generate(const IPv4Address& local_ip, uint16_t local_port,
-                      const IPv4Address& remote_ip, uint16_t remote_port) const;
+    uint32_t generate(const IPv4Address& local_ip, uint16_t local_port, const IPv4Address& remote_ip,
+                      uint16_t remote_port) const;
 
     // The per-4-tuple offset alone, without the clock term. Exposed so tests
     // can observe the two halves of RFC 6528's sum separately - the whole
     // point of the scheme is that one moves with time and the other does not.
-    uint32_t offset_for(const IPv4Address& local_ip, uint16_t local_port,
-                        const IPv4Address& remote_ip, uint16_t remote_port) const;
+    uint32_t offset_for(const IPv4Address& local_ip, uint16_t local_port, const IPv4Address& remote_ip,
+                        uint16_t remote_port) const;
 
 private:
     uint64_t _key_low;

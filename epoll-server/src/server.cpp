@@ -18,13 +18,11 @@ namespace
 
 Server::Server(uint16_t port, size_t worker_count, const ChannelOptions& channel_options)
     : Server(port, worker_count, open_channel(channel_options))
-{
-}
+{}
 
 Server::Server(uint16_t port, size_t worker_count, OpenedChannel opened)
-    : _port(port),
-      _network_stack(std::move(opened.channel), opened.config),
-      _epoll(), _completion_queue(), _thread_pool(worker_count), _timer_fd(-1), _last_timer_advance_ms(0)
+    : _port(port), _network_stack(std::move(opened.channel), opened.config), _epoll(), _completion_queue(),
+      _thread_pool(worker_count), _timer_fd(-1), _last_timer_advance_ms(0)
 {
     this->_network_stack.listen(port);
     // One fd per interface. A frame arriving on one link wakes only that link's
@@ -189,10 +187,7 @@ void Server::_handle_new_connections()
     while (TcpConnection* connection = this->_network_stack.accept(this->_port))
     {
         uint64_t connection_id = connection->get_id();
-        connection->set_data_ready_callback([this, connection_id]()
-        {
-            this->_try_dispatch(connection_id);
-        });
+        connection->set_data_ready_callback([this, connection_id]() { this->_try_dispatch(connection_id); });
     }
 }
 
@@ -227,28 +222,27 @@ void Server::_try_dispatch(uint64_t connection_id)
     // per-connection processing would go) runs on a worker thread; the
     // result is applied back on the reactor thread via the completion
     // queue, since NetworkStack/TcpConnection are only safe to touch there.
-    this->_thread_pool.submit([this, connection_id, data]()
-    {
-        Bytes response;
-        try
+    this->_thread_pool.submit(
+        [this, connection_id, data]()
         {
-            response = data;
-        }
-        catch (const std::exception& e)
-        {
-            // The completion MUST still be pushed. It is what clears in_flight
-            // and dispatches whatever queued up behind this chunk, so failing
-            // to push it wedges the connection permanently - every later byte
-            // queued and never dispatched, on a connection that keeps acking.
-            // An empty response is a bad answer; no response is a stuck one.
-            LOG_ERROR("Server: work for connection " << connection_id << " failed: " << e.what());
-        }
+            Bytes response;
+            try
+            {
+                response = data;
+            }
+            catch (const std::exception& e)
+            {
+                // The completion MUST still be pushed. It is what clears in_flight
+                // and dispatches whatever queued up behind this chunk, so failing
+                // to push it wedges the connection permanently - every later byte
+                // queued and never dispatched, on a connection that keeps acking.
+                // An empty response is a bad answer; no response is a stuck one.
+                LOG_ERROR("Server: work for connection " << connection_id << " failed: " << e.what());
+            }
 
-        this->_completion_queue.push([this, connection_id, response]()
-        {
-            this->_apply_response(connection_id, response);
+            this->_completion_queue.push([this, connection_id, response]()
+                                         { this->_apply_response(connection_id, response); });
         });
-    });
 }
 
 void Server::_apply_response(uint64_t connection_id, const Bytes& response)
@@ -320,8 +314,7 @@ void Server::_continue_response(uint64_t connection_id)
     catch (const std::exception& e)
     {
         this->_unsent.erase(connection_id);
-        LOG_ERROR("Server: sending the response for connection " << connection_id
-                  << " failed: " << e.what());
+        LOG_ERROR("Server: sending the response for connection " << connection_id << " failed: " << e.what());
     }
 
     // Clear the in-flight mark whatever happened above. It is what lets the

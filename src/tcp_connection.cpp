@@ -32,17 +32,28 @@ namespace
     {
         switch (state)
         {
-        case TcpState::LISTEN:        return "LISTEN";
-        case TcpState::SYN_SENT:      return "SYN_SENT";
-        case TcpState::SYN_RECEIVED:  return "SYN_RECEIVED";
-        case TcpState::ESTABLISHED:   return "ESTABLISHED";
-        case TcpState::FIN_WAIT_1:    return "FIN_WAIT_1";
-        case TcpState::FIN_WAIT_2:    return "FIN_WAIT_2";
-        case TcpState::CLOSE_WAIT:    return "CLOSE_WAIT";
-        case TcpState::CLOSING:       return "CLOSING";
-        case TcpState::LAST_ACK:      return "LAST_ACK";
-        case TcpState::TIME_WAIT:     return "TIME_WAIT";
-        case TcpState::CLOSED:        return "CLOSED";
+        case TcpState::LISTEN:
+            return "LISTEN";
+        case TcpState::SYN_SENT:
+            return "SYN_SENT";
+        case TcpState::SYN_RECEIVED:
+            return "SYN_RECEIVED";
+        case TcpState::ESTABLISHED:
+            return "ESTABLISHED";
+        case TcpState::FIN_WAIT_1:
+            return "FIN_WAIT_1";
+        case TcpState::FIN_WAIT_2:
+            return "FIN_WAIT_2";
+        case TcpState::CLOSE_WAIT:
+            return "CLOSE_WAIT";
+        case TcpState::CLOSING:
+            return "CLOSING";
+        case TcpState::LAST_ACK:
+            return "LAST_ACK";
+        case TcpState::TIME_WAIT:
+            return "TIME_WAIT";
+        case TcpState::CLOSED:
+            return "CLOSED";
         }
         return "UNKNOWN";
     }
@@ -54,32 +65,24 @@ namespace
 }
 
 TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port,
-                              uint32_t initial_seq, SendSegmentFn send_segment, uint16_t local_mss,
-                              CongestionControlAlgorithm algorithm)
-    : _id(g_next_connection_id.fetch_add(1)),
-      _local_port(local_port), _remote_ip(remote_ip), _remote_port(remote_port),
-      _state(TcpState::LISTEN),
-      _send_next(initial_seq), _recv_next(0),
+                             uint32_t initial_seq, SendSegmentFn send_segment, uint16_t local_mss,
+                             CongestionControlAlgorithm algorithm)
+    : _id(g_next_connection_id.fetch_add(1)), _local_port(local_port), _remote_ip(remote_ip), _remote_port(remote_port),
+      _state(TcpState::LISTEN), _send_next(initial_seq), _recv_next(0),
       // Kept in declaration order. Members are initialised in the order they
       // are declared regardless of the order written here, so any divergence
       // is a lie about what actually happens - and a real hazard the moment
       // one member's initialiser reads another.
-      _unsacked_in_flight_bytes(0), _send_queued_bytes(0),
-      _fin_requested(false), _time_wait_ms_remaining(0),
-      _now_ms(1), _srtt_scaled(0), _rttvar_scaled(0), _has_rtt_sample(false),
-      _rto_ms(INITIAL_RTO_MS),
-      _persist_ms_remaining(0), _persist_backoff(0),
-      _ack_pending(false), _ack_delay_ms_remaining(0),
-      _keepalive_enabled(false), _keepalive_idle_ms_remaining(KEEPALIVE_IDLE_MS),
-      _keepalive_probe_ms_remaining(0), _keepalive_probes_sent(0),
-      _sack_permitted(false), _last_out_of_order_seq(0),
-      _timestamps_negotiated(false), _ts_recent(0), _have_ts_recent(false),
-      _local_mss(local_mss), _peer_mss(DEFAULT_PEER_MSS), _effective_mss(std::min(local_mss, DEFAULT_PEER_MSS)),
-      _window_scaling_negotiated(false), _peer_window_scale(0),
+      _unsacked_in_flight_bytes(0), _send_queued_bytes(0), _fin_requested(false), _time_wait_ms_remaining(0),
+      _now_ms(1), _srtt_scaled(0), _rttvar_scaled(0), _has_rtt_sample(false), _rto_ms(INITIAL_RTO_MS),
+      _persist_ms_remaining(0), _persist_backoff(0), _ack_pending(false), _ack_delay_ms_remaining(0),
+      _keepalive_enabled(false), _keepalive_idle_ms_remaining(KEEPALIVE_IDLE_MS), _keepalive_probe_ms_remaining(0),
+      _keepalive_probes_sent(0), _sack_permitted(false), _last_out_of_order_seq(0), _timestamps_negotiated(false),
+      _ts_recent(0), _have_ts_recent(false), _local_mss(local_mss), _peer_mss(DEFAULT_PEER_MSS),
+      _effective_mss(std::min(local_mss, DEFAULT_PEER_MSS)), _window_scaling_negotiated(false), _peer_window_scale(0),
       _peer_window(local_mss), // conservative placeholder until the handshake's real window arrives
       _congestion(make_congestion_control(algorithm)), _dup_ack_count(0), _in_fast_recovery(false),
-      _send_segment(std::move(send_segment)),
-      _receive_queued_bytes(0)
+      _send_segment(std::move(send_segment)), _receive_queued_bytes(0)
 {
     // Seeded with the MSS this side advertises, which is all that is known
     // before the handshake. on_established() re-seeds it with the negotiated
@@ -261,8 +264,10 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
     _ack_delay_ms_remaining = 0;
 
     size_t consumed = payload.size();
-    if (flags & FLAG_SYN) consumed += 1;
-    if (flags & FLAG_FIN) consumed += 1;
+    if (flags & FLAG_SYN)
+        consumed += 1;
+    if (flags & FLAG_FIN)
+        consumed += 1;
     _send_next = seq + static_cast<uint32_t>(consumed);
 
     InFlightSegment entry;
@@ -321,16 +326,16 @@ void TcpConnection::_schedule_or_send_ack()
     }
 }
 
-void TcpConnection::accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss,
-                                         bool peer_supports_window_scaling, uint8_t peer_window_scale,
-                                         bool peer_supports_timestamps, uint32_t peer_timestamp,
-                                         bool peer_permits_sack)
+void TcpConnection::accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss, bool peer_supports_window_scaling,
+                                        uint8_t peer_window_scale, bool peer_supports_timestamps,
+                                        uint32_t peer_timestamp, bool peer_permits_sack)
 {
     _sack_permitted = peer_permits_sack;
     _recv_next = peer_isn + 1; // the SYN itself consumes one sequence number
     _peer_mss = peer_mss != 0 ? peer_mss : DEFAULT_PEER_MSS;
     _effective_mss = std::min(_local_mss, _peer_mss);
-    _window_scaling_negotiated = peer_supports_window_scaling; // we always send our own option, so it comes down to the peer's
+    _window_scaling_negotiated =
+        peer_supports_window_scaling; // we always send our own option, so it comes down to the peer's
     _peer_window_scale = peer_window_scale;
     _timestamps_negotiated = peer_supports_timestamps;
     if (peer_supports_timestamps)
@@ -387,11 +392,10 @@ Bytes TcpConnection::read(size_t max_bytes)
     // correct, but a whole probe interval slower than it needs to be. Only
     // worth a segment when the window was actually shut.
     if (window_before == 0 && _advertised_window() > 0
-        && (_state == TcpState::ESTABLISHED || _state == TcpState::FIN_WAIT_1
-            || _state == TcpState::FIN_WAIT_2))
+        && (_state == TcpState::ESTABLISHED || _state == TcpState::FIN_WAIT_1 || _state == TcpState::FIN_WAIT_2))
     {
         LOG_DEBUG("TcpConnection[" << _id << "] window reopened to " << _advertised_window()
-                  << " after read - sending a window update");
+                                   << " after read - sending a window update");
         _send_pure_ack();
     }
 
@@ -412,8 +416,8 @@ void TcpConnection::reduce_effective_mss(uint16_t path_mss)
         return; // never upward - see the header
     }
 
-    LOG_DEBUG("TcpConnection[" << _id << "] lowering effective MSS " << _effective_mss
-              << " -> " << candidate << " after an ICMP Fragmentation Needed");
+    LOG_DEBUG("TcpConnection[" << _id << "] lowering effective MSS " << _effective_mss << " -> " << candidate
+                               << " after an ICMP Fragmentation Needed");
     _effective_mss = candidate;
 }
 
@@ -543,8 +547,8 @@ void TcpConnection::_send_keepalive_probe()
     // and entangling it with the retransmit timer would mean a dead peer got
     // torn down by whichever of the two mechanisms happened to notice first,
     // with a different timeout and a different log line each time.
-    LOG_DEBUG("TcpConnection[" << _id << "] keepalive probe " << (_keepalive_probes_sent + 1)
-              << "/" << KEEPALIVE_MAX_PROBES << " at seq=" << (_send_next - 1));
+    LOG_DEBUG("TcpConnection[" << _id << "] keepalive probe " << (_keepalive_probes_sent + 1) << "/"
+                               << KEEPALIVE_MAX_PROBES << " at seq=" << (_send_next - 1));
     _send_segment(_build_header(FLAG_ACK, _send_next - 1), Bytes());
     _keepalive_probes_sent += 1;
     _keepalive_probe_ms_remaining = KEEPALIVE_PROBE_INTERVAL_MS;
@@ -572,8 +576,8 @@ void TcpConnection::_run_keepalive(uint32_t elapsed_ms)
 
         if (_keepalive_probes_sent >= KEEPALIVE_MAX_PROBES)
         {
-            LOG_WARNING("TcpConnection[" << _id << "] peer unresponsive after "
-                        << _keepalive_probes_sent << " keepalive probes - closing");
+            LOG_WARNING("TcpConnection[" << _id << "] peer unresponsive after " << _keepalive_probes_sent
+                                         << " keepalive probes - closing");
             _transition(TcpState::CLOSED);
             return;
         }
@@ -624,12 +628,9 @@ void TcpConnection::_update_rto_from_sample(uint32_t rtt_ms)
         // positive value which the shift then folds straight into the
         // estimate. The expanded form only ever adds and subtracts
         // non-negative quantities, so it is exact in unsigned integers.
-        uint32_t error = sample_scaled > _srtt_scaled ? sample_scaled - _srtt_scaled
-                                                      : _srtt_scaled - sample_scaled;
-        _rttvar_scaled = _rttvar_scaled - (_rttvar_scaled >> RTT_VARIANCE_SHIFT)
-                       + (error >> RTT_VARIANCE_SHIFT);
-        _srtt_scaled = _srtt_scaled - (_srtt_scaled >> RTT_SMOOTHING_SHIFT)
-                     + (sample_scaled >> RTT_SMOOTHING_SHIFT);
+        uint32_t error = sample_scaled > _srtt_scaled ? sample_scaled - _srtt_scaled : _srtt_scaled - sample_scaled;
+        _rttvar_scaled = _rttvar_scaled - (_rttvar_scaled >> RTT_VARIANCE_SHIFT) + (error >> RTT_VARIANCE_SHIFT);
+        _srtt_scaled = _srtt_scaled - (_srtt_scaled >> RTT_SMOOTHING_SHIFT) + (sample_scaled >> RTT_SMOOTHING_SHIFT);
     }
 
     // RTO = SRTT + max(G, K * RTTVAR), where G is the clock granularity. The
@@ -637,8 +638,7 @@ void TcpConnection::_update_rto_from_sample(uint32_t rtt_ms)
     // and without a floor of one granularity the timeout would collapse onto
     // the mean itself, firing on the first sample that lands a hair above
     // average.
-    uint32_t variance_term = std::max(RTO_CLOCK_GRANULARITY_MS * RTO_SCALE,
-                                      RTO_VARIANCE_MULTIPLIER * _rttvar_scaled);
+    uint32_t variance_term = std::max(RTO_CLOCK_GRANULARITY_MS * RTO_SCALE, RTO_VARIANCE_MULTIPLIER * _rttvar_scaled);
     uint32_t rto_scaled = _srtt_scaled + variance_term;
 
     // Round up rather than truncate: a timeout is a deadline, and rounding it
@@ -646,9 +646,8 @@ void TcpConnection::_update_rto_from_sample(uint32_t rtt_ms)
     int rto = static_cast<int>((rto_scaled + RTO_SCALE - 1) / RTO_SCALE);
     _rto_ms = std::min(std::max(rto, MIN_RTO_MS), MAX_RTO_MS);
 
-    LOG_DEBUG("TcpConnection[" << _id << "] rtt sample " << rtt_ms << " ms -> srtt "
-              << (_srtt_scaled / RTO_SCALE) << " rttvar " << (_rttvar_scaled / RTO_SCALE)
-              << " rto " << _rto_ms);
+    LOG_DEBUG("TcpConnection[" << _id << "] rtt sample " << rtt_ms << " ms -> srtt " << (_srtt_scaled / RTO_SCALE)
+                               << " rttvar " << (_rttvar_scaled / RTO_SCALE) << " rto " << _rto_ms);
 }
 
 bool TcpConnection::_apply_sack_blocks(const Tcp& segment)
@@ -716,11 +715,10 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     // unchanged. The last three are what separate a loss signal from a peer
     // that is merely sending its own data or opening its window - both of
     // which repeat the same ack number with no loss at all.
-    bool carries_data = segment.has_next_layer()
-        && dynamic_cast<const Raw*>(&segment.get_next_layer()) != nullptr
-        && !static_cast<const Raw&>(segment.get_next_layer()).get_data().empty();
-    bool is_duplicate_ack = !_in_flight.empty() && ack == snd_una && !carries_data
-        && !segment.get_syn() && !segment.get_fin() && _peer_window == previous_peer_window;
+    bool carries_data = segment.has_next_layer() && dynamic_cast<const Raw*>(&segment.get_next_layer()) != nullptr
+                        && !static_cast<const Raw&>(segment.get_next_layer()).get_data().empty();
+    bool is_duplicate_ack = !_in_flight.empty() && ack == snd_una && !carries_data && !segment.get_syn()
+                            && !segment.get_fin() && _peer_window == previous_peer_window;
 
     if (is_duplicate_ack)
     {
@@ -759,7 +757,8 @@ void TcpConnection::_handle_ack(const Tcp& segment)
             _congestion->on_fast_retransmit(_bytes_in_flight(), DUP_ACK_FAST_RETRANSMIT_THRESHOLD, _now_ms);
             _in_fast_recovery = true;
             LOG_DEBUG("TcpConnection[" << _id << "] fast retransmit at seq=" << oldest.seq
-                      << " (3 duplicate acks), cwnd " << cwnd_before << " -> " << _congestion->window());
+                                       << " (3 duplicate acks), cwnd " << cwnd_before << " -> "
+                                       << _congestion->window());
         }
         else if (_in_fast_recovery || sack_advanced)
         {
@@ -985,8 +984,8 @@ void TcpConnection::on_segment(const Tcp& segment)
     if (segment.get_rst())
     {
         bool past_handshake = _state == TcpState::ESTABLISHED || _state == TcpState::FIN_WAIT_1
-            || _state == TcpState::FIN_WAIT_2 || _state == TcpState::CLOSE_WAIT
-            || _state == TcpState::CLOSING || _state == TcpState::LAST_ACK;
+                              || _state == TcpState::FIN_WAIT_2 || _state == TcpState::CLOSE_WAIT
+                              || _state == TcpState::CLOSING || _state == TcpState::LAST_ACK;
         if (past_handshake && !_seq_in_receive_window(segment.get_sequence_number()))
         {
             // RFC 793 SS3.9: a reset outside the receive window is ignored -
@@ -1063,11 +1062,10 @@ void TcpConnection::on_segment(const Tcp& segment)
         //
         // Compared with the same wraparound-safe subtraction used for sequence
         // numbers, because this clock wraps too.
-        if (_have_ts_recent && seq_at_or_before(their_timestamp, _ts_recent)
-            && their_timestamp != _ts_recent)
+        if (_have_ts_recent && seq_at_or_before(their_timestamp, _ts_recent) && their_timestamp != _ts_recent)
         {
-            LOG_DEBUG("TcpConnection[" << _id << "] PAWS: dropping a segment whose timestamp "
-                      << their_timestamp << " predates " << _ts_recent);
+            LOG_DEBUG("TcpConnection[" << _id << "] PAWS: dropping a segment whose timestamp " << their_timestamp
+                                       << " predates " << _ts_recent);
             // Still ack it: the peer may simply be out of date, and silence
             // would leave it retransmitting.
             _send_pure_ack();
@@ -1094,9 +1092,7 @@ void TcpConnection::on_segment(const Tcp& segment)
     // places the FIN one past the end of that data in sequence space, and
     // _handle_fin() has to know where the FIN actually sits. Held as a pointer
     // rather than a copied Bytes so states that ignore data pay nothing.
-    const Raw* payload_layer = segment.has_next_layer()
-        ? dynamic_cast<const Raw*>(&segment.get_next_layer())
-        : nullptr;
+    const Raw* payload_layer = segment.has_next_layer() ? dynamic_cast<const Raw*>(&segment.get_next_layer()) : nullptr;
     uint32_t payload_size = payload_layer ? static_cast<uint32_t>(payload_layer->get_data().size()) : 0;
 
     if (_state == TcpState::ESTABLISHED || _state == TcpState::FIN_WAIT_1 || _state == TcpState::FIN_WAIT_2)
@@ -1136,8 +1132,7 @@ void TcpConnection::on_segment(const Tcp& segment)
                 // RCV.NXT again: that duplicate ack is the signal a sender's
                 // fast retransmit depends on, so it must be sent *immediately*,
                 // never delayed
-                if (_reorder_buffer.find(seq) == _reorder_buffer.end()
-                    && _seq_in_receive_window(seq))
+                if (_reorder_buffer.find(seq) == _reorder_buffer.end() && _seq_in_receive_window(seq))
                 {
                     _reorder_buffer[seq] = payload;
                     _last_out_of_order_seq = seq;
@@ -1265,7 +1260,7 @@ void TcpConnection::on_time_passed(uint32_t elapsed_ms)
     if (oldest.retransmit_attempts > MAX_RETRANSMIT_ATTEMPTS)
     {
         LOG_WARNING("TcpConnection[" << _id << "] giving up after " << (oldest.retransmit_attempts - 1)
-                    << " retransmit attempts at seq=" << oldest.seq << " - closing");
+                                     << " retransmit attempts at seq=" << oldest.seq << " - closing");
         _transition(TcpState::CLOSED);
         return;
     }
@@ -1291,10 +1286,10 @@ void TcpConnection::on_time_passed(uint32_t elapsed_ms)
     int rto_before = _rto_ms;
     _rto_ms = std::min(_rto_ms * 2, MAX_RTO_MS);
 
-    LOG_DEBUG("TcpConnection[" << _id << "] retransmit timeout at seq=" << oldest.seq
-              << " (attempt " << oldest.retransmit_attempts << "/" << MAX_RETRANSMIT_ATTEMPTS
-              << "), cwnd " << cwnd_before << " -> " << _congestion->window()
-              << ", rto " << rto_before << " -> " << _rto_ms);
+    LOG_DEBUG("TcpConnection[" << _id << "] retransmit timeout at seq=" << oldest.seq << " (attempt "
+                               << oldest.retransmit_attempts << "/" << MAX_RETRANSMIT_ATTEMPTS << "), cwnd "
+                               << cwnd_before << " -> " << _congestion->window() << ", rto " << rto_before << " -> "
+                               << _rto_ms);
 
     _send_segment(_build_header(oldest.flags, oldest.seq), oldest.payload);
     oldest.retransmitted = true; // no RTT sample may ever come from it now

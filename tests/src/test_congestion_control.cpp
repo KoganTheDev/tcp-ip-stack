@@ -22,14 +22,13 @@ namespace
     {
         uint32_t difference = actual > expected ? actual - expected : expected - actual;
         test_assert(difference <= tolerance,
-                    what + ": expected about " + std::to_string(expected) + " but got " +
-                    std::to_string(actual));
+                    what + ": expected about " + std::to_string(expected) + " but got " + std::to_string(actual));
     }
 
     // Acknowledges `bytes` in MSS-sized pieces without any time passing, which
     // is the shape of a real ack clock: one ack per segment.
-    void acknowledge(CongestionControl& cc, uint32_t bytes, uint32_t in_flight = 0,
-                     uint32_t srtt_ms = 0, uint64_t now_ms = 0)
+    void acknowledge(CongestionControl& cc, uint32_t bytes, uint32_t in_flight = 0, uint32_t srtt_ms = 0,
+                     uint64_t now_ms = 0)
     {
         while (bytes >= MSS)
         {
@@ -53,15 +52,13 @@ namespace
     // so acknowledging (segments - 1) * MSS lands on the number precisely -
     // which matters for the tests below that need two instances to reach an
     // identical starting point by different routes.
-    std::unique_ptr<CongestionControl> established_at(CongestionControlAlgorithm algorithm,
-                                                      uint32_t segments)
+    std::unique_ptr<CongestionControl> established_at(CongestionControlAlgorithm algorithm, uint32_t segments)
     {
         auto cc = make_congestion_control(algorithm);
         cc->on_established(MSS);
         acknowledge(*cc, (segments - 1) * MSS);
-        test_assert(cc->window() == segments * MSS,
-                    std::string("test setup: slow start could not reach ") +
-                    std::to_string(segments) + " segments (ssthresh caps it)");
+        test_assert(cc->window() == segments * MSS, std::string("test setup: slow start could not reach ")
+                                                        + std::to_string(segments) + " segments (ssthresh caps it)");
         return cc;
     }
 
@@ -82,8 +79,7 @@ TEST(SlowStartDoublesTheWindowEveryRoundTripInBothAlgorithms)
         auto cc = make_congestion_control(algorithm);
         cc->on_established(MSS);
 
-        test_assert(cc->window() == MSS,
-                    std::string(cc->name()) + " should start at one segment");
+        test_assert(cc->window() == MSS, std::string(cc->name()) + " should start at one segment");
 
         // A round trip's worth of acks is one acknowledgement per byte of the
         // current window, and slow start turns each of those into another
@@ -91,8 +87,7 @@ TEST(SlowStartDoublesTheWindowEveryRoundTripInBothAlgorithms)
         for (uint32_t expected : {2u, 4u, 8u, 16u})
         {
             acknowledge(*cc, cc->window());
-            assert_near(cc->window(), expected * MSS, 0,
-                        std::string(cc->name()) + " slow start round trip");
+            assert_near(cc->window(), expected * MSS, 0, std::string(cc->name()) + " slow start round trip");
         }
     }
 }
@@ -113,11 +108,10 @@ TEST(SlowStartStopsAtTheThresholdAndCongestionAvoidanceTakesOver)
         acknowledge(*cc, before, before, 100, 0);
         uint32_t growth = cc->window() - before;
 
-        test_assert(growth < before / 4,
-                    std::string(cc->name()) + " should not still be doubling past ssthresh, grew by " +
-                    std::to_string(growth) + " from " + std::to_string(before));
-        test_assert(cc->window() > before,
-                    std::string(cc->name()) + " should still be growing past ssthresh");
+        test_assert(growth < before / 4, std::string(cc->name())
+                                             + " should not still be doubling past ssthresh, grew by "
+                                             + std::to_string(growth) + " from " + std::to_string(before));
+        test_assert(cc->window() > before, std::string(cc->name()) + " should still be growing past ssthresh");
     }
 }
 
@@ -128,8 +122,7 @@ TEST(RetransmitTimeoutCollapsesBothAlgorithmsToOneSegment)
         auto cc = established_at(algorithm, BIG_WINDOW_SEGMENTS);
         cc->on_retransmit_timeout(BIG_WINDOW_SEGMENTS * MSS, 5000);
 
-        test_assert(cc->window() == MSS,
-                    std::string(cc->name()) + " should collapse to one segment on a timeout");
+        test_assert(cc->window() == MSS, std::string(cc->name()) + " should collapse to one segment on a timeout");
         test_assert(cc->slow_start_threshold() < BIG_WINDOW_SEGMENTS * MSS,
                     std::string(cc->name()) + " should lower the threshold on a timeout");
     }
@@ -169,8 +162,7 @@ TEST(RenoHalvesWhatWasInFlightWhileCubicKeepsSeventyPercent)
     reno->on_fast_retransmit(BIG_WINDOW_SEGMENTS * MSS, 3, 0);
     cubic->on_fast_retransmit(BIG_WINDOW_SEGMENTS * MSS, 3, 0);
 
-    assert_near(reno->slow_start_threshold(), (BIG_WINDOW_SEGMENTS * MSS) / 2, MSS,
-                "reno multiplicative decrease");
+    assert_near(reno->slow_start_threshold(), (BIG_WINDOW_SEGMENTS * MSS) / 2, MSS, "reno multiplicative decrease");
     assert_near(cubic->slow_start_threshold(), (BIG_WINDOW_SEGMENTS * MSS * 7) / 10, MSS,
                 "cubic multiplicative decrease");
 
@@ -192,8 +184,7 @@ TEST(RenoReducesFromWhatWasInFlightNotFromTheWindowItWasAllowed)
     busy->on_fast_retransmit(BIG_WINDOW_SEGMENTS * MSS, 3, 0);
 
     assert_near(idle->slow_start_threshold(), 5 * MSS, MSS, "reno decrease from a near-idle window");
-    assert_near(busy->slow_start_threshold(), (BIG_WINDOW_SEGMENTS * MSS) / 2, MSS,
-                "reno decrease from a full window");
+    assert_near(busy->slow_start_threshold(), (BIG_WINDOW_SEGMENTS * MSS) / 2, MSS, "reno decrease from a full window");
 }
 
 // This is the headline claim, and the reason this phase had to wait for the
@@ -223,8 +214,8 @@ TEST(CubicGrowthIsDrivenByElapsedTimeNotByHowManyAcksArrived)
     }
 
     test_assert(slow_path->window() > fast_path->window(),
-                "cubic should reopen faster when more real time has passed, got " +
-                std::to_string(slow_path->window()) + " vs " + std::to_string(fast_path->window()));
+                "cubic should reopen faster when more real time has passed, got " + std::to_string(slow_path->window())
+                    + " vs " + std::to_string(fast_path->window()));
     test_assert(slow_path->window() - fast_path->window() > 5 * MSS,
                 "the difference should be substantial, not a rounding artefact");
 }
@@ -249,8 +240,7 @@ TEST(RenoGrowthIgnoresElapsedTimeEntirely)
         fast_path->on_ack(MSS, started_at, 100, i);
     }
 
-    test_assert(slow_path->window() == fast_path->window(),
-                "reno's window is a function of acks alone");
+    test_assert(slow_path->window() == fast_path->window(), "reno's window is a function of acks alone");
 }
 
 TEST(TheTcpFriendlyRegionKeepsCubicGrowingWhereItsCurveIsFlat)
@@ -276,8 +266,8 @@ TEST(TheTcpFriendlyRegionKeepsCubicGrowingWhereItsCurveIsFlat)
     }
 
     test_assert(cc->window() > started_at + MSS,
-                "the friendly region must keep cubic moving where its curve cannot, grew only " +
-                std::to_string(cc->window() - started_at) + " bytes");
+                "the friendly region must keep cubic moving where its curve cannot, grew only "
+                    + std::to_string(cc->window() - started_at) + " bytes");
 }
 
 TEST(FastConvergenceAimsLowerWhenTheSecondLossComesBelowTheFirst)
@@ -317,8 +307,8 @@ TEST(FastConvergenceAimsLowerWhenTheSecondLossComesBelowTheFirst)
     }
 
     test_assert(shrinking->window() < steady->window(),
-                "fast convergence should hold the shrinking flow below the steady one, got " +
-                std::to_string(shrinking->window()) + " vs " + std::to_string(steady->window()));
+                "fast convergence should hold the shrinking flow below the steady one, got "
+                    + std::to_string(shrinking->window()) + " vs " + std::to_string(steady->window()));
 }
 
 // --- the seam, from the connection's side -----------------------------------
@@ -339,10 +329,9 @@ TEST(AConnectionDefaultsToCubicAndCanBeGivenReno)
     test_assert(std::string(defaulted.get_congestion_control_name()) == "cubic",
                 "a connection should default to cubic, as Linux does");
 
-    TcpConnection classic(8080, IPv4Address("10.0.0.1"), 12345, 1000, send_nothing,
-                          1460, CongestionControlAlgorithm::RENO);
-    test_assert(std::string(classic.get_congestion_control_name()) == "reno",
-                "and should honour an explicit choice");
+    TcpConnection classic(8080, IPv4Address("10.0.0.1"), 12345, 1000, send_nothing, 1460,
+                          CongestionControlAlgorithm::RENO);
+    test_assert(std::string(classic.get_congestion_control_name()) == "reno", "and should honour an explicit choice");
 }
 
 TEST(TheWindowIsReDenominatedInTheMssTheHandshakeSettled)
@@ -362,6 +351,6 @@ TEST(TheWindowIsReDenominatedInTheMssTheHandshakeSettled)
 
     test_assert(connection.get_state() == TcpState::ESTABLISHED, "handshake should complete");
     test_assert(connection.get_congestion_window() == 536,
-                "once established the window is denominated in the negotiated effective MSS, got " +
-                std::to_string(connection.get_congestion_window()));
+                "once established the window is denominated in the negotiated effective MSS, got "
+                    + std::to_string(connection.get_congestion_window()));
 }

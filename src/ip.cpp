@@ -7,31 +7,23 @@
 #include "icmp.h"
 #include "raw.h"
 
-Ip::Ip(uint8_t version, uint8_t IHL, uint8_t TOS, uint16_t total_length, uint16_t identification,
-     uint8_t ip_flags, uint16_t fragment_offset, uint8_t TTL, uint8_t protocol,
-     uint16_t header_checksum, const Bytes &src_address, const Bytes &dest_address)
-    : _version(version),
-      _IHL(IHL),
-      _TOS(TOS),
-      _total_length(total_length),
-      _identification(identification),
-     _flags(ip_flags & 0xE0), // only the top 3 bits are flags; the rest belongs to the offset
-     _fragment_offset(fragment_offset),
-     _TTL(TTL), _protocol(protocol),
-     _header_checksum(header_checksum),
-     _src_address(src_address),
-     _dest_address(dest_address)
-{
-}
+Ip::Ip(uint8_t version, uint8_t IHL, uint8_t TOS, uint16_t total_length, uint16_t identification, uint8_t ip_flags,
+       uint16_t fragment_offset, uint8_t TTL, uint8_t protocol, uint16_t header_checksum, const Bytes& src_address,
+       const Bytes& dest_address)
+    : _version(version), _IHL(IHL), _TOS(TOS), _total_length(total_length), _identification(identification),
+      _flags(ip_flags & 0xE0), // only the top 3 bits are flags; the rest belongs to the offset
+      _fragment_offset(fragment_offset), _TTL(TTL), _protocol(protocol), _header_checksum(header_checksum),
+      _src_address(src_address), _dest_address(dest_address)
+{}
 
-Ip::Ip(const Bytes &bytes)
+Ip::Ip(const Bytes& bytes)
 {
     this->from_bytes(bytes);
 }
 
 void Ip::from_bytes(const Bytes& data)
 {
-    if (data.size() < 20) 
+    if (data.size() < 20)
     // ip header minimum size when IHL = 5 and there`s no options field
     {
         throw EXCEPTION(BaseException, "Invalid IPv4 header length");
@@ -49,7 +41,7 @@ void Ip::from_bytes(const Bytes& data)
     {
         throw EXCEPTION(BaseException, "Invalid IHL (too big)");
     }
-    
+
     // ?? Ask Alon: i can use both data.size() and the field total length to check if the IHL field is correct, which one should i use?
     size_t header_bytes = _IHL * 4; // IHL represents header length in words of 32-bits
     if (data.size() < header_bytes)
@@ -143,8 +135,7 @@ Bytes Ip::_header_to_bytes() const
     // _flags already holds the 3 bits in their byte-6 positions (0x80/0x40/
     // 0x20); shifting up by 8 lands them at bits 15/14/13 of the 16-bit field
     uint16_t flags_and_offset =
-    (static_cast<uint16_t>(this->_flags) << 8) |
-    (this->_fragment_offset & 0x1FFF);  // 13-bit offset
+        (static_cast<uint16_t>(this->_flags) << 8) | (this->_fragment_offset & 0x1FFF);  // 13-bit offset
     result.append_int<uint16_t>(flags_and_offset);
     result.append_int<uint8_t>(this->_TTL);
     result.append_int<uint8_t>(this->_protocol);
@@ -190,8 +181,7 @@ std::string Ip::to_string() const
 
     // IP flags
     uint16_t flags_and_offset =
-    (static_cast<uint16_t>(this->_flags) << 8) |
-    (this->_fragment_offset & 0x1FFF);  // 13-bit offset
+        (static_cast<uint16_t>(this->_flags) << 8) | (this->_fragment_offset & 0x1FFF);  // 13-bit offset
     result += this->_field_to_string("IP flags and offset", int_to_bytes<uint16_t>(flags_and_offset).to_hex());
 
     result += this->_field_to_string("TTL", byte_to_hex(this->_TTL));
@@ -206,4 +196,3 @@ std::string Ip::to_string() const
 
     return result;
 }
-

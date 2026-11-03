@@ -94,10 +94,8 @@ TEST(TruncatedButPlausibleHeadersDoNotCrash)
     // A real Ethernet+IP+TCP header's opening bytes, cut off at every
     // possible length - including lengths that pass Ethernet's own size
     // check but leave IP/TCP with too little to work with.
-    Bytes full = Bytes::from_hex(
-        "aabbccddeeff001122334455080045000028000140004006"
-        "0000ac100a63ac100a0c00500050000000000000000050022000000000"
-    );
+    Bytes full = Bytes::from_hex("aabbccddeeff001122334455080045000028000140004006"
+                                 "0000ac100a63ac100a0c00500050000000000000000050022000000000");
 
     for (size_t len = 0; len <= full.size(); len++)
     {

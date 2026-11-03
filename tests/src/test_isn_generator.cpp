@@ -30,12 +30,8 @@ TEST(SipHashMatchesTheReferenceVectors)
     };
 
     const std::vector<Vector> vectors = {
-        {0, 0x726fdb47dd0e0e31ULL},
-        {1, 0x74f839c593dc67fdULL},
-        {2, 0x0d6c8009d9a94f5aULL},
-        {3, 0x85676696d7fb7e2dULL},
-        {8, 0x93f5f5799a932462ULL},
-        {15, 0xa129ca6149be45e5ULL},
+        {0, 0x726fdb47dd0e0e31ULL}, {1, 0x74f839c593dc67fdULL}, {2, 0x0d6c8009d9a94f5aULL},
+        {3, 0x85676696d7fb7e2dULL}, {8, 0x93f5f5799a932462ULL}, {15, 0xa129ca6149be45e5ULL},
     };
 
     uint8_t message[16];
@@ -86,8 +82,7 @@ TEST(TheOffsetIsNotSymmetricInTheAddressPair)
     // *from* it.
     IsnGenerator generator(TEST_KEY_LOW, TEST_KEY_HIGH);
 
-    test_assert(generator.offset_for(LOCAL, 8080, PEER, 12345) !=
-                generator.offset_for(PEER, 12345, LOCAL, 8080),
+    test_assert(generator.offset_for(LOCAL, 8080, PEER, 12345) != generator.offset_for(PEER, 12345, LOCAL, 8080),
                 "swapping the endpoints must not reproduce the offset");
 }
 
@@ -101,8 +96,7 @@ TEST(ADifferentSecretGivesAnUnrelatedOffsetForTheSameConnection)
     IsnGenerator one(TEST_KEY_LOW, TEST_KEY_HIGH);
     IsnGenerator another(TEST_KEY_LOW ^ 1, TEST_KEY_HIGH);
 
-    test_assert(one.offset_for(LOCAL, 8080, PEER, 12345) !=
-                another.offset_for(LOCAL, 8080, PEER, 12345),
+    test_assert(one.offset_for(LOCAL, 8080, PEER, 12345) != another.offset_for(LOCAL, 8080, PEER, 12345),
                 "a one-bit change in the key must change the offset");
 }
 
@@ -131,8 +125,7 @@ TEST(OffsetsAreSpreadAcrossTheSequenceSpaceRatherThanClustered)
 
     test_assert(offsets.size() == 199, "200 consecutive ports must not collide");
     test_assert(smallest_gap > 65536,
-                "consecutive ports must not land near each other, smallest gap was " +
-                std::to_string(smallest_gap));
+                "consecutive ports must not land near each other, smallest gap was " + std::to_string(smallest_gap));
 }
 
 TEST(TheClockTermAdvancesTheIsnBeyondItsOwnOffset)
@@ -156,7 +149,6 @@ TEST(TwoGeneratorsDrawDifferentSecrets)
     IsnGenerator one;
     IsnGenerator another;
 
-    test_assert(one.offset_for(LOCAL, 8080, PEER, 12345) !=
-                another.offset_for(LOCAL, 8080, PEER, 12345),
+    test_assert(one.offset_for(LOCAL, 8080, PEER, 12345) != another.offset_for(LOCAL, 8080, PEER, 12345),
                 "two stacks must not share a secret");
 }

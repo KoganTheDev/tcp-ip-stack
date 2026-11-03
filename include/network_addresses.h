@@ -43,7 +43,7 @@ private:
 
 namespace std
 {
-    template<>
+    template <>
     struct hash<IPv4Address>
     {
         std::size_t operator()(const IPv4Address& ip_address) const noexcept; // Hash an IPv4 address for a hash map

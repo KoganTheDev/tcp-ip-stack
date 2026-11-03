@@ -1,8 +1,7 @@
 #include "thread_pool.h"
 #include "logger.h"
 
-ThreadPool::ThreadPool(size_t worker_count)
-    : _stopping(false)
+ThreadPool::ThreadPool(size_t worker_count) : _stopping(false)
 {
     for (size_t i = 0; i < worker_count; ++i)
     {
@@ -79,10 +78,7 @@ void ThreadPool::_worker_loop()
 
         {
             std::unique_lock<std::mutex> lock(this->_queue_mutex);
-            this->_condition.wait(lock, [this]
-            {
-                return this->_stopping.load() || !this->_tasks.empty();
-            });
+            this->_condition.wait(lock, [this] { return this->_stopping.load() || !this->_tasks.empty(); });
 
             if (this->_stopping.load() && this->_tasks.empty())
             {

@@ -50,10 +50,8 @@ public:
 
     // Offers one fragment's payload. fragment_offset is the raw header field,
     // counted in 8-byte units as it is on the wire.
-    Result offer(const IPv4Address& source, const IPv4Address& destination,
-                 uint16_t identification, uint8_t protocol,
-                 uint16_t fragment_offset, bool more_fragments,
-                 const Bytes& payload, Bytes& out_datagram);
+    Result offer(const IPv4Address& source, const IPv4Address& destination, uint16_t identification, uint8_t protocol,
+                 uint16_t fragment_offset, bool more_fragments, const Bytes& payload, Bytes& out_datagram);
 
     // Ages every partial datagram and drops those that ran out of time. The
     // source address of each expired one is appended to expired_sources, so the

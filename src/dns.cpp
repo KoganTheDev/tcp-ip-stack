@@ -24,14 +24,14 @@ Dns::Dns(const Bytes& bytes) : Dns()
 
 void Dns::set_response(bool response)
 {
-    this->_flags = response ? static_cast<uint16_t>(this->_flags | 0x8000)
-                            : static_cast<uint16_t>(this->_flags & 0x7fff);
+    this->_flags =
+        response ? static_cast<uint16_t>(this->_flags | 0x8000) : static_cast<uint16_t>(this->_flags & 0x7fff);
 }
 
 void Dns::set_recursion_desired(bool desired)
 {
-    this->_flags = desired ? static_cast<uint16_t>(this->_flags | 0x0100)
-                           : static_cast<uint16_t>(this->_flags & 0xfeff);
+    this->_flags =
+        desired ? static_cast<uint16_t>(this->_flags | 0x0100) : static_cast<uint16_t>(this->_flags & 0xfeff);
 }
 
 std::string Dns::_decode_name(const Bytes& data, size_t& offset) const
@@ -60,8 +60,8 @@ std::string Dns::_decode_name(const Bytes& data, size_t& offset) const
             {
                 throw EXCEPTION(BaseException, "DNS compression pointer truncated");
             }
-            uint16_t target = static_cast<uint16_t>(
-                ((static_cast<uint16_t>(length) << 8) | data[position + 1]) & OFFSET_MASK);
+            uint16_t target =
+                static_cast<uint16_t>(((static_cast<uint16_t>(length) << 8) | data[position + 1]) & OFFSET_MASK);
 
             if (!jumped)
             {

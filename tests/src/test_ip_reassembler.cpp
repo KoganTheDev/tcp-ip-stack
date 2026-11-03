@@ -25,7 +25,10 @@ namespace
     Bytes filled(size_t length, uint8_t value)
     {
         Bytes b(static_cast<unsigned int>(length));
-        for (size_t i = 0; i < length; i++) { b[i] = value; }
+        for (size_t i = 0; i < length; i++)
+        {
+            b[i] = value;
+        }
         return b;
     }
 }
@@ -78,7 +81,8 @@ TEST(OverlappingFragmentsDestroyTheWholeDatagram)
     test_assert(offer(reassembler, 1, true, filled(16, 0xBB), out) == IpReassembler::Result::Rejected,
                 "a fragment overlapping one already held must be refused, not resolved in favour of either");
     test_assert(reassembler.pending_datagrams() == 0,
-                "the whole datagram must be discarded - keeping the non-overlapping parts would still let an attacker steer the result");
+                "the whole datagram must be discarded - keeping the non-overlapping parts would still let an attacker "
+                "steer the result");
     test_assert(reassembler.buffered_bytes() == 0, "and its buffer released");
 }
 
@@ -128,9 +132,11 @@ TEST(PendingDatagramsAreCapped)
     test_assert(reassembler.pending_datagrams() == IpReassembler::MAX_PENDING_DATAGRAMS, "the table should be full");
 
     IpReassembler::Result result = reassembler.offer(SRC, DST, 9999, PROTO, 0, true, filled(8, 0xAA), out);
-    test_assert(result == IpReassembler::Result::Rejected,
-                "a further partial datagram must be refused once the limit is reached, or an attacker sets the memory budget");
-    test_assert(reassembler.pending_datagrams() == IpReassembler::MAX_PENDING_DATAGRAMS, "and must not be admitted anyway");
+    test_assert(
+        result == IpReassembler::Result::Rejected,
+        "a further partial datagram must be refused once the limit is reached, or an attacker sets the memory budget");
+    test_assert(reassembler.pending_datagrams() == IpReassembler::MAX_PENDING_DATAGRAMS,
+                "and must not be admitted anyway");
 }
 
 TEST(IncompleteDatagramsExpireAndNameTheirSender)
@@ -142,12 +148,15 @@ TEST(IncompleteDatagramsExpireAndNameTheirSender)
     std::vector<IPv4Address> expired;
     reassembler.age(TEST_TICK_MS, expired);
     reassembler.age(TEST_TICK_MS, expired);
-    test_assert(expired.empty() && reassembler.pending_datagrams() == 1, "it should still be waiting before the timeout elapses");
+    test_assert(expired.empty() && reassembler.pending_datagrams() == 1,
+                "it should still be waiting before the timeout elapses");
 
     reassembler.age(TEST_TICK_MS, expired);
-    test_assert(reassembler.pending_datagrams() == 0, "a datagram whose fragments never arrived must not be held forever");
-    test_assert(expired.size() == 1 && expired[0] == SRC,
-                "the sender must be reported so it can be told - it is otherwise waiting on a datagram nobody will deliver");
+    test_assert(reassembler.pending_datagrams() == 0,
+                "a datagram whose fragments never arrived must not be held forever");
+    test_assert(
+        expired.size() == 1 && expired[0] == SRC,
+        "the sender must be reported so it can be told - it is otherwise waiting on a datagram nobody will deliver");
     test_assert(reassembler.buffered_bytes() == 0, "the buffer must be released");
 }
 

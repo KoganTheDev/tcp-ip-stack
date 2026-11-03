@@ -9,7 +9,7 @@ namespace
     {
         const Bytes& bytes = ip.get_address();
         return (static_cast<uint32_t>(bytes[0]) << 24) | (static_cast<uint32_t>(bytes[1]) << 16)
-             | (static_cast<uint32_t>(bytes[2]) << 8) | static_cast<uint32_t>(bytes[3]);
+               | (static_cast<uint32_t>(bytes[2]) << 8) | static_cast<uint32_t>(bytes[3]);
     }
 
     IPv4Address from_uint32(uint32_t value)

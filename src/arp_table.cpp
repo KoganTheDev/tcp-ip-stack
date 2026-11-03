@@ -1,9 +1,6 @@
 #include "arp_table.h"
 
-ArpTable::ArpTable(int default_ttl_ms)
-    : _default_ttl_ms(default_ttl_ms)
-{
-}
+ArpTable::ArpTable(int default_ttl_ms) : _default_ttl_ms(default_ttl_ms) {}
 
 bool ArpTable::learn(const IPv4Address& ip, const MacAddress& mac)
 {
@@ -68,7 +65,7 @@ void ArpTable::remove(const IPv4Address& ip)
 
 void ArpTable::age(uint32_t elapsed_ms)
 {
-    for (auto it = this->_entries.begin(); it != this->_entries.end(); )
+    for (auto it = this->_entries.begin(); it != this->_entries.end();)
     {
         if (it->second.is_static)
         {

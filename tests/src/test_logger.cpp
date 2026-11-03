@@ -24,10 +24,7 @@ TEST(BelowMinimumLevelProducesNoOutput)
 {
     Logger::instance().set_level(LogLevel::WARNING);
 
-    std::string output = capture_stderr([]
-    {
-        LOG_INFO("this should not appear");
-    });
+    std::string output = capture_stderr([] { LOG_INFO("this should not appear"); });
 
     test_assert(output.empty(), "a message below the configured minimum level should produce no output");
 
@@ -38,14 +35,12 @@ TEST(AtOrAboveMinimumLevelProducesFormattedOutput)
 {
     Logger::instance().set_level(LogLevel::WARNING);
 
-    std::string output = capture_stderr([]
-    {
-        LOG_ERROR("something went wrong");
-    });
+    std::string output = capture_stderr([] { LOG_ERROR("something went wrong"); });
 
     test_assert(!output.empty(), "a message at or above the configured minimum level should produce output");
     test_assert(output.find("ERROR") != std::string::npos, "the log line should include the level name");
-    test_assert(output.find("something went wrong") != std::string::npos, "the log line should include the message text");
+    test_assert(output.find("something went wrong") != std::string::npos,
+                "the log line should include the message text");
 
     Logger::instance().set_level(LogLevel::INFO);
 }
@@ -56,10 +51,7 @@ TEST(MessageExactlyAtMinimumLevelIsLogged)
 {
     Logger::instance().set_level(LogLevel::WARNING);
 
-    std::string output = capture_stderr([]
-    {
-        LOG_WARNING("borderline message");
-    });
+    std::string output = capture_stderr([] { LOG_WARNING("borderline message"); });
 
     test_assert(!output.empty(), "a message exactly at the configured minimum level should still be logged");
     test_assert(output.find("WARNING") != std::string::npos, "the log line should reflect the WARNING level");
@@ -73,11 +65,8 @@ TEST(MacroSupportsStreamStyleConcatenation)
 {
     Logger::instance().set_level(LogLevel::INFO);
 
-    std::string output = capture_stderr([]
-    {
-        LOG_INFO("value=" << 42 << ", ok=" << true);
-    });
+    std::string output = capture_stderr([] { LOG_INFO("value=" << 42 << ", ok=" << true); });
 
     test_assert(output.find("value=42, ok=1") != std::string::npos,
-        "the macro should support chained << concatenation like the std::cerr calls it replaces");
+                "the macro should support chained << concatenation like the std::cerr calls it replaces");
 }

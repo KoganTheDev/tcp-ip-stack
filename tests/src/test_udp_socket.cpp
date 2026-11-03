@@ -40,9 +40,7 @@ TEST(IncomingDatagramReachesRegisteredCallback)
     std::vector<ReceivedDatagram> received;
     UdpSocket socket(8080, [](const IPv4Address&, const Udp&, const Bytes&) {});
     socket.set_datagram_received_callback([&received](const IPv4Address& src_ip, uint16_t src_port, const Bytes& data)
-    {
-        received.push_back({src_ip, src_port, data});
-    });
+                                          { received.push_back({src_ip, src_port, data}); });
 
     Bytes payload = Bytes::from_hex("68656c6c6f"); // "hello"
     socket.on_datagram(IPv4Address("10.0.0.1"), *make_incoming_datagram(payload));
@@ -71,18 +69,18 @@ TEST(SendToInvokesSendCallbackWithCorrectHeaderAndPayload)
 {
     std::vector<SentDatagram> sent;
     UdpSocket socket(8080, [&sent](const IPv4Address& dest_ip, const Udp& header, const Bytes& payload)
-    {
-        sent.push_back({dest_ip, header.get_src_port(), header.get_dest_port(), payload});
-    });
+                     { sent.push_back({dest_ip, header.get_src_port(), header.get_dest_port(), payload}); });
 
     Bytes payload = Bytes::from_hex("6f6b"); // "ok"
     socket.send_to(IPv4Address("10.0.0.2"), 9000, payload);
 
     test_assert(sent.size() == 1, "send_to() should invoke the send callback exactly once");
-    test_assert(sent[0].dest_ip.to_string() == "10.0.0.2", "the send callback should receive the correct destination IP");
+    test_assert(sent[0].dest_ip.to_string() == "10.0.0.2",
+                "the send callback should receive the correct destination IP");
     test_assert(sent[0].src_port == 8080, "the outgoing header's source port should be this socket's bound port");
     test_assert(sent[0].dest_port == 9000, "the outgoing header's destination port should match send_to()'s argument");
-    test_assert(sent[0].payload.to_hex() == payload.to_hex(), "the outgoing payload should be exactly what was passed to send_to()");
+    test_assert(sent[0].payload.to_hex() == payload.to_hex(),
+                "the outgoing payload should be exactly what was passed to send_to()");
 }
 
 // A socket can correspond with many different peers, one datagram at a
@@ -93,18 +91,16 @@ TEST(SocketCanSendToAndReceiveFromMultipleDifferentPeers)
     std::vector<SentDatagram> sent;
     std::vector<ReceivedDatagram> received;
     UdpSocket socket(8080, [&sent](const IPv4Address& dest_ip, const Udp& header, const Bytes& payload)
-    {
-        sent.push_back({dest_ip, header.get_src_port(), header.get_dest_port(), payload});
-    });
+                     { sent.push_back({dest_ip, header.get_src_port(), header.get_dest_port(), payload}); });
     socket.set_datagram_received_callback([&received](const IPv4Address& src_ip, uint16_t src_port, const Bytes& data)
-    {
-        received.push_back({src_ip, src_port, data});
-    });
+                                          { received.push_back({src_ip, src_port, data}); });
 
     socket.send_to(IPv4Address("10.0.0.2"), 9000, Bytes::from_hex("01"));
     socket.send_to(IPv4Address("10.0.0.3"), 9001, Bytes::from_hex("02"));
 
     test_assert(sent.size() == 2, "two send_to() calls to different peers should each go out");
-    test_assert(sent[0].dest_ip.to_string() == "10.0.0.2", "each send should go to its own destination, independent of the others");
-    test_assert(sent[1].dest_ip.to_string() == "10.0.0.3", "each send should go to its own destination, independent of the others");
+    test_assert(sent[0].dest_ip.to_string() == "10.0.0.2",
+                "each send should go to its own destination, independent of the others");
+    test_assert(sent[1].dest_ip.to_string() == "10.0.0.3",
+                "each send should go to its own destination, independent of the others");
 }

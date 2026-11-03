@@ -13,7 +13,8 @@ TEST(MssAndWindowScaleOptionsRoundTrip)
 
     Bytes bytes = segment.to_bytes();
     // MSS (4 bytes) + window scale (3 bytes) = 7, NOP-padded to 8 -> 28-byte header
-    test_assert(bytes.size() == 28, "20-byte fixed header + 8 bytes of NOP-padded options should give a 28-byte segment");
+    test_assert(bytes.size() == 28,
+                "20-byte fixed header + 8 bytes of NOP-padded options should give a 28-byte segment");
 
     Tcp parsed(bytes);
     test_assert(parsed.has_mss_option(), "MSS option should round-trip");
@@ -27,7 +28,8 @@ TEST(SegmentWithoutOptionsHasNoOptionsAfterRoundTrip)
 {
     Tcp segment(12345, 80, 1000, 2000, 5, 0x10, 65535, 0, 0);
     Bytes bytes = segment.to_bytes();
-    test_assert(bytes.size() == 20, "a segment with no options set should serialize to exactly the fixed 20-byte header");
+    test_assert(bytes.size() == 20,
+                "a segment with no options set should serialize to exactly the fixed 20-byte header");
 
     Tcp parsed(bytes);
     test_assert(!parsed.has_mss_option(), "no MSS option should be present if none was set");
@@ -50,7 +52,8 @@ TEST(UnknownOptionKindIsSkippedWithoutBreakingParsing)
 
     Tcp parsed(with_unknown);
     test_assert(parsed.has_mss_option(), "the known MSS option before the unknown one should still parse correctly");
-    test_assert(parsed.get_mss_option() == 1460, "the known MSS option's value should be unaffected by the unknown option after it");
+    test_assert(parsed.get_mss_option() == 1460,
+                "the known MSS option's value should be unaffected by the unknown option after it");
 }
 
 // RFC 7323 SS2.3 caps the window scale shift at 14. The value arrives as a raw
@@ -66,7 +69,8 @@ TEST(OversizedWindowScaleOptionIsClampedAtParseTime)
 
     test_assert(parsed.has_window_scale_option(), "the option should still be recognised, not discarded");
     test_assert(parsed.get_window_scale_option() == Tcp::MAX_WINDOW_SCALE,
-                "a shift count above the RFC 7323 maximum must be clamped to 14, never stored raw - it is used as a shift count");
+                "a shift count above the RFC 7323 maximum must be clamped to 14, never stored raw - it is used as a "
+                "shift count");
 }
 
 // The boundary itself must pass through untouched - the clamp has to be a cap,
@@ -77,7 +81,8 @@ TEST(MaximumLegalWindowScaleOptionIsPreservedExactly)
     segment.set_window_scale_option(14);
 
     Tcp parsed(segment.to_bytes());
-    test_assert(parsed.get_window_scale_option() == 14, "a shift count of exactly 14 is legal and must survive parsing unchanged");
+    test_assert(parsed.get_window_scale_option() == 14,
+                "a shift count of exactly 14 is legal and must survive parsing unchanged");
 }
 
 // Timestamps differ from MSS and window scale in that they appear on every

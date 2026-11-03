@@ -25,10 +25,7 @@ public:
         return frame;
     }
 
-    void write(const Bytes& buffer) override
-    {
-        this->_outbound.push_back(buffer);
-    }
+    void write(const Bytes& buffer) override { this->_outbound.push_back(buffer); }
 
     int get_fd() const override { return -1; }
 

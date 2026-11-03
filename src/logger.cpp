@@ -10,17 +10,20 @@ Logger& Logger::instance()
     return logger;
 }
 
-Logger::Logger()
-    : _min_level(LogLevel::INFO)
+Logger::Logger() : _min_level(LogLevel::INFO)
 {
     const char* level_env = std::getenv("LOG_LEVEL");
     if (level_env)
     {
         std::string level_str(level_env);
-        if (level_str == "DEBUG") this->_min_level = LogLevel::DEBUG;
-        else if (level_str == "INFO") this->_min_level = LogLevel::INFO;
-        else if (level_str == "WARNING") this->_min_level = LogLevel::WARNING;
-        else if (level_str == "ERROR") this->_min_level = LogLevel::ERROR;
+        if (level_str == "DEBUG")
+            this->_min_level = LogLevel::DEBUG;
+        else if (level_str == "INFO")
+            this->_min_level = LogLevel::INFO;
+        else if (level_str == "WARNING")
+            this->_min_level = LogLevel::WARNING;
+        else if (level_str == "ERROR")
+            this->_min_level = LogLevel::ERROR;
         // anything else (typo, unrecognized value): keep the INFO default
         // rather than fail the program over a malformed env var
     }
@@ -31,8 +34,8 @@ Logger::Logger()
         this->_file_sink.open(file_env, std::ios::app);
         if (!this->_file_sink.is_open())
         {
-            std::cerr << "Logger: failed to open LOG_FILE=\"" << file_env
-                       << "\" - continuing with console-only logging" << std::endl;
+            std::cerr << "Logger: failed to open LOG_FILE=\"" << file_env << "\" - continuing with console-only logging"
+                      << std::endl;
         }
     }
 }
@@ -47,10 +50,14 @@ const char* Logger::_level_name(LogLevel level)
 {
     switch (level)
     {
-    case LogLevel::DEBUG:   return "DEBUG";
-    case LogLevel::INFO:    return "INFO";
-    case LogLevel::WARNING: return "WARNING";
-    case LogLevel::ERROR:   return "ERROR";
+    case LogLevel::DEBUG:
+        return "DEBUG";
+    case LogLevel::INFO:
+        return "INFO";
+    case LogLevel::WARNING:
+        return "WARNING";
+    case LogLevel::ERROR:
+        return "ERROR";
     }
     return "UNKNOWN";
 }
@@ -66,8 +73,8 @@ std::string Logger::_timestamp()
     return std::string(buffer);
 }
 
-void Logger::log(LogLevel level, const std::string& message,
-                  const std::string& file, const std::string& func, unsigned int line)
+void Logger::log(LogLevel level, const std::string& message, const std::string& file, const std::string& func,
+                 unsigned int line)
 {
     if (level < this->_min_level)
     {
@@ -75,8 +82,8 @@ void Logger::log(LogLevel level, const std::string& message,
     }
 
     std::ostringstream formatted;
-    formatted << "[" << _timestamp() << "] [" << _level_name(level) << "] "
-              << file << ":" << line << " (" << func << "): " << message;
+    formatted << "[" << _timestamp() << "] [" << _level_name(level) << "] " << file << ":" << line << " (" << func
+              << "): " << message;
 
     std::lock_guard<std::mutex> lock(this->_mutex);
     std::cerr << formatted.str() << std::endl;

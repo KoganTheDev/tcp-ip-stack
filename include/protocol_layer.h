@@ -25,12 +25,12 @@ protected:
     void encapsulate(std::unique_ptr<ProtocolLayer> next_layer);
     template <typename T>
     void encapsulate(T&& next_layer);
-    
+
     // Returns a formatted string of a field and its value
     static std::string _field_to_string(const std::string& name, const std::string& value);
     // Returns a formatted string of the protocol name
     static std::string _protocol_header_to_string(const std::string& protocol_name);
-    
+
 
     std::unique_ptr<ProtocolLayer> _next_layer;
 };

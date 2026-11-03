@@ -12,21 +12,19 @@ namespace
 }
 
 Dhcp::Dhcp()
-    : _op(OP_BOOTREQUEST), _hardware_type(HTYPE_ETHERNET), _hardware_length(HLEN_ETHERNET),
-      _hops(0), _transaction_id(0), _seconds_elapsed(0), _flags(0)
-{
-}
+    : _op(OP_BOOTREQUEST), _hardware_type(HTYPE_ETHERNET), _hardware_length(HLEN_ETHERNET), _hops(0),
+      _transaction_id(0), _seconds_elapsed(0), _flags(0)
+{}
 
-Dhcp::Dhcp(const Bytes& bytes)
-    : Dhcp()
+Dhcp::Dhcp(const Bytes& bytes) : Dhcp()
 {
     this->from_bytes(bytes);
 }
 
 void Dhcp::set_broadcast_flag(bool broadcast)
 {
-    this->_flags = broadcast ? static_cast<uint16_t>(this->_flags | 0x8000)
-                             : static_cast<uint16_t>(this->_flags & 0x7fff);
+    this->_flags =
+        broadcast ? static_cast<uint16_t>(this->_flags | 0x8000) : static_cast<uint16_t>(this->_flags & 0x7fff);
 }
 
 void Dhcp::from_bytes(const Bytes& data)
@@ -51,9 +49,7 @@ void Dhcp::from_bytes(const Bytes& data)
     // much of it is real. Trusting hlen would let a message claim 200 bytes of
     // MAC address, so only an Ethernet-sized one is taken and anything else
     // leaves the address zero rather than reading past the field.
-    this->_client_mac = this->_hardware_length == HLEN_ETHERNET
-        ? MacAddress(data.slice(28, 6))
-        : MacAddress();
+    this->_client_mac = this->_hardware_length == HLEN_ETHERNET ? MacAddress(data.slice(28, 6)) : MacAddress();
 
     this->_options.clear();
 
@@ -132,8 +128,7 @@ Bytes Dhcp::to_bytes()
     result.append_int<uint16_t>(this->_seconds_elapsed);
     result.append_int<uint16_t>(this->_flags);
 
-    for (const IPv4Address* address : {&this->_client_ip, &this->_your_ip,
-                                       &this->_server_ip, &this->_gateway_ip})
+    for (const IPv4Address* address : {&this->_client_ip, &this->_your_ip, &this->_server_ip, &this->_gateway_ip})
     {
         const Bytes& octets = address->get_address();
         result.insert(result.end(), octets.begin(), octets.end());

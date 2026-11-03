@@ -42,8 +42,14 @@ TEST(ArpReplyRoundTrip)
 TEST(UndersizedArpPacketIsRejected)
 {
     bool threw = false;
-    try { Arp arp(Bytes::from_hex("0001080006040001")); } // 8 bytes, well under the 28-byte minimum
-    catch (const BaseException&) { threw = true; }
+    try
+    {
+        Arp arp(Bytes::from_hex("0001080006040001"));
+    } // 8 bytes, well under the 28-byte minimum
+    catch (const BaseException&)
+    {
+        threw = true;
+    }
     test_assert(threw, "an ARP packet shorter than 28 bytes should throw");
 }
 
@@ -60,28 +66,42 @@ TEST(UndersizedArpPacketIsRejected)
 namespace
 {
     // htype(2) ptype(2) hlen(1) plen(1) op(2) sha(6) spa(4) tha(6) tpa(4)
-    const std::string VALID_ARP =
-        "0001" "0800" "06" "04" "0001"
-        "112233445566" "0a000001" "000000000000" "0a000002";
+    const std::string VALID_ARP = "0001"
+                                  "0800"
+                                  "06"
+                                  "04"
+                                  "0001"
+                                  "112233445566"
+                                  "0a000001"
+                                  "000000000000"
+                                  "0a000002";
 
     bool arp_is_rejected(const std::string& hex)
     {
-        try { Arp arp(Bytes::from_hex(hex)); }
-        catch (const BaseException&) { return true; }
+        try
+        {
+            Arp arp(Bytes::from_hex(hex));
+        }
+        catch (const BaseException&)
+        {
+            return true;
+        }
         return false;
     }
 }
 
 TEST(WellFormedEthernetIpv4ArpIsStillAccepted)
 {
-    test_assert(!arp_is_rejected(VALID_ARP), "a normal Ethernet/IPv4 ARP packet must still parse - the guard must not be over-tight");
+    test_assert(!arp_is_rejected(VALID_ARP),
+                "a normal Ethernet/IPv4 ARP packet must still parse - the guard must not be over-tight");
 }
 
 TEST(ArpWithNonEthernetHardwareTypeIsRejected)
 {
     std::string packet = VALID_ARP;
     packet.replace(0, 4, "0009"); // hardware type 9, not Ethernet
-    test_assert(arp_is_rejected(packet), "an ARP packet for a non-Ethernet hardware type must be rejected, not read as if it were Ethernet");
+    test_assert(arp_is_rejected(packet),
+                "an ARP packet for a non-Ethernet hardware type must be rejected, not read as if it were Ethernet");
 }
 
 TEST(ArpWithNonIpv4ProtocolTypeIsRejected)
@@ -95,9 +115,11 @@ TEST(ArpWithMismatchedAddressLengthsIsRejected)
 {
     std::string with_bad_hlen = VALID_ARP;
     with_bad_hlen.replace(8, 2, "08"); // claims 8-byte hardware addresses
-    test_assert(arp_is_rejected(with_bad_hlen), "a hardware address length other than 6 must be rejected - the slices below assume 6");
+    test_assert(arp_is_rejected(with_bad_hlen),
+                "a hardware address length other than 6 must be rejected - the slices below assume 6");
 
     std::string with_bad_plen = VALID_ARP;
     with_bad_plen.replace(10, 2, "10"); // claims 16-byte protocol addresses
-    test_assert(arp_is_rejected(with_bad_plen), "a protocol address length other than 4 must be rejected - the slices below assume 4");
+    test_assert(arp_is_rejected(with_bad_plen),
+                "a protocol address length other than 4 must be rejected - the slices below assume 4");
 }

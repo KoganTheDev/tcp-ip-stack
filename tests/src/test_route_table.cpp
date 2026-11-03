@@ -27,8 +27,9 @@ TEST(ConnectedRouteResolvesTheDestinationItself)
     table.add(IPv4Address("10.0.0.0"), 24, IPv4Address());
 
     test_assert(has_route_for(table, "10.0.0.7"), "an address inside the connected network should match");
-    test_assert(next_hop_for(table, "10.0.0.7") == IPv4Address("10.0.0.7"),
-                "a directly reachable destination is its own next hop - there is no router in between to address the frame to");
+    test_assert(
+        next_hop_for(table, "10.0.0.7") == IPv4Address("10.0.0.7"),
+        "a directly reachable destination is its own next hop - there is no router in between to address the frame to");
 }
 
 TEST(DefaultRouteSendsEverythingElseToTheGateway)
@@ -40,7 +41,8 @@ TEST(DefaultRouteSendsEverythingElseToTheGateway)
     test_assert(next_hop_for(table, "10.0.0.7") == IPv4Address("10.0.0.7"),
                 "an on-link destination must still resolve to itself even with a default route present");
     test_assert(next_hop_for(table, "8.8.8.8") == IPv4Address("10.0.0.1"),
-                "an off-link destination must resolve to the gateway - the IP header still names 8.8.8.8, but the frame goes to the router");
+                "an off-link destination must resolve to the gateway - the IP header still names 8.8.8.8, but the "
+                "frame goes to the router");
 }
 
 // The reason routes are matched by prefix length rather than insertion order:
@@ -53,10 +55,12 @@ TEST(LongestPrefixWinsRegardlessOfInsertionOrder)
     table.add(IPv4Address("192.168.5.0"), 24, IPv4Address("10.0.0.3")); // more specific
     table.add(IPv4Address("192.168.5.9"), 32, IPv4Address("10.0.0.4")); // host route
 
-    test_assert(next_hop_for(table, "192.168.5.9") == IPv4Address("10.0.0.4"), "a /32 host route must beat every shorter prefix");
+    test_assert(next_hop_for(table, "192.168.5.9") == IPv4Address("10.0.0.4"),
+                "a /32 host route must beat every shorter prefix");
     test_assert(next_hop_for(table, "192.168.5.20") == IPv4Address("10.0.0.3"), "the /24 must beat the /16");
     test_assert(next_hop_for(table, "192.168.9.1") == IPv4Address("10.0.0.2"), "the /16 must beat the default route");
-    test_assert(next_hop_for(table, "1.2.3.4") == IPv4Address("10.0.0.1"), "the default route catches whatever nothing else matched");
+    test_assert(next_hop_for(table, "1.2.3.4") == IPv4Address("10.0.0.1"),
+                "the default route catches whatever nothing else matched");
 }
 
 TEST(NoMatchingRouteIsReportedRatherThanGuessed)
@@ -64,8 +68,8 @@ TEST(NoMatchingRouteIsReportedRatherThanGuessed)
     RouteTable table;
     table.add(IPv4Address("10.0.0.0"), 24, IPv4Address());
 
-    test_assert(!has_route_for(table, "8.8.8.8"),
-                "with no default route an off-link destination is unreachable, and lookup must say so rather than inventing a next hop");
+    test_assert(!has_route_for(table, "8.8.8.8"), "with no default route an off-link destination is unreachable, and "
+                                                  "lookup must say so rather than inventing a next hop");
 }
 
 // A caller passing 10.0.0.7/24 means the 10.0.0.0 network. Storing it verbatim
@@ -78,7 +82,8 @@ TEST(RoutesAreNormalisedToTheirNetworkAddress)
     test_assert(table.size() == 1, "precondition");
     test_assert(table.routes()[0].destination == IPv4Address("10.0.0.0"),
                 "the host bits must be masked off on insertion, or lookups against this route never match");
-    test_assert(next_hop_for(table, "10.0.0.99") == IPv4Address("192.168.1.1"), "the normalised route should still match its network");
+    test_assert(next_hop_for(table, "10.0.0.99") == IPv4Address("192.168.1.1"),
+                "the normalised route should still match its network");
 }
 
 TEST(AddingTheSameNetworkReplacesRatherThanDuplicates)
@@ -108,14 +113,18 @@ TEST(BroadcastRecognisesLimitedAndDirectedForms)
     config.ip = IPv4Address("10.0.0.2");
     config.prefix_length = 24;
 
-    test_assert(is_broadcast_address(IPv4Address("255.255.255.255"), config), "the limited broadcast is always broadcast");
-    test_assert(is_broadcast_address(IPv4Address("10.0.0.255"), config), "the all-ones host part of our own network is a directed broadcast");
+    test_assert(is_broadcast_address(IPv4Address("255.255.255.255"), config),
+                "the limited broadcast is always broadcast");
+    test_assert(is_broadcast_address(IPv4Address("10.0.0.255"), config),
+                "the all-ones host part of our own network is a directed broadcast");
     test_assert(!is_broadcast_address(IPv4Address("10.0.0.2"), config), "our own address is not a broadcast");
-    test_assert(!is_broadcast_address(IPv4Address("10.0.1.255"), config), "another network's directed broadcast is not ours");
+    test_assert(!is_broadcast_address(IPv4Address("10.0.1.255"), config),
+                "another network's directed broadcast is not ours");
 
     InterfaceConfig unconfigured;
-    test_assert(is_broadcast_address(IPv4Address("255.255.255.255"), unconfigured),
-                "the limited broadcast must be recognised even with no address configured - that is the whole point of it");
+    test_assert(
+        is_broadcast_address(IPv4Address("255.255.255.255"), unconfigured),
+        "the limited broadcast must be recognised even with no address configured - that is the whole point of it");
     test_assert(!is_broadcast_address(IPv4Address("10.0.0.255"), unconfigured),
                 "without an address there is no network whose host part could be all ones");
 }

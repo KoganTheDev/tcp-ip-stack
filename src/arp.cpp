@@ -4,23 +4,19 @@
 #include "raw.h"
 #include <string>
 
-Arp::Arp(ArpOperation operation, const MacAddress& sender_hardware_address, const IPv4Address& sender_protocol_address, const MacAddress& target_hardware_address, const IPv4Address& target_protocol_address)
-    : _hardware_type(ArpHardwareType::ETHERNET),
-      _protocol_type(ArpProtocolType::IPV4),
-      _hardware_address_length(6),
-      _protocol_address_length(4),
-      _operation(operation),
-      _sender_hardware_address(sender_hardware_address),
-      _sender_protocol_address(sender_protocol_address),
-      _target_hardware_address(target_hardware_address),
+Arp::Arp(ArpOperation operation, const MacAddress& sender_hardware_address, const IPv4Address& sender_protocol_address,
+         const MacAddress& target_hardware_address, const IPv4Address& target_protocol_address)
+    : _hardware_type(ArpHardwareType::ETHERNET), _protocol_type(ArpProtocolType::IPV4), _hardware_address_length(6),
+      _protocol_address_length(4), _operation(operation), _sender_hardware_address(sender_hardware_address),
+      _sender_protocol_address(sender_protocol_address), _target_hardware_address(target_hardware_address),
       _target_protocol_address(target_protocol_address)
-{
-}
+{}
 
-Arp::Arp(const MacAddress &sender_hardware_address, const IPv4Address &sender_protocol_address, const IPv4Address &target_protocol_address) 
- : Arp(ArpOperation::REQUEST, sender_hardware_address, sender_protocol_address, MacAddress("00:00:00:00:00:00"), target_protocol_address)
-{
-}
+Arp::Arp(const MacAddress& sender_hardware_address, const IPv4Address& sender_protocol_address,
+         const IPv4Address& target_protocol_address)
+    : Arp(ArpOperation::REQUEST, sender_hardware_address, sender_protocol_address, MacAddress("00:00:00:00:00:00"),
+          target_protocol_address)
+{}
 
 Arp::Arp(const Bytes& bytes)
 {
@@ -34,7 +30,7 @@ void Arp::from_bytes(const Bytes& data)
         throw EXCEPTION(BaseException, "Invalid ARP packet size");
     }
     this->_hardware_type = static_cast<ArpHardwareType>(data.slice_int<uint16_t>(0));
-    this->_protocol_type = static_cast<ArpProtocolType>(data.slice_int<uint16_t>(2)); 
+    this->_protocol_type = static_cast<ArpProtocolType>(data.slice_int<uint16_t>(2));
     this->_hardware_address_length = data.slice_int<uint8_t>(4);
     this->_protocol_address_length = data.slice_int<uint8_t>(5);
     this->_operation = static_cast<ArpOperation>(data.slice_int<uint16_t>(6));
@@ -51,10 +47,8 @@ void Arp::from_bytes(const Bytes& data)
     // refusing it here is both the honest answer and the narrower attack
     // surface - ARP is the protocol that believes whatever it is told, and the
     // fixed fields are the one part that can be checked cheaply.
-    if (this->_hardware_type != ArpHardwareType::ETHERNET
-        || this->_protocol_type != ArpProtocolType::IPV4
-        || this->_hardware_address_length != 6
-        || this->_protocol_address_length != 4)
+    if (this->_hardware_type != ArpHardwareType::ETHERNET || this->_protocol_type != ArpProtocolType::IPV4
+        || this->_hardware_address_length != 6 || this->_protocol_address_length != 4)
     {
         throw EXCEPTION(BaseException, "Unsupported ARP binding (not Ethernet/IPv4 with 6/4 address lengths)");
     }
@@ -66,7 +60,7 @@ void Arp::from_bytes(const Bytes& data)
 
     if (data.size() > 28)
     {
-        this->_next_layer = std::make_unique<Raw>(data.slice(28)); 
+        this->_next_layer = std::make_unique<Raw>(data.slice(28));
     }
 }
 
@@ -83,7 +77,7 @@ Bytes Arp::to_bytes()
     result |= this->_sender_protocol_address.get_address();
     result |= this->_target_hardware_address.get_address();
     result |= this->_target_protocol_address.get_address();
-    
+
     if (this->_next_layer)
     {
         result |= this->_next_layer->to_bytes();
@@ -111,6 +105,6 @@ std::string Arp::to_string() const
     {
         result += this->_next_layer->to_string();
     }
-    
+
     return result;
 }

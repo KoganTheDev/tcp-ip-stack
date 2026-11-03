@@ -69,8 +69,7 @@ public:
     // As above, and also reports which interface to send by. The two-argument
     // form is kept because most callers genuinely do not care - a host with one
     // link has nothing to choose.
-    bool lookup(const IPv4Address& destination, IPv4Address& out_next_hop,
-                size_t& out_interface_index) const;
+    bool lookup(const IPv4Address& destination, IPv4Address& out_next_hop, size_t& out_interface_index) const;
 
     const std::vector<Route>& routes() const { return _routes; }
     size_t size() const { return _routes.size(); }

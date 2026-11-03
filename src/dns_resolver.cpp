@@ -33,10 +33,8 @@ namespace
 DnsResolver::DnsResolver(SendFn send, uint32_t random_seed)
     : _send(std::move(send)),
       // Derived differently so one seed still yields two unrelated streams.
-      _id_entropy(random_seed),
-      _port_entropy(random_seed ^ 0x9e3779b9u)
-{
-}
+      _id_entropy(random_seed), _port_entropy(random_seed ^ 0x9e3779b9u)
+{}
 
 void DnsResolver::set_servers(const std::vector<IPv4Address>& servers)
 {
@@ -58,8 +56,10 @@ namespace
     uint32_t advance(uint32_t state, uint64_t key_low, uint64_t key_high)
     {
         uint8_t buffer[4] = {
-            static_cast<uint8_t>(state >> 24), static_cast<uint8_t>(state >> 16),
-            static_cast<uint8_t>(state >> 8), static_cast<uint8_t>(state),
+            static_cast<uint8_t>(state >> 24),
+            static_cast<uint8_t>(state >> 16),
+            static_cast<uint8_t>(state >> 8),
+            static_cast<uint8_t>(state),
         };
         return static_cast<uint32_t>(siphash_2_4(buffer, sizeof(buffer), key_low, key_high));
     }
@@ -80,8 +80,8 @@ uint16_t DnsResolver::_next_source_port()
     for (int attempt = 0; attempt < 64; attempt++)
     {
         this->_port_entropy = advance(this->_port_entropy, PORT_KEY_LOW, PORT_KEY_HIGH);
-        uint16_t port = static_cast<uint16_t>(
-            FIRST_EPHEMERAL_PORT + (this->_port_entropy % (65536u - FIRST_EPHEMERAL_PORT)));
+        uint16_t port =
+            static_cast<uint16_t>(FIRST_EPHEMERAL_PORT + (this->_port_entropy % (65536u - FIRST_EPHEMERAL_PORT)));
         if (this->_pending.count(port) == 0)
         {
             return port;
@@ -147,9 +147,8 @@ void DnsResolver::_send_query(Pending& query)
     query.timeout_ms_remaining = QUERY_TIMEOUT_MS;
 
     const IPv4Address& server = this->_servers[query.server_index];
-    LOG_DEBUG("DnsResolver: query " << query.name << " to " << server.to_string()
-              << " (id=" << query.transaction_id << " sport=" << query.source_port
-              << " attempt " << query.attempts << ")");
+    LOG_DEBUG("DnsResolver: query " << query.name << " to " << server.to_string() << " (id=" << query.transaction_id
+                                    << " sport=" << query.source_port << " attempt " << query.attempts << ")");
 
     try
     {
@@ -208,8 +207,8 @@ void DnsResolver::_retry_or_fail(Pending& query)
     this->_finish(query, {});
 }
 
-void DnsResolver::on_datagram(const IPv4Address& source, uint16_t source_port,
-                              uint16_t destination_port, const Bytes& payload)
+void DnsResolver::on_datagram(const IPv4Address& source, uint16_t source_port, uint16_t destination_port,
+                              const Bytes& payload)
 {
     // Match on the destination port first: it is the per-query secret, so a
     // datagram that does not land on an outstanding query's port is not worth
@@ -229,8 +228,7 @@ void DnsResolver::on_datagram(const IPv4Address& source, uint16_t source_port,
     // that learns the port has a free shot at the id.
     if (!(source == this->_servers[query.server_index]))
     {
-        LOG_DEBUG("DnsResolver: dropping a reply for " << query.name
-                  << " from an address that was not asked");
+        LOG_DEBUG("DnsResolver: dropping a reply for " << query.name << " from an address that was not asked");
         return;
     }
 
@@ -269,7 +267,7 @@ void DnsResolver::on_datagram(const IPv4Address& source, uint16_t source_port,
         // result - a partial answer set is worse than none, because the address
         // it omits may be the only one that works.
         LOG_WARNING("DnsResolver: truncated answer for " << query.name
-                    << " and DNS over TCP is out of scope - failing the query");
+                                                         << " and DNS over TCP is out of scope - failing the query");
         this->_finish(query, {});
         return;
     }
@@ -285,8 +283,7 @@ void DnsResolver::on_datagram(const IPv4Address& source, uint16_t source_port,
             this->_finish(query, {});
             return;
         }
-        LOG_DEBUG("DnsResolver: server error " << static_cast<int>(message.response_code())
-                  << " for " << query.name);
+        LOG_DEBUG("DnsResolver: server error " << static_cast<int>(message.response_code()) << " for " << query.name);
         this->_retry_or_fail(query);
         return;
     }
@@ -354,8 +351,9 @@ void DnsResolver::on_datagram(const IPv4Address& source, uint16_t source_port,
                 ttl = (ttl == 0) ? record.ttl : std::min(ttl, record.ttl);
             }
         }
-        int cache_ms = std::max(MIN_CACHE_MS,
-            std::min(MAX_CACHE_MS, static_cast<int>(std::min<uint32_t>(ttl, MAX_CACHE_MS / 1000) * 1000)));
+        int cache_ms =
+            std::max(MIN_CACHE_MS,
+                     std::min(MAX_CACHE_MS, static_cast<int>(std::min<uint32_t>(ttl, MAX_CACHE_MS / 1000) * 1000)));
 
         if (this->_cache.size() >= MAX_CACHE_ENTRIES)
         {
@@ -363,14 +361,14 @@ void DnsResolver::on_datagram(const IPv4Address& source, uint16_t source_port,
             // and bounded, and "closest to worthless" is a better eviction
             // choice than "least recently touched" when every entry has a
             // known expiry.
-            auto soonest = std::min_element(this->_cache.begin(), this->_cache.end(),
-                [](const auto& a, const auto& b) { return a.second.ms_remaining < b.second.ms_remaining; });
+            auto soonest = std::min_element(this->_cache.begin(), this->_cache.end(), [](const auto& a, const auto& b)
+                                            { return a.second.ms_remaining < b.second.ms_remaining; });
             this->_cache.erase(soonest);
         }
         this->_cache[query.name] = CacheEntry{addresses, cache_ms};
 
-        LOG_DEBUG("DnsResolver: " << query.name << " resolved to " << addresses.size()
-                  << " address(es), cached for " << cache_ms << "ms");
+        LOG_DEBUG("DnsResolver: " << query.name << " resolved to " << addresses.size() << " address(es), cached for "
+                                  << cache_ms << "ms");
     }
 
     this->_finish(query, addresses);

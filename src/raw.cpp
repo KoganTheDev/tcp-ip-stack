@@ -3,10 +3,7 @@
 #include <utility>
 
 
-Raw::Raw(Bytes data)
-    : _data(std::move(data))
-{
-}
+Raw::Raw(Bytes data) : _data(std::move(data)) {}
 
 std::string Raw::to_string() const
 {

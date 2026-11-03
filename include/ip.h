@@ -25,9 +25,9 @@ enum IpFlag : uint8_t
 class Ip : public ProtocolLayer
 {
 public:
-    Ip(uint8_t version, uint8_t _IHL, uint8_t TOS, uint16_t total_length, uint16_t identification,
-        uint8_t ip_flags, uint16_t fragment_offset, uint8_t TTL, uint8_t protocol,
-        uint16_t header_checksum, const Bytes& src_address, const Bytes& dest_address);
+    Ip(uint8_t version, uint8_t _IHL, uint8_t TOS, uint16_t total_length, uint16_t identification, uint8_t ip_flags,
+       uint16_t fragment_offset, uint8_t TTL, uint8_t protocol, uint16_t header_checksum, const Bytes& src_address,
+       const Bytes& dest_address);
     Ip(const Bytes& bytes); // Constructor that gets a bytestream and serializes it directly into an IP object
 
     void from_bytes(const Bytes& data);
@@ -93,10 +93,12 @@ private:
     // The three flag bits (reserved/DF/MF) as one field, in their wire
     // positions (see IpFlag) - mirrors how Tcp keeps a single flags byte.
     uint8_t _flags;
-    uint16_t _fragment_offset; // When fragmentation occurs, represents the offset from the start of the packet. valid values [0, 8191]
-    uint8_t _TTL; // Time to live, used to prevent routing loops, when the packet reaches a router, the router decrements 1 from this field and recalculates the IP header checksum.
+    uint16_t
+        _fragment_offset; // When fragmentation occurs, represents the offset from the start of the packet. valid values [0, 8191]
+    uint8_t
+        _TTL; // Time to live, used to prevent routing loops, when the packet reaches a router, the router decrements 1 from this field and recalculates the IP header checksum.
     uint8_t _protocol; // Defines the transport protocol within the packet
-    uint16_t _header_checksum; // Used for error detection only. if an error is detected, the packet is dropped. 
+    uint16_t _header_checksum; // Used for error detection only. if an error is detected, the packet is dropped.
     Bytes _src_address; // IP source address
     Bytes _dest_address; // IP destination address
     // Options exactly as received (IHL*4 - 20 bytes). Never interpreted, but

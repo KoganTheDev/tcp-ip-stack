@@ -31,13 +31,12 @@ class Arp : public ProtocolLayer
 {
 public:
     Arp() = default;
-    Arp(
-        ArpOperation operation, const MacAddress& sender_hardware_address, const IPv4Address& sender_protocol_address, 
-        const MacAddress& target_hardware_address, const IPv4Address& target_protocol_address
-    );
-    Arp(const MacAddress& sender_hardware_address, const IPv4Address& sender_protocol_address, const IPv4Address& target_protocol_address);
+    Arp(ArpOperation operation, const MacAddress& sender_hardware_address, const IPv4Address& sender_protocol_address,
+        const MacAddress& target_hardware_address, const IPv4Address& target_protocol_address);
+    Arp(const MacAddress& sender_hardware_address, const IPv4Address& sender_protocol_address,
+        const IPv4Address& target_protocol_address);
     Arp(const Bytes& bytes); // Constructor that gets a bytestream and serializes it directly into an ARP object
-    
+
     void from_bytes(const Bytes& data);
     Bytes to_bytes();
     virtual std::string to_string() const;
@@ -59,8 +58,10 @@ private:
     uint8_t _hardware_address_length; // hlen
     uint8_t _protocol_address_length; // plen
     ArpOperation _operation; // oper, 1 - ARP request | 2 - ARP reply
-    MacAddress _sender_hardware_address; // sha, on ARP request holds the sender`s MAC address, on ARP reply holds the requested MAC address from the receiver
+    MacAddress
+        _sender_hardware_address; // sha, on ARP request holds the sender`s MAC address, on ARP reply holds the requested MAC address from the receiver
     IPv4Address _sender_protocol_address; // spa, Sender IP address
-    MacAddress _target_hardware_address; // tha, on Arp request - not used, on ARP reply holds the MAC address of the machine the ARP request was sent for.
+    MacAddress
+        _target_hardware_address; // tha, on Arp request - not used, on ARP reply holds the MAC address of the machine the ARP request was sent for.
     IPv4Address _target_protocol_address; // tpa, IP address of the machine the ARP request was sent for
 };

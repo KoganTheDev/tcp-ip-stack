@@ -1,15 +1,16 @@
 #include "utils.h"
 
-void system_wrapper(const std::string &command)
+void system_wrapper(const std::string& command)
 {
-    int return_value = system(command.c_str()); 
+    int return_value = system(command.c_str());
     if (return_value != 0)
     {
-        throw EXCEPTION(SystemException, "Error in command \"" + command + "\", return value " + std::to_string(return_value));
+        throw EXCEPTION(SystemException,
+                        "Error in command \"" + command + "\", return value " + std::to_string(return_value));
     }
 }
 
-std::string string_replace_all(const std::string &str, const std::string &to_replace, const std::string &replace_with)
+std::string string_replace_all(const std::string& str, const std::string& to_replace, const std::string& replace_with)
 {
     if (to_replace.empty())
     {
@@ -27,8 +28,8 @@ std::string string_replace_all(const std::string &str, const std::string &to_rep
 }
 
 uint8_t hex_char_to_int(char character)
-{   
-    if ('0'<= character && character <= '9')
+{
+    if ('0' <= character && character <= '9')
     {
         return character - '0';
     }
@@ -48,7 +49,7 @@ uint8_t hex_char_to_int(char character)
 
 uint8_t decimal_char_to_int(char character)
 {
-    if ('0'<= character && character <= '9')
+    if ('0' <= character && character <= '9')
     {
         return character - '0';
     }
@@ -61,7 +62,7 @@ uint8_t decimal_char_to_int(char character)
 std::string byte_to_hex(uint8_t byte)
 {
     const std::string hex_chars = "0123456789abcdef";
-    return { hex_chars[byte / 0x10], hex_chars[byte % 0x10] };
+    return {hex_chars[byte / 0x10], hex_chars[byte % 0x10]};
 }
 
 std::string byte_to_decimal(uint8_t byte)
@@ -81,17 +82,17 @@ std::string byte_to_decimal(uint8_t byte)
     return std::string(result.rbegin(), result.rend());
 }
 
-uint8_t decimal_to_byte(const std::string &decimal)
+uint8_t decimal_to_byte(const std::string& decimal)
 {
     if (decimal.empty())
     {
         throw EXCEPTION(BaseException, "Invalid decimal format");
     }
     uint16_t result = 0;
-    
+
     for (char digit : decimal)
     {
-        result *= 10;       
+        result *= 10;
         result += decimal_char_to_int(digit);
         if (result > 0xff)
         {

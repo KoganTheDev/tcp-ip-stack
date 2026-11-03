@@ -1,6 +1,6 @@
 #include "test.h"
 
-int main() 
+int main()
 {
     BaseTest::run_all_tests();
     return 0;

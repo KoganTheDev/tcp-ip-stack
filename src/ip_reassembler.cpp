@@ -5,10 +5,8 @@
 
 bool IpReassembler::Key::operator==(const Key& other) const
 {
-    return this->identification == other.identification
-        && this->protocol == other.protocol
-        && this->source == other.source
-        && this->destination == other.destination;
+    return this->identification == other.identification && this->protocol == other.protocol
+           && this->source == other.source && this->destination == other.destination;
 }
 
 size_t IpReassembler::KeyHash::operator()(const Key& key) const
@@ -20,16 +18,11 @@ size_t IpReassembler::KeyHash::operator()(const Key& key) const
     return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3);
 }
 
-IpReassembler::IpReassembler(int timeout_ms)
-    : _buffered_bytes(0), _timeout_ms(timeout_ms)
-{
-}
+IpReassembler::IpReassembler(int timeout_ms) : _buffered_bytes(0), _timeout_ms(timeout_ms) {}
 
-IpReassembler::Result IpReassembler::offer(
-    const IPv4Address& source, const IPv4Address& destination,
-    uint16_t identification, uint8_t protocol,
-    uint16_t fragment_offset, bool more_fragments,
-    const Bytes& payload, Bytes& out_datagram)
+IpReassembler::Result IpReassembler::offer(const IPv4Address& source, const IPv4Address& destination,
+                                           uint16_t identification, uint8_t protocol, uint16_t fragment_offset,
+                                           bool more_fragments, const Bytes& payload, Bytes& out_datagram)
 {
     // The offset field counts 8-byte units, which is why a non-last fragment's
     // payload must itself be a multiple of 8 - there would be no way to express
@@ -39,9 +32,9 @@ IpReassembler::Result IpReassembler::offer(
 
     if (payload.empty() || end > MAX_DATAGRAM_BYTES)
     {
-        LOG_WARNING("IpReassembler: rejecting a fragment from " << source.to_string()
-                    << " claiming bytes " << start << "-" << end
-                    << " (empty, or past the maximum datagram size)");
+        LOG_WARNING("IpReassembler: rejecting a fragment from " << source.to_string() << " claiming bytes " << start
+                                                                << "-" << end
+                                                                << " (empty, or past the maximum datagram size)");
         return Result::Rejected;
     }
 
@@ -55,8 +48,8 @@ IpReassembler::Result IpReassembler::offer(
         if (this->_partials.size() >= MAX_PENDING_DATAGRAMS
             || this->_buffered_bytes + payload.size() > MAX_BUFFERED_BYTES)
         {
-            LOG_WARNING("IpReassembler: refusing a new partial datagram from " << source.to_string()
-                        << " - already holding " << this->_partials.size() << " datagrams, "
+            LOG_WARNING("IpReassembler: refusing a new partial datagram from "
+                        << source.to_string() << " - already holding " << this->_partials.size() << " datagrams, "
                         << this->_buffered_bytes << " bytes");
             return Result::Rejected;
         }
@@ -72,7 +65,7 @@ IpReassembler::Result IpReassembler::offer(
         || this->_buffered_bytes + payload.size() > MAX_BUFFERED_BYTES)
     {
         LOG_WARNING("IpReassembler: dropping datagram from " << source.to_string()
-                    << " - too many fragments or too many bytes buffered");
+                                                             << " - too many fragments or too many bytes buffered");
         this->_drop(key);
         return Result::Rejected;
     }
@@ -88,10 +81,9 @@ IpReassembler::Result IpReassembler::offer(
         size_t other_end = other_start + entry.second.size();
         if (start < other_end && other_start < end)
         {
-            LOG_WARNING("IpReassembler: dropping datagram from " << source.to_string()
-                        << " - fragment " << start << "-" << end << " overlaps "
-                        << other_start << "-" << other_end
-                        << ". Overlapping fragments are refused rather than resolved.");
+            LOG_WARNING("IpReassembler: dropping datagram from "
+                        << source.to_string() << " - fragment " << start << "-" << end << " overlaps " << other_start
+                        << "-" << other_end << ". Overlapping fragments are refused rather than resolved.");
             this->_drop(key);
             return Result::Rejected;
         }
@@ -104,8 +96,8 @@ IpReassembler::Result IpReassembler::offer(
         // is the same contradiction as an overlap.
         if (partial.have_last && partial.total_length != end)
         {
-            LOG_WARNING("IpReassembler: dropping datagram from " << source.to_string()
-                        << " - a second final fragment disagrees about the total length");
+            LOG_WARNING("IpReassembler: dropping datagram from "
+                        << source.to_string() << " - a second final fragment disagrees about the total length");
             this->_drop(key);
             return Result::Rejected;
         }
@@ -117,8 +109,8 @@ IpReassembler::Result IpReassembler::offer(
     // is another contradiction.
     if (partial.have_last && end > partial.total_length)
     {
-        LOG_WARNING("IpReassembler: dropping datagram from " << source.to_string()
-                    << " - a fragment extends past the declared end of the datagram");
+        LOG_WARNING("IpReassembler: dropping datagram from "
+                    << source.to_string() << " - a fragment extends past the declared end of the datagram");
         this->_drop(key);
         return Result::Rejected;
     }
@@ -133,8 +125,8 @@ IpReassembler::Result IpReassembler::offer(
     }
 
     out_datagram = this->_assemble(partial);
-    LOG_DEBUG("IpReassembler: reassembled a " << out_datagram.size() << "-byte datagram from "
-              << source.to_string() << " out of " << partial.fragments.size() << " fragments");
+    LOG_DEBUG("IpReassembler: reassembled a " << out_datagram.size() << "-byte datagram from " << source.to_string()
+                                              << " out of " << partial.fragments.size() << " fragments");
     this->_drop(key);
     return Result::Complete;
 }
@@ -184,13 +176,13 @@ void IpReassembler::_drop(const Key& key)
 
 void IpReassembler::age(uint32_t elapsed_ms, std::vector<IPv4Address>& expired_sources)
 {
-    for (auto it = this->_partials.begin(); it != this->_partials.end(); )
+    for (auto it = this->_partials.begin(); it != this->_partials.end();)
     {
         it->second.ms_remaining -= static_cast<int>(elapsed_ms);
         if (it->second.ms_remaining <= 0)
         {
-            LOG_WARNING("IpReassembler: a partial datagram from " << it->second.source.to_string()
-                        << " timed out with " << it->second.received_bytes << " bytes buffered");
+            LOG_WARNING("IpReassembler: a partial datagram from " << it->second.source.to_string() << " timed out with "
+                                                                  << it->second.received_bytes << " bytes buffered");
             expired_sources.push_back(it->second.source);
             this->_buffered_bytes -= it->second.received_bytes;
             it = this->_partials.erase(it);

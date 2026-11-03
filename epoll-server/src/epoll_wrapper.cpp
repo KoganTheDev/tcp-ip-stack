@@ -4,8 +4,7 @@
 #include <unistd.h>
 #include <cerrno>
 
-EpollWrapper::EpollWrapper(int max_events)
-    : _epoll_fd(-1), _max_events(max_events)
+EpollWrapper::EpollWrapper(int max_events) : _epoll_fd(-1), _max_events(max_events)
 {
     this->_epoll_fd = epoll_create1(0);
     if (this->_epoll_fd < 0)

@@ -9,8 +9,8 @@
 class Tcp : public ProtocolLayer
 {
 public:
-    Tcp(uint16_t src_port, uint16_t dest_port, uint32_t sequence_number, uint32_t acknowledgement_number, uint8_t data_offset,
-        uint8_t tcp_flags, uint16_t window, uint16_t checksum, uint16_t urgent_pointer);
+    Tcp(uint16_t src_port, uint16_t dest_port, uint32_t sequence_number, uint32_t acknowledgement_number,
+        uint8_t data_offset, uint8_t tcp_flags, uint16_t window, uint16_t checksum, uint16_t urgent_pointer);
     // Parses a segment off the wire. Takes the buffer by value and moves it in
     // as _received_bytes, so the receive path (which passes an rvalue slice)
     // doesn't copy the whole segment a second time just to keep it for the
@@ -52,13 +52,21 @@ public:
     // caller (TcpConnection) to only set these before sending a SYN.
     bool has_mss_option() const { return _has_mss_option; }
     uint16_t get_mss_option() const { return _mss_option; }
-    void set_mss_option(uint16_t mss) { _has_mss_option = true; _mss_option = mss; }
+    void set_mss_option(uint16_t mss)
+    {
+        _has_mss_option = true;
+        _mss_option = mss;
+    }
 
     bool has_window_scale_option() const { return _has_window_scale_option; }
     // Always in [0, MAX_WINDOW_SCALE] - clamped at parse time, so a caller may
     // use it directly as a shift count without re-checking. See _parse().
     uint8_t get_window_scale_option() const { return _window_scale_option; }
-    void set_window_scale_option(uint8_t shift) { _has_window_scale_option = true; _window_scale_option = shift; }
+    void set_window_scale_option(uint8_t shift)
+    {
+        _has_window_scale_option = true;
+        _window_scale_option = shift;
+    }
 
     // RFC 7323 timestamps. Unlike MSS and window scale these appear on EVERY
     // segment once negotiated, not only on the SYN - they have to, because each
@@ -85,7 +93,11 @@ public:
     // At most four fit in the 40 bytes of option space, and only three
     // alongside a timestamp, which is why a receiver reports the most useful
     // ones rather than all it has.
-    struct SackBlock { uint32_t start; uint32_t end; };
+    struct SackBlock
+    {
+        uint32_t start;
+        uint32_t end;
+    };
     const std::vector<SackBlock>& get_sack_blocks() const { return _sack_blocks; }
     void set_sack_blocks(const std::vector<SackBlock>& blocks) { _sack_blocks = blocks; }
     static constexpr size_t MAX_SACK_BLOCKS = 4;
@@ -126,12 +138,13 @@ private:
     // if SYN = 0: this is the accumulated sequence number of the first data byte of this segment for the current session
     uint32_t _sequence_number;
 
-    uint32_t _acknowledgement_number; // If the ACK flag = 1: thevalue of this field is the next sequence number the the sender of the ACK is expecting
+    uint32_t
+        _acknowledgement_number; // If the ACK flag = 1: thevalue of this field is the next sequence number the the sender of the ACK is expecting
 
     uint8_t _data_offset; // Specifies the size of the TCP header in 32-bit words. |data_offset| = [5, 15]
-    
+
     // the following are the different TCP flags from MSB to LSB
-    
+
     // congestion window reduced (CWR) flag is set by the sending host to indicate that it received a TCP segment with the ECE flag set
     // and had responded in congestion control mechanism
     bool _cwr;
@@ -139,7 +152,7 @@ private:
     // ECN-Echo (ECE) has a dual role depending on the SYN flag
     // if SYN = 1: the TCP peer is ECN capable
     // if SYN = 0: a packet with the Congestion Experienced flag set (ECN = 11) in its IP header
-    // was received during normal transmission. 
+    // was received during normal transmission.
     bool _ece;
 
     bool _urg; // Indicates that the Urgent pointer field is significant
@@ -165,11 +178,12 @@ private:
     uint16_t _window;
 
     // Used for error checking of the TCP header, the payload and an IP pseudo-header.
-    // The pseudo-header consists of the source IP address, destination IP address, the protocol number for then TCP protocol (6) and the 
+    // The pseudo-header consists of the source IP address, destination IP address, the protocol number for then TCP protocol (6) and the
     // length of the TCP header and payload (in bytes).
     uint16_t _checksum;
 
-    uint16_t _urgent_ptr; // If the URG flag is set, then this field is the offset from the sequence number indicating the last urgent data byte.
+    uint16_t
+        _urgent_ptr; // If the URG flag is set, then this field is the offset from the sequence number indicating the last urgent data byte.
 
     // Options (kind 2 = MSS, kind 3 = window scale) - absent unless
     // explicitly set via set_mss_option()/set_window_scale_option(), or

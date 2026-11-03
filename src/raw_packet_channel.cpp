@@ -36,7 +36,8 @@ RawPacketChannel::RawPacketChannel(const std::string& interface_name)
     this->_fd = socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK, htons(ETH_P_ALL));
     if (this->_fd < 0)
     {
-        throw EXCEPTION(SystemException,
+        throw EXCEPTION(
+            SystemException,
             "socket(AF_PACKET, SOCK_RAW) failed - this needs CAP_NET_RAW (run as root, or setcap cap_net_raw+ep)");
     }
 
@@ -56,10 +57,9 @@ RawPacketChannel::RawPacketChannel(const std::string& interface_name)
         throw;
     }
 
-    LOG_INFO("RawPacketChannel: bound to " << this->_interface_name
-             << " (index " << this->_interface_index
-             << ", mac " << this->_interface_mac.to_string()
-             << ", mtu " << this->_mtu
+    LOG_INFO("RawPacketChannel: bound to "
+             << this->_interface_name << " (index " << this->_interface_index << ", mac "
+             << this->_interface_mac.to_string() << ", mtu " << this->_mtu
              << ", kernel drops our own frames: " << (this->_kernel_ignores_outgoing ? "yes" : "no") << ")");
 }
 
@@ -85,7 +85,7 @@ void RawPacketChannel::_query_interface()
         if (ioctl(this->_fd, op, &request) < 0)
         {
             throw EXCEPTION(SystemException,
-                std::string("ioctl() failed querying ") + what + " for interface " + this->_interface_name);
+                            std::string("ioctl() failed querying ") + what + " for interface " + this->_interface_name);
         }
     };
 
@@ -103,9 +103,9 @@ void RawPacketChannel::_query_interface()
     interface_ioctl(SIOCGIFFLAGS, "the interface flags");
     if ((request.ifr_flags & IFF_UP) == 0)
     {
-        throw EXCEPTION(BaseException,
-            "interface " + this->_interface_name + " is down - bring it up with: ip link set "
-            + this->_interface_name + " up");
+        throw EXCEPTION(BaseException, "interface " + this->_interface_name
+                                           + " is down - bring it up with: ip link set " + this->_interface_name
+                                           + " up");
     }
 
     // Read the MTU rather than insisting on a particular one: the stack now
@@ -117,10 +117,10 @@ void RawPacketChannel::_query_interface()
     interface_ioctl(SIOCGIFMTU, "the MTU");
     if (request.ifr_mtu < MIN_SUPPORTED_MTU || request.ifr_mtu > MAX_SUPPORTED_MTU)
     {
-        throw EXCEPTION(BaseException,
-            "interface " + this->_interface_name + " has MTU " + std::to_string(request.ifr_mtu)
-            + ", outside the supported range " + std::to_string(MIN_SUPPORTED_MTU)
-            + "-" + std::to_string(MAX_SUPPORTED_MTU));
+        throw EXCEPTION(BaseException, "interface " + this->_interface_name + " has MTU "
+                                           + std::to_string(request.ifr_mtu) + ", outside the supported range "
+                                           + std::to_string(MIN_SUPPORTED_MTU) + "-"
+                                           + std::to_string(MAX_SUPPORTED_MTU));
     }
     this->_mtu = static_cast<uint16_t>(request.ifr_mtu);
 }
@@ -177,8 +177,8 @@ Bytes RawPacketChannel::read(unsigned int max_length)
         std::memset(&from, 0, sizeof(from));
         socklen_t from_length = sizeof(from);
 
-        ssize_t received = recvfrom(this->_fd, buffer.data(), max_length, 0,
-                                    reinterpret_cast<struct sockaddr*>(&from), &from_length);
+        ssize_t received =
+            recvfrom(this->_fd, buffer.data(), max_length, 0, reinterpret_cast<struct sockaddr*>(&from), &from_length);
 
         if (received < 0)
         {
@@ -227,8 +227,8 @@ void RawPacketChannel::write(const Bytes& buffer)
     destination.sll_protocol = htons(ETH_P_ALL);
     destination.sll_ifindex = this->_interface_index;
 
-    ssize_t sent = sendto(this->_fd, buffer.data(), buffer.size(), 0,
-                          reinterpret_cast<struct sockaddr*>(&destination), sizeof(destination));
+    ssize_t sent = sendto(this->_fd, buffer.data(), buffer.size(), 0, reinterpret_cast<struct sockaddr*>(&destination),
+                          sizeof(destination));
 
     if (sent < 0)
     {

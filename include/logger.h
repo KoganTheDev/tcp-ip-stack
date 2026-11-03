@@ -36,8 +36,8 @@ public:
     // Below the configured minimum level, returns immediately without
     // taking the lock - cheap for DEBUG-level calls left in place in a
     // run that isn't asking for them.
-    void log(LogLevel level, const std::string& message,
-              const std::string& file, const std::string& func, unsigned int line);
+    void log(LogLevel level, const std::string& message, const std::string& file, const std::string& func,
+             unsigned int line);
 
     // Overrides whatever LOG_LEVEL set (or its INFO default) - independent
     // of the environment, mainly for tests.
@@ -59,7 +59,11 @@ private:
 // exceptions.h. (std::ostringstream() << x).str() is the same idiom used to
 // build a message inline for a thrown exception - operator<< on a temporary
 // stream is legal; the temporary lives until the end of the full expression.
-#define LOG_DEBUG(x)   Logger::instance().log(LogLevel::DEBUG,   (std::ostringstream() << x).str(), __FILE__, __func__, __LINE__)
-#define LOG_INFO(x)    Logger::instance().log(LogLevel::INFO,    (std::ostringstream() << x).str(), __FILE__, __func__, __LINE__)
-#define LOG_WARNING(x) Logger::instance().log(LogLevel::WARNING, (std::ostringstream() << x).str(), __FILE__, __func__, __LINE__)
-#define LOG_ERROR(x)   Logger::instance().log(LogLevel::ERROR,   (std::ostringstream() << x).str(), __FILE__, __func__, __LINE__)
+#define LOG_DEBUG(x) \
+    Logger::instance().log(LogLevel::DEBUG, (std::ostringstream() << x).str(), __FILE__, __func__, __LINE__)
+#define LOG_INFO(x) \
+    Logger::instance().log(LogLevel::INFO, (std::ostringstream() << x).str(), __FILE__, __func__, __LINE__)
+#define LOG_WARNING(x) \
+    Logger::instance().log(LogLevel::WARNING, (std::ostringstream() << x).str(), __FILE__, __func__, __LINE__)
+#define LOG_ERROR(x) \
+    Logger::instance().log(LogLevel::ERROR, (std::ostringstream() << x).str(), __FILE__, __func__, __LINE__)

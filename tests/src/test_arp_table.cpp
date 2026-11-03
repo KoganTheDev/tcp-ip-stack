@@ -128,6 +128,7 @@ TEST(ArpTableRefusesNewEntriesOnceFull)
     // refreshing something already held replaces rather than adds, so it must
     // still be allowed even when full - otherwise a busy peer's mapping would
     // age out and could never be relearned
-    test_assert(table.learn(IPv4Address("10.0.0.1"), MAC), "refreshing an existing mapping must still be allowed when full");
+    test_assert(table.learn(IPv4Address("10.0.0.1"), MAC),
+                "refreshing an existing mapping must still be allowed when full");
     test_assert(table.size() == ArpTable::MAX_ENTRIES, "refreshing must not change the table's size");
 }

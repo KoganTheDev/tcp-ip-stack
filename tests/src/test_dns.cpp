@@ -21,8 +21,7 @@ namespace
     {
         Bytes wire;
 
-        MessageBuilder(uint16_t id, uint16_t flags, uint16_t qd, uint16_t an,
-                       uint16_t ns = 0, uint16_t ar = 0)
+        MessageBuilder(uint16_t id, uint16_t flags, uint16_t qd, uint16_t an, uint16_t ns = 0, uint16_t ar = 0)
         {
             wire.append_int<uint16_t>(id);
             wire.append_int<uint16_t>(flags);
@@ -44,16 +43,14 @@ namespace
                 {
                     wire.append_int<uint8_t>(static_cast<uint8_t>(n[start + i]));
                 }
-                if (dot == std::string::npos) break;
+                if (dot == std::string::npos)
+                    break;
                 start = dot + 1;
             }
             wire.append_int<uint8_t>(0);
         }
 
-        void pointer(uint16_t offset)
-        {
-            wire.append_int<uint16_t>(static_cast<uint16_t>(0xc000 | offset));
-        }
+        void pointer(uint16_t offset) { wire.append_int<uint16_t>(static_cast<uint16_t>(0xc000 | offset)); }
 
         void question_tail(uint16_t type = DNS_TYPE_A)
         {
@@ -75,8 +72,7 @@ namespace
     // A well-formed answer: one question, one A record whose name is a
     // compression pointer back to the question - which is what every real
     // server sends.
-    Bytes good_response(uint16_t id, const std::string& name,
-                        const IPv4Address& ip = ANSWER, uint32_t ttl = 300)
+    Bytes good_response(uint16_t id, const std::string& name, const IPv4Address& ip = ANSWER, uint32_t ttl = 300)
     {
         MessageBuilder b(id, 0x8180, 1, 1); // response, recursion available
         b.name(name);
@@ -111,8 +107,7 @@ namespace
     public:
         ResolverHarness()
             : resolver([this](const IPv4Address& s, uint16_t sp, const Bytes& payload)
-                       { sent.push_back({s, sp, std::make_unique<Dns>(payload)}); },
-                       0xA5A5A5A5)
+                       { sent.push_back({s, sp, std::make_unique<Dns>(payload)}); }, 0xA5A5A5A5)
         {
             resolver.set_servers({SERVER, OTHER_SERVER});
         }
@@ -227,7 +222,8 @@ TEST(ALabelLongerThanSixtyThreeBytesIsRefused)
 {
     MessageBuilder b(1, 0x8180, 1, 0);
     b.wire.append_int<uint8_t>(64); // one over the maximum, and not a pointer
-    for (int i = 0; i < 64; i++) b.wire.append_int<uint8_t>('a');
+    for (int i = 0; i < 64; i++)
+        b.wire.append_int<uint8_t>('a');
     b.wire.append_int<uint8_t>(0);
 
     test_assert(throws_on_parse(b.wire), "a 64-byte label must be refused");
@@ -265,8 +261,7 @@ TEST(AnAbsurdRecordCountDoesNotPreallocateAnything)
     // records from a 12-byte message.
     MessageBuilder b(1, 0x8180, 0, 65535);
 
-    test_assert(throws_on_parse(b.wire),
-                "a count with no records behind it must fail on the missing bytes");
+    test_assert(throws_on_parse(b.wire), "a count with no records behind it must fail on the missing bytes");
 }
 
 TEST(AnUnknownRecordTypeSurvivesTheParse)
@@ -281,13 +276,13 @@ TEST(AnUnknownRecordTypeSurvivesTheParse)
     b.wire.append_int<uint16_t>(DNS_CLASS_IN);
     b.wire.append_int<uint32_t>(60);
     b.wire.append_int<uint16_t>(3);
-    for (int i = 0; i < 3; i++) b.wire.append_int<uint8_t>(0xab);
+    for (int i = 0; i < 3; i++)
+        b.wire.append_int<uint8_t>(0xab);
 
     Dns parsed(b.wire);
     test_assert(parsed.answers().size() == 1, "the record should parse");
     test_assert(parsed.answers()[0].rdata.size() == 3, "with its data kept verbatim");
-    test_assert(parsed.answers()[0].address() == IPv4Address(),
-                "and no address, since it is not an A record");
+    test_assert(parsed.answers()[0].address() == IPv4Address(), "and no address, since it is not an A record");
 }
 
 // --- the resolver, and what stops a forged answer ---------------------------
@@ -299,8 +294,7 @@ TEST(AQuerySetsRecursionDesiredAndAsksTheFirstServer)
 
     test_assert(h.sent.size() == 1, "one query should go out");
     test_assert(h.last().server == SERVER, "to the first configured server");
-    test_assert(h.last().message->recursion_desired(),
-                "RD is what makes this a stub - the server does the walk");
+    test_assert(h.last().message->recursion_desired(), "RD is what makes this a stub - the server does the walk");
     test_assert(h.last().message->questions().size() == 1, "asking one question");
     test_assert(h.last().message->questions()[0].name == "example.com", "for the right name");
 }
@@ -383,8 +377,7 @@ TEST(AnAnswerFromAnAddressThatWasNotAskedIsIgnored)
     ResolverHarness h;
     h.resolver.resolve("example.com", h.recorder());
 
-    h.resolver.on_datagram(IPv4Address("6.6.6.6"), DnsResolver::SERVER_PORT,
-                           h.last().source_port,
+    h.resolver.on_datagram(IPv4Address("6.6.6.6"), DnsResolver::SERVER_PORT, h.last().source_port,
                            good_response(h.last().message->get_id(), "example.com"));
 
     test_assert(h.callbacks == 0, "a reply must come from the server that was asked");
@@ -573,11 +566,14 @@ TEST(ResolvingWithNoServersConfiguredFailsImmediately)
 {
     std::vector<SentQuery> sent;
     DnsResolver resolver([&sent](const IPv4Address& s, uint16_t sp, const Bytes& p)
-                         { sent.push_back({s, sp, std::make_unique<Dns>(p)}); },
-                         12345);
+                         { sent.push_back({s, sp, std::make_unique<Dns>(p)}); }, 12345);
     int calls = 0;
-    resolver.resolve("example.com", [&calls](const std::string&, const std::vector<IPv4Address>& a)
-                     { calls++; test_assert(a.empty(), "no addresses"); });
+    resolver.resolve("example.com",
+                     [&calls](const std::string&, const std::vector<IPv4Address>& a)
+                     {
+                         calls++;
+                         test_assert(a.empty(), "no addresses");
+                     });
 
     test_assert(calls == 1, "the callback must fire even with nowhere to ask");
     test_assert(sent.empty(), "and nothing should go on the wire");
@@ -605,8 +601,7 @@ TEST(AQueryThatGivesUpStillReleasesItsPort)
     resolver.set_release_port_callback([&released](uint16_t port) { released.push_back(port); });
     resolver.set_servers({SERVER, OTHER_SERVER});
 
-    resolver.resolve("nowhere.example.com",
-                     [](const std::string&, const std::vector<IPv4Address>&) {});
+    resolver.resolve("nowhere.example.com", [](const std::string&, const std::vector<IPv4Address>&) {});
     test_assert(bound.size() == 1, "one port taken");
     test_assert(released.empty(), "and not released while the query is still trying");
 
@@ -616,10 +611,9 @@ TEST(AQueryThatGivesUpStillReleasesItsPort)
     }
 
     test_assert(!resolver.busy(), "the query should have given up");
-    test_assert(released.size() == bound.size(),
-                "every port taken must be released exactly once - " +
-                std::to_string(bound.size()) + " taken, " +
-                std::to_string(released.size()) + " released");
+    test_assert(released.size() == bound.size(), "every port taken must be released exactly once - "
+                                                     + std::to_string(bound.size()) + " taken, "
+                                                     + std::to_string(released.size()) + " released");
     test_assert(released[0] == bound[0], "and it must be the port that was taken");
 }
 

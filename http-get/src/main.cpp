@@ -50,30 +50,34 @@ namespace
 
     void print_usage(const char* program)
     {
-        std::cout <<
-            "Usage: " << program << " [options] <host>[:port][/path]\n"
-            "\n"
-            "Fetches one URL over this stack - no kernel sockets are involved in\n"
-            "the connection. Prints each stage as it completes, so the DHCP lease,\n"
-            "the DNS answer and the TCP handshake are all visible.\n"
-            "\n"
-            "  --dhcp                get the address, gateway and DNS servers by\n"
-            "                          DHCP instead of the static options below\n"
-            "  --transport tap|nic   tap: a TAP device (default); nic: AF_PACKET\n"
-            "  --device PATH|NAME    TAP device path, or interface name for nic\n"
-            "  --ip A.B.C.D          address this stack answers for (ignored with --dhcp)\n"
-            "  --prefix N            network prefix length (default 24)\n"
-            "  --gateway A.B.C.D     next hop for anything off the local network\n"
-            "  --mac AA:BB:...       override the MAC\n"
-            "  --dns A.B.C.D         DNS server (repeatable; ignored with --dhcp)\n"
-            "  --timeout N           give up after N seconds (default 30)\n"
-            "  --headers-only        print the response head, not the body\n"
-            "  -h, --help            this message\n"
-            "\n"
-            "Examples:\n"
-            "  sudo " << program << " --transport nic --device eth0 --dhcp example.com/\n"
-            "  sudo " << program << " --transport nic --device vstack0 \\\n"
-            "        --ip 10.9.0.2 --gateway 10.9.0.1 --dns 10.9.0.1 www.test.local/index.html\n";
+        std::cout << "Usage: " << program
+                  << " [options] <host>[:port][/path]\n"
+                     "\n"
+                     "Fetches one URL over this stack - no kernel sockets are involved in\n"
+                     "the connection. Prints each stage as it completes, so the DHCP lease,\n"
+                     "the DNS answer and the TCP handshake are all visible.\n"
+                     "\n"
+                     "  --dhcp                get the address, gateway and DNS servers by\n"
+                     "                          DHCP instead of the static options below\n"
+                     "  --transport tap|nic   tap: a TAP device (default); nic: AF_PACKET\n"
+                     "  --device PATH|NAME    TAP device path, or interface name for nic\n"
+                     "  --ip A.B.C.D          address this stack answers for (ignored with --dhcp)\n"
+                     "  --prefix N            network prefix length (default 24)\n"
+                     "  --gateway A.B.C.D     next hop for anything off the local network\n"
+                     "  --mac AA:BB:...       override the MAC\n"
+                     "  --dns A.B.C.D         DNS server (repeatable; ignored with --dhcp)\n"
+                     "  --timeout N           give up after N seconds (default 30)\n"
+                     "  --headers-only        print the response head, not the body\n"
+                     "  -h, --help            this message\n"
+                     "\n"
+                     "Examples:\n"
+                     "  sudo "
+                  << program
+                  << " --transport nic --device eth0 --dhcp example.com/\n"
+                     "  sudo "
+                  << program
+                  << " --transport nic --device vstack0 \\\n"
+                     "        --ip 10.9.0.2 --gateway 10.9.0.1 --dns 10.9.0.1 www.test.local/index.html\n";
     }
 
     // host[:port][/path] - deliberately not a URL parser. A scheme, userinfo,
@@ -143,56 +147,80 @@ namespace
                 print_usage(argv[0]);
                 return false;
             }
-            else if (arg == "--dhcp") { config.use_dhcp = true; }
-            else if (arg == "--headers-only") { config.show_body = false; }
+            else if (arg == "--dhcp")
+            {
+                config.use_dhcp = true;
+            }
+            else if (arg == "--headers-only")
+            {
+                config.show_body = false;
+            }
             else if (arg == "--transport")
             {
                 const char* value = next("tap or nic");
-                if (!value) return false;
-                if (std::strcmp(value, "tap") == 0) { config.channel.transport = Transport::Tap; }
-                else if (std::strcmp(value, "nic") == 0) { config.channel.transport = Transport::RawNic; }
-                else { std::cerr << "--transport must be tap or nic\n"; return false; }
+                if (!value)
+                    return false;
+                if (std::strcmp(value, "tap") == 0)
+                {
+                    config.channel.transport = Transport::Tap;
+                }
+                else if (std::strcmp(value, "nic") == 0)
+                {
+                    config.channel.transport = Transport::RawNic;
+                }
+                else
+                {
+                    std::cerr << "--transport must be tap or nic\n";
+                    return false;
+                }
             }
             else if (arg == "--device")
             {
                 const char* value = next("a path or interface name");
-                if (!value) return false;
+                if (!value)
+                    return false;
                 config.channel.device = value;
             }
             else if (arg == "--ip")
             {
                 const char* value = next("an address");
-                if (!value) return false;
+                if (!value)
+                    return false;
                 config.channel.local_ip = IPv4Address(value);
             }
             else if (arg == "--prefix")
             {
                 const char* value = next("a prefix length");
-                if (!value) return false;
+                if (!value)
+                    return false;
                 config.channel.prefix_length = static_cast<uint8_t>(std::stoi(value));
             }
             else if (arg == "--gateway")
             {
                 const char* value = next("an address");
-                if (!value) return false;
+                if (!value)
+                    return false;
                 config.channel.gateway = IPv4Address(value);
             }
             else if (arg == "--mac")
             {
                 const char* value = next("a MAC address");
-                if (!value) return false;
+                if (!value)
+                    return false;
                 config.channel.local_mac = MacAddress(value);
             }
             else if (arg == "--dns")
             {
                 const char* value = next("an address");
-                if (!value) return false;
+                if (!value)
+                    return false;
                 dns_servers.push_back(IPv4Address(value));
             }
             else if (arg == "--timeout")
             {
                 const char* value = next("a number of seconds");
-                if (!value) return false;
+                if (!value)
+                    return false;
                 config.timeout_seconds = std::stoi(value);
             }
             else if (!arg.empty() && arg[0] == '-')
@@ -243,12 +271,18 @@ namespace
     {
         switch (stage)
         {
-        case Stage::WaitingForLease: return "waiting for a DHCP lease";
-        case Stage::Resolving:       return "resolving the hostname";
-        case Stage::Connecting:      return "opening the connection";
-        case Stage::Exchanging:      return "waiting for the response";
-        case Stage::Done:            return "done";
-        case Stage::Failed:          return "failed";
+        case Stage::WaitingForLease:
+            return "waiting for a DHCP lease";
+        case Stage::Resolving:
+            return "resolving the hostname";
+        case Stage::Connecting:
+            return "opening the connection";
+        case Stage::Exchanging:
+            return "waiting for the response";
+        case Stage::Done:
+            return "done";
+        case Stage::Failed:
+            return "failed";
         }
         return "?";
     }
@@ -307,8 +341,7 @@ int main(int argc, char** argv)
         }
 
         NetworkStack stack(std::move(opened.channel), interface);
-        std::cout << "interface " << config.channel.device
-                  << "  mac " << interface.mac.to_string() << "\n";
+        std::cout << "interface " << config.channel.device << "  mac " << interface.mac.to_string() << "\n";
 
         DhcpClient* dhcp = nullptr;
         Stage stage = Stage::Connecting;
@@ -325,10 +358,8 @@ int main(int argc, char** argv)
             {
                 stack.set_dns_servers(dns_servers);
             }
-            std::cout << "address  " << interface.ip.to_string()
-                      << "/" << static_cast<int>(interface.prefix_length)
-                      << "  gateway " << (interface.has_gateway() ? interface.gateway.to_string() : "none")
-                      << "\n";
+            std::cout << "address  " << interface.ip.to_string() << "/" << static_cast<int>(interface.prefix_length)
+                      << "  gateway " << (interface.has_gateway() ? interface.gateway.to_string() : "none") << "\n";
         }
 
         IPv4Address server_ip;
@@ -403,10 +434,9 @@ int main(int argc, char** argv)
                 if (dhcp && dhcp->has_lease())
                 {
                     const DhcpLease& lease = dhcp->lease();
-                    std::cout << "DHCP     " << lease.ip.to_string()
-                              << "/" << static_cast<int>(lease.prefix_length())
-                              << "  gateway " << lease.gateway.to_string()
-                              << "  lease " << lease.lease_seconds << "s\n";
+                    std::cout << "DHCP     " << lease.ip.to_string() << "/" << static_cast<int>(lease.prefix_length())
+                              << "  gateway " << lease.gateway.to_string() << "  lease " << lease.lease_seconds
+                              << "s\n";
                     if (!lease.dns_servers.empty())
                     {
                         std::cout << "DNS via  ";
@@ -429,22 +459,22 @@ int main(int argc, char** argv)
                         stage = Stage::Resolving;
                         std::cout << "DNS      resolving " << config.url_host << "...\n";
                         stack.resolve(config.url_host,
-                            [&](const std::string& name, const std::vector<IPv4Address>& addresses)
-                            {
-                                if (addresses.empty())
-                                {
-                                    std::cerr << "could not resolve " << name << "\n";
-                                    resolve_failed = true;
-                                    return;
-                                }
-                                server_ip = addresses.front();
-                                std::cout << "DNS      " << name << " is " << server_ip.to_string();
-                                if (addresses.size() > 1)
-                                {
-                                    std::cout << " (+" << (addresses.size() - 1) << " more)";
-                                }
-                                std::cout << "\n";
-                            });
+                                      [&](const std::string& name, const std::vector<IPv4Address>& addresses)
+                                      {
+                                          if (addresses.empty())
+                                          {
+                                              std::cerr << "could not resolve " << name << "\n";
+                                              resolve_failed = true;
+                                              return;
+                                          }
+                                          server_ip = addresses.front();
+                                          std::cout << "DNS      " << name << " is " << server_ip.to_string();
+                                          if (addresses.size() > 1)
+                                          {
+                                              std::cout << " (+" << (addresses.size() - 1) << " more)";
+                                          }
+                                          std::cout << "\n";
+                                      });
                     }
                     break;
                 }
@@ -454,19 +484,19 @@ int main(int argc, char** argv)
                     server_ip = IPv4Address(config.url_host);
                 }
 
-                std::cout << "TCP      connecting to " << server_ip.to_string()
-                          << ":" << config.port << "...\n";
+                std::cout << "TCP      connecting to " << server_ip.to_string() << ":" << config.port << "...\n";
                 connection = stack.connect(server_ip, config.port);
                 if (!connection)
                 {
                     std::cerr << "could not start the connection\n";
                     return 1;
                 }
-                connection->set_data_ready_callback([&]()
-                {
-                    Bytes chunk = connection->read();
-                    response.append(reinterpret_cast<const char*>(chunk.data()), chunk.size());
-                });
+                connection->set_data_ready_callback(
+                    [&]()
+                    {
+                        Bytes chunk = connection->read();
+                        response.append(reinterpret_cast<const char*>(chunk.data()), chunk.size());
+                    });
                 stage = Stage::Exchanging;
                 break;
 
@@ -499,12 +529,14 @@ int main(int argc, char** argv)
                     // when to stop. HTTP/1.1 requires Host - it is what makes
                     // name-based virtual hosting possible, and is the reason a
                     // DNS lookup and a TCP connection are not the whole story.
-                    std::string request =
-                        "GET " + config.path + " HTTP/1.1\r\n"
-                        "Host: " + config.url_host + "\r\n"
-                        "User-Agent: tcp-ip-stack-http-get/1.0\r\n"
-                        "Connection: close\r\n"
-                        "\r\n";
+                    std::string request = "GET " + config.path
+                                          + " HTTP/1.1\r\n"
+                                            "Host: "
+                                          + config.url_host
+                                          + "\r\n"
+                                            "User-Agent: tcp-ip-stack-http-get/1.0\r\n"
+                                            "Connection: close\r\n"
+                                            "\r\n";
                     Bytes payload(request); // Bytes has a std::string constructor
                     size_t accepted = connection->send(payload);
                     if (accepted != payload.size())
@@ -551,8 +583,7 @@ int main(int argc, char** argv)
         std::string body;
         if (!split_response(response, head, body))
         {
-            std::cerr << "the response had no complete header section ("
-                      << response.size() << " bytes received)\n";
+            std::cerr << "the response had no complete header section (" << response.size() << " bytes received)\n";
             return 1;
         }
 

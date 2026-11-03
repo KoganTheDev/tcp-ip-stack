@@ -105,8 +105,8 @@ protected:
     // Grow _cwnd past ssthresh. Called once per acknowledgement, only when
     // _cwnd >= _ssthresh - slow start is handled by the base and is identical
     // in both algorithms.
-    virtual void _grow_in_congestion_avoidance(uint32_t bytes_acked, uint32_t bytes_in_flight,
-                                               uint32_t srtt_ms, uint64_t now_ms) = 0;
+    virtual void _grow_in_congestion_avoidance(uint32_t bytes_acked, uint32_t bytes_in_flight, uint32_t srtt_ms,
+                                               uint64_t now_ms) = 0;
 
     // Optional hook for implementations with state that outlives a single
     // congestion event and has to be cleared on a fresh connection. Reno has
@@ -157,8 +157,8 @@ public:
 
 protected:
     void _on_congestion_event(uint32_t bytes_in_flight, uint64_t now_ms) override;
-    void _grow_in_congestion_avoidance(uint32_t bytes_acked, uint32_t bytes_in_flight,
-                                       uint32_t srtt_ms, uint64_t now_ms) override;
+    void _grow_in_congestion_avoidance(uint32_t bytes_acked, uint32_t bytes_in_flight, uint32_t srtt_ms,
+                                       uint64_t now_ms) override;
 };
 
 // CUBIC, RFC 8312. The default on Linux since 2.6.19, and so the algorithm most
@@ -202,8 +202,8 @@ public:
 
 protected:
     void _on_congestion_event(uint32_t bytes_in_flight, uint64_t now_ms) override;
-    void _grow_in_congestion_avoidance(uint32_t bytes_acked, uint32_t bytes_in_flight,
-                                       uint32_t srtt_ms, uint64_t now_ms) override;
+    void _grow_in_congestion_avoidance(uint32_t bytes_acked, uint32_t bytes_in_flight, uint32_t srtt_ms,
+                                       uint64_t now_ms) override;
     void _on_reset() override;
 
 private:

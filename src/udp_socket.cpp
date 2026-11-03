@@ -3,8 +3,7 @@
 
 UdpSocket::UdpSocket(uint16_t local_port, SendDatagramFn send_datagram)
     : _local_port(local_port), _send_datagram(std::move(send_datagram))
-{
-}
+{}
 
 void UdpSocket::on_datagram(const IPv4Address& src_ip, const Udp& segment)
 {

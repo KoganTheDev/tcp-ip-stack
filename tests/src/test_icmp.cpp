@@ -27,17 +27,18 @@ TEST(IcmpChecksumSelfVerifiesAndRejectsCorruption)
     message.compute_checksum();
     test_assert(message.verify_checksum(), "a correctly-computed ICMP checksum must self-verify");
 
-    Icmp corrupted(ICMP_ECHO_REQUEST, ICMP_CODE_NONE, message.get_checksum(), 0x00010002 /* rest_of_header changed after the checksum was computed */, Bytes::from_hex("deadbeef"));
-    test_assert(!corrupted.verify_checksum(), "a message whose fields changed after the checksum was computed must fail verification");
+    Icmp corrupted(ICMP_ECHO_REQUEST, ICMP_CODE_NONE, message.get_checksum(),
+                   0x00010002 /* rest_of_header changed after the checksum was computed */,
+                   Bytes::from_hex("deadbeef"));
+    test_assert(!corrupted.verify_checksum(),
+                "a message whose fields changed after the checksum was computed must fail verification");
 }
 
 TEST(IcmpDestinationUnreachableRoundTripsWithEmbeddedOriginalPacket)
 {
     // RFC 792: Destination Unreachable carries the unused 4 bytes plus the
     // original IP header + first 8 bytes of its payload as the "payload" here
-    Bytes embedded_original = Bytes::from_hex(
-        "4500001c00000000401100000a0000010a00000212345678"
-    );
+    Bytes embedded_original = Bytes::from_hex("4500001c00000000401100000a0000010a00000212345678");
     Icmp unreachable(ICMP_DESTINATION_UNREACHABLE, ICMP_CODE_PORT_UNREACHABLE, 0, 0, embedded_original);
     unreachable.compute_checksum();
 

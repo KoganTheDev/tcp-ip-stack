@@ -5,8 +5,7 @@
 const MacAddress MacAddress::BROADCAST = MacAddress("ff:ff:ff:ff:ff:ff");
 
 
-MacAddress::MacAddress(const Bytes& address)
-    : _address(address)
+MacAddress::MacAddress(const Bytes& address) : _address(address)
 {
     if (address.size() != 6)
     {
@@ -34,7 +33,7 @@ MacAddress::MacAddress(const std::string& address)
     {
         throw EXCEPTION(BaseException, "Invalid MAC address format");
     }
-    
+
     this->_address = Bytes::from_hex(address_hex);
 }
 
@@ -59,8 +58,7 @@ std::string MacAddress::to_string() const
     return result;
 }
 
-IPv4Address::IPv4Address(const Bytes& address)
-    : _address(address)
+IPv4Address::IPv4Address(const Bytes& address) : _address(address)
 {
     if (address.size() != 4)
     {
@@ -76,14 +74,14 @@ IPv4Address::IPv4Address(const std::string& address)
         size_t dot_position = address.find('.', current_position);
         std::string section = address.substr(current_position, dot_position - current_position);
         this->_address.push_back(decimal_to_byte(section));
-        
+
         current_position = dot_position;
         if (current_position != std::string::npos)
         {
             current_position += 1; // go after dot
         }
     }
-    
+
     if (this->_address.size() != 4)
     {
         throw EXCEPTION(BaseException, "Invalid IPv4 address");
@@ -101,7 +99,7 @@ std::size_t std::hash<IPv4Address>::operator()(const IPv4Address& ip_address) co
 }
 
 
-bool IPv4Address::operator==(const IPv4Address &other) const noexcept
+bool IPv4Address::operator==(const IPv4Address& other) const noexcept
 {
     return this->_address == other._address;
 }

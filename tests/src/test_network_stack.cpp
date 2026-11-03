@@ -42,9 +42,8 @@ namespace
     // NetworkStack::_send_ip_packet's own build path.
     Bytes wrap_ip(uint8_t protocol, const Bytes& segment)
     {
-        auto ip = std::make_unique<Ip>(
-            4, 5, 0, static_cast<uint16_t>(20 + segment.size()), 0,
-            0, 0, 64, protocol, 0, PEER_IP.get_address(), LOCAL_IP.get_address());
+        auto ip = std::make_unique<Ip>(4, 5, 0, static_cast<uint16_t>(20 + segment.size()), 0, 0, 0, 64, protocol, 0,
+                                       PEER_IP.get_address(), LOCAL_IP.get_address());
         *ip /= std::make_unique<Raw>(segment);
         ip->compute_checksum();
 
@@ -81,8 +80,8 @@ namespace
     // the checksum is computed over the exact bytes on the wire, so verifying
     // over a re-serialization (which would drop those options) must not reject
     // it. options.size() must be a multiple of 4.
-    Bytes build_tcp_with_options(uint8_t flags, uint32_t seq, uint32_t ack,
-                                 uint16_t src_port, uint16_t dest_port, const Bytes& options)
+    Bytes build_tcp_with_options(uint8_t flags, uint32_t seq, uint32_t ack, uint16_t src_port, uint16_t dest_port,
+                                 const Bytes& options)
     {
         Bytes seg;
         seg.append_int<uint16_t>(src_port);
@@ -126,9 +125,8 @@ namespace
     Bytes build_icmp_port_unreachable_for_our_tcp(uint16_t local_port, uint16_t remote_port)
     {
         Tcp our_segment(local_port, remote_port, 0, 0, 5, 0x02 /* SYN */, 65535, 0, 0);
-        auto embedded_ip = std::make_unique<Ip>(
-            4, 5, 0, 40, 0, 0, 0, 64, IpProtocol::TCP, 0,
-            LOCAL_IP.get_address(), PEER_IP.get_address());
+        auto embedded_ip = std::make_unique<Ip>(4, 5, 0, 40, 0, 0, 0, 64, IpProtocol::TCP, 0, LOCAL_IP.get_address(),
+                                                PEER_IP.get_address());
         *embedded_ip /= std::make_unique<Raw>(our_segment.to_bytes());
         embedded_ip->compute_checksum();
         Bytes embedded = embedded_ip->to_bytes().slice(0, 28);
@@ -141,21 +139,38 @@ namespace
     // --- outbound-frame parsers (extract primitives, so the parsed layer
     // chain's lifetime doesn't have to outlive the call) ---
 
-    struct ArpView { bool is_arp = false; ArpOperation op = ArpOperation::REQUEST;
-                     std::string sender_mac, sender_ip, target_ip; };
-    struct TcpView { bool is_tcp = false; uint16_t src_port = 0, dest_port = 0;
-                     uint32_t seq = 0, ack = 0; bool syn = false, ack_flag = false, rst = false;
-                     uint16_t window = 0; bool has_timestamp = false, has_sack_permitted = false,
-                     has_window_scale = false; uint32_t ts_echo = 0; };
-    struct IcmpView { bool is_icmp = false; uint8_t type = 0, code = 0; Bytes payload; };
+    struct ArpView
+    {
+        bool is_arp = false;
+        ArpOperation op = ArpOperation::REQUEST;
+        std::string sender_mac, sender_ip, target_ip;
+    };
+    struct TcpView
+    {
+        bool is_tcp = false;
+        uint16_t src_port = 0, dest_port = 0;
+        uint32_t seq = 0, ack = 0;
+        bool syn = false, ack_flag = false, rst = false;
+        uint16_t window = 0;
+        bool has_timestamp = false, has_sack_permitted = false, has_window_scale = false;
+        uint32_t ts_echo = 0;
+    };
+    struct IcmpView
+    {
+        bool is_icmp = false;
+        uint8_t type = 0, code = 0;
+        Bytes payload;
+    };
 
     ArpView view_arp(const Bytes& frame)
     {
         ArpView v;
         Ethernet eth(frame);
-        if (eth.get_ethernet_protocol() != EtherType::ARP || !eth.has_next_layer()) return v;
+        if (eth.get_ethernet_protocol() != EtherType::ARP || !eth.has_next_layer())
+            return v;
         const Arp* arp = dynamic_cast<const Arp*>(&eth.get_next_layer());
-        if (!arp) return v;
+        if (!arp)
+            return v;
         v.is_arp = true;
         v.op = arp->get_operation();
         v.sender_mac = arp->get_sender_hardware_address().to_string();
@@ -168,11 +183,14 @@ namespace
     {
         TcpView v;
         Ethernet eth(frame);
-        if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer()) return v;
+        if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer())
+            return v;
         const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
-        if (!ip || ip->get_protocol() != IpProtocol::TCP || !ip->has_next_layer()) return v;
+        if (!ip || ip->get_protocol() != IpProtocol::TCP || !ip->has_next_layer())
+            return v;
         const Tcp* tcp = dynamic_cast<const Tcp*>(&ip->get_next_layer());
-        if (!tcp) return v;
+        if (!tcp)
+            return v;
         v.is_tcp = true;
         v.src_port = tcp->get_src_port();
         v.dest_port = tcp->get_dest_port();
@@ -193,11 +211,14 @@ namespace
     {
         IcmpView v;
         Ethernet eth(frame);
-        if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer()) return v;
+        if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer())
+            return v;
         const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
-        if (!ip || ip->get_protocol() != IpProtocol::ICMP || !ip->has_next_layer()) return v;
+        if (!ip || ip->get_protocol() != IpProtocol::ICMP || !ip->has_next_layer())
+            return v;
         const Icmp* icmp = dynamic_cast<const Icmp*>(&ip->get_next_layer());
-        if (!icmp) return v;
+        if (!icmp)
+            return v;
         v.is_icmp = true;
         v.type = icmp->get_type();
         v.code = icmp->get_code();
@@ -213,17 +234,32 @@ namespace
 
     ArpView find_arp(const std::vector<Bytes>& frames)
     {
-        for (const Bytes& f : frames) { ArpView v = view_arp(f); if (v.is_arp) return v; }
+        for (const Bytes& f : frames)
+        {
+            ArpView v = view_arp(f);
+            if (v.is_arp)
+                return v;
+        }
         return ArpView();
     }
     TcpView find_tcp(const std::vector<Bytes>& frames)
     {
-        for (const Bytes& f : frames) { TcpView v = view_tcp(f); if (v.is_tcp) return v; }
+        for (const Bytes& f : frames)
+        {
+            TcpView v = view_tcp(f);
+            if (v.is_tcp)
+                return v;
+        }
         return TcpView();
     }
     IcmpView find_icmp(const std::vector<Bytes>& frames)
     {
-        for (const Bytes& f : frames) { IcmpView v = view_icmp(f); if (v.is_icmp) return v; }
+        for (const Bytes& f : frames)
+        {
+            IcmpView v = view_icmp(f);
+            if (v.is_icmp)
+                return v;
+        }
         return IcmpView();
     }
 
@@ -244,13 +280,17 @@ namespace
     IpFragmentView view_ip_fragment(const Bytes& frame)
     {
         IpFragmentView v;
-        if (frame.size() < 14 + 20) return v;
-        if (frame.slice_int<uint16_t>(12) != EtherType::IPv4) return v; // ethertype
+        if (frame.size() < 14 + 20)
+            return v;
+        if (frame.slice_int<uint16_t>(12) != EtherType::IPv4)
+            return v; // ethertype
         Bytes ip = frame.slice(14);
-        if (ip.size() < 20) return v;
+        if (ip.size() < 20)
+            return v;
         size_t ihl = static_cast<size_t>(ip[0] & 0x0f) * 4;
         uint16_t total_length = ip.slice_int<uint16_t>(2);
-        if (ihl < 20 || total_length < ihl || ip.size() < total_length) return v;
+        if (ihl < 20 || total_length < ihl || ip.size() < total_length)
+            return v;
         v.is_ipv4 = true;
         v.identification = ip.slice_int<uint16_t>(4);
         uint16_t flags_and_offset = ip.slice_int<uint16_t>(6);
@@ -266,9 +306,11 @@ namespace
         for (const Bytes& frame : frames)
         {
             Ethernet eth(frame);
-            if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer()) continue;
+            if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer())
+                continue;
             const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
-            if (ip && ip->get_protocol() == IpProtocol::UDP) return true;
+            if (ip && ip->get_protocol() == IpProtocol::UDP)
+                return true;
         }
         return false;
     }
@@ -380,8 +422,8 @@ TEST(UdpToBoundPortReachesTheSocket)
 
     std::vector<Bytes> received;
     UdpSocket* socket = stack->bind_udp(8080);
-    socket->set_datagram_received_callback(
-        [&received](const IPv4Address&, uint16_t, const Bytes& data) { received.push_back(data); });
+    socket->set_datagram_received_callback([&received](const IPv4Address&, uint16_t, const Bytes& data)
+                                           { received.push_back(data); });
 
     Bytes payload = Bytes::from_hex("68656c6c6f"); // "hello"
     channel->push_inbound(build_udp(40000, 8080, payload));
@@ -417,9 +459,11 @@ TEST(UdpSendToUnresolvedPeerArpsThenFlushes)
     for (const Bytes& frame : channel->outbound_frames())
     {
         Ethernet eth(frame);
-        if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer()) continue;
+        if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer())
+            continue;
         const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
-        if (ip && ip->get_protocol() == IpProtocol::UDP) found_udp = true;
+        if (ip && ip->get_protocol() == IpProtocol::UDP)
+            found_udp = true;
     }
     test_assert(found_udp, "the queued UDP datagram should be sent once ARP resolution completes");
 }
@@ -464,7 +508,9 @@ TEST(SynWithUnmodeledOptionsIsAcceptedNotDroppedAsBadChecksum)
     // options: MSS=1460 (kind 2), SACK-permitted (kind 4, len 2), NOP, NOP - 8
     // bytes total. The codec understands MSS but not SACK-permitted; on the old
     // code its re-serialization would drop SACK-permitted and fail the checksum.
-    Bytes options = Bytes::from_hex("020405b4" "0402" "0101");
+    Bytes options = Bytes::from_hex("020405b4"
+                                    "0402"
+                                    "0101");
     channel->push_inbound(build_tcp_with_options(FLAG_SYN, 2000, 0, 40000, 80, options));
     stack->poll();
 
@@ -500,7 +546,8 @@ TEST(OversizedUdpDatagramIsFragmented)
     for (const Bytes& frame : channel->outbound_frames())
     {
         IpFragmentView v = view_ip_fragment(frame);
-        if (v.is_ipv4 && v.protocol == IpProtocol::UDP) frags.push_back(v);
+        if (v.is_ipv4 && v.protocol == IpProtocol::UDP)
+            frags.push_back(v);
     }
     test_assert(frags.size() >= 2, "an oversized UDP datagram should be split into multiple IP fragments");
 
@@ -510,13 +557,15 @@ TEST(OversizedUdpDatagramIsFragmented)
     for (size_t i = 0; i < frags.size(); i++)
     {
         test_assert(frags[i].identification == id, "all fragments of one datagram must share the identification");
-        test_assert(frags[i].frag_offset * 8u == expected_offset, "each fragment's offset should follow the previous one");
+        test_assert(frags[i].frag_offset * 8u == expected_offset,
+                    "each fragment's offset should follow the previous one");
         bool is_last = (i + 1 == frags.size());
         test_assert(frags[i].mf == !is_last, "More-Fragments should be set on every fragment except the last");
         reassembled |= frags[i].payload;
         expected_offset += frags[i].payload.size();
     }
-    test_assert(reassembled.size() == 8 + payload.size(), "the fragments should reassemble into the whole UDP datagram");
+    test_assert(reassembled.size() == 8 + payload.size(),
+                "the fragments should reassemble into the whole UDP datagram");
 
     Udp datagram(reassembled); // parses only because the reassembled length now matches
     test_assert(datagram.get_src_port() == 8080, "the reassembled datagram should carry the socket's source port");
@@ -644,8 +693,10 @@ TEST(TwoStacksHandshakeExchangeDataAndHalfClose)
     {
         for (int i = 0; i < 12; i++)
         {
-            stack_a.poll(); stack_b.poll();
-            stack_a.on_time_passed(TEST_TICK_MS); stack_b.on_time_passed(TEST_TICK_MS);
+            stack_a.poll();
+            stack_b.poll();
+            stack_a.on_time_passed(TEST_TICK_MS);
+            stack_b.on_time_passed(TEST_TICK_MS);
         }
     };
 
@@ -662,17 +713,15 @@ TEST(TwoStacksHandshakeExchangeDataAndHalfClose)
 
     // server echoes whatever it receives
     std::vector<Bytes> server_received;
-    server->set_data_ready_callback([&server_received, server]()
-    {
-        Bytes data = server->read();
-        server_received.push_back(data);
-        server->send(data);
-    });
+    server->set_data_ready_callback(
+        [&server_received, server]()
+        {
+            Bytes data = server->read();
+            server_received.push_back(data);
+            server->send(data);
+        });
     std::vector<Bytes> client_received;
-    client->set_data_ready_callback([&client_received, client]()
-    {
-        client_received.push_back(client->read());
-    });
+    client->set_data_ready_callback([&client_received, client]() { client_received.push_back(client->read()); });
 
     Bytes message = Bytes::from_hex("68656c6c6f"); // "hello"
     client->send(message);
@@ -708,8 +757,8 @@ TEST(PaddedShortUdpDatagramStillReachesTheSocket)
 
     std::vector<Bytes> received;
     UdpSocket* socket = stack->bind_udp(8080);
-    socket->set_datagram_received_callback(
-        [&received](const IPv4Address&, uint16_t, const Bytes& data) { received.push_back(data); });
+    socket->set_datagram_received_callback([&received](const IPv4Address&, uint16_t, const Bytes& data)
+                                           { received.push_back(data); });
 
     Bytes payload = Bytes::from_hex("68656c6c6f"); // "hello" - 5 bytes, well under the minimum
     Bytes frame = build_udp(40000, 8080, payload);
@@ -724,8 +773,10 @@ TEST(PaddedShortUdpDatagramStillReachesTheSocket)
     channel->push_inbound(padded);
     stack->poll();
 
-    test_assert(received.size() == 1, "a padded short datagram must still reach the socket - the payload has to be trimmed to IP's total_length, not to the end of the frame");
-    test_assert(received[0].to_hex() == payload.to_hex(), "the trailing padding must not be delivered as part of the payload");
+    test_assert(received.size() == 1, "a padded short datagram must still reach the socket - the payload has to be "
+                                      "trimmed to IP's total_length, not to the end of the frame");
+    test_assert(received[0].to_hex() == payload.to_hex(),
+                "the trailing padding must not be delivered as part of the payload");
 }
 
 // _reap_closed_connections() erases from _connections but never from
@@ -762,8 +813,11 @@ TEST(AcceptSkipsStaleQueueEntriesAndReturnsTheReadyConnection)
 
     TcpConnection* accepted = stack->accept(80);
 
-    test_assert(accepted != nullptr, "accept() must skip the stale key and return the connection queued behind it, not report nothing pending");
-    test_assert(accepted->get_state() == TcpState::ESTABLISHED, "the returned connection should be the live, established one");
+    test_assert(
+        accepted != nullptr,
+        "accept() must skip the stale key and return the connection queued behind it, not report nothing pending");
+    test_assert(accepted->get_state() == TcpState::ESTABLISHED,
+                "the returned connection should be the live, established one");
 }
 
 // --- inbound filtering: what makes this stack safe on a shared segment ---
@@ -816,8 +870,9 @@ TEST(BroadcastFrameIsStillAccepted)
     channel->push_inbound(build_arp_request()); // sent to ff:ff:ff:ff:ff:ff
     stack->poll();
 
-    test_assert(!channel->outbound_frames().empty(),
-                "a broadcast ARP request for our IP must still be answered - the L2 filter must accept group addresses");
+    test_assert(
+        !channel->outbound_frames().empty(),
+        "a broadcast ARP request for our IP must still be answered - the L2 filter must accept group addresses");
 }
 
 // ARP that does not target our IP is somebody else's conversation. Acting on it
@@ -840,11 +895,13 @@ TEST(ArpForAThirdPartyIsNeitherAnsweredNorLearned)
     // to PEER now has to resolve its MAC first, so the stack emits an ARP
     // request rather than going straight to a SYN.
     stack->connect(PEER_IP, 9999);
-    test_assert(channel->outbound_frames().size() == 1, "connect() to an unresolved peer should emit exactly one frame");
+    test_assert(channel->outbound_frames().size() == 1,
+                "connect() to an unresolved peer should emit exactly one frame");
 
     Ethernet out(channel->outbound_frames()[0]);
     test_assert(out.get_ethernet_protocol() == EtherType::ARP,
-                "the peer's MAC must not have been learned from third-party ARP - connect() should have to resolve it, emitting an ARP request rather than a SYN");
+                "the peer's MAC must not have been learned from third-party ARP - connect() should have to resolve it, "
+                "emitting an ARP request rather than a SYN");
 }
 
 // A static ARP entry never ages out and is never replaced by anything learned
@@ -860,8 +917,8 @@ TEST(StaticArpEntryLetsConnectSkipResolutionEntirely)
 
     test_assert(channel->outbound_frames().size() == 1, "connect() should emit exactly one frame");
     TcpView syn = view_tcp(channel->outbound_frames()[0]);
-    test_assert(syn.is_tcp && syn.syn,
-                "with the peer's MAC already known statically, connect() should send the SYN straight out rather than an ARP request first");
+    test_assert(syn.is_tcp && syn.syn, "with the peer's MAC already known statically, connect() should send the SYN "
+                                       "straight out rather than an ARP request first");
 }
 
 // poll() used to drain unconditionally, so a peer sending faster than the stack
@@ -881,7 +938,8 @@ TEST(PollStopsOnItsBudgetAndReportsThatFramesRemain)
         channel->push_inbound(build_arp_request());
     }
 
-    test_assert(stack->poll() == false, "poll() must report false when it stopped on the budget with frames still queued");
+    test_assert(stack->poll() == false,
+                "poll() must report false when it stopped on the budget with frames still queued");
     test_assert(static_cast<int>(channel->outbound_frames().size()) == NetworkStack::POLL_FRAME_BUDGET,
                 "exactly the budgeted number of frames should have been processed in the first pass");
 
@@ -931,11 +989,13 @@ TEST(ConnectingOffLinkResolvesTheGatewayNotTheDestination)
 
     stack->connect(IPv4Address("8.8.8.8"), 443);
 
-    test_assert(channel->outbound_frames().size() == 1, "connect() to an unresolved next hop should emit one ARP request");
+    test_assert(channel->outbound_frames().size() == 1,
+                "connect() to an unresolved next hop should emit one ARP request");
     ArpView arp = view_arp(channel->outbound_frames()[0]);
     test_assert(arp.is_arp && arp.op == ArpOperation::REQUEST, "it should be an ARP request");
     test_assert(arp.target_ip == PEER_IP.to_string(),
-                "the request must ask for the GATEWAY's MAC. Asking for 8.8.8.8 is the old behaviour and can never be answered - no host on this segment owns it");
+                "the request must ask for the GATEWAY's MAC. Asking for 8.8.8.8 is the old behaviour and can never be "
+                "answered - no host on this segment owns it");
 }
 
 TEST(GatewayArpReplyReleasesTheOffLinkConnection)
@@ -960,8 +1020,9 @@ TEST(GatewayArpReplyReleasesTheOffLinkConnection)
     Ethernet eth(channel->outbound_frames()[0]);
     test_assert(eth.get_dest() == PEER_MAC, "the frame goes to the gateway's MAC");
     const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
-    test_assert(ip != nullptr && IPv4Address(ip->get_dest_address()) == IPv4Address("8.8.8.8"),
-                "the IP header must still name 8.8.8.8 - the L3 destination and the L2 destination are different things");
+    test_assert(
+        ip != nullptr && IPv4Address(ip->get_dest_address()) == IPv4Address("8.8.8.8"),
+        "the IP header must still name 8.8.8.8 - the L3 destination and the L2 destination are different things");
 }
 
 TEST(OnLinkDestinationsStillResolveThemselvesWithAGatewayPresent)
@@ -985,29 +1046,36 @@ TEST(BroadcastIsSentWithoutResolutionAndAcceptedInbound)
     UdpSocket* socket = stack->bind_udp(68);
     socket->send_to(IPv4Address("255.255.255.255"), 67, Bytes::from_hex("abcd"));
 
-    test_assert(channel->outbound_frames().size() == 1, "a broadcast datagram should go straight out, with no ARP request first");
+    test_assert(channel->outbound_frames().size() == 1,
+                "a broadcast datagram should go straight out, with no ARP request first");
     Ethernet eth(channel->outbound_frames()[0]);
     test_assert(eth.get_dest() == MacAddress::BROADCAST, "it must be addressed to the broadcast MAC");
 
     // inbound: a broadcast datagram is not addressed to our IP, and must be
     // accepted anyway or a host could never be reached before it has an address
     std::vector<Bytes> received;
-    socket->set_datagram_received_callback(
-        [&received](const IPv4Address&, uint16_t, const Bytes& data) { received.push_back(data); });
+    socket->set_datagram_received_callback([&received](const IPv4Address&, uint16_t, const Bytes& data)
+                                           { received.push_back(data); });
 
     Bytes frame = build_udp(67, 68, Bytes::from_hex("beef"));
     // rewrite the IP destination (bytes 30-33 of the frame) to the broadcast
-    for (int i = 0; i < 4; i++) { frame[30 + i] = 0xFF; }
+    for (int i = 0; i < 4; i++)
+    {
+        frame[30 + i] = 0xFF;
+    }
     // and recompute the IP header checksum over the modified header
-    frame[24] = 0; frame[25] = 0;
+    frame[24] = 0;
+    frame[25] = 0;
     Bytes header = frame.slice(14, 20);
     Bytes cs = int_to_bytes<uint16_t>(internet_checksum(header));
-    frame[24] = cs[0]; frame[25] = cs[1];
+    frame[24] = cs[0];
+    frame[25] = cs[1];
 
     channel->push_inbound(frame);
     stack->poll();
 
-    test_assert(received.size() == 1, "a broadcast datagram must be accepted even though it is not addressed to our own IP");
+    test_assert(received.size() == 1,
+                "a broadcast datagram must be accepted even though it is not addressed to our own IP");
 }
 
 // The accept queue was unbounded, which is where a SYN flood lands: a remote
@@ -1038,7 +1106,8 @@ TEST(SynsBeyondTheListenBacklogAreDropped)
     stack->poll();
 
     test_assert(channel->outbound_frames().empty(),
-                "a SYN beyond the backlog must be dropped silently - not answered with a SYN-ACK, and not RST either, so the peer's own retransmission can succeed once the application drains");
+                "a SYN beyond the backlog must be dropped silently - not answered with a SYN-ACK, and not RST either, "
+                "so the peer's own retransmission can succeed once the application drains");
 
     // once the application accepts, there is room again
     test_assert(stack->accept(80) != nullptr, "the queued connection should still be acceptable");
@@ -1047,8 +1116,9 @@ TEST(SynsBeyondTheListenBacklogAreDropped)
     stack->poll();
 
     TcpView syn_ack = find_tcp(channel->outbound_frames());
-    test_assert(syn_ack.is_tcp && syn_ack.syn && syn_ack.ack_flag,
-                "with the queue drained a new SYN must be answered again - the backlog is a limit, not a permanent refusal");
+    test_assert(
+        syn_ack.is_tcp && syn_ack.syn && syn_ack.ack_flag,
+        "with the queue drained a new SYN must be answered again - the backlog is a limit, not a permanent refusal");
 }
 
 // --- receive-side reassembly, end to end ---
@@ -1062,13 +1132,12 @@ namespace
     // One fragment of a larger UDP datagram. offset_units is the header field,
     // counted in 8-byte units. The payload is a raw slice, not a UDP header,
     // for every fragment after the first.
-    Bytes build_ip_fragment(uint8_t protocol, const Bytes& slice, uint16_t offset_units,
-                            bool more_fragments, uint16_t identification)
+    Bytes build_ip_fragment(uint8_t protocol, const Bytes& slice, uint16_t offset_units, bool more_fragments,
+                            uint16_t identification)
     {
         uint8_t flags = more_fragments ? IP_FLAG_MORE_FRAGMENTS : 0;
-        auto ip = std::make_unique<Ip>(
-            4, 5, 0, static_cast<uint16_t>(20 + slice.size()), identification,
-            flags, offset_units, 64, protocol, 0, PEER_IP.get_address(), LOCAL_IP.get_address());
+        auto ip = std::make_unique<Ip>(4, 5, 0, static_cast<uint16_t>(20 + slice.size()), identification, flags,
+                                       offset_units, 64, protocol, 0, PEER_IP.get_address(), LOCAL_IP.get_address());
         *ip /= std::make_unique<Raw>(slice);
         ip->compute_checksum();
 
@@ -1085,14 +1154,17 @@ TEST(FragmentedUdpDatagramIsReassembledAndDelivered)
 
     std::vector<Bytes> received;
     UdpSocket* socket = stack->bind_udp(9000);
-    socket->set_datagram_received_callback(
-        [&received](const IPv4Address&, uint16_t, const Bytes& data) { received.push_back(data); });
+    socket->set_datagram_received_callback([&received](const IPv4Address&, uint16_t, const Bytes& data)
+                                           { received.push_back(data); });
 
     // a 24-byte UDP payload, so the whole datagram is 8 + 24 = 32 bytes, split
     // into two fragments of 16 bytes each (a non-last fragment's payload must
     // be a multiple of 8)
     Bytes payload(24u);
-    for (size_t i = 0; i < payload.size(); i++) { payload[i] = static_cast<uint8_t>(i); }
+    for (size_t i = 0; i < payload.size(); i++)
+    {
+        payload[i] = static_cast<uint8_t>(i);
+    }
 
     Udp udp(40000, 9000, static_cast<uint16_t>(8 + payload.size()), 0, Bytes());
     udp /= std::make_unique<Raw>(payload);
@@ -1146,16 +1218,15 @@ namespace
     Bytes build_icmp_fragmentation_needed(uint16_t local_port, uint16_t remote_port, uint16_t next_hop_mtu)
     {
         Tcp our_segment(local_port, remote_port, 0, 0, 5, 0x02 /* SYN */, 65535, 0, 0);
-        auto embedded_ip = std::make_unique<Ip>(
-            4, 5, 0, 40, 0, 0, 0, 64, IpProtocol::TCP, 0,
-            LOCAL_IP.get_address(), PEER_IP.get_address());
+        auto embedded_ip = std::make_unique<Ip>(4, 5, 0, 40, 0, 0, 0, 64, IpProtocol::TCP, 0, LOCAL_IP.get_address(),
+                                                PEER_IP.get_address());
         *embedded_ip /= std::make_unique<Raw>(our_segment.to_bytes());
         embedded_ip->compute_checksum();
         Bytes embedded = embedded_ip->to_bytes().slice(0, 28);
 
         // RFC 1191: the next hop's MTU lives in the low half of rest-of-header
-        Icmp icmp(IcmpType::ICMP_DESTINATION_UNREACHABLE, ICMP_CODE_FRAGMENTATION_NEEDED,
-                  0, static_cast<uint32_t>(next_hop_mtu), embedded);
+        Icmp icmp(IcmpType::ICMP_DESTINATION_UNREACHABLE, ICMP_CODE_FRAGMENTATION_NEEDED, 0,
+                  static_cast<uint32_t>(next_hop_mtu), embedded);
         icmp.compute_checksum();
         return wrap_ip(IpProtocol::ICMP, icmp.to_bytes());
     }
@@ -1175,8 +1246,8 @@ namespace
     // fallback - already at the floor, so no report could lower it and the test
     // would pass without the mechanism doing anything. Starting from a real
     // 1460 is what makes a reduction observable.
-    TcpConnection* accept_connection_with_peer_mss(NetworkStack& stack, FakePacketChannel& channel,
-                                                   uint16_t local_port, uint16_t remote_port)
+    TcpConnection* accept_connection_with_peer_mss(NetworkStack& stack, FakePacketChannel& channel, uint16_t local_port,
+                                                   uint16_t remote_port)
     {
         stack.listen(local_port);
         stack.add_static_arp_entry(PEER_IP, PEER_MAC);
@@ -1202,15 +1273,16 @@ TEST(FragmentationNeededLowersTheMssInsteadOfKillingTheConnection)
     TcpConnection* connection = accept_connection_with_peer_mss(*stack, *channel, 80, 40000);
     test_assert(connection != nullptr, "precondition: the connection was accepted");
     uint16_t mss_before = connection->get_effective_mss();
-    test_assert(mss_before == 1460, "precondition: the peer advertised a full-sized MSS, so there is room to come down from");
+    test_assert(mss_before == 1460,
+                "precondition: the peer advertised a full-sized MSS, so there is room to come down from");
 
     channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 1000));
     stack->poll();
 
     test_assert(stack->find_connection(connection->get_id()) != nullptr,
-                "Fragmentation Needed must NOT fail the connection - the destination is reachable, the packet was just too big");
-    test_assert(connection->get_effective_mss() < mss_before,
-                "it must lower the segment size instead");
+                "Fragmentation Needed must NOT fail the connection - the destination is reachable, the packet was just "
+                "too big");
+    test_assert(connection->get_effective_mss() < mss_before, "it must lower the segment size instead");
     test_assert(connection->get_effective_mss() == 1000 - 40,
                 "the new MSS should be the reported next-hop MTU less an IP and a TCP header");
 }
@@ -1229,8 +1301,8 @@ TEST(FragmentationNeededNeverRaisesTheMss)
 
     channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 9000));
     stack->poll();
-    test_assert(connection->get_effective_mss() == 960,
-                "a report claiming a larger MTU must be ignored - an attacker could otherwise talk this stack into oversized segments");
+    test_assert(connection->get_effective_mss() == 960, "a report claiming a larger MTU must be ignored - an attacker "
+                                                        "could otherwise talk this stack into oversized segments");
 }
 
 TEST(OtherUnreachableCodesStillFailTheConnection)
@@ -1245,8 +1317,8 @@ TEST(OtherUnreachableCodesStillFailTheConnection)
     channel->push_inbound(build_icmp_port_unreachable_for_our_tcp(local_port, 80));
     stack->poll();
 
-    test_assert(stack->find_connection(id) == nullptr,
-                "a genuine unreachable must still fail the connection fast rather than letting it grind through its retransmit budget");
+    test_assert(stack->find_connection(id) == nullptr, "a genuine unreachable must still fail the connection fast "
+                                                       "rather than letting it grind through its retransmit budget");
 }
 
 // Routers predating RFC 1191 report the failure without saying how small is
@@ -1275,8 +1347,8 @@ TEST(TcpSegmentsAreSentWithDontFragmentSet)
 
     Ethernet eth(channel->outbound_frames()[0]);
     const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
-    test_assert(ip != nullptr && ip->get_ip_flag_d(),
-                "a TCP segment must carry DF - without it a small link silently fragments and the sender never learns the path MTU");
+    test_assert(ip != nullptr && ip->get_ip_flag_d(), "a TCP segment must carry DF - without it a small link silently "
+                                                      "fragments and the sender never learns the path MTU");
 }
 
 // --- ICMP as a control plane: rate limiting, a ping client, and smurf ---
@@ -1303,7 +1375,10 @@ TEST(GeneratedIcmpErrorsAreRateLimited)
     for (const Bytes& frame : channel->outbound_frames())
     {
         IcmpView view = view_icmp(frame);
-        if (view.is_icmp && view.type == IcmpType::ICMP_DESTINATION_UNREACHABLE) { errors++; }
+        if (view.is_icmp && view.type == IcmpType::ICMP_DESTINATION_UNREACHABLE)
+        {
+            errors++;
+        }
     }
 
     test_assert(errors > 0, "some errors should still be sent - the budget is a limit, not a mute");
@@ -1311,7 +1386,10 @@ TEST(GeneratedIcmpErrorsAreRateLimited)
 
     // the budget refills over time rather than being spent once and gone
     channel->clear_outbound();
-    for (int i = 0; i < 20; i++) { stack->on_time_passed(TEST_TICK_MS); }
+    for (int i = 0; i < 20; i++)
+    {
+        stack->on_time_passed(TEST_TICK_MS);
+    }
     channel->push_inbound(build_udp(40000, 9999, Bytes::from_hex("aa")));
     stack->poll();
 
@@ -1341,9 +1419,8 @@ TEST(BroadcastPingIsIgnored)
     icmp.compute_checksum();
     Bytes segment = icmp.to_bytes();
 
-    auto ip = std::make_unique<Ip>(
-        4, 5, 0, static_cast<uint16_t>(20 + segment.size()), 0, 0, 0, 64,
-        IpProtocol::ICMP, 0, PEER_IP.get_address(), IPv4Address("255.255.255.255").get_address());
+    auto ip = std::make_unique<Ip>(4, 5, 0, static_cast<uint16_t>(20 + segment.size()), 0, 0, 0, 64, IpProtocol::ICMP,
+                                   0, PEER_IP.get_address(), IPv4Address("255.255.255.255").get_address());
     *ip /= std::make_unique<Raw>(segment);
     ip->compute_checksum();
     Ethernet eth(PEER_MAC, MacAddress::BROADCAST, EtherType::IPv4);
@@ -1352,8 +1429,9 @@ TEST(BroadcastPingIsIgnored)
     channel->push_inbound(eth.to_bytes());
     stack->poll();
 
-    test_assert(channel->outbound_frames().empty(),
-                "a ping to the broadcast address must be ignored - answering makes this host one voice in an amplifier");
+    test_assert(
+        channel->outbound_frames().empty(),
+        "a ping to the broadcast address must be ignored - answering makes this host one voice in an amplifier");
 }
 
 TEST(EchoRequestIsSentAndItsReplyReported)
@@ -1368,13 +1446,16 @@ TEST(EchoRequestIsSentAndItsReplyReported)
     test_assert(sent.is_icmp && sent.type == IcmpType::ICMP_ECHO_REQUEST, "an echo request should go out");
 
     // the peer echoes identifier, sequence and payload back untouched
-    struct Reply { IPv4Address source; uint16_t id; uint16_t seq; Bytes payload; };
+    struct Reply
+    {
+        IPv4Address source;
+        uint16_t id;
+        uint16_t seq;
+        Bytes payload;
+    };
     std::vector<Reply> replies;
-    stack->set_echo_reply_callback(
-        [&replies](const IPv4Address& src, uint16_t id, uint16_t seq, const Bytes& payload)
-        {
-            replies.push_back({src, id, seq, payload});
-        });
+    stack->set_echo_reply_callback([&replies](const IPv4Address& src, uint16_t id, uint16_t seq, const Bytes& payload)
+                                   { replies.push_back({src, id, seq, payload}); });
 
     Icmp reply(IcmpType::ICMP_ECHO_REPLY, ICMP_CODE_NONE, 0, (0x1234u << 16) | 7u, Bytes::from_hex("cafe"));
     reply.compute_checksum();
@@ -1384,7 +1465,8 @@ TEST(EchoRequestIsSentAndItsReplyReported)
     test_assert(replies.size() == 1, "the reply should be reported to the application");
     test_assert(replies[0].id == 0x1234 && replies[0].seq == 7,
                 "identifier and sequence come back untouched, which is how a reply is matched to its request");
-    test_assert(replies[0].payload.to_hex() == "cafe", "and the payload verbatim, which is what lets a ping time a round trip");
+    test_assert(replies[0].payload.to_hex() == "cafe",
+                "and the payload verbatim, which is what lets a ping time a round trip");
 }
 
 TEST(APingFromAnUnresolvedPeerArpsForItInsteadOfThrowing)
@@ -1405,14 +1487,12 @@ TEST(APingFromAnUnresolvedPeerArpsForItInsteadOfThrowing)
     channel->push_inbound(build_icmp_echo_request(0x00010001, Bytes::from_hex("41")));
     stack->poll();
 
-    test_assert(!find_icmp(channel->outbound_frames()).is_icmp,
-                "no reply can be sent to a peer whose MAC is unknown");
+    test_assert(!find_icmp(channel->outbound_frames()).is_icmp, "no reply can be sent to a peer whose MAC is unknown");
 
     ArpView request = find_arp(channel->outbound_frames());
     test_assert(request.is_arp && request.op == ArpOperation::REQUEST,
                 "but the stack must ARP for it, so the next ping can be answered");
-    test_assert(request.target_ip == PEER_IP.to_string(),
-                "and ARP for the peer that pinged us");
+    test_assert(request.target_ip == PEER_IP.to_string(), "and ARP for the peer that pinged us");
 }
 
 TEST(ThePingAfterResolutionIsAnswered)
@@ -1445,13 +1525,11 @@ namespace
     // Same as wrap_ip, but the caller chooses the IP destination - which is the
     // whole point here, since the bug being tested is the receive path using
     // this interface's address instead of the one on the wire.
-    Bytes wrap_ip_to(uint8_t protocol, const Bytes& segment, const IPv4Address& destination,
-                     const MacAddress& dest_mac, const IPv4Address& source = PEER_IP,
-                     const MacAddress& source_mac = PEER_MAC)
+    Bytes wrap_ip_to(uint8_t protocol, const Bytes& segment, const IPv4Address& destination, const MacAddress& dest_mac,
+                     const IPv4Address& source = PEER_IP, const MacAddress& source_mac = PEER_MAC)
     {
-        auto ip = std::make_unique<Ip>(
-            4, 5, 0, static_cast<uint16_t>(20 + segment.size()), 0,
-            0, 0, 64, protocol, 0, source.get_address(), destination.get_address());
+        auto ip = std::make_unique<Ip>(4, 5, 0, static_cast<uint16_t>(20 + segment.size()), 0, 0, 0, 64, protocol, 0,
+                                       source.get_address(), destination.get_address());
         *ip /= std::make_unique<Raw>(segment);
         ip->compute_checksum();
 
@@ -1464,8 +1542,8 @@ namespace
     // the sender would actually use. Every other UDP test in this file sends
     // checksum 0 ("not computed"), which is why none of them could reach the
     // bug this exercises.
-    Bytes build_checksummed_udp_to(const IPv4Address& destination, const MacAddress& dest_mac,
-                                   uint16_t src_port, uint16_t dest_port, const Bytes& payload)
+    Bytes build_checksummed_udp_to(const IPv4Address& destination, const MacAddress& dest_mac, uint16_t src_port,
+                                   uint16_t dest_port, const Bytes& payload)
     {
         Udp udp(src_port, dest_port, static_cast<uint16_t>(8 + payload.size()), 0, Bytes());
         if (!payload.empty())
@@ -1500,11 +1578,11 @@ TEST(ADirectedBroadcastWithARealChecksumIsAccepted)
 
     bool received = false;
     UdpSocket* socket = stack->bind_udp(9999);
-    socket->set_datagram_received_callback(
-        [&received](const IPv4Address&, uint16_t, const Bytes&) { received = true; });
+    socket->set_datagram_received_callback([&received](const IPv4Address&, uint16_t, const Bytes&)
+                                           { received = true; });
 
-    channel->push_inbound(build_checksummed_udp_to(
-        IPv4Address("10.0.0.255"), MacAddress::BROADCAST, 5000, 9999, Bytes::from_hex("cafe")));
+    channel->push_inbound(build_checksummed_udp_to(IPv4Address("10.0.0.255"), MacAddress::BROADCAST, 5000, 9999,
+                                                   Bytes::from_hex("cafe")));
     stack->poll();
 
     test_assert(received, "a directed broadcast with a correct checksum must be delivered, "
@@ -1520,11 +1598,10 @@ TEST(AUnicastDatagramWithARealChecksumStillVerifies)
 
     bool received = false;
     UdpSocket* socket = stack->bind_udp(9999);
-    socket->set_datagram_received_callback(
-        [&received](const IPv4Address&, uint16_t, const Bytes&) { received = true; });
+    socket->set_datagram_received_callback([&received](const IPv4Address&, uint16_t, const Bytes&)
+                                           { received = true; });
 
-    channel->push_inbound(build_checksummed_udp_to(
-        LOCAL_IP, LOCAL_MAC, 5000, 9999, Bytes::from_hex("cafe")));
+    channel->push_inbound(build_checksummed_udp_to(LOCAL_IP, LOCAL_MAC, 5000, 9999, Bytes::from_hex("cafe")));
     stack->poll();
 
     test_assert(received, "a correctly checksummed unicast datagram must still be delivered");
@@ -1538,8 +1615,8 @@ TEST(ACorruptedChecksumIsStillRejected)
 
     bool received = false;
     UdpSocket* socket = stack->bind_udp(9999);
-    socket->set_datagram_received_callback(
-        [&received](const IPv4Address&, uint16_t, const Bytes&) { received = true; });
+    socket->set_datagram_received_callback([&received](const IPv4Address&, uint16_t, const Bytes&)
+                                           { received = true; });
 
     Bytes frame = build_checksummed_udp_to(LOCAL_IP, LOCAL_MAC, 5000, 9999, Bytes::from_hex("cafe"));
     frame[frame.size() - 3] = static_cast<byte_t>(frame[frame.size() - 3] ^ 0xff);
@@ -1628,8 +1705,7 @@ TEST(APacketLeavesByTheInterfaceItsRouteNames)
 
     test_assert(contains_udp(second->outbound_frames()),
                 "a datagram for 192.168.5.9 must go out of the interface that network is on");
-    test_assert(!contains_udp(first->outbound_frames()),
-                "and must not go out of the other one");
+    test_assert(!contains_udp(first->outbound_frames()), "and must not go out of the other one");
 }
 
 TEST(TheSourceAddressIsTheEgressInterfacesOwn)
@@ -1656,12 +1732,13 @@ TEST(TheSourceAddressIsTheEgressInterfacesOwn)
     for (const Bytes& frame : second->outbound_frames())
     {
         Ethernet eth(frame);
-        if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer()) continue;
+        if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer())
+            continue;
         const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
-        if (!ip || ip->get_protocol() != IpProtocol::UDP) continue;
+        if (!ip || ip->get_protocol() != IpProtocol::UDP)
+            continue;
 
-        test_assert(eth.get_src() == SECOND_MAC,
-                    "the frame must carry the egress interface's MAC, not the primary's");
+        test_assert(eth.get_src() == SECOND_MAC, "the frame must carry the egress interface's MAC, not the primary's");
         test_assert(IPv4Address(ip->get_src_address()) == SECOND_IP,
                     "the IP header must carry the egress interface's address, not the primary's");
 
@@ -1706,8 +1783,7 @@ TEST(EachInterfaceResolvesAgainstItsOwnArpTable)
     test_assert(request.is_arp && request.op == ArpOperation::REQUEST,
                 "the first interface must ARP for its own neighbour");
     test_assert(request.target_ip == PEER_IP.to_string(), "for the right address");
-    test_assert(!find_arp(second->outbound_frames()).is_arp,
-                "and the second interface must not be asked about it");
+    test_assert(!find_arp(second->outbound_frames()).is_arp, "and the second interface must not be asked about it");
 }
 
 TEST(AnArpRequestCarriesTheIdentityOfTheLinkItLeavesBy)
@@ -1728,8 +1804,7 @@ TEST(AnArpRequestCarriesTheIdentityOfTheLinkItLeavesBy)
                 "the second interface should ARP for its neighbour");
     test_assert(request.sender_ip == SECOND_IP.to_string(),
                 "the request must carry that interface's address as the sender");
-    test_assert(request.sender_mac == SECOND_MAC.to_string(),
-                "and that interface's MAC");
+    test_assert(request.sender_mac == SECOND_MAC.to_string(), "and that interface's MAC");
 }
 
 namespace
@@ -1767,8 +1842,7 @@ TEST(ABroadcastPingIsRefusedOnEveryInterfaceNotJustTheFirst)
     first->clear_outbound();
     second->clear_outbound();
 
-    second->push_inbound(build_broadcast_echo_request(IPv4Address("192.168.5.255"),
-                                                      MacAddress::BROADCAST,
+    second->push_inbound(build_broadcast_echo_request(IPv4Address("192.168.5.255"), MacAddress::BROADCAST,
                                                       SECOND_PEER_IP, SECOND_PEER_MAC));
     stack->poll();
 
@@ -1791,9 +1865,8 @@ TEST(ABroadcastPingToThePrimarysNetworkIsStillRefused)
     stack->poll();
     first->clear_outbound();
 
-    first->push_inbound(build_broadcast_echo_request(IPv4Address("10.0.0.255"),
-                                                     MacAddress::BROADCAST,
-                                                     PEER_IP, PEER_MAC));
+    first->push_inbound(
+        build_broadcast_echo_request(IPv4Address("10.0.0.255"), MacAddress::BROADCAST, PEER_IP, PEER_MAC));
     stack->poll();
 
     test_assert(!find_icmp(first->outbound_frames()).is_icmp,
@@ -1839,8 +1912,7 @@ TEST(ThePollBudgetIsSharedAcrossInterfacesNotMultipliedByThem)
 
     test_assert(!drained, "poll() must report that frames are still queued");
     test_assert(consumed <= 64,
-                "one poll() must not exceed the shared frame budget - consumed " +
-                std::to_string(consumed));
+                "one poll() must not exceed the shared frame budget - consumed " + std::to_string(consumed));
 }
 
 TEST(APollBudgetSpentRoundRobinDoesNotStarveAQuietInterface)
@@ -1879,8 +1951,7 @@ namespace
     // made (see _forward_ip), so a packet whose transport header does not parse
     // is dropped rather than forwarded. A test using two loose bytes would be
     // testing that limitation rather than the forwarding.
-    Bytes build_transit_packet(const IPv4Address& destination, uint8_t ttl,
-                               const Bytes& body = Bytes::from_hex("d0d0"),
+    Bytes build_transit_packet(const IPv4Address& destination, uint8_t ttl, const Bytes& body = Bytes::from_hex("d0d0"),
                                const IPv4Address& source = PEER_IP)
     {
         Udp udp(4444, 5555, static_cast<uint16_t>(8 + body.size()), 0, Bytes());
@@ -1890,10 +1961,8 @@ namespace
         }
         Bytes payload = udp.to_bytes();
 
-        auto ip = std::make_unique<Ip>(
-            4, 5, 0, static_cast<uint16_t>(20 + payload.size()), 0x1234,
-            0, 0, ttl, IpProtocol::UDP, 0,
-            source.get_address(), destination.get_address());
+        auto ip = std::make_unique<Ip>(4, 5, 0, static_cast<uint16_t>(20 + payload.size()), 0x1234, 0, 0, ttl,
+                                       IpProtocol::UDP, 0, source.get_address(), destination.get_address());
         *ip /= std::make_unique<Raw>(payload);
         ip->compute_checksum();
 
@@ -1943,9 +2012,11 @@ namespace
         for (const Bytes& frame : frames)
         {
             Ethernet eth(frame);
-            if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer()) continue;
+            if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer())
+                continue;
             const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
-            if (!ip || !(IPv4Address(ip->get_dest_address()) == destination)) continue;
+            if (!ip || !(IPv4Address(ip->get_dest_address()) == destination))
+                continue;
 
             IpView v;
             v.found = true;
@@ -2009,8 +2080,7 @@ TEST(ARouterForwardsTransitTrafficOutTheRightInterface)
 
     test_assert(find_ip_to(second->outbound_frames(), BEHIND_US).found,
                 "the packet must go out of the interface its route names");
-    test_assert(!find_ip_to(first->outbound_frames(), BEHIND_US).found,
-                "and not back out of the one it arrived on");
+    test_assert(!find_ip_to(first->outbound_frames(), BEHIND_US).found, "and not back out of the one it arrived on");
 }
 
 TEST(ForwardingDecrementsTheTtl)
@@ -2027,10 +2097,8 @@ TEST(ForwardingDecrementsTheTtl)
     IpView forwarded = find_ip_to(second->outbound_frames(), BEHIND_US);
     test_assert(forwarded.found, "the packet should have been forwarded");
     test_assert(forwarded.ttl == 63,
-                "TTL must be decremented on the way through, got " +
-                std::to_string(forwarded.ttl));
-    test_assert(forwarded.checksum_ok,
-                "and the header checksum recomputed - the TTL it covers just changed");
+                "TTL must be decremented on the way through, got " + std::to_string(forwarded.ttl));
+    test_assert(forwarded.checksum_ok, "and the header checksum recomputed - the TTL it covers just changed");
 }
 
 TEST(ForwardingPreservesTheSourceAddressAndThePayload)
@@ -2074,8 +2142,7 @@ TEST(ATtlThatRunsOutDrawsTimeExceededRatherThanSilence)
     first->push_inbound(build_transit_packet(BEHIND_US, 1));
     stack->poll();
 
-    test_assert(!find_ip_to(second->outbound_frames(), BEHIND_US).found,
-                "an expired packet must not be forwarded");
+    test_assert(!find_ip_to(second->outbound_frames(), BEHIND_US).found, "an expired packet must not be forwarded");
 
     IcmpView reply = find_icmp(first->outbound_frames());
     test_assert(reply.is_icmp, "the sender must be told, on the interface it can be reached by");
@@ -2116,8 +2183,7 @@ TEST(APacketIsNotForwardedBackOutTheInterfaceItArrivedOn)
     // interface 0 that neighbour. An unknown address would be dropped for want
     // of an ARP entry and the test would pass however broken the guard was -
     // which is exactly what the first version of it did.
-    first->push_inbound(build_transit_packet(PEER_IP, 64, Bytes::from_hex("d0d0"),
-                                             IPv4Address("10.0.0.77")));
+    first->push_inbound(build_transit_packet(PEER_IP, 64, Bytes::from_hex("d0d0"), IPv4Address("10.0.0.77")));
     stack->poll();
 
     test_assert(!find_ip_to(first->outbound_frames(), PEER_IP).found,
@@ -2210,7 +2276,11 @@ TEST(ASynAckOnTheWireEchoesEveryOptionThePeerOffered)
 
     // MSS 1460, SACK-permitted, timestamps (TSval 0x11223344, TSecr 0), NOP,
     // window scale 7 - the layout Linux sends.
-    Bytes options = Bytes::from_hex("020405b4" "0402" "080a1122334400000000" "01" "030307");
+    Bytes options = Bytes::from_hex("020405b4"
+                                    "0402"
+                                    "080a1122334400000000"
+                                    "01"
+                                    "030307");
     channel->push_inbound(build_tcp_with_options(FLAG_SYN, 2000, 0, 40000, 80, options));
     stack->poll();
 

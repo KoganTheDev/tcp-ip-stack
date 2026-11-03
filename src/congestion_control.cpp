@@ -13,8 +13,7 @@ void CongestionControl::on_established(uint32_t mss)
     _on_reset();
 }
 
-void CongestionControl::on_ack(uint32_t bytes_acked, uint32_t bytes_in_flight,
-                               uint32_t srtt_ms, uint64_t now_ms)
+void CongestionControl::on_ack(uint32_t bytes_acked, uint32_t bytes_in_flight, uint32_t srtt_ms, uint64_t now_ms)
 {
     if (_cwnd < _ssthresh)
     {
@@ -32,8 +31,7 @@ void CongestionControl::on_ack(uint32_t bytes_acked, uint32_t bytes_in_flight,
     _cwnd = std::min(_cwnd, MAX_CWND);
 }
 
-void CongestionControl::on_fast_retransmit(uint32_t bytes_in_flight, uint32_t duplicate_acks,
-                                           uint64_t now_ms)
+void CongestionControl::on_fast_retransmit(uint32_t bytes_in_flight, uint32_t duplicate_acks, uint64_t now_ms)
 {
     _on_congestion_event(bytes_in_flight, now_ms);
     _cwnd = std::min(_ssthresh + duplicate_acks * _mss, MAX_CWND);
@@ -182,8 +180,7 @@ void CubicCongestionControl::_grow_in_congestion_avoidance(uint32_t bytes_acked,
     // Less lost, so less to re-earn. The claim this region supports is
     // therefore about the average over a loss cycle, not about being larger
     // than Reno at every instant, which it is not.
-    _w_est += (3.0 * (1.0 - BETA) / (1.0 + BETA))
-              * (static_cast<double>(bytes_acked) / _mss) / cwnd_segments;
+    _w_est += (3.0 * (1.0 - BETA) / (1.0 + BETA)) * (static_cast<double>(bytes_acked) / _mss) / cwnd_segments;
     target = std::max(target, _w_est);
 
     double growth_segments;

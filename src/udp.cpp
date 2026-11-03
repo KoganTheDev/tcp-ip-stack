@@ -3,10 +3,7 @@
 #include "raw.h"
 
 Udp::Udp(uint16_t src_port, uint16_t dest_port, uint16_t length, uint16_t checksum, const Bytes& data)
-    : _src_port(src_port),
-      _dest_port(dest_port),
-      _length(length),
-      _checksum(checksum)
+    : _src_port(src_port), _dest_port(dest_port), _length(length), _checksum(checksum)
 {
     if (!data.empty())
     {
@@ -14,7 +11,7 @@ Udp::Udp(uint16_t src_port, uint16_t dest_port, uint16_t length, uint16_t checks
     }
 }
 
-Udp::Udp(const Bytes &bytes)
+Udp::Udp(const Bytes& bytes)
 {
     this->from_bytes(bytes);
 }

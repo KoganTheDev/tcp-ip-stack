@@ -41,18 +41,15 @@ uint8_t DhcpLease::prefix_length() const
 }
 
 DhcpClient::DhcpClient(const MacAddress& mac, SendFn send, uint32_t random_seed)
-    : _mac(mac), _send(std::move(send)),
-      _state(DhcpClientState::INIT), _transaction_id(random_seed),
-      _retransmit_ms_remaining(0), _retransmit_interval_ms(RETRANSMIT_BASE_MS),
-      _seconds_elapsed_ms(0),
+    : _mac(mac), _send(std::move(send)), _state(DhcpClientState::INIT), _transaction_id(random_seed),
+      _retransmit_ms_remaining(0), _retransmit_interval_ms(RETRANSMIT_BASE_MS), _seconds_elapsed_ms(0),
       _renewal_ms_remaining(0), _rebinding_ms_remaining(0), _expiry_ms_remaining(0)
-{
-}
+{}
 
 bool DhcpClient::has_lease() const
 {
     return _state == DhcpClientState::BOUND || _state == DhcpClientState::RENEWING
-        || _state == DhcpClientState::REBINDING;
+           || _state == DhcpClientState::REBINDING;
 }
 
 void DhcpClient::start()
@@ -130,7 +127,8 @@ void DhcpClient::_send_request(bool unicast_to_server)
         // the two cases differently, and a request carrying both is
         // ambiguous enough that some servers NAK it.
         message.set_client_ip(_lease.ip);
-        LOG_DEBUG("DhcpClient: REQUEST to " << _lease.server.to_string() << " (renewing " << _lease.ip.to_string() << ")");
+        LOG_DEBUG("DhcpClient: REQUEST to " << _lease.server.to_string() << " (renewing " << _lease.ip.to_string()
+                                            << ")");
         _send(_lease.server, message.to_bytes());
         return;
     }
@@ -201,8 +199,7 @@ void DhcpClient::on_datagram(const Bytes& payload)
         _offer = DhcpLease{};
         _offer.ip = message.get_your_ip();
         _offer.server = message.get_option_address(DHCP_OPTION_SERVER_IDENTIFIER);
-        LOG_DEBUG("DhcpClient: OFFER of " << _offer.ip.to_string()
-                 << " from " << _offer.server.to_string());
+        LOG_DEBUG("DhcpClient: OFFER of " << _offer.ip.to_string() << " from " << _offer.server.to_string());
 
         _state = DhcpClientState::REQUESTING;
         _retransmit_interval_ms = RETRANSMIT_BASE_MS;
@@ -252,8 +249,7 @@ void DhcpClient::_apply_ack(const Dhcp& message)
     // would make max_ip_payload() zero and spin the fragmentation loop forever.
     if (granted.mtu < 68)
     {
-        LOG_WARNING("DhcpClient: ignoring illegal interface MTU " << granted.mtu
-                    << " (minimum is 68), keeping 1500");
+        LOG_WARNING("DhcpClient: ignoring illegal interface MTU " << granted.mtu << " (minimum is 68), keeping 1500");
         granted.mtu = 1500;
     }
     granted.lease_seconds = message.get_option_uint32(DHCP_OPTION_LEASE_TIME, 0);
@@ -285,10 +281,10 @@ void DhcpClient::_apply_ack(const Dhcp& message)
     }
 
     int lease_ms = lease_seconds_to_ms(granted.lease_seconds);
-    uint32_t t1_seconds = message.get_option_uint32(DHCP_OPTION_RENEWAL_TIME,
-        granted.lease_seconds * T1_NUMERATOR / T1_DENOMINATOR);
-    uint32_t t2_seconds = message.get_option_uint32(DHCP_OPTION_REBINDING_TIME,
-        granted.lease_seconds * T2_NUMERATOR / T2_DENOMINATOR);
+    uint32_t t1_seconds =
+        message.get_option_uint32(DHCP_OPTION_RENEWAL_TIME, granted.lease_seconds * T1_NUMERATOR / T1_DENOMINATOR);
+    uint32_t t2_seconds =
+        message.get_option_uint32(DHCP_OPTION_REBINDING_TIME, granted.lease_seconds * T2_NUMERATOR / T2_DENOMINATOR);
 
     _lease = granted;
     _state = DhcpClientState::BOUND;
@@ -297,10 +293,9 @@ void DhcpClient::_apply_ack(const Dhcp& message)
     _expiry_ms_remaining = lease_ms;
     _retransmit_ms_remaining = 0;
 
-    LOG_INFO("DhcpClient: ACK - bound to " << _lease.ip.to_string()
-             << "/" << static_cast<int>(_lease.prefix_length())
-             << " gw " << _lease.gateway.to_string()
-             << " for " << _lease.lease_seconds << "s");
+    LOG_INFO("DhcpClient: ACK - bound to " << _lease.ip.to_string() << "/" << static_cast<int>(_lease.prefix_length())
+                                           << " gw " << _lease.gateway.to_string() << " for " << _lease.lease_seconds
+                                           << "s");
 
     if (_on_lease_acquired)
     {
@@ -352,7 +347,7 @@ void DhcpClient::on_time_passed(uint32_t elapsed_ms)
     if (_expiry_ms_remaining <= 0)
     {
         LOG_WARNING("DhcpClient: lease on " << _lease.ip.to_string()
-                    << " expired without renewal - releasing the address");
+                                            << " expired without renewal - releasing the address");
         if (_on_lease_lost)
         {
             _on_lease_lost();

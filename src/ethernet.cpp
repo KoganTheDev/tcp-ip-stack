@@ -6,25 +6,21 @@
 #include "arp.h"
 #include "ip.h"
 
-const std::map<EtherType, const std::string> Ethernet::ETHERTYPE_TO_NAME = {
-    {ARP, "ARP"}, {IPv4, "IPv4"}
-};
+const std::map<EtherType, const std::string> Ethernet::ETHERTYPE_TO_NAME = {{ARP, "ARP"}, {IPv4, "IPv4"}};
 
-Ethernet::Ethernet(const Bytes &data)
+Ethernet::Ethernet(const Bytes& data)
 {
     this->from_bytes(data);
 }
 
-Ethernet::Ethernet(const MacAddress &src, const MacAddress &dest, EtherType ethernet_protocol)
-    : _src(src),
-      _dest(dest),
-      _ethernet_protocol(ethernet_protocol)
-{
-}
+Ethernet::Ethernet(const MacAddress& src, const MacAddress& dest, EtherType ethernet_protocol)
+    : _src(src), _dest(dest), _ethernet_protocol(ethernet_protocol)
+{}
 
-void Ethernet::from_bytes(const Bytes &data)
+void Ethernet::from_bytes(const Bytes& data)
 {
-    if (data.size() < 14){
+    if (data.size() < 14)
+    {
         throw EXCEPTION(BaseException, "Ethernet header too short");
     }
     this->_dest = data.slice(0, 6);
@@ -34,13 +30,13 @@ void Ethernet::from_bytes(const Bytes &data)
     switch (this->_ethernet_protocol)
     {
     case EtherType::ARP:
-        this->_next_layer = std::make_unique<Arp>(data.slice(14, 28)); 
+        this->_next_layer = std::make_unique<Arp>(data.slice(14, 28));
         break;
     case EtherType::IPv4:
-        this->_next_layer = std::make_unique<Ip>(data.slice(14)); 
+        this->_next_layer = std::make_unique<Ip>(data.slice(14));
         break;
     default:
-        this->_next_layer = std::make_unique<Raw>(data.slice(14)); 
+        this->_next_layer = std::make_unique<Raw>(data.slice(14));
         break;
     }
 }
@@ -84,6 +80,6 @@ std::string Ethernet::to_string() const
     {
         result += this->_next_layer->to_string();
     }
-    
+
     return result;
 }

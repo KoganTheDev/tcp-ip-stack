@@ -8,15 +8,15 @@
 #include "exceptions.h"
 
 // Macro to define a new test
-#define TEST(name) \
-class Test_##name : public BaseTest\
-{\
-public: \
-    Test_##name() : BaseTest(#name, __FILE__) {}\
-    void test();\
-};\
-static Test_##name test_instance_##name;\
-void Test_##name::test()
+#define TEST(name)                                   \
+    class Test_##name : public BaseTest              \
+    {                                                \
+    public:                                          \
+        Test_##name() : BaseTest(#name, __FILE__) {} \
+        void test();                                 \
+    };                                               \
+    static Test_##name test_instance_##name;         \
+    void Test_##name::test()
 
 
 class AssertException : public BaseException
@@ -31,7 +31,7 @@ void test_assert(bool condition, const std::string& message);
 
 class BaseTest;
 
-inline std::vector<BaseTest*>& get_tests() 
+inline std::vector<BaseTest*>& get_tests()
 {
     static std::vector<BaseTest*> tests;
     return tests;
@@ -47,10 +47,7 @@ public:
         get_tests().push_back(this);
     }
 
-    ~BaseTest()
-    {
-        get_tests().erase(std::find(get_tests().begin(), get_tests().end(), this));
-    }
+    ~BaseTest() { get_tests().erase(std::find(get_tests().begin(), get_tests().end(), this)); }
 
     virtual void test() = 0;
 
@@ -71,7 +68,7 @@ public:
                 std::cout << "Test '" << test->_name << "' passed" << std::endl;
                 passed_count++;
             }
-            catch(const BaseException& e)
+            catch (const BaseException& e)
             {
                 std::cout << "Test '" << test->_name << "' failed with exception: " << e.what() << std::endl;
             }

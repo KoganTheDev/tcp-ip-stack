@@ -19,10 +19,20 @@ namespace
     // vectors rather than to a reading of it.
     void sip_round(uint64_t& v0, uint64_t& v1, uint64_t& v2, uint64_t& v3)
     {
-        v0 += v1; v1 = rotate_left(v1, 13); v1 ^= v0; v0 = rotate_left(v0, 32);
-        v2 += v3; v3 = rotate_left(v3, 16); v3 ^= v2;
-        v0 += v3; v3 = rotate_left(v3, 21); v3 ^= v0;
-        v2 += v1; v1 = rotate_left(v1, 17); v1 ^= v2; v2 = rotate_left(v2, 32);
+        v0 += v1;
+        v1 = rotate_left(v1, 13);
+        v1 ^= v0;
+        v0 = rotate_left(v0, 32);
+        v2 += v3;
+        v3 = rotate_left(v3, 16);
+        v3 ^= v2;
+        v0 += v3;
+        v3 = rotate_left(v3, 21);
+        v3 ^= v0;
+        v2 += v1;
+        v1 = rotate_left(v1, 17);
+        v1 ^= v2;
+        v2 = rotate_left(v2, 32);
     }
 }
 
@@ -80,20 +90,16 @@ IsnGenerator::IsnGenerator()
     // while looking exactly as correct as it does now.
     std::random_device entropy;
     std::uniform_int_distribution<uint64_t> any_value;
-    std::mt19937_64 mixer(
-        (static_cast<uint64_t>(entropy()) << 32) ^ entropy());
+    std::mt19937_64 mixer((static_cast<uint64_t>(entropy()) << 32) ^ entropy());
 
     _key_low = any_value(mixer);
     _key_high = any_value(mixer);
 }
 
-IsnGenerator::IsnGenerator(uint64_t key_low, uint64_t key_high)
-    : _key_low(key_low), _key_high(key_high)
-{
-}
+IsnGenerator::IsnGenerator(uint64_t key_low, uint64_t key_high) : _key_low(key_low), _key_high(key_high) {}
 
-uint32_t IsnGenerator::offset_for(const IPv4Address& local_ip, uint16_t local_port,
-                                  const IPv4Address& remote_ip, uint16_t remote_port) const
+uint32_t IsnGenerator::offset_for(const IPv4Address& local_ip, uint16_t local_port, const IPv4Address& remote_ip,
+                                  uint16_t remote_port) const
 {
     // The 4-tuple, serialised big-endian so the value does not depend on the
     // host's byte order - two machines in a test fleet disagreeing about ISNs
@@ -118,8 +124,8 @@ uint32_t IsnGenerator::offset_for(const IPv4Address& local_ip, uint16_t local_po
     return static_cast<uint32_t>(siphash_2_4(tuple, sizeof(tuple), _key_low, _key_high));
 }
 
-uint32_t IsnGenerator::generate(const IPv4Address& local_ip, uint16_t local_port,
-                                const IPv4Address& remote_ip, uint16_t remote_port) const
+uint32_t IsnGenerator::generate(const IPv4Address& local_ip, uint16_t local_port, const IPv4Address& remote_ip,
+                                uint16_t remote_port) const
 {
     // RFC 6528's M: a timer incrementing every 4 microseconds, so sequence
     // space advances at 250 kHz. That rate is not arbitrary - it is slow

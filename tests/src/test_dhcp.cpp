@@ -16,8 +16,7 @@ namespace
     // Everything a server would send in an ACK, built the way a server builds
     // it rather than by mutating a client message - so the parse under test is
     // the parse a real reply gets.
-    Bytes build_reply(DhcpMessageType type, uint32_t xid, const MacAddress& mac,
-                      const IPv4Address& offered = OFFERED,
+    Bytes build_reply(DhcpMessageType type, uint32_t xid, const MacAddress& mac, const IPv4Address& offered = OFFERED,
                       uint32_t lease_seconds = 3600)
     {
         Dhcp reply;
@@ -59,12 +58,9 @@ namespace
     {
     public:
         ClientHarness()
-            : client(CLIENT_MAC,
-                     [this](const IPv4Address& dest, const Bytes& payload)
-                     {
-                         sent.push_back({dest, std::make_unique<Dhcp>(payload)});
-                     },
-                     0x11223344)
+            : client(
+                  CLIENT_MAC, [this](const IPv4Address& dest, const Bytes& payload)
+                  { sent.push_back({dest, std::make_unique<Dhcp>(payload)}); }, 0x11223344)
         {
             client.set_lease_acquired_callback([this](const DhcpLease& l) { acquired.push_back(l); });
             client.set_lease_lost_callback([this]() { losses++; });
@@ -86,8 +82,7 @@ namespace
     {
         harness.client.start();
         harness.client.on_datagram(build_reply(DHCP_OFFER, harness.current_xid(), CLIENT_MAC));
-        harness.client.on_datagram(build_reply(DHCP_ACK, harness.current_xid(), CLIENT_MAC,
-                                               OFFERED, lease_seconds));
+        harness.client.on_datagram(build_reply(DHCP_ACK, harness.current_xid(), CLIENT_MAC, OFFERED, lease_seconds));
     }
 }
 
@@ -112,8 +107,7 @@ TEST(ADhcpMessageSurvivesARoundTrip)
     test_assert(parsed.get_client_ip() == IPv4Address("10.0.0.5"), "ciaddr should survive");
     test_assert(parsed.get_broadcast_flag(), "the broadcast flag should survive");
     test_assert(parsed.get_message_type() == DHCP_REQUEST, "option 53 should survive");
-    test_assert(parsed.get_option_address(DHCP_OPTION_REQUESTED_IP) == OFFERED,
-                "option 50 should survive");
+    test_assert(parsed.get_option_address(DHCP_OPTION_REQUESTED_IP) == OFFERED, "option 50 should survive");
 }
 
 TEST(AnOptionLengthRunningPastTheEndIsRejected)
@@ -239,8 +233,7 @@ TEST(AMessageWithoutTheMagicCookieCarriesNoOptions)
 
     Dhcp parsed(wire);
 
-    test_assert(parsed.get_message_type() == DHCP_MESSAGE_TYPE_UNKNOWN,
-                "no cookie means no options, not a throw");
+    test_assert(parsed.get_message_type() == DHCP_MESSAGE_TYPE_UNKNOWN, "no cookie means no options, not a throw");
 }
 
 TEST(ASubnetMaskBecomesAPrefixLength)
@@ -290,8 +283,7 @@ TEST(AnOfferIsAnsweredWithABroadcastRequestNamingTheServer)
     test_assert(request.get_message_type() == DHCP_REQUEST, "it should be a REQUEST");
     test_assert(harness.last().destination == limited_broadcast_address(),
                 "broadcast, so the servers whose offers were not taken hear it too");
-    test_assert(request.get_option_address(DHCP_OPTION_REQUESTED_IP) == OFFERED,
-                "naming the address being accepted");
+    test_assert(request.get_option_address(DHCP_OPTION_REQUESTED_IP) == OFFERED, "naming the address being accepted");
     test_assert(request.get_option_address(DHCP_OPTION_SERVER_IDENTIFIER) == SERVER,
                 "and the server it came from - which is what releases the other offers");
     test_assert(harness.client.state() == DhcpClientState::REQUESTING, "state should be REQUESTING");
@@ -324,8 +316,7 @@ TEST(ASecondOffersArrivingLateIsIgnored)
     harness.client.on_datagram(build_reply(DHCP_OFFER, harness.current_xid(), CLIENT_MAC));
     size_t after_first = harness.sent.size();
 
-    harness.client.on_datagram(build_reply(DHCP_OFFER, harness.current_xid(), CLIENT_MAC,
-                                           IPv4Address("192.168.1.99")));
+    harness.client.on_datagram(build_reply(DHCP_OFFER, harness.current_xid(), CLIENT_MAC, IPv4Address("192.168.1.99")));
 
     test_assert(harness.sent.size() == after_first, "a second offer should draw nothing");
     test_assert(harness.client.state() == DhcpClientState::REQUESTING, "and should not change state");
@@ -350,8 +341,7 @@ TEST(AReplyForSomeoneElsesMacIsIgnored)
     ClientHarness harness;
     harness.client.start();
 
-    harness.client.on_datagram(build_reply(DHCP_OFFER, harness.current_xid(),
-                                           MacAddress("de:ad:be:ef:00:02")));
+    harness.client.on_datagram(build_reply(DHCP_OFFER, harness.current_xid(), MacAddress("de:ad:be:ef:00:02")));
 
     test_assert(harness.sent.size() == 1, "a reply addressed to another client must draw nothing");
 }
@@ -524,6 +514,5 @@ TEST(ALegalInterfaceMtuIsTaken)
     ack.set_option(DHCP_OPTION_INTERFACE_MTU, mtu);
     harness.client.on_datagram(ack.to_bytes());
 
-    test_assert(harness.acquired.size() == 1 && harness.acquired[0].mtu == 1400,
-                "a legal MTU is used as given");
+    test_assert(harness.acquired.size() == 1 && harness.acquired[0].mtu == 1400, "a legal MTU is used as given");
 }

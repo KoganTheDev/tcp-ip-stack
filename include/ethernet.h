@@ -27,13 +27,14 @@ class Ethernet : public ProtocolLayer
 {
 public:
     Ethernet() = default;
-    Ethernet(const Bytes& data); // Constructor that gets a bytestream and serializes it directly into an Ethernet object
+    Ethernet(
+        const Bytes& data); // Constructor that gets a bytestream and serializes it directly into an Ethernet object
     Ethernet(const MacAddress& src, const MacAddress& dest, EtherType ethernet_protocol);
 
     // Implement protocol layer interface
     void from_bytes(const Bytes& data);
     Bytes to_bytes();
-    
+
     virtual std::string to_string() const;
 
     const MacAddress& get_src() const { return this->_src; }
@@ -45,5 +46,5 @@ private:
     MacAddress _dest;
     EtherType _ethernet_protocol;
 
-    static const std::map<EtherType, const std::string> ETHERTYPE_TO_NAME; 
+    static const std::map<EtherType, const std::string> ETHERTYPE_TO_NAME;
 };

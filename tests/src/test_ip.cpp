@@ -38,8 +38,10 @@ TEST(HeaderRoundTripPreservesEveryField)
     test_assert(parsed.get_identification() == 0x1234, "identification should survive a round trip");
     test_assert(parsed.get_TTL() == 64, "TTL should survive a round trip");
     test_assert(parsed.get_protocol() == ISOLATED_PROTOCOL, "protocol should survive a round trip");
-    test_assert(parsed.get_src_address() == IPv4Address("10.0.0.1").get_address(), "src address should survive a round trip");
-    test_assert(parsed.get_dest_address() == IPv4Address("10.0.0.2").get_address(), "dest address should survive a round trip");
+    test_assert(parsed.get_src_address() == IPv4Address("10.0.0.1").get_address(),
+                "src address should survive a round trip");
+    test_assert(parsed.get_dest_address() == IPv4Address("10.0.0.2").get_address(),
+                "dest address should survive a round trip");
 }
 
 // The whole point of the Part-C flag unification: every one of the three flag
@@ -49,8 +51,8 @@ TEST(HeaderRoundTripPreservesEveryField)
 TEST(AllFlagBitsAndVersionRoundTrip)
 {
     uint8_t all_flags = IP_FLAG_RESERVED | IP_FLAG_DONT_FRAGMENT | IP_FLAG_MORE_FRAGMENTS;
-    Ip original(6, 5, 0, 20, 0, all_flags, 0x1FFF, 64, ISOLATED_PROTOCOL, 0,
-                IPv4Address("10.0.0.1").get_address(), IPv4Address("10.0.0.2").get_address());
+    Ip original(6, 5, 0, 20, 0, all_flags, 0x1FFF, 64, ISOLATED_PROTOCOL, 0, IPv4Address("10.0.0.1").get_address(),
+                IPv4Address("10.0.0.2").get_address());
     original.compute_checksum();
 
     Ip parsed(original.to_bytes());
@@ -87,20 +89,38 @@ TEST(FragmentFlagsAreReadable)
 TEST(MalformedHeadersAreRejected)
 {
     bool threw = false;
-    try { Ip ip(Bytes::from_hex("450000")); } // only 3 bytes, well under the 20-byte minimum
-    catch (const BaseException&) { threw = true; }
+    try
+    {
+        Ip ip(Bytes::from_hex("450000"));
+    } // only 3 bytes, well under the 20-byte minimum
+    catch (const BaseException&)
+    {
+        threw = true;
+    }
     test_assert(threw, "a header shorter than 20 bytes should throw");
 
     threw = false;
     // byte 0 = 0x44 -> version 4, IHL 4, which is below the minimum of 5
-    try { Ip ip(Bytes::from_hex("44000014000000004006000000000000000000000000")); }
-    catch (const BaseException&) { threw = true; }
+    try
+    {
+        Ip ip(Bytes::from_hex("44000014000000004006000000000000000000000000"));
+    }
+    catch (const BaseException&)
+    {
+        threw = true;
+    }
     test_assert(threw, "an IHL below 5 should throw");
 
     threw = false;
     // byte 0 = 0x46 -> IHL 6 claims a 24-byte header, but only 20 bytes are given
-    try { Ip ip(Bytes::from_hex("4600001400000000400600000a0000010a000002")); }
-    catch (const BaseException&) { threw = true; }
+    try
+    {
+        Ip ip(Bytes::from_hex("4600001400000000400600000a0000010a000002"));
+    }
+    catch (const BaseException&)
+    {
+        threw = true;
+    }
     test_assert(threw, "data shorter than the IHL-indicated length should throw");
 }
 
@@ -111,7 +131,11 @@ TEST(MalformedHeadersAreRejected)
 // verification and is dropped as corrupt.
 TEST(AHeaderWithOptionsVerifiesAndRoundTrips)
 {
-    Bytes header = Bytes::from_hex("46000018abcd0000" "40fd0000" "0a000001" "0a000002" "94040000");
+    Bytes header = Bytes::from_hex("46000018abcd0000"
+                                   "40fd0000"
+                                   "0a000001"
+                                   "0a000002"
+                                   "94040000");
     uint16_t checksum = internet_checksum(header);
     header[10] = static_cast<byte_t>(checksum >> 8);
     header[11] = static_cast<byte_t>(checksum & 0xff);
@@ -119,6 +143,5 @@ TEST(AHeaderWithOptionsVerifiesAndRoundTrips)
     Ip parsed(header);
     test_assert(parsed.get_IHL() == 6, "IHL should read as 6");
     test_assert(parsed.verify_checksum(), "a correct checksum over a 24-byte header must verify");
-    test_assert(parsed.to_bytes() == header,
-                "serializing must reproduce the options, or IHL and the bytes disagree");
+    test_assert(parsed.to_bytes() == header, "serializing must reproduce the options, or IHL and the bytes disagree");
 }

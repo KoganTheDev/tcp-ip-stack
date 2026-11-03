@@ -12,6 +12,7 @@ void SystemNetworkObject::_set_interface_state(const std::string& interface, boo
     int return_value = system(command.c_str());
     if (return_value != 0)
     {
-        throw EXCEPTION(SystemException, "Error in command \"" + command + "\", return value " + std::to_string(return_value));
+        throw EXCEPTION(SystemException,
+                        "Error in command \"" + command + "\", return value " + std::to_string(return_value));
     }
 }

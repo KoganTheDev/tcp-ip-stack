@@ -78,8 +78,8 @@ public:
     // for the same reason Linux does: it is what the peers on the other end of
     // these connections are almost certainly running, and a stack whose default
     // loses to its own peers is not a useful default.
-    TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port,
-                  uint32_t initial_seq, SendSegmentFn send_segment, uint16_t local_mss = DEFAULT_LOCAL_MSS,
+    TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port, uint32_t initial_seq,
+                  SendSegmentFn send_segment, uint16_t local_mss = DEFAULT_LOCAL_MSS,
                   CongestionControlAlgorithm algorithm = CongestionControlAlgorithm::CUBIC);
 
     // Feeds in a segment already verified (checksum, IP addresses, ports) to
@@ -250,10 +250,9 @@ public:
     // parameters carry over whatever options (if any) the peer's SYN
     // itself carried - defaulted so tests that don't care about option
     // negotiation can keep calling this with just peer_isn.
-    void accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss = 0,
-                              bool peer_supports_window_scaling = false, uint8_t peer_window_scale = 0,
-                              bool peer_supports_timestamps = false, uint32_t peer_timestamp = 0,
-                              bool peer_permits_sack = false);
+    void accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss = 0, bool peer_supports_window_scaling = false,
+                             uint8_t peer_window_scale = 0, bool peer_supports_timestamps = false,
+                             uint32_t peer_timestamp = 0, bool peer_permits_sack = false);
 
     // Active open: sends a bare SYN (no ACK - there's nothing to acknowledge
     // yet) and moves to SYN_SENT. NetworkStack calls this once the peer's

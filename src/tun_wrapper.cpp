@@ -10,9 +10,7 @@
 #include <vector>
 #include <cerrno>
 
-TunWrapper::TunWrapper(const std::string &device_path)
-    : _fd(-1),
-      _is_active(false)
+TunWrapper::TunWrapper(const std::string& device_path) : _fd(-1), _is_active(false)
 {
     this->_interface_name = this->_open_device(device_path);
 }
@@ -35,7 +33,7 @@ void TunWrapper::stop()
     this->_is_active = false;
 }
 
-std::string TunWrapper::_open_device(const std::string &device_path)
+std::string TunWrapper::_open_device(const std::string& device_path)
 {
     // {} rather than {0}: ifreq's second member is a union, and naming a single
     // zero initialises only the first member of the first field, which
@@ -45,19 +43,19 @@ std::string TunWrapper::_open_device(const std::string &device_path)
     int fd, err;
 
     fd = open(device_path.c_str(), O_RDWR);
-    
+
     if (fd < 0)
     {
         throw EXCEPTION(SystemException, "Failed opening the TUN device.");
     }
-    
+
     // flags: tun device, no packet info
     ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
 
     // if we want to control the interface name in the future:
     // strncpy(ifr.ifr_name, interface_name, IFNAMSIZ);
 
-    err = ioctl(fd, TUNSETIFF, (void*) &ifr);
+    err = ioctl(fd, TUNSETIFF, (void*)&ifr);
 
     if (err < 0)
     {
@@ -77,7 +75,7 @@ void TunWrapper::_close_device()
     {
         printf("Error closing TunWrapper, errno: %d", errno);
     }
-    this->_fd = -1; 
+    this->_fd = -1;
 }
 
 Bytes TunWrapper::read(unsigned int max_size)

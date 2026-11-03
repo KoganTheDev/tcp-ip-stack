@@ -54,12 +54,10 @@ class DnsResolver
 public:
     // Sends `payload` from UDP port `source_port` to `server`:53. The resolver
     // chooses the source port itself - see the class comment.
-    using SendFn = std::function<void(const IPv4Address& server, uint16_t source_port,
-                                      const Bytes& payload)>;
+    using SendFn = std::function<void(const IPv4Address& server, uint16_t source_port, const Bytes& payload)>;
     // The answer, or an empty vector if the name could not be resolved. Called
     // exactly once per resolve() call, whatever happens.
-    using ResolvedFn = std::function<void(const std::string& name,
-                                          const std::vector<IPv4Address>& addresses)>;
+    using ResolvedFn = std::function<void(const std::string& name, const std::vector<IPv4Address>& addresses)>;
     // "I am finished with this source port." Whoever bound a socket for it in
     // SendFn should tear that socket down.
     //
@@ -90,8 +88,7 @@ public:
     void resolve(const std::string& name, ResolvedFn callback);
 
     // Feeds in a datagram received on one of this resolver's source ports.
-    void on_datagram(const IPv4Address& source, uint16_t source_port,
-                     uint16_t destination_port, const Bytes& payload);
+    void on_datagram(const IPv4Address& source, uint16_t source_port, uint16_t destination_port, const Bytes& payload);
 
     void on_time_passed(uint32_t elapsed_ms);
 

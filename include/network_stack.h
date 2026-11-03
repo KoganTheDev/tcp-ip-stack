@@ -232,8 +232,8 @@ public:
     // back untouched by the peer, which is how a reply is matched to the
     // request that caused it; the payload comes back verbatim too, which is
     // what lets a ping measure a round trip without any state at this end.
-    void send_echo_request(const IPv4Address& destination, uint16_t identifier,
-                           uint16_t sequence, const Bytes& payload = Bytes());
+    void send_echo_request(const IPv4Address& destination, uint16_t identifier, uint16_t sequence,
+                           const Bytes& payload = Bytes());
 
     // Notified when an Echo Reply arrives: source, identifier, sequence, payload.
     using EchoReplyFn = std::function<void(const IPv4Address&, uint16_t, uint16_t, const Bytes&)>;
@@ -413,8 +413,7 @@ private:
     // Route lookup that also answers "by which link". Returns false when there
     // is no route at all - which with several interfaces is the only honest
     // answer, since there is no interface to guess.
-    bool _route_for(const IPv4Address& destination, IPv4Address& out_next_hop,
-                    size_t& out_interface_index) const;
+    bool _route_for(const IPv4Address& destination, IPv4Address& out_next_hop, size_t& out_interface_index) const;
     // The address a packet to this destination will carry. Used by both the IP
     // header and the transport pseudo-header checksums, so that the two cannot
     // be computed from different answers - see its definition.
@@ -481,7 +480,8 @@ private:
     struct Interface
     {
         Interface(std::unique_ptr<PacketChannel> ch, const InterfaceConfig& cfg, int arp_ttl_ms)
-            : channel(std::move(ch)), config(cfg), arp_table(arp_ttl_ms) {}
+            : channel(std::move(ch)), config(cfg), arp_table(arp_ttl_ms)
+        {}
 
         std::unique_ptr<PacketChannel> channel;
         InterfaceConfig config;
@@ -568,5 +568,4 @@ private:
     // _watch_for_close()'s comment for why this exists instead of scanning
     // every connection on every poll()/on_time_passed()
     std::deque<uint64_t> _pending_reap_ids;
-
 };

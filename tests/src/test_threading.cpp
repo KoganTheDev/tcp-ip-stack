@@ -42,25 +42,24 @@ TEST(EveryTaskSubmittedToThePoolRunsExactlyOnce)
         ThreadPool pool(4);
         for (int i = 0; i < TASK_COUNT; i++)
         {
-            pool.submit([&, i]()
-            {
-                per_task[i].fetch_add(1);
-                total.fetch_add(1);
-            });
+            pool.submit(
+                [&, i]()
+                {
+                    per_task[i].fetch_add(1);
+                    total.fetch_add(1);
+                });
         }
         // The destructor is the join. Asserting after the scope is what makes
         // this a test of "shutdown drains" rather than of "we waited long
         // enough", which would be a race dressed as a test.
     }
 
-    test_assert(total.load() == TASK_COUNT,
-                "every submitted task must run - got " + std::to_string(total.load()) +
-                " of " + std::to_string(TASK_COUNT));
+    test_assert(total.load() == TASK_COUNT, "every submitted task must run - got " + std::to_string(total.load())
+                                                + " of " + std::to_string(TASK_COUNT));
     for (int i = 0; i < TASK_COUNT; i++)
     {
         test_assert(per_task[i].load() == 1,
-                    "task " + std::to_string(i) + " ran " +
-                    std::to_string(per_task[i].load()) + " times, not once");
+                    "task " + std::to_string(i) + " ran " + std::to_string(per_task[i].load()) + " times, not once");
     }
 }
 
@@ -77,13 +76,14 @@ TEST(TasksSubmittedFromManyThreadsAreAllRun)
         std::vector<std::thread> producers;
         for (int p = 0; p < PRODUCERS; p++)
         {
-            producers.emplace_back([&pool, &total]()
-            {
-                for (int i = 0; i < PER_PRODUCER; i++)
+            producers.emplace_back(
+                [&pool, &total]()
                 {
-                    pool.submit([&total]() { total.fetch_add(1); });
-                }
-            });
+                    for (int i = 0; i < PER_PRODUCER; i++)
+                    {
+                        pool.submit([&total]() { total.fetch_add(1); });
+                    }
+                });
         }
         for (std::thread& producer : producers)
         {
@@ -92,8 +92,7 @@ TEST(TasksSubmittedFromManyThreadsAreAllRun)
     }
 
     test_assert(total.load() == PRODUCERS * PER_PRODUCER,
-                "no task may be lost across concurrent producers - got " +
-                std::to_string(total.load()));
+                "no task may be lost across concurrent producers - got " + std::to_string(total.load()));
 }
 
 TEST(ShutdownDrainsQueuedWorkRatherThanDiscardingIt)
@@ -107,17 +106,18 @@ TEST(ShutdownDrainsQueuedWorkRatherThanDiscardingIt)
     ThreadPool pool(2);
     for (int i = 0; i < TASK_COUNT; i++)
     {
-        pool.submit([&completed]()
-        {
-            brief_pause(); // guarantee a real backlog behind the first few
-            completed.fetch_add(1);
-        });
+        pool.submit(
+            [&completed]()
+            {
+                brief_pause(); // guarantee a real backlog behind the first few
+                completed.fetch_add(1);
+            });
     }
     pool.shutdown();
 
-    test_assert(completed.load() == TASK_COUNT,
-                "shutdown must drain the queue, not discard it - " +
-                std::to_string(completed.load()) + " of " + std::to_string(TASK_COUNT) + " ran");
+    test_assert(completed.load() == TASK_COUNT, "shutdown must drain the queue, not discard it - "
+                                                    + std::to_string(completed.load()) + " of "
+                                                    + std::to_string(TASK_COUNT) + " ran");
 }
 
 TEST(ShutdownIsIdempotent)
@@ -162,9 +162,9 @@ TEST(AThrowingTaskDoesNotKillItsWorker)
         }
     }
 
-    test_assert(survived.load() == TASK_COUNT / 3,
-                "work submitted after a throwing task must still run - got " +
-                std::to_string(survived.load()) + " of " + std::to_string(TASK_COUNT / 3));
+    test_assert(survived.load() == TASK_COUNT / 3, "work submitted after a throwing task must still run - got "
+                                                       + std::to_string(survived.load()) + " of "
+                                                       + std::to_string(TASK_COUNT / 3));
 }
 
 TEST(SubmittingAfterShutdownIsRefusedRatherThanSilentlyQueued)
@@ -216,13 +216,14 @@ TEST(CompletionQueueDeliversWorkPushedFromOtherThreads)
     std::vector<std::thread> producers;
     for (int p = 0; p < PRODUCERS; p++)
     {
-        producers.emplace_back([&queue, &total]()
-        {
-            for (int i = 0; i < PER_PRODUCER; i++)
+        producers.emplace_back(
+            [&queue, &total]()
             {
-                queue.push([&total]() { total.fetch_add(1); });
-            }
-        });
+                for (int i = 0; i < PER_PRODUCER; i++)
+                {
+                    queue.push([&total]() { total.fetch_add(1); });
+                }
+            });
     }
     for (std::thread& producer : producers)
     {
@@ -250,8 +251,7 @@ TEST(AThrowingCompletionDoesNotEscapeToTheReactor)
 
     queue.drain_and_run(); // must return normally
 
-    test_assert(ran_after.load() == 1,
-                "completions queued behind a throwing one must still run");
+    test_assert(ran_after.load() == 1, "completions queued behind a throwing one must still run");
 }
 
 TEST(DrainingAnEmptyCompletionQueueIsHarmless)

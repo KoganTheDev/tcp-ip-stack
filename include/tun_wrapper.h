@@ -9,14 +9,14 @@
 class TunWrapper : public SystemNetworkObject, public PacketChannel
 {
 public:
-    TunWrapper(const std::string& device_path="/dev/net/tun");
+    TunWrapper(const std::string& device_path = "/dev/net/tun");
     ~TunWrapper();
 
     virtual void start();
     virtual void stop();
 
     Bytes read(unsigned int max_length) override;
-    void write(const Bytes &buffer) override;
+    void write(const Bytes& buffer) override;
 
     std::string get_interface_name();
     int get_fd() const override { return this->_fd; }

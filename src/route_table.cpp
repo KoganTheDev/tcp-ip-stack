@@ -66,8 +66,7 @@ bool RouteTable::lookup(const IPv4Address& destination, IPv4Address& out_next_ho
     return this->lookup(destination, out_next_hop, ignored);
 }
 
-bool RouteTable::lookup(const IPv4Address& destination, IPv4Address& out_next_hop,
-                        size_t& out_interface_index) const
+bool RouteTable::lookup(const IPv4Address& destination, IPv4Address& out_next_hop, size_t& out_interface_index) const
 {
     uint32_t target = ipv4_to_uint32(destination);
 
