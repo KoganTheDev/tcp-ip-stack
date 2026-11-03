@@ -1672,3 +1672,30 @@ TEST(WindowUpdatesAreNotDuplicateAcks)
     test_assert(count_data_segments(sent) == 1,
                 "an ack that changes the advertised window is a window update, not a duplicate");
 }
+
+// The receive side of a sequence-number wrap. With RCV.NXT at 0xFFFFFFFB, a
+// segment at seq 0 is 5 bytes AHEAD - but a plain `seq > _recv_next` reads it
+// as 4 GiB behind, takes the "already seen" branch, and drops it. Every
+// out-of-order segment straddling the wrap is then lost, and recovery costs a
+// full retransmit instead of a buffered gap-fill.
+TEST(OutOfOrderSegmentAcrossASequenceNumberWrapIsBuffered)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent, 0xFFFFFFFA); // RCV.NXT = 0xFFFFFFFB
+
+    std::vector<Bytes> received;
+    connection->set_data_ready_callback([&received, &connection]() { received.push_back(connection->read()); });
+
+    Bytes first = Bytes::from_hex("68656c6c6f");  // "hello" - seq 0xFFFFFFFB..0xFFFFFFFF
+    Bytes second = Bytes::from_hex("776f726c64"); // "world" - seq 0..4, past the wrap
+
+    connection->on_segment(*make_incoming_segment(0, 1001, FLAG_ACK, second));
+    test_assert(received.empty(), "the segment past the wrap is out of order, not deliverable yet");
+
+    connection->on_segment(*make_incoming_segment(0xFFFFFFFB, 1001, FLAG_ACK, first));
+    test_assert(received.size() == 2,
+                "the gap-filler should release the buffered segment from past the wrap too, got " +
+                std::to_string(received.size()) + " chunk(s)");
+    test_assert(received.size() == 2 && received[1].to_hex() == second.to_hex(),
+                "and deliver it second, in sequence order");
+}

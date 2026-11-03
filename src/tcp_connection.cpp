@@ -150,7 +150,10 @@ std::vector<Tcp::SackBlock> TcpConnection::_sack_blocks_to_report() const
     {
         for (size_t i = 0; i < blocks.size(); i++)
         {
-            if (blocks[i].start <= _last_out_of_order_seq && _last_out_of_order_seq < blocks[i].end)
+            // modular, like every other sequence comparison: a block can
+            // straddle the wrap, with end numerically below start
+            if (seq_at_or_before(blocks[i].start, _last_out_of_order_seq)
+                && !seq_at_or_before(blocks[i].end, _last_out_of_order_seq))
             {
                 std::swap(blocks[0], blocks[i]);
                 break;
@@ -1125,7 +1128,7 @@ void TcpConnection::on_segment(const Tcp& segment)
                 // with the next segment or piggyback on our own data
                 _schedule_or_send_ack();
             }
-            else if (seq > _recv_next)
+            else if (!seq_at_or_before(seq, _recv_next)) // seq after RCV.NXT, modulo 2^32
             {
                 // out of order - buffer it if there's room and it isn't
                 // already there (a retransmit of an already-buffered
