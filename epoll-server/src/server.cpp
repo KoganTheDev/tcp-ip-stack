@@ -141,6 +141,7 @@ void Server::run(const volatile std::sig_atomic_t& stop_flag)
                 stack_has_more_frames = !this->_network_stack.poll();
                 polled_this_round = true;
                 this->_handle_new_connections();
+                this->_flush_unsent(); // acks just processed may have freed send room
             }
             else if (event.data.fd == this->_timer_fd)
             {
@@ -161,6 +162,7 @@ void Server::run(const volatile std::sig_atomic_t& stop_flag)
                 if (elapsed_ms > 0)
                 {
                     this->_network_stack.on_time_passed(static_cast<uint32_t>(elapsed_ms));
+                    this->_flush_unsent();
                 }
             }
             else if (event.data.fd == this->_completion_queue.get_fd())
@@ -177,6 +179,7 @@ void Server::run(const volatile std::sig_atomic_t& stop_flag)
         {
             stack_has_more_frames = !this->_network_stack.poll();
             this->_handle_new_connections();
+            this->_flush_unsent();
         }
     }
 }
@@ -253,41 +256,99 @@ void Server::_apply_response(uint64_t connection_id, const Bytes& response)
     // Looked up by id, not held as a pointer across the async gap above -
     // find_connection() safely returns nullptr if NetworkStack already
     // reaped this connection (e.g. the peer sent RST) instead of dangling.
+    if (this->_network_stack.find_connection(connection_id) == nullptr)
+    {
+        // reaped while this was in the pool - the peer sent RST, say
+        this->_in_flight.erase(connection_id);
+        return;
+    }
+
+    // send() takes only what fits in the send buffer, and a response can be
+    // larger than that (read() hands over up to the whole 128 KiB receive
+    // buffer). Whatever does not fit is held here and retried, not dropped.
+    // The connection stays marked in flight until all of it is out, so nothing
+    // more is read from it meanwhile - the same window backpressure that paces
+    // the receive side now also covers a peer that is slow to ack.
+    this->_unsent[connection_id] = response;
+    this->_continue_response(connection_id);
+}
+
+void Server::_continue_response(uint64_t connection_id)
+{
+    auto unsent_it = this->_unsent.find(connection_id);
+    if (unsent_it == this->_unsent.end())
+    {
+        return;
+    }
+
     TcpConnection* connection = this->_network_stack.find_connection(connection_id);
-
-    // Clear the in-flight mark first, unconditionally. It is what lets the next
-    // chunk be picked up, so anything that could throw below must not be able
-    // to skip it - that is how a connection ends up acking forever while
-    // silently answering nothing.
-    this->_in_flight.erase(connection_id);
-
     if (connection == nullptr)
     {
-        return; // reaped while this was in the pool - the peer sent RST, say
+        this->_unsent.erase(unsent_it);
+        this->_in_flight.erase(connection_id);
+        return; // reaped while waiting for room
     }
 
     try
     {
-        connection->send(response);
+        Bytes& remaining = unsent_it->second;
+        size_t accepted = connection->send(remaining);
+        TcpState state = connection->get_state();
+        bool can_still_send = state == TcpState::ESTABLISHED || state == TcpState::CLOSE_WAIT;
+        if (accepted < remaining.size() && can_still_send)
+        {
+            // No room for the rest yet. It goes out once an ack frees send
+            // buffer space, which can only happen in poll() or a timer tick -
+            // run() calls _flush_unsent() after both.
+            remaining = remaining.slice(accepted, remaining.size() - accepted);
+            return;
+        }
+        // Either everything was accepted, or the connection can no longer send
+        // at all and send() would return 0 forever - holding the tail then
+        // would keep this connection in flight, and unread, for good.
+        this->_unsent.erase(unsent_it);
 
-        // the peer already sent its FIN (CLOSE_WAIT) and we've now sent
+        // the peer already sent its FIN (CLOSE_WAIT) and we've now handed over
         // everything we had for it - safe to close our side. TcpConnection
         // defers this itself if this send is still in flight, so this is
         // never premature.
-        if (connection->get_state() == TcpState::CLOSE_WAIT)
+        if (state == TcpState::CLOSE_WAIT)
         {
             connection->close();
         }
     }
     catch (const std::exception& e)
     {
+        this->_unsent.erase(connection_id);
         LOG_ERROR("Server: sending the response for connection " << connection_id
                   << " failed: " << e.what());
     }
+
+    // Clear the in-flight mark whatever happened above. It is what lets the
+    // next chunk be picked up, so a throw must not be able to skip it - that
+    // is how a connection ends up acking forever while silently answering
+    // nothing.
+    this->_in_flight.erase(connection_id);
 
     // Whatever arrived while that chunk was in the pool is still sitting unread
     // in the stack's receive queue, holding the window down. Reading it now is
     // what reopens the window and lets the peer continue - so the cycle is
     // "read, work, respond, read again" with the window doing the pacing.
     this->_try_dispatch(connection_id);
+}
+
+void Server::_flush_unsent()
+{
+    // Copy the ids first: _continue_response() erases from _unsent, which
+    // would invalidate an iterator over it.
+    std::vector<uint64_t> waiting;
+    waiting.reserve(this->_unsent.size());
+    for (const auto& entry : this->_unsent)
+    {
+        waiting.push_back(entry.first);
+    }
+    for (uint64_t connection_id : waiting)
+    {
+        this->_continue_response(connection_id);
+    }
 }

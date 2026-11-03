@@ -83,6 +83,13 @@ private:
     // response (if the connection still exists) and dispatches the next
     // queued chunk for the same connection, if any.
     void _apply_response(uint64_t connection_id, const Bytes& response);
+    // Hands as much of a connection's held response to send() as it will take.
+    // Once all of it is out, clears the in-flight mark and dispatches the next
+    // chunk; until then the connection stays in flight and is not read from.
+    void _continue_response(uint64_t connection_id);
+    // Retries every held response. Called after anything that can free send
+    // buffer room: poll() (acks arrive) and a timer tick.
+    void _flush_unsent();
 
     uint16_t _port;
     NetworkStack _network_stack;
@@ -121,4 +128,8 @@ private:
     // closed, and the peer stops sending. No buffer here, no cap to pick, and
     // no connection killed for the crime of being faster than the thread pool.
     std::unordered_set<uint64_t> _in_flight;
+
+    // The part of a response send() could not take yet, per connection. Only
+    // present while that connection is also in _in_flight.
+    std::unordered_map<uint64_t, Bytes> _unsent;
 };
