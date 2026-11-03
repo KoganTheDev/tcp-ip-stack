@@ -1,0 +1,87 @@
+# Style for tcp-ip-stack. Derived from what the code already does (measured
+# before the first format run), so formatting standardises the existing
+# conventions rather than imposing new ones.
+---
+Language: Cpp
+Standard: c++17
+BasedOnStyle: LLVM
+
+# 4-space indent, no tabs - the existing convention.
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4
+
+# 99% of lines already fit in 116 columns. 120 keeps the first run from
+# rewrapping hundreds of lines that are only slightly over 100.
+ColumnLimit: 120
+
+# Opening braces on their own line everywhere, lambdas included.
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterCaseLabel: true
+  AfterClass: true
+  AfterControlStatement: Always
+  AfterEnum: true
+  AfterFunction: true
+  AfterNamespace: true
+  AfterStruct: true
+  AfterUnion: true
+  AfterExternBlock: true
+  BeforeCatch: true
+  BeforeElse: true
+  BeforeLambdaBody: true
+  BeforeWhile: false
+  IndentBraces: false
+  SplitEmptyFunction: false
+  SplitEmptyRecord: false
+  SplitEmptyNamespace: false
+
+# public:/private: at the class's own indent.
+AccessModifierOffset: -4
+IndentCaseLabels: false
+NamespaceIndentation: All
+
+# `const Tcp& header`, `TcpConnection* connection`.
+PointerAlignment: Left
+ReferenceAlignment: Pointer
+DerivePointerAlignment: false
+
+# Short accessors in headers stay on one line; control flow does not.
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortLambdasOnASingleLine: Inline
+AllowShortEnumsOnASingleLine: false
+
+# Continued conditions start with the operator: `&& next_condition`.
+BreakBeforeBinaryOperators: NonAssignment
+BreakConstructorInitializers: BeforeColon
+BreakInheritanceList: BeforeColon
+AlwaysBreakTemplateDeclarations: Yes
+
+# The comments here are long-form explanations, some with hand-laid-out
+# diagrams. Never rewrap them, and leave trailing comments where they are.
+ReflowComments: false
+AlignTrailingComments:
+  Kind: Leave
+AlignConsecutiveAssignments: None
+AlignConsecutiveDeclarations: None
+AlignConsecutiveMacros: None
+AlignEscapedNewlines: Left
+
+# Include order is sometimes meaningful (own header first, then the rest);
+# do not let the formatter reorder it.
+SortIncludes: Never
+IncludeBlocks: Preserve
+
+MaxEmptyLinesToKeep: 2
+KeepEmptyLines:
+  AtStartOfBlock: false
+  AtStartOfFile: false
+InsertNewlineAtEOF: true
+Cpp11BracedListStyle: true
+FixNamespaceComments: false
+SpaceBeforeParens: ControlStatements
