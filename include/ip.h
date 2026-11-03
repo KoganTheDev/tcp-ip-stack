@@ -76,11 +76,12 @@ public:
     const Bytes& get_dest_address() const { return _dest_address; }
 
 private:
-    // Serializes just the 20-byte header (this stack never emits IP options,
-    // so IHL is always 5) using whatever _header_checksum currently holds -
-    // shared by to_bytes() and compute_checksum(), which calls it twice: once
-    // with the checksum field zeroed to compute over, once implicitly via
-    // to_bytes() afterward with the real value in place.
+    // Serializes the header - the fixed 20 bytes plus any options a parsed
+    // packet carried, so the bytes always agree with IHL - using whatever
+    // _header_checksum currently holds. Shared by to_bytes() and
+    // compute_checksum(), which calls it twice: once with the checksum field
+    // zeroed to compute over, once implicitly via to_bytes() afterward with the
+    // real value in place.
     Bytes _header_to_bytes() const;
 
     //* Note: Check if IP_option (variable length, optional, not common) is needed as part of the ip4 header
@@ -98,4 +99,9 @@ private:
     uint16_t _header_checksum; // Used for error detection only. if an error is detected, the packet is dropped. 
     Bytes _src_address; // IP source address
     Bytes _dest_address; // IP destination address
+    // Options exactly as received (IHL*4 - 20 bytes). Never interpreted, but
+    // kept: the header checksum covers them and IHL counts them, so dropping
+    // them breaks both verification and re-serialization. Empty for headers
+    // this stack builds, which never carry options.
+    Bytes _options;
 };

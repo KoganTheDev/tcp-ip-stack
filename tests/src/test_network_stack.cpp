@@ -2156,3 +2156,36 @@ TEST(UdpQueuedOnASecondInterfaceIsFlushedWhenThatInterfaceResolves)
     test_assert(contains_udp(second->outbound_frames()),
                 "the queued datagram must leave once the second interface learns the peer's MAC");
 }
+
+TEST(ForwardingAPacketWithIpOptionsRecomputesTheChecksumOverTheWholeHeader)
+{
+    // The checksum covers IHL*4 bytes. Recomputing it over a fixed 20 after the
+    // TTL decrement sends an optioned packet out with a checksum that leaves
+    // the 4 option bytes out, and the next hop drops it.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_router(first, second);
+
+    Bytes frame = build_transit_packet(BEHIND_US, 64);
+    const size_t ip_start = 14;
+    Bytes optioned = frame.slice(0, ip_start + 20);
+    optioned |= Bytes::from_hex("94040000"); // Router Alert, RFC 2113
+    optioned |= frame.slice(ip_start + 20, frame.size() - ip_start - 20);
+    optioned[ip_start] = 0x46; // IHL 6
+    uint16_t total_length = static_cast<uint16_t>(optioned.size() - ip_start);
+    optioned[ip_start + 2] = static_cast<byte_t>(total_length >> 8);
+    optioned[ip_start + 3] = static_cast<byte_t>(total_length & 0xff);
+    optioned[ip_start + 10] = 0;
+    optioned[ip_start + 11] = 0;
+    uint16_t checksum = internet_checksum(optioned.slice(ip_start, 24));
+    optioned[ip_start + 10] = static_cast<byte_t>(checksum >> 8);
+    optioned[ip_start + 11] = static_cast<byte_t>(checksum & 0xff);
+
+    first->push_inbound(optioned);
+    stack->poll();
+
+    IpView forwarded = find_ip_to(second->outbound_frames(), BEHIND_US);
+    test_assert(forwarded.found, "an optioned packet should be accepted and forwarded");
+    test_assert(forwarded.ttl == 63, "with its TTL decremented");
+    test_assert(forwarded.checksum_ok, "and a checksum that covers the options too");
+}

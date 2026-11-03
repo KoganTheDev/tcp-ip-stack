@@ -1488,7 +1488,10 @@ void NetworkStack::_forward_ip(size_t ingress, const Ip& ip, const Bytes& ip_byt
     // stack is only supposed to be relaying. Everything else is preserved too,
     // including identification and the fragment fields, since a forwarded
     // fragment must still reassemble with its siblings at the destination.
-    if (ip_bytes.size() < IP_HEADER_SIZE)
+    // The checksum covers the whole header, options included - IHL*4 bytes,
+    // not the fixed 20 this stack's own headers happen to be.
+    size_t header_bytes = static_cast<size_t>(ip.get_IHL()) * 4;
+    if (header_bytes < IP_HEADER_SIZE || ip_bytes.size() < header_bytes)
     {
         return; // cannot happen after a successful parse; not worth trusting
     }
@@ -1496,7 +1499,7 @@ void NetworkStack::_forward_ip(size_t ingress, const Ip& ip, const Bytes& ip_byt
     forwarded[TTL_OFFSET] = static_cast<byte_t>(ttl - 1);
     forwarded[CHECKSUM_OFFSET] = 0;
     forwarded[CHECKSUM_OFFSET + 1] = 0;
-    uint16_t checksum = internet_checksum(forwarded.slice(0, IP_HEADER_SIZE));
+    uint16_t checksum = internet_checksum(forwarded.slice(0, header_bytes));
     forwarded[CHECKSUM_OFFSET] = static_cast<byte_t>(checksum >> 8);
     forwarded[CHECKSUM_OFFSET + 1] = static_cast<byte_t>(checksum & 0xff);
 

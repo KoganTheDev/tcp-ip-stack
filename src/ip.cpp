@@ -74,6 +74,7 @@ void Ip::from_bytes(const Bytes& data)
     _header_checksum = data.slice_int<uint16_t>(10);
     _src_address = Bytes(data.slice(12, 4));
     _dest_address = Bytes(data.slice(16, 4));
+    _options = Bytes(data.slice(20, header_bytes - 20));
 
     // Trim the payload to what total_length actually declares, rather than
     // handing on "everything left in the buffer".
@@ -133,7 +134,7 @@ void Ip::from_bytes(const Bytes& data)
 Bytes Ip::_header_to_bytes() const
 {
     Bytes result;
-    result.reserve(20); // fixed IP header size (no options) - avoids reallocating as fields are appended
+    result.reserve(20 + this->_options.size()); // avoids reallocating as fields are appended
     uint8_t version_and_IHL = (this->_version << 4) | this->_IHL;
     result.append_int<uint8_t>(version_and_IHL);
     result.append_int<uint8_t>(this->_TOS);
@@ -150,6 +151,7 @@ Bytes Ip::_header_to_bytes() const
     result.append_int<uint16_t>(this->_header_checksum);
     result |= this->_src_address;
     result |= this->_dest_address;
+    result |= this->_options;
     return result;
 }
 

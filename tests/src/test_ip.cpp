@@ -1,6 +1,7 @@
 #include "test.h"
 #include "ip.h"
 #include "network_addresses.h"
+#include "utils.h"
 
 #include <memory>
 
@@ -101,4 +102,23 @@ TEST(MalformedHeadersAreRejected)
     try { Ip ip(Bytes::from_hex("4600001400000000400600000a0000010a000002")); }
     catch (const BaseException&) { threw = true; }
     test_assert(threw, "data shorter than the IHL-indicated length should throw");
+}
+
+// RFC 791: IHL counts the options, and the header checksum covers them. A
+// parse that skips past them and a serialize that leaves them out - while still
+// writing the original IHL - checksums 20 bytes of a 24-byte header, so every
+// optioned packet (IGMP always carries Router Alert, RFC 2113) fails
+// verification and is dropped as corrupt.
+TEST(AHeaderWithOptionsVerifiesAndRoundTrips)
+{
+    Bytes header = Bytes::from_hex("46000018abcd0000" "40fd0000" "0a000001" "0a000002" "94040000");
+    uint16_t checksum = internet_checksum(header);
+    header[10] = static_cast<byte_t>(checksum >> 8);
+    header[11] = static_cast<byte_t>(checksum & 0xff);
+
+    Ip parsed(header);
+    test_assert(parsed.get_IHL() == 6, "IHL should read as 6");
+    test_assert(parsed.verify_checksum(), "a correct checksum over a 24-byte header must verify");
+    test_assert(parsed.to_bytes() == header,
+                "serializing must reproduce the options, or IHL and the bytes disagree");
 }
