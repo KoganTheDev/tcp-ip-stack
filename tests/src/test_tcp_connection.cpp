@@ -1622,3 +1622,53 @@ TEST(KeepaliveLeavesAPeerWithAShutWindowAlone)
                 "persist owns this connection's timing, not keepalive");
     test_assert(!sent.empty(), "persist should still be probing throughout");
 }
+
+namespace
+{
+    size_t count_data_segments(const std::vector<RecordedSegment>& sent)
+    {
+        size_t n = 0;
+        for (const RecordedSegment& s : sent)
+        {
+            if (!s.payload.empty()) n++;
+        }
+        return n;
+    }
+}
+
+// RFC 5681 2: an ack is a duplicate only if it carries no data and leaves the
+// advertised window unchanged (as well as not moving SND.UNA). A peer that is
+// itself sending - a request/response protocol, say - piggybacks the same ack
+// on every data segment; counting those as duplicates fires a spurious fast
+// retransmit and halves cwnd for a loss that never happened.
+TEST(DataSegmentsCarryingTheSameAckAreNotDuplicateAcks)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->send(Bytes::from_hex("6f6b"));
+    test_assert(count_data_segments(sent) == 1, "one data segment in flight");
+    uint32_t snd_una = sent[0].seq;
+
+    for (uint32_t i = 0; i < 3; i++)
+    {
+        connection->on_segment(*make_incoming_segment(501 + i, snd_una, FLAG_ACK, Bytes::from_hex("aa")));
+    }
+    test_assert(count_data_segments(sent) == 1,
+                "data segments that repeat SND.UNA must not trigger a fast retransmit");
+}
+
+TEST(WindowUpdatesAreNotDuplicateAcks)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->send(Bytes::from_hex("6f6b"));
+    uint32_t snd_una = sent[0].seq;
+
+    connection->on_segment(*make_incoming_segment_win(501, snd_una, FLAG_ACK, 30000));
+    connection->on_segment(*make_incoming_segment_win(501, snd_una, FLAG_ACK, 40000));
+    connection->on_segment(*make_incoming_segment_win(501, snd_una, FLAG_ACK, 50000));
+    test_assert(count_data_segments(sent) == 1,
+                "an ack that changes the advertised window is a window update, not a duplicate");
+}

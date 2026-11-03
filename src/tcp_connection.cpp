@@ -703,11 +703,23 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     // ack - it's still telling us something current about its receive
     // buffer
     uint8_t peer_shift = _window_scaling_negotiated ? _peer_window_scale : 0;
+    uint32_t previous_peer_window = _peer_window;
     _peer_window = static_cast<uint32_t>(segment.get_window()) << peer_shift;
 
     uint32_t snd_una = _in_flight.empty() ? _send_next : _in_flight.front().seq;
 
-    if (!_in_flight.empty() && ack == snd_una)
+    // RFC 5681 2's definition of a duplicate ack, all five conditions: data
+    // outstanding, SND.UNA not moved, no payload, no SYN/FIN, and the window
+    // unchanged. The last three are what separate a loss signal from a peer
+    // that is merely sending its own data or opening its window - both of
+    // which repeat the same ack number with no loss at all.
+    bool carries_data = segment.has_next_layer()
+        && dynamic_cast<const Raw*>(&segment.get_next_layer()) != nullptr
+        && !static_cast<const Raw&>(segment.get_next_layer()).get_data().empty();
+    bool is_duplicate_ack = !_in_flight.empty() && ack == snd_una && !carries_data
+        && !segment.get_syn() && !segment.get_fin() && _peer_window == previous_peer_window;
+
+    if (is_duplicate_ack)
     {
         // a duplicate ack: SND.UNA hasn't moved despite another ack for it
         // arriving - classic Reno's signal that a segment probably got
@@ -761,7 +773,13 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         return;
     }
 
-    _dup_ack_count = 0;
+    // Only an ack that moves SND.UNA ends a run of duplicates. One that repeats
+    // it without qualifying (data, a window update) says nothing about loss
+    // either way, so it must not erase the count already built up.
+    if (ack != snd_una)
+    {
+        _dup_ack_count = 0;
+    }
 
     bool fin_acked = false;
     bool acked_anything = false;
