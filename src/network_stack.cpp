@@ -1929,13 +1929,29 @@ bool NetworkStack::_may_report_error_about(const Ip& ip) const
 
     // Never about an error: two hosts that each think the other is wrong
     // would trade them indefinitely.
-    if (ip.get_protocol() == IpProtocol::ICMP && ip.has_next_layer())
+    //
+    // The type is read from whichever form the payload is in. A complete
+    // datagram's is parsed into an Icmp, but a first fragment's is left as Raw
+    // by the codec - and offset 0 means the fragment rule above let it
+    // through. If the type cannot be read at all, refuse: an error not sent is
+    // a missed diagnostic, an error about an error is a potential loop.
+    if (ip.get_protocol() == IpProtocol::ICMP)
     {
-        const Icmp* icmp = dynamic_cast<const Icmp*>(&ip.get_next_layer());
-        if (icmp != nullptr && is_icmp_error_type(icmp->get_type()))
+        if (!ip.has_next_layer())
         {
             return false;
         }
+        const ProtocolLayer& payload = ip.get_next_layer();
+        if (const Icmp* icmp = dynamic_cast<const Icmp*>(&payload))
+        {
+            return !is_icmp_error_type(icmp->get_type());
+        }
+        const Raw* raw = dynamic_cast<const Raw*>(&payload);
+        if (raw == nullptr || raw->get_data().empty())
+        {
+            return false;
+        }
+        return !is_icmp_error_type(raw->get_data()[0]);
     }
     return true;
 }

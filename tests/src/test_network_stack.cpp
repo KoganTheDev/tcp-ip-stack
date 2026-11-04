@@ -2606,3 +2606,26 @@ TEST(HalfOpenConnectionsPerListeningPortAreCapped)
     test_assert(answer.is_tcp && answer.syn && answer.ack_flag && answer.dest_port == 20000,
                 "a completed handshake must free its half-open slot");
 }
+
+TEST(AnExpiredIcmpErrorThatIsAFirstFragmentDrawsNoTimeExceeded)
+{
+    // Fragments are left unparsed (Raw, not Icmp) by the IP codec - only the
+    // reassembled datagram is parsed. A first fragment has offset 0, so the
+    // non-first-fragment rule does not apply to it, and a check that only
+    // recognised a parsed Icmp layer failed open: an ICMP error arriving as a
+    // first fragment drew an error about an error.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_router(first, second);
+
+    Icmp unreachable(IcmpType::ICMP_DESTINATION_UNREACHABLE, 1, 0, 0, Bytes());
+    unreachable /= std::make_unique<Raw>(Bytes(28));
+    unreachable.compute_checksum();
+    Bytes fragment_payload = unreachable.to_bytes().slice(0, 16); // a first fragment: 8-byte multiple, MF set
+    first->push_inbound(
+        build_ip_frame(PEER_IP, BEHIND_US, 1, IpProtocol::ICMP, fragment_payload, IP_FLAG_MORE_FRAGMENTS, 0));
+    stack->poll();
+
+    test_assert(!any_icmp(first->outbound_frames()),
+                "an ICMP error must not draw another even when it arrives as a first fragment");
+}
