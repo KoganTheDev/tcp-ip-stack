@@ -2995,3 +2995,37 @@ TEST(AGroupMacIsRefusedAsAnInterfacesOwnAddress)
     }
     test_assert(threw, "bb:bb:... has the group bit set and must be refused as an interface's own MAC");
 }
+
+TEST(ADirectedBroadcastForAnotherLinkIsNeitherForwardedNorResolved)
+{
+    // ABroadcastIsNeverForwarded above only held because the forwarding path
+    // missed in the ARP table: it still sent "who-has 192.168.5.255" onto the
+    // second link, and anyone there could answer it. After that every directed
+    // broadcast from the first link would be relayed onto the second - the
+    // amplifier RFC 2644 stopped routers being.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_router(first, second);
+    const IPv4Address second_broadcast("192.168.5.255");
+
+    first->push_inbound(build_transit_packet(second_broadcast, 64));
+    stack->poll();
+    for (const Bytes& frame : second->outbound_frames())
+    {
+        ArpView arp = view_arp(frame);
+        test_assert(!(arp.is_arp && arp.target_ip == second_broadcast.to_string()),
+                    "the router must not try to resolve a broadcast address");
+    }
+
+    // Plant a mapping for the broadcast address, as a host on link 2 could.
+    Ethernet planted(SECOND_PEER_MAC, MacAddress::BROADCAST, EtherType::ARP);
+    planted /= std::make_unique<Arp>(SECOND_PEER_MAC, second_broadcast, SECOND_IP);
+    second->push_inbound(planted.to_bytes());
+    stack->poll();
+    second->clear_outbound();
+
+    first->push_inbound(build_transit_packet(second_broadcast, 64));
+    stack->poll();
+    test_assert(!find_ip_to(second->outbound_frames(), second_broadcast).found,
+                "a directed broadcast must not be relayed even once something claims that address");
+}

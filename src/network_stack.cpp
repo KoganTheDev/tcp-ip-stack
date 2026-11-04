@@ -1594,6 +1594,17 @@ void NetworkStack::_forward_ip(size_t ingress, const Ip& ip, const Bytes& ip_byt
     IPv4Address source(ip.get_src_address());
     IPv4Address destination(ip.get_dest_address());
 
+    // A directed broadcast for one of this router's OTHER links is not transit
+    // traffic either. _handle_ip only recognises the arrival link's broadcast,
+    // so without this the packet was routed to the link it names, missed in
+    // the ARP table, and drew "who-has 192.168.5.255" there - which anyone on
+    // that link could answer, after which every directed broadcast would be
+    // relayed: the amplifier RFC 2644 stopped routers being.
+    if (this->_is_broadcast_for_any_interface(destination))
+    {
+        return;
+    }
+
     // Worth knowing about the packet that reaches here: the receive path has
     // already parsed it all the way to L4, because Ip::from_bytes builds a Tcp,
     // Udp or Icmp for the payload. So a transit packet whose transport header
