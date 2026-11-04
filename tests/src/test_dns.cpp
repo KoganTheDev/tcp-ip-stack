@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <map>
+#include <set>
 #include <memory>
 #include <string>
 #include <vector>
@@ -665,4 +666,33 @@ TEST(AnAliasChaseReleasesTheFirstPortBeforeTakingASecond)
     test_assert(released.size() == 1, "the abandoned port must be released as the alias is chased");
     test_assert(released[0] == first_port, "specifically the first one");
     test_assert(h.last().source_port != first_port, "and a fresh one taken");
+}
+
+TEST(APortTheHostReportsInUseIsNeverChosen)
+{
+    // The resolver half of the socket-hijack fix: given the same seed, a run
+    // told that the ports it would have picked are taken must pick others.
+    ResolverHarness probe;
+    for (int i = 0; i < 8; i++)
+    {
+        probe.resolver.resolve("host" + std::to_string(i) + ".example.com", probe.recorder());
+    }
+    std::set<uint16_t> taken;
+    for (const SentQuery& q : probe.sent)
+    {
+        taken.insert(q.source_port);
+    }
+
+    ResolverHarness h;
+    h.resolver.set_port_in_use_callback([&taken](uint16_t port) { return taken.count(port) > 0; });
+    for (int i = 0; i < 8; i++)
+    {
+        h.resolver.resolve("host" + std::to_string(i) + ".example.com", h.recorder());
+    }
+    test_assert(h.sent.size() == 8, "every query should still go out");
+    for (const SentQuery& q : h.sent)
+    {
+        test_assert(taken.count(q.source_port) == 0,
+                    "port " + std::to_string(q.source_port) + " was reported in use and must not be chosen");
+    }
 }

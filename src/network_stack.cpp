@@ -316,6 +316,10 @@ DnsResolver& NetworkStack::_ensure_dns_resolver()
     // The other half of "a fresh port per query". Without this the sockets
     // bound above accumulate one per lookup, forever - see unbind_udp().
     this->_dns_resolver->set_release_port_callback([this](uint16_t source_port) { this->unbind_udp(source_port); });
+    // And the guard on that socket-per-query: never choose a port something
+    // else already has bound, or bind_udp() above returns that socket.
+    this->_dns_resolver->set_port_in_use_callback([this](uint16_t port)
+                                                  { return this->_udp_sockets.count(port) > 0; });
 
     return *this->_dns_resolver;
 }

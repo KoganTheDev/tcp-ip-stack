@@ -2312,3 +2312,63 @@ TEST(ASynAckCarriesNoOptionThePeerDidNotOffer)
     test_assert(!syn_ack.has_sack_permitted, "no SACK-permitted on a SYN-ACK to a peer that offered none");
     test_assert(!syn_ack.has_timestamp, "no timestamp on a SYN-ACK to a peer that offered none");
 }
+
+TEST(ADnsQueryNeverTakesOverAPortTheApplicationBound)
+{
+    // The resolver picks a random ephemeral source port per query and binds a
+    // socket there - but bind_udp() hands back whatever socket already owns a
+    // port. Picking one the application bound meant the resolver overwrote the
+    // application's receive callback, and its later unbind_udp() destroyed the
+    // socket the application still held a pointer to: a use-after-free.
+    //
+    // Every even ephemeral port is taken here, so before the fix each query
+    // collides with probability 1/2 and twenty of them collide with certainty
+    // for all practical purposes.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    channel->push_inbound(build_arp_request()); // the DNS server's MAC
+    stack->poll();
+    channel->clear_outbound();
+
+    std::vector<UdpSocket*> app_sockets;
+    for (uint32_t port = 49152; port <= 65535; port += 2)
+    {
+        app_sockets.push_back(stack->bind_udp(static_cast<uint16_t>(port)));
+    }
+
+    stack->set_dns_servers({PEER_IP});
+    for (int i = 0; i < 20; i++)
+    {
+        stack->resolve("host" + std::to_string(i) + ".example.com",
+                       [](const std::string&, const std::vector<IPv4Address>&) {});
+    }
+
+    int queries = 0;
+    for (const Bytes& frame : channel->outbound_frames())
+    {
+        Ethernet eth(frame);
+        if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer()) continue;
+        const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
+        if (!ip || ip->get_protocol() != IpProtocol::UDP || !ip->has_next_layer()) continue;
+        const Udp* udp = dynamic_cast<const Udp*>(&ip->get_next_layer());
+        if (!udp || udp->get_dest_port() != 53) continue;
+        queries++;
+        test_assert(udp->get_src_port() % 2 == 1, "a DNS query went out from port " +
+                                                      std::to_string(udp->get_src_port()) +
+                                                      ", which the application had bound");
+    }
+    test_assert(queries == 20, "every resolve() should have sent a query, got " + std::to_string(queries));
+
+    // Let every query give up, so each releases (unbinds) its port. The
+    // application's sockets must all survive that.
+    for (int i = 0; i < 120; i++)
+    {
+        stack->on_time_passed(1000);
+    }
+    for (size_t i = 0; i < app_sockets.size(); i++)
+    {
+        uint16_t port = static_cast<uint16_t>(49152 + 2 * i);
+        test_assert(stack->bind_udp(port) == app_sockets[i],
+                    "the application's socket on port " + std::to_string(port) + " was torn down by the resolver");
+    }
+}

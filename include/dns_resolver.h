@@ -68,6 +68,12 @@ public:
     // interface carries both rather than leaving the second to whoever
     // remembers.
     using ReleasePortFn = std::function<void(uint16_t source_port)>;
+    // "Is this port already taken by someone else on this host?" The resolver
+    // knows only its own outstanding queries; whoever owns the socket table
+    // knows the rest. Choosing a port the application already bound is not
+    // merely a collision: the bind returns the application's own socket, so the
+    // resolver would hijack its callback and later unbind it out from under it.
+    using PortInUseFn = std::function<bool(uint16_t port)>;
 
     // random_seed feeds both the transaction ids and the source ports. See the
     // class comment for why a counter would defeat the whole exercise.
@@ -77,6 +83,10 @@ public:
     // per query - it just never tells anyone when a port is finished with, which
     // is what leaked a socket per lookup before this existed.
     void set_release_port_callback(ReleasePortFn callback) { _release_port = std::move(callback); }
+
+    // Optional, but required whenever anything else on the host binds UDP ports
+    // in the ephemeral range - see PortInUseFn.
+    void set_port_in_use_callback(PortInUseFn callback) { _port_in_use = std::move(callback); }
 
     // The servers to ask, in order of preference. Normally set from the DHCP
     // lease's option 6.
@@ -131,6 +141,7 @@ private:
 
     SendFn _send;
     ReleasePortFn _release_port;
+    PortInUseFn _port_in_use;
     // Two independent state words, not one shared one. They started as a
     // single word with two different hash keys, and that was wrong: a keyed
     // hash gives you unrelated *outputs*, but if both streams advance the same

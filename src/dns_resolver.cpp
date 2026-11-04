@@ -82,7 +82,8 @@ uint16_t DnsResolver::_next_source_port()
         this->_port_entropy = advance(this->_port_entropy, PORT_KEY_LOW, PORT_KEY_HIGH);
         uint16_t port =
             static_cast<uint16_t>(FIRST_EPHEMERAL_PORT + (this->_port_entropy % (65536u - FIRST_EPHEMERAL_PORT)));
-        if (this->_pending.count(port) == 0)
+        bool taken_elsewhere = this->_port_in_use && this->_port_in_use(port);
+        if (this->_pending.count(port) == 0 && !taken_elsewhere)
         {
             return port;
         }
