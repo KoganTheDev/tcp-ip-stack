@@ -1748,3 +1748,63 @@ TEST(OnlySequenceNumbersInFlightCountAsSentAndUnacknowledged)
     test_assert(!connection->has_sent_unacknowledged(1003), "SND.NXT does not - it has not been sent");
     test_assert(!connection->has_sent_unacknowledged(1000), "nor does anything already acknowledged");
 }
+
+// A peer may retransmit differently than it first sent - Linux collapses
+// several lost segments into one larger retransmission. When that in-order
+// segment covers data already sitting in the reorder buffer, the buffered
+// entries are now behind RCV.NXT. Draining only by an exact match on RCV.NXT
+// never finds them: they stay buffered forever, still counted as occupying the
+// receive buffer, and the advertised window shrinks for good.
+TEST(ACoalescedRetransmissionDrainsTheOutOfOrderSegmentsItCovers)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent); // RCV.NXT = 501
+
+    size_t delivered = 0;
+    connection->set_data_ready_callback([&delivered, &connection]() { delivered += connection->read().size(); });
+
+    // 70 KB arrives out of order, one 1000-byte segment at a time, leaving the
+    // first 1000 bytes missing.
+    const uint32_t chunk = 1000;
+    const uint32_t chunks = 70;
+    for (uint32_t i = 1; i <= chunks; i++)
+    {
+        connection->on_segment(*make_incoming_segment(501 + i * chunk, 1001, FLAG_ACK, Bytes(chunk)));
+    }
+    test_assert(delivered == 0, "nothing is deliverable while the first chunk is missing");
+
+    // The retransmission covers the hole AND everything after it, in one go.
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes((chunks + 1) * chunk)));
+    test_assert(delivered == (chunks + 1) * chunk,
+                "the whole range is delivered once, got " + std::to_string(delivered) + " bytes");
+
+    // Everything was read, so the whole buffer is free again and the window
+    // is back at its (field-clamped) maximum.
+    sent.clear();
+    connection->send(Bytes::from_hex("6869"));
+    test_assert(!sent.empty(), "precondition: a segment went out");
+    test_assert(sent.back().window == 65535,
+                "the window must reopen fully, got " + std::to_string(sent.back().window) +
+                    " - buffered segments behind RCV.NXT are still being counted");
+}
+
+// The partial case: in-order data that reaches into a buffered segment without
+// covering it. Only the part past RCV.NXT is new - delivering the whole entry
+// would hand the application the overlap twice, and dropping it would lose
+// the tail until the peer retransmitted it.
+TEST(InOrderDataOverlappingABufferedSegmentDeliversOnlyItsNewTail)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent); // RCV.NXT = 501
+
+    Bytes received;
+    connection->set_data_ready_callback([&received, &connection]() { received |= connection->read(); });
+
+    // buffered: "fghijklmno" at 506..515
+    connection->on_segment(*make_incoming_segment(506, 1001, FLAG_ACK, Bytes::from_hex("666768696a6b6c6d6e6f")));
+    // in order: "abcdefghij" at 501..510 - overlaps the first five buffered bytes
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes::from_hex("6162636465666768696a")));
+
+    test_assert(received.to_hex() == Bytes::from_hex("6162636465666768696a6b6c6d6e6f").to_hex(),
+                "expected \"abcdefghijklmno\" exactly once each, got hex " + received.to_hex());
+}

@@ -290,6 +290,9 @@ private:
     // advances _recv_next past it. Shared by the in-order-arrival path and
     // the reorder-buffer-draining loop in on_segment().
     void _deliver(const Bytes& payload);
+    // Resolves every reorder-buffer entry that RCV.NXT has reached or passed:
+    // delivers whatever part of it is new, discards the rest.
+    void _drain_reorder_buffer();
     // Sends whatever's queued that now fits under min(cwnd, peer window) -
     // shared by the normal new-ack path and fast recovery's dup-ack path
     // (a fast-recovery window inflation can itself open room to send).

@@ -427,6 +427,51 @@ void TcpConnection::initiate_connect()
     _send_flags(FLAG_SYN, Bytes(), false); // active open: bare SYN, nothing to ack yet
 }
 
+void TcpConnection::_drain_reorder_buffer()
+{
+    // Every buffered segment that now starts at or before RCV.NXT is resolved:
+    // delivered if it extends past RCV.NXT (only that new tail), or discarded
+    // if RCV.NXT has already passed its end. Matching only an entry that
+    // starts exactly at RCV.NXT is not enough - when the in-order data that
+    // just arrived overlapped a buffered segment (a peer that coalesced its
+    // retransmissions, say), that segment starts behind RCV.NXT, is never
+    // matched, and sits counted against the receive window forever.
+    //
+    // A rescan from the start after each step rather than a single ordered
+    // walk: the map is keyed by raw uint32_t, so near the 2^32 wrap its order
+    // is not sequence order. The buffer is bounded by the receive window, and
+    // each pass removes an entry, so this terminates.
+    bool progressed = true;
+    while (progressed)
+    {
+        progressed = false;
+        for (auto it = _reorder_buffer.begin(); it != _reorder_buffer.end(); ++it)
+        {
+            uint32_t start = it->first;
+            if (!seq_at_or_before(start, _recv_next))
+            {
+                continue; // still beyond a gap
+            }
+            uint32_t end = start + static_cast<uint32_t>(it->second.size());
+            Bytes new_tail;
+            if (!seq_at_or_before(end, _recv_next))
+            {
+                uint32_t already_seen = _recv_next - start;
+                new_tail = it->second.slice(already_seen, it->second.size() - already_seen);
+            }
+            // erase before delivering: _deliver() runs the application's
+            // callback, which must not find a half-processed entry here
+            _reorder_buffer.erase(it);
+            if (!new_tail.empty())
+            {
+                _deliver(new_tail);
+            }
+            progressed = true;
+            break;
+        }
+    }
+}
+
 void TcpConnection::_deliver(const Bytes& payload)
 {
     // RCV.NXT advances here because the bytes are acknowledged - they arrived
@@ -1106,19 +1151,8 @@ void TcpConnection::on_segment(const Tcp& segment)
             {
                 _deliver(payload);
 
-                // drain any now-contiguous buffered segments the gap-filler
-                // just unblocked, in order
-                while (true)
-                {
-                    auto next_it = _reorder_buffer.find(_recv_next);
-                    if (next_it == _reorder_buffer.end())
-                    {
-                        break;
-                    }
-                    Bytes buffered = std::move(next_it->second);
-                    _reorder_buffer.erase(next_it);
-                    _deliver(buffered);
-                }
+                // drain any buffered segments the gap-filler just unblocked
+                _drain_reorder_buffer();
 
                 // in-order data: the ack may be delayed (RFC 1122) to coalesce
                 // with the next segment or piggyback on our own data
@@ -1149,17 +1183,7 @@ void TcpConnection::on_segment(const Tcp& segment)
                     Bytes new_part = payload.slice(static_cast<size_t>(already_seen));
                     _deliver(new_part);
 
-                    while (true)
-                    {
-                        auto next_it = _reorder_buffer.find(_recv_next);
-                        if (next_it == _reorder_buffer.end())
-                        {
-                            break;
-                        }
-                        Bytes buffered = std::move(next_it->second);
-                        _reorder_buffer.erase(next_it);
-                        _deliver(buffered);
-                    }
+                    _drain_reorder_buffer();
                 }
                 // a duplicate/overlap of already-seen data: ack now, don't delay
                 _send_pure_ack();
