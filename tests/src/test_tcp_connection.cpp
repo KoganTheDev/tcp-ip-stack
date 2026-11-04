@@ -1929,3 +1929,39 @@ TEST(ASegmentDroppedForAckingUnsentDataDoesNotAdvanceTheTimestampEcho)
     test_assert(received.size() == 1 && received[0].to_hex() == "aabb",
                 "the peer's genuine segment must still be accepted - the dropped one must not have moved TS.Recent");
 }
+
+// After a zero-window probe byte is accepted the peer acks SND.NXT + 1, but
+// the data released once the window reopens starts at SND.NXT - so its first
+// segment straddles that ack. If the segment is then lost, every duplicate ack
+// says SND.NXT + 1 while SND.UNA stays at SND.NXT: they never matched, and
+// recovery fell to the retransmission timeout. An ack inside the front
+// segment is a partial ack of it and moves SND.UNA, after which the
+// duplicates count.
+TEST(LossRightAfterAnAcceptedProbeIsRecoveredByFastRetransmit)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 0)); // window shut
+    connection->send(Bytes::from_hex("68656c6c6f"));
+    for (int i = 0; i < 4 && sent.empty(); i++)
+    {
+        connection->on_time_passed(TEST_TICK_MS);
+    }
+    test_assert(sent.size() == 1 && sent[0].payload.size() == 1, "precondition: one probe byte at 1001");
+
+    // the probe byte is accepted and the window reopens: the data goes out
+    connection->on_segment(*make_incoming_segment_win(501, 1002, FLAG_ACK, 65535));
+    size_t released = sent.size();
+    test_assert(released >= 2 && sent.back().payload.size() >= 4, "precondition: the queued data was released");
+
+    // ...and is lost. The peer, holding only byte 1001, keeps acking 1002.
+    for (int i = 0; i < 5 && sent.size() == released; i++)
+    {
+        connection->on_segment(*make_incoming_segment_win(501, 1002, FLAG_ACK, 65535));
+    }
+    test_assert(sent.size() > released && !sent.back().payload.empty(),
+                "the lost data must be fast-retransmitted on duplicate acks, not left to the timeout");
+    test_assert(sent.back().seq == 1002 && sent.back().payload.to_hex() == Bytes::from_hex("656c6c6f").to_hex(),
+                "and what is resent is exactly what the peer lacks: \"ello\" at 1002, not the byte it acked");
+}

@@ -879,6 +879,35 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         acked_anything = true;
     }
 
+    // A partial ack: one that lands inside the front segment rather than at
+    // its end. Its acknowledged prefix is trimmed off, so SND.UNA really moves
+    // to the ack. The case that makes this matter: after a zero-window probe
+    // byte is accepted the peer acks SND.NXT + 1, but the data released next
+    // starts at SND.NXT. If that segment is lost, the peer's duplicate acks
+    // all say SND.NXT + 1 - which never equalled an untrimmed SND.UNA, so
+    // fast retransmit could not fire and only the timeout recovered it.
+    // A segment carrying SYN is left whole: the SYN is not payload to trim.
+    if (!_in_flight.empty())
+    {
+        InFlightSegment& front = _in_flight.front();
+        bool inside = !seq_at_or_before(ack, front.seq) && !seq_at_or_before(front.end_seq, ack);
+        if (inside && !(front.flags & FLAG_SYN))
+        {
+            uint32_t trimmed = ack - front.seq;
+            if (trimmed <= front.payload.size())
+            {
+                front.payload = front.payload.slice(trimmed, front.payload.size() - trimmed);
+                front.seq = ack;
+                if (!front.sacked)
+                {
+                    _unsacked_in_flight_bytes -= trimmed;
+                }
+                bytes_acked += trimmed;
+                acked_anything = true;
+            }
+        }
+    }
+
     // A timestamp echo beats the ack clock, and beats it precisely where the
     // ack clock fails. Karn's algorithm has to throw away the sample from a
     // retransmitted segment because an ack cannot say which transmission it
