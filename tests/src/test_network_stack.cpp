@@ -2701,3 +2701,100 @@ TEST(AHardIcmpErrorDoesNotAbortAnEstablishedConnection)
                 "once established, even a hard error is reported, not fatal (RFC 5461) - "
                 "the peer's own RST is what ends a connection it no longer has");
 }
+
+TEST(HalfOpenConnectionsThatTimeOutFreeTheirSlots)
+{
+    // A flood's SYNs never complete; their connections leave SYN_RECEIVED by
+    // giving up instead. That exit has to free the slot as surely as a
+    // completed handshake does - if it did not, one flood would leave the port
+    // refusing every connection for good.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    stack->listen(80);
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+
+    for (size_t i = 0; i < NetworkStack::MAX_HALF_OPEN_PER_PORT; i++)
+    {
+        channel->push_inbound(build_tcp(FLAG_SYN, 1000, 0, static_cast<uint16_t>(30000 + i), 80));
+    }
+    for (int i = 0; i < 50; i++)
+    {
+        stack->poll();
+    }
+
+    // Let every SYN-ACK retransmission run out.
+    for (int i = 0; i < 600; i++)
+    {
+        stack->on_time_passed(1000);
+    }
+
+    // That is long enough for the peer's ARP entry to age out too; re-teach it,
+    // or the SYN-ACK below waits on resolution and the test measures ARP
+    // expiry rather than slot release.
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+    channel->clear_outbound();
+    channel->push_inbound(build_tcp(FLAG_SYN, 5000, 0, 20000, 80));
+    stack->poll();
+    TcpView answer = find_tcp(channel->outbound_frames());
+    test_assert(answer.is_tcp && answer.syn && answer.ack_flag && answer.dest_port == 20000,
+                "once the half-open connections have given up, a new SYN must be answered");
+}
+
+TEST(AConnectionLeavesTheHalfOpenCountOnceNotOnEveryTransition)
+{
+    // A connection stops counting as half-open when it leaves SYN_RECEIVED -
+    // once. If its later transitions (here CLOSE_WAIT, on the peer's FIN) also
+    // took a slot back, the count would undershoot and the cap would quietly
+    // stop holding.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    stack->listen(80);
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+    channel->clear_outbound();
+
+    for (size_t i = 0; i < NetworkStack::MAX_HALF_OPEN_PER_PORT; i++)
+    {
+        channel->push_inbound(build_tcp(FLAG_SYN, 1000, 0, static_cast<uint16_t>(30000 + i), 80));
+    }
+    for (int i = 0; i < 50; i++)
+    {
+        stack->poll();
+    }
+    uint32_t isn = 0;
+    for (const Bytes& frame : channel->outbound_frames())
+    {
+        TcpView v = view_tcp(frame);
+        if (v.is_tcp && v.syn && v.ack_flag && v.dest_port == 30000)
+        {
+            isn = v.seq;
+        }
+    }
+
+    // One completes its handshake (64 -> 63 half-open), then the peer closes
+    // its side - a further transition, to CLOSE_WAIT, that must not count.
+    channel->push_inbound(build_tcp(FLAG_ACK, 1001, isn + 1, 30000, 80));
+    stack->poll();
+    channel->push_inbound(build_tcp(0x01 /* FIN */ | FLAG_ACK, 1001, isn + 1, 30000, 80));
+    stack->poll();
+
+    channel->clear_outbound();
+    channel->push_inbound(build_tcp(FLAG_SYN, 5000, 0, 20000, 80));
+    channel->push_inbound(build_tcp(FLAG_SYN, 5000, 0, 20001, 80));
+    stack->poll();
+    stack->poll();
+
+    int answered = 0;
+    for (const Bytes& frame : channel->outbound_frames())
+    {
+        TcpView v = view_tcp(frame);
+        if (v.is_tcp && v.syn && v.ack_flag && (v.dest_port == 20000 || v.dest_port == 20001))
+        {
+            answered++;
+        }
+    }
+    test_assert(answered == 1, "exactly one slot was freed, so exactly one new SYN may be answered, got " +
+                                   std::to_string(answered));
+}

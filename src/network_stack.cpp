@@ -993,17 +993,8 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
         // SYN built a connection that lived, retransmitting its SYN-ACK, until
         // it gave up. Dropped silently for the same reason as above.
         //
-        // A linear count rather than a maintained counter: it is bounded by the
-        // connection table, and a counter would have to be kept right on every
-        // path out of SYN_RECEIVED (completion, RST, timeout, reap).
-        size_t half_open = 0;
-        for (const auto& entry : this->_connections)
-        {
-            if (entry.first.local_port == key.local_port && entry.second->get_state() == TcpState::SYN_RECEIVED)
-            {
-                half_open++;
-            }
-        }
+        auto half_open_it = this->_half_open_per_port.find(key.local_port);
+        size_t half_open = half_open_it == this->_half_open_per_port.end() ? 0 : half_open_it->second;
         if (half_open >= MAX_HALF_OPEN_PER_PORT)
         {
             LOG_WARNING("NetworkStack: dropping a SYN for port " << key.local_port << " - " << half_open
@@ -1051,8 +1042,37 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
     }
 
     this->_watch_for_close(*connection);
+    this->_track_half_open(*connection, key.local_port);
     this->_connections_by_id[connection->get_id()] = key;
     this->_connections[key] = std::move(connection);
+}
+
+void NetworkStack::_track_half_open(TcpConnection& connection, uint16_t local_port)
+{
+    this->_half_open_per_port[local_port] += 1;
+    // `counted` makes the decrement happen exactly once: on the first
+    // transition out of SYN_RECEIVED, whichever one that is. It lives behind a
+    // shared_ptr rather than as mutable lambda state on purpose -
+    // TcpConnection::_transition() invokes a *copy* of each subscriber (so a
+    // subscriber can register another without invalidating the iteration), and
+    // state kept inside the lambda would be updated on that throwaway copy and
+    // lost, decrementing again on every later transition. The connection is
+    // owned by this stack, so `this` outlives every call.
+    auto counted = std::make_shared<bool>(true);
+    connection.add_state_changed_callback(
+        [this, local_port, counted](TcpState new_state)
+        {
+            if (!*counted || new_state == TcpState::SYN_RECEIVED)
+            {
+                return;
+            }
+            *counted = false;
+            auto it = this->_half_open_per_port.find(local_port);
+            if (it != this->_half_open_per_port.end() && --it->second == 0)
+            {
+                this->_half_open_per_port.erase(it);
+            }
+        });
 }
 
 void NetworkStack::_handle_udp(const Ip& ip, const Udp& udp)

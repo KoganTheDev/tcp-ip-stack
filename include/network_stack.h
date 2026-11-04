@@ -343,6 +343,10 @@ private:
     // method. The actual erase happens later, safely, in
     // _reap_closed_connections().
     void _watch_for_close(TcpConnection& connection);
+    // Counts a freshly accepted SYN_RECEIVED connection against its port, and
+    // uncounts it on its first transition anywhere else - completion, RST,
+    // give-up - which is every way out of the state, so the count cannot leak.
+    void _track_half_open(TcpConnection& connection, uint16_t local_port);
 
     // dont_fragment sets the DF bit, which is what asks the network to report
     // a too-small link rather than silently splitting the packet. That report
@@ -571,6 +575,12 @@ private:
     EchoReplyFn _on_echo_reply;
     std::unordered_map<uint16_t, size_t> _listening_ports; // port -> backlog
     std::unordered_map<uint16_t, std::deque<ConnectionKey>> _pending_accepts;
+    // Connections in SYN_RECEIVED per local port, for MAX_HALF_OPEN_PER_PORT.
+    // Kept as a counter so the check on every SYN is O(1) rather than a walk
+    // of the whole connection table - which, under exactly the flood the cap
+    // exists for, would make each SYN cost time proportional to every
+    // connection open. See _track_half_open() for how it stays right.
+    std::unordered_map<uint16_t, size_t> _half_open_per_port;
     std::unordered_map<uint16_t, std::unique_ptr<UdpSocket>> _udp_sockets;
     std::unordered_map<ConnectionKey, std::unique_ptr<TcpConnection>, ConnectionKeyHash> _connections;
     // id -> key, not id -> TcpConnection* - find_connection() and reaping
