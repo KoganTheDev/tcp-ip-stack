@@ -1378,9 +1378,21 @@ TcpConnection* NetworkStack::_connection_from_icmp_quote(const Icmp& icmp, uint3
 
 void NetworkStack::_handle_icmp_fragmentation_needed(const Icmp& icmp)
 {
-    TcpConnection* connection = this->_connection_from_icmp_quote(icmp);
+    uint32_t quoted_seq = 0;
+    TcpConnection* connection = this->_connection_from_icmp_quote(icmp, &quoted_seq);
     if (connection == nullptr)
     {
+        return;
+    }
+
+    // RFC 5927 5.2: the same test as for any other error. What a forged
+    // Fragmentation Needed controls is the MSS - anyone guessing the ports
+    // could shrink the connection to the 536-byte floor. A genuine one is
+    // about the segment that was too big, which is still in flight.
+    if (!connection->has_sent_unacknowledged(quoted_seq))
+    {
+        LOG_DEBUG("NetworkStack: ignoring a Fragmentation Needed quoting sequence "
+                  << quoted_seq << ", which this connection does not have in flight");
         return;
     }
 

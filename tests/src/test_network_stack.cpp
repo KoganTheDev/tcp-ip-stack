@@ -1225,9 +1225,12 @@ TEST(AFragmentThatNeverCompletesDrawsIcmpTimeExceeded)
 namespace
 {
     // An ICMP Fragmentation Needed for a segment we sent, naming next_hop_mtu.
-    Bytes build_icmp_fragmentation_needed(uint16_t local_port, uint16_t remote_port, uint16_t next_hop_mtu)
+    // quoted_seq: the sequence number of the segment that was too big. A
+    // genuine report quotes one this side has in flight (RFC 5927).
+    Bytes build_icmp_fragmentation_needed(uint16_t local_port, uint16_t remote_port, uint16_t next_hop_mtu,
+                                          uint32_t quoted_seq = 0)
     {
-        Tcp our_segment(local_port, remote_port, 0, 0, 5, 0x02 /* SYN */, 65535, 0, 0);
+        Tcp our_segment(local_port, remote_port, quoted_seq, 0, 5, 0x10 /* ACK */, 65535, 0, 0);
         auto embedded_ip = std::make_unique<Ip>(4, 5, 0, 40, 0, 0, 0, 64, IpProtocol::TCP, 0, LOCAL_IP.get_address(),
                                                 PEER_IP.get_address());
         *embedded_ip /= std::make_unique<Raw>(our_segment.to_bytes());
@@ -1273,6 +1276,15 @@ namespace
 
         return stack.accept(local_port);
     }
+
+    // Puts one data segment in flight and returns its sequence number - the
+    // segment a Fragmentation Needed report is then about.
+    uint32_t send_one_segment(TcpConnection& connection, FakePacketChannel& channel)
+    {
+        channel.clear_outbound();
+        connection.send(Bytes(100));
+        return find_tcp(channel.outbound_frames()).seq;
+    }
 }
 
 TEST(FragmentationNeededLowersTheMssInsteadOfKillingTheConnection)
@@ -1285,8 +1297,9 @@ TEST(FragmentationNeededLowersTheMssInsteadOfKillingTheConnection)
     uint16_t mss_before = connection->get_effective_mss();
     test_assert(mss_before == 1460,
                 "precondition: the peer advertised a full-sized MSS, so there is room to come down from");
+    uint32_t seq = send_one_segment(*connection, *channel);
 
-    channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 1000));
+    channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 1000, seq));
     stack->poll();
 
     test_assert(stack->find_connection(connection->get_id()) != nullptr,
@@ -1305,11 +1318,12 @@ TEST(FragmentationNeededNeverRaisesTheMss)
     auto stack = make_stack(channel);
 
     TcpConnection* connection = accept_connection_with_peer_mss(*stack, *channel, 80, 40000);
-    channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 1000));
+    uint32_t seq = send_one_segment(*connection, *channel);
+    channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 1000, seq));
     stack->poll();
     test_assert(connection->get_effective_mss() == 960, "precondition: lowered once");
 
-    channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 9000));
+    channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 9000, seq));
     stack->poll();
     test_assert(connection->get_effective_mss() == 960, "a report claiming a larger MTU must be ignored - an attacker "
                                                         "could otherwise talk this stack into oversized segments");
@@ -1341,8 +1355,9 @@ TEST(FragmentationNeededWithoutAnMtuFallsBackToTheMinimum)
 
     TcpConnection* connection = accept_connection_with_peer_mss(*stack, *channel, 80, 40000);
     test_assert(connection->get_effective_mss() == 1460, "precondition: starting from a full-sized MSS");
+    uint32_t seq = send_one_segment(*connection, *channel);
 
-    channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 0));
+    channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 0, seq));
     stack->poll();
 
     test_assert(connection->get_effective_mss() == 576 - 40,
@@ -3104,4 +3119,30 @@ TEST(TheApplicationCannotBindAPortADnsQueryIsUsing)
     catch (const std::exception&)
     {}
     test_assert(bound, "a port the resolver has released must be bindable again");
+}
+
+TEST(AFragmentationNeededQuotingNoSegmentInFlightIsIgnored)
+{
+    // RFC 5927 5.2: Fragmentation Needed is as forgeable as any ICMP error, and
+    // what it controls is the MSS. Anyone who guesses a connection's ports can
+    // otherwise shrink its segments to the 536-byte floor - many times the
+    // packets for the same data. A genuine report quotes the segment that was
+    // too big, which this side still has in flight.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    TcpConnection* connection = accept_connection_with_peer_mss(*stack, *channel, 80, 40000);
+    test_assert(connection->get_effective_mss() == 1460, "precondition: a full-sized MSS");
+
+    // nothing in flight at all: no segment can have been too big
+    channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 600, 12345));
+    stack->poll();
+    test_assert(connection->get_effective_mss() == 1460, "a report with nothing in flight must be ignored");
+
+    // something in flight, but the quote names a sequence number it does not cover
+    uint32_t seq = send_one_segment(*connection, *channel);
+    channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 600, seq + 100000));
+    stack->poll();
+    test_assert(connection->get_effective_mss() == 1460,
+                "a report quoting a sequence number never sent must be ignored, got MSS " +
+                    std::to_string(connection->get_effective_mss()));
 }
