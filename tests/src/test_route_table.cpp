@@ -128,3 +128,26 @@ TEST(BroadcastRecognisesLimitedAndDirectedForms)
     test_assert(!is_broadcast_address(IPv4Address("10.0.0.255"), unconfigured),
                 "without an address there is no network whose host part could be all ones");
 }
+
+TEST(PointToPointPrefixesHaveNoDirectedBroadcast)
+{
+    // RFC 3021: a /31 is a point-to-point link of exactly two hosts and has no
+    // broadcast address - both addresses are hosts. Treating the all-ones one
+    // as broadcast made the peer's own address "broadcast": frames to it went
+    // to ff:ff:ff:ff:ff:ff and every ICMP error to it was suppressed. A /32
+    // is a single host, and its one address is that host, not a broadcast.
+    InterfaceConfig p2p;
+    p2p.ip = IPv4Address("10.0.0.0");
+    p2p.prefix_length = 31;
+    test_assert(!is_broadcast_address(IPv4Address("10.0.0.1"), p2p), "a /31 peer's address is a host, not a broadcast");
+    test_assert(!is_broadcast_address(IPv4Address("10.0.0.0"), p2p), "and so is ours");
+
+    InterfaceConfig host;
+    host.ip = IPv4Address("10.0.0.7");
+    host.prefix_length = 32;
+    test_assert(!is_broadcast_address(IPv4Address("10.0.0.7"), host), "a /32's only address is the host itself");
+
+    test_assert(is_broadcast_address(IPv4Address("255.255.255.255"), p2p) &&
+                    is_broadcast_address(IPv4Address("255.255.255.255"), host),
+                "the limited broadcast still is one, whatever the prefix");
+}

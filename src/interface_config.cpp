@@ -75,6 +75,14 @@ bool is_broadcast_address(const IPv4Address& ip, const InterfaceConfig& config)
         return false;
     }
 
+    // Nor on a /31 or /32. A /31 is a point-to-point link whose two addresses
+    // are both hosts (RFC 3021), and a /32 is one host - the all-ones "host
+    // part" there is a host's own address, never a broadcast.
+    if (config.prefix_length >= 31)
+    {
+        return false;
+    }
+
     uint32_t mask = mask_for(config.prefix_length);
     uint32_t network = to_uint32(config.ip) & mask;
     return value == (network | ~mask);
