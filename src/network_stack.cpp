@@ -37,8 +37,14 @@ namespace
 
     // 224.0.0.0/4. Class E (240.0.0.0/4) is not multicast, but is no more a
     // single host's address, so callers asking "is this one host" test both.
-    bool is_multicast(const IPv4Address& address) { return (address.get_address()[0] & 0xF0) == 0xE0; }
-    bool is_class_e(const IPv4Address& address) { return (address.get_address()[0] & 0xF0) == 0xF0; }
+    bool is_multicast(const IPv4Address& address)
+    {
+        return (address.get_address()[0] & 0xF0) == 0xE0;
+    }
+    bool is_class_e(const IPv4Address& address)
+    {
+        return (address.get_address()[0] & 0xF0) == 0xF0;
+    }
 
     // The ICMP types that are themselves error reports (RFC 1122 3.2.2 lists
     // them): Destination Unreachable, Source Quench, Redirect, Time Exceeded,
@@ -130,9 +136,9 @@ namespace
     {
         if ((mac.get_address()[0] & 0x01) != 0)
         {
-            throw EXCEPTION(BaseException, "interface MAC " + mac.to_string() +
-                                               " is a group (multicast) address and cannot be a station's own; "
-                                               "use a unicast one, e.g. a locally administered 02:...");
+            throw EXCEPTION(BaseException, "interface MAC " + mac.to_string()
+                                               + " is a group (multicast) address and cannot be a station's own; "
+                                                 "use a unicast one, e.g. a locally administered 02:...");
         }
     }
 }
@@ -388,8 +394,7 @@ DnsResolver& NetworkStack::_ensure_dns_resolver()
         });
     // And the guard on that socket-per-query: never choose a port something
     // else already has bound, or bind_udp() above returns that socket.
-    this->_dns_resolver->set_port_in_use_callback([this](uint16_t port)
-                                                  { return this->_udp_sockets.count(port) > 0; });
+    this->_dns_resolver->set_port_in_use_callback([this](uint16_t port) { return this->_udp_sockets.count(port) > 0; });
 
     return *this->_dns_resolver;
 }
@@ -625,8 +630,7 @@ void NetworkStack::on_time_passed(uint32_t elapsed_ms)
         {
             continue;
         }
-        bool about_icmp_error =
-            datagram.protocol == IpProtocol::ICMP && is_icmp_error_type(datagram.first_bytes[0]);
+        bool about_icmp_error = datagram.protocol == IpProtocol::ICMP && is_icmp_error_type(datagram.first_bytes[0]);
         if (!this->_may_report_error_for(datagram.source, datagram.destination, about_icmp_error))
         {
             continue;
@@ -1427,7 +1431,7 @@ void NetworkStack::_handle_icmp_error(const Icmp& icmp)
     if (!connection->has_sent_unacknowledged(quoted_seq))
     {
         LOG_DEBUG("NetworkStack: ignoring an ICMP error quoting sequence " << quoted_seq
-                                                                          << ", which this connection has not sent");
+                                                                           << ", which this connection has not sent");
         return;
     }
 
@@ -2068,7 +2072,7 @@ void NetworkStack::_send_icmp_message(const IPv4Address& dest_ip, const Icmp& he
 }
 
 bool NetworkStack::_may_report_error_for(const IPv4Address& source, const IPv4Address& destination,
-                                        bool about_icmp_error) const
+                                         bool about_icmp_error) const
 {
     // RFC 1122 3.2.2 and RFC 1812 4.3.2.7: the packets an ICMP error must
     // never be sent about. Separate from _may_send_icmp_error(), which limits
@@ -2076,8 +2080,8 @@ bool NetworkStack::_may_report_error_for(const IPv4Address& source, const IPv4Ad
     // checked first so they do not spend that budget either.
 
     // Not to a single host: there is nobody, or everybody, to send it to.
-    if (source == IPv4Address("0.0.0.0") || (source.get_address()[0] == 127) || is_multicast(source) ||
-        is_class_e(source) || this->_is_broadcast_for_any_interface(source))
+    if (source == IPv4Address("0.0.0.0") || (source.get_address()[0] == 127) || is_multicast(source)
+        || is_class_e(source) || this->_is_broadcast_for_any_interface(source))
     {
         return false;
     }

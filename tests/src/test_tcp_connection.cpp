@@ -1783,9 +1783,8 @@ TEST(ACoalescedRetransmissionDrainsTheOutOfOrderSegmentsItCovers)
     sent.clear();
     connection->send(Bytes::from_hex("6869"));
     test_assert(!sent.empty(), "precondition: a segment went out");
-    test_assert(sent.back().window == 65535,
-                "the window must reopen fully, got " + std::to_string(sent.back().window) +
-                    " - buffered segments behind RCV.NXT are still being counted");
+    test_assert(sent.back().window == 65535, "the window must reopen fully, got " + std::to_string(sent.back().window)
+                                                 + " - buffered segments behind RCV.NXT are still being counted");
 }
 
 // The partial case: in-order data that reaches into a buffered segment without
@@ -1899,8 +1898,8 @@ TEST(DrainingManySegmentsAcrossTheWrapDeliversTheWholeStreamInOrder)
     first.append_int<uint8_t>(0);
     connection->on_segment(*make_incoming_segment(rcv_nxt, 1001, FLAG_ACK, first));
 
-    test_assert(received.size() == total, "the whole stream should be delivered, got " +
-                                              std::to_string(received.size()) + " of " + std::to_string(total));
+    test_assert(received.size() == total, "the whole stream should be delivered, got " + std::to_string(received.size())
+                                              + " of " + std::to_string(total));
     bool in_order = true;
     for (uint32_t i = 0; i < received.size() && in_order; i++)
     {
@@ -1922,8 +1921,8 @@ TEST(ASegmentDroppedForAckingUnsentDataDoesNotAdvanceTheTimestampEcho)
     connection->set_data_ready_callback([&received, &connection]() { received.push_back(connection->read()); });
 
     // at RCV.NXT, timestamp 2^30 ahead, acking 2^30 past anything sent
-    connection->on_segment(*make_segment_ts(501, 1001 + (1u << 30), FLAG_ACK, 6000 + (1u << 30), 0,
-                                            Bytes::from_hex("eeee")));
+    connection->on_segment(
+        *make_segment_ts(501, 1001 + (1u << 30), FLAG_ACK, 6000 + (1u << 30), 0, Bytes::from_hex("eeee")));
     test_assert(received.empty(), "precondition: the segment acking unsent data is dropped");
 
     connection->on_segment(*make_segment_ts(501, 1001, FLAG_ACK, 6000, 0, Bytes::from_hex("aabb")));

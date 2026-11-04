@@ -2358,15 +2358,18 @@ TEST(ADnsQueryNeverTakesOverAPortTheApplicationBound)
     for (const Bytes& frame : channel->outbound_frames())
     {
         Ethernet eth(frame);
-        if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer()) continue;
+        if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer())
+            continue;
         const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
-        if (!ip || ip->get_protocol() != IpProtocol::UDP || !ip->has_next_layer()) continue;
+        if (!ip || ip->get_protocol() != IpProtocol::UDP || !ip->has_next_layer())
+            continue;
         const Udp* udp = dynamic_cast<const Udp*>(&ip->get_next_layer());
-        if (!udp || udp->get_dest_port() != 53) continue;
+        if (!udp || udp->get_dest_port() != 53)
+            continue;
         queries++;
-        test_assert(udp->get_src_port() % 2 == 1, "a DNS query went out from port " +
-                                                      std::to_string(udp->get_src_port()) +
-                                                      ", which the application had bound");
+        test_assert(udp->get_src_port() % 2 == 1, "a DNS query went out from port "
+                                                      + std::to_string(udp->get_src_port())
+                                                      + ", which the application had bound");
     }
     test_assert(queries == 20, "every resolve() should have sent a query, got " + std::to_string(queries));
 
@@ -2398,9 +2401,9 @@ namespace
                          const Bytes& payload, uint8_t flags = 0, uint16_t fragment_offset = 0,
                          const MacAddress& dest_mac = LOCAL_MAC)
     {
-        auto ip = std::make_unique<Ip>(4, 5, 0, static_cast<uint16_t>(20 + payload.size()), 0x4242, flags,
-                                       fragment_offset, ttl, protocol, 0, source.get_address(),
-                                       destination.get_address());
+        auto ip =
+            std::make_unique<Ip>(4, 5, 0, static_cast<uint16_t>(20 + payload.size()), 0x4242, flags, fragment_offset,
+                                 ttl, protocol, 0, source.get_address(), destination.get_address());
         *ip /= std::make_unique<Raw>(payload);
         ip->compute_checksum();
         Ethernet eth(PEER_MAC, dest_mac, EtherType::IPv4);
@@ -2415,7 +2418,10 @@ namespace
         return udp.to_bytes();
     }
 
-    bool any_icmp(const std::vector<Bytes>& frames) { return find_icmp(frames).is_icmp; }
+    bool any_icmp(const std::vector<Bytes>& frames)
+    {
+        return find_icmp(frames).is_icmp;
+    }
 }
 
 TEST(ABroadcastToAnUnboundPortDrawsNoPortUnreachable)
@@ -2449,10 +2455,10 @@ TEST(AMulticastPacketIsNeitherForwardedNorAnsweredWithAnError)
     // it, "not forwarded" holds trivially and proves nothing.
     stack->add_route(IPv4Address("0.0.0.0"), 0, SECOND_PEER_IP, 1);
 
-    first->push_inbound(build_ip_frame(PEER_IP, IPv4Address("224.0.0.252"), 1, IpProtocol::UDP,
-                                       udp_bytes(40000, 5355), 0, 0, MacAddress("01:00:5e:00:00:fc")));
-    first->push_inbound(build_ip_frame(PEER_IP, IPv4Address("239.1.2.3"), 32, IpProtocol::UDP,
-                                       udp_bytes(40000, 5000), 0, 0, MacAddress("01:00:5e:01:02:03")));
+    first->push_inbound(build_ip_frame(PEER_IP, IPv4Address("224.0.0.252"), 1, IpProtocol::UDP, udp_bytes(40000, 5355),
+                                       0, 0, MacAddress("01:00:5e:00:00:fc")));
+    first->push_inbound(build_ip_frame(PEER_IP, IPv4Address("239.1.2.3"), 32, IpProtocol::UDP, udp_bytes(40000, 5000),
+                                       0, 0, MacAddress("01:00:5e:01:02:03")));
     stack->poll();
 
     test_assert(!any_icmp(first->outbound_frames()), "multicast must not draw an ICMP error");
@@ -2472,8 +2478,7 @@ TEST(AnExpiredPacketFromANonUnicastSourceDrawsNoTimeExceeded)
     stack->add_route(IPv4Address("0.0.0.0"), 0, SECOND_PEER_IP, 1);
 
     first->push_inbound(build_ip_frame(IPv4Address("0.0.0.0"), BEHIND_US, 1, IpProtocol::UDP, udp_bytes(1, 2)));
-    first->push_inbound(build_ip_frame(IPv4Address("255.255.255.255"), BEHIND_US, 1, IpProtocol::UDP,
-                                       udp_bytes(1, 2)));
+    first->push_inbound(build_ip_frame(IPv4Address("255.255.255.255"), BEHIND_US, 1, IpProtocol::UDP, udp_bytes(1, 2)));
     first->push_inbound(build_ip_frame(IPv4Address("224.0.0.9"), BEHIND_US, 1, IpProtocol::UDP, udp_bytes(1, 2)));
     stack->poll();
 
@@ -2605,8 +2610,8 @@ TEST(HalfOpenConnectionsPerListeningPortAreCapped)
         }
     }
     test_assert(syn_acks.size() == NetworkStack::MAX_HALF_OPEN_PER_PORT,
-                "only MAX_HALF_OPEN_PER_PORT SYNs may be answered while none completes, got " +
-                    std::to_string(syn_acks.size()));
+                "only MAX_HALF_OPEN_PER_PORT SYNs may be answered while none completes, got "
+                    + std::to_string(syn_acks.size()));
 
     // The cap counts connections still half-open, not ever accepted: one
     // completing its handshake frees a slot for the next SYN.
@@ -2811,8 +2816,8 @@ TEST(AConnectionLeavesTheHalfOpenCountOnceNotOnEveryTransition)
             answered++;
         }
     }
-    test_assert(answered == 1, "exactly one slot was freed, so exactly one new SYN may be answered, got " +
-                                   std::to_string(answered));
+    test_assert(answered == 1,
+                "exactly one slot was freed, so exactly one new SYN may be answered, got " + std::to_string(answered));
 }
 
 TEST(ADirectedBroadcastLeavesByTheInterfaceWhoseNetworkItBelongsTo)
@@ -2842,9 +2847,11 @@ TEST(ADirectedBroadcastLeavesByTheInterfaceWhoseNetworkItBelongsTo)
     for (const Bytes& frame : second->outbound_frames())
     {
         Ethernet eth(frame);
-        if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer()) continue;
+        if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer())
+            continue;
         const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
-        if (!ip || !(IPv4Address(ip->get_dest_address()) == IPv4Address("192.168.5.255"))) continue;
+        if (!ip || !(IPv4Address(ip->get_dest_address()) == IPv4Address("192.168.5.255")))
+            continue;
         found = true;
         test_assert(eth.get_dest() == MacAddress::BROADCAST, "a broadcast goes to the broadcast MAC");
         test_assert(IPv4Address(ip->get_src_address()) == SECOND_IP, "from the second link's own address");
@@ -2949,8 +2956,8 @@ TEST(AReassemblyTimeoutOfAnIcmpErrorDrawsNoTimeExceeded)
     Icmp unreachable(IcmpType::ICMP_DESTINATION_UNREACHABLE, 1, 0, 0, Bytes());
     unreachable /= std::make_unique<Raw>(Bytes(28));
     unreachable.compute_checksum();
-    channel->push_inbound(build_ip_frame(PEER_IP, LOCAL_IP, 64, IpProtocol::ICMP,
-                                         unreachable.to_bytes().slice(0, 16), IP_FLAG_MORE_FRAGMENTS, 0));
+    channel->push_inbound(build_ip_frame(PEER_IP, LOCAL_IP, 64, IpProtocol::ICMP, unreachable.to_bytes().slice(0, 16),
+                                         IP_FLAG_MORE_FRAGMENTS, 0));
     test_assert(!time_exceeded_after_reassembly_timeout(*stack, *channel),
                 "an ICMP error must not draw another, even one that never finished reassembling");
 }
@@ -2967,8 +2974,8 @@ TEST(AUnicastDatagramInALinkLayerBroadcastIsDiscarded)
     stack->poll();
     channel->clear_outbound();
 
-    channel->push_inbound(build_ip_frame(PEER_IP, LOCAL_IP, 64, IpProtocol::UDP, udp_bytes(40000, 9999), 0, 0,
-                                         MacAddress::BROADCAST));
+    channel->push_inbound(
+        build_ip_frame(PEER_IP, LOCAL_IP, 64, IpProtocol::UDP, udp_bytes(40000, 9999), 0, 0, MacAddress::BROADCAST));
     stack->poll();
     test_assert(!any_icmp(channel->outbound_frames()),
                 "a unicast datagram that arrived as a link-layer broadcast draws no Port Unreachable");
@@ -2980,10 +2987,10 @@ TEST(ARouterNeverForwardsAUnicastDatagramThatArrivedAsALinkLayerBroadcast)
     FakePacketChannel* second = nullptr;
     auto stack = make_router(first, second);
 
-    first->push_inbound(build_ip_frame(PEER_IP, BEHIND_US, 64, IpProtocol::UDP, udp_bytes(1, 2), 0, 0,
-                                       MacAddress::BROADCAST));
-    first->push_inbound(build_ip_frame(PEER_IP, BEHIND_US, 1, IpProtocol::UDP, udp_bytes(3, 4), 0, 0,
-                                       MacAddress::BROADCAST));
+    first->push_inbound(
+        build_ip_frame(PEER_IP, BEHIND_US, 64, IpProtocol::UDP, udp_bytes(1, 2), 0, 0, MacAddress::BROADCAST));
+    first->push_inbound(
+        build_ip_frame(PEER_IP, BEHIND_US, 1, IpProtocol::UDP, udp_bytes(3, 4), 0, 0, MacAddress::BROADCAST));
     stack->poll();
 
     test_assert(!find_ip_to(second->outbound_frames(), BEHIND_US).found, "it must not be forwarded");
@@ -3062,11 +3069,14 @@ TEST(TheApplicationCannotBindAPortADnsQueryIsUsing)
     for (const Bytes& frame : channel->outbound_frames())
     {
         Ethernet eth(frame);
-        if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer()) continue;
+        if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer())
+            continue;
         const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
-        if (!ip || ip->get_protocol() != IpProtocol::UDP || !ip->has_next_layer()) continue;
+        if (!ip || ip->get_protocol() != IpProtocol::UDP || !ip->has_next_layer())
+            continue;
         const Udp* udp = dynamic_cast<const Udp*>(&ip->get_next_layer());
-        if (udp && udp->get_dest_port() == 53) query_port = udp->get_src_port();
+        if (udp && udp->get_dest_port() == 53)
+            query_port = udp->get_src_port();
     }
     test_assert(query_port != 0, "precondition: the query went out");
 
@@ -3092,7 +3102,6 @@ TEST(TheApplicationCannotBindAPortADnsQueryIsUsing)
         bound = stack->bind_udp(query_port) != nullptr;
     }
     catch (const std::exception&)
-    {
-    }
+    {}
     test_assert(bound, "a port the resolver has released must be bindable again");
 }

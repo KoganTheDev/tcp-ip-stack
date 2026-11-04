@@ -147,7 +147,7 @@ TEST(PointToPointPrefixesHaveNoDirectedBroadcast)
     host.prefix_length = 32;
     test_assert(!is_broadcast_address(IPv4Address("10.0.0.7"), host), "a /32's only address is the host itself");
 
-    test_assert(is_broadcast_address(IPv4Address("255.255.255.255"), p2p) &&
-                    is_broadcast_address(IPv4Address("255.255.255.255"), host),
+    test_assert(is_broadcast_address(IPv4Address("255.255.255.255"), p2p)
+                    && is_broadcast_address(IPv4Address("255.255.255.255"), host),
                 "the limited broadcast still is one, whatever the prefix");
 }

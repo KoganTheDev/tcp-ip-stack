@@ -354,8 +354,8 @@ void Server::_close_if_finished(uint64_t connection_id)
     // nothing it sent is still unread (anything unread would have been
     // dispatched, and so be in flight, by the time this runs).
     TcpConnection* connection = this->_network_stack.find_connection(connection_id);
-    if (connection == nullptr || this->_in_flight.count(connection_id) > 0 ||
-        connection->get_state() != TcpState::CLOSE_WAIT)
+    if (connection == nullptr || this->_in_flight.count(connection_id) > 0
+        || connection->get_state() != TcpState::CLOSE_WAIT)
     {
         return;
     }

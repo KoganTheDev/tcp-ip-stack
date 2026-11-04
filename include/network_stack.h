@@ -412,8 +412,7 @@ private:
     // The address and ICMP-type rules of _may_report_error_about(), for a
     // caller that has only those facts - the reassembly timeout, whose
     // datagram never finished parsing.
-    bool _may_report_error_for(const IPv4Address& source, const IPv4Address& destination,
-                               bool about_icmp_error) const;
+    bool _may_report_error_for(const IPv4Address& source, const IPv4Address& destination, bool about_icmp_error) const;
     // RFC 792 Time Exceeded, code 1: a datagram whose remaining fragments never
     // arrived, so the reassembly timer ran out. Unlike the other ICMP errors
     // this stack sends, there is no original packet left to quote back - the
