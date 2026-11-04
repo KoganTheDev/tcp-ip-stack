@@ -386,6 +386,11 @@ private:
 
     TcpState _state;
     uint32_t _send_next; // SND.NXT - next sequence number this side will send
+    // SND.MAX (RFC 9293): one past the highest sequence number ever actually
+    // put on the wire. Usually equal to SND.NXT, but a zero-window probe sends
+    // a byte at SND.NXT without advancing it, and a peer that accepts that byte
+    // acks one past SND.NXT. An ack beyond this, though, is for data never sent.
+    uint32_t _send_max;
     uint32_t _recv_next; // RCV.NXT - next sequence number expected from the peer
 
     // the sliding window: ordered oldest-first by sequence number, so the

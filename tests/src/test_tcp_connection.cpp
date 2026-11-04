@@ -1808,3 +1808,62 @@ TEST(InOrderDataOverlappingABufferedSegmentDeliversOnlyItsNewTail)
     test_assert(received.to_hex() == Bytes::from_hex("6162636465666768696a6b6c6d6e6f").to_hex(),
                 "expected \"abcdefghijklmno\" exactly once each, got hex " + received.to_hex());
 }
+
+// RFC 9293 3.10.7.4: an ACK for something not yet sent is answered with an ACK
+// and otherwise ignored. Before, it went straight to the cumulative-ack loop,
+// which retired every in-flight segment it "covered" - data the peer never
+// received, never to be retransmitted - and took an RTT sample from it.
+TEST(AnAckForDataNeverSentIsAnsweredAndIgnored)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent); // SND.NXT = 1001
+
+    connection->send(Bytes::from_hex("6869")); // in flight: [1001, 1003)
+    test_assert(sent.size() == 1, "precondition: the data went out");
+
+    // 2^30 ahead: "after" SND.NXT in modular arithmetic, so it reads as an ack
+    // of everything outstanding and then some
+    sent.clear();
+    connection->on_segment(*make_incoming_segment(501, 1001 + (1u << 30), FLAG_ACK));
+    test_assert(sent.size() == 1 && sent[0].payload.empty() && sent[0].ack == 501,
+                "the bogus ack should be answered with a plain ACK of what we have");
+    test_assert(connection->bytes_unacked() == 2, "and must retire nothing - those 2 bytes are still unacknowledged");
+
+    // The data is still outstanding, so the retransmit timer still covers it.
+    sent.clear();
+    for (int i = 0; i < 20 && sent.empty(); i++)
+    {
+        connection->on_time_passed(TEST_TICK_MS);
+    }
+    test_assert(!sent.empty() && sent[0].seq == 1001 && sent[0].payload.size() == 2,
+                "the unacknowledged data must still be retransmitted");
+}
+
+// The guard on the rule above. A zero-window probe sends one byte at SND.NXT
+// without advancing SND.NXT, so a peer that accepts it legitimately acks
+// SND.NXT + 1. That ack is for data that WAS sent; treating it as "never sent"
+// would drop the window update it carries, the probe would fire again, draw
+// the same ack, and the connection would stall forever.
+TEST(AnAckForAnAcceptedZeroWindowProbeIsHonoured)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 0)); // window shut
+    connection->send(Bytes::from_hex("68656c6c6f"));
+    for (int i = 0; i < 4 && sent.empty(); i++)
+    {
+        connection->on_time_passed(TEST_TICK_MS);
+    }
+    test_assert(sent.size() == 1 && sent[0].seq == 1001 && sent[0].payload.size() == 1, "precondition: one probe");
+
+    // The peer took the probe byte and reopened: it acks 1002, past SND.NXT.
+    size_t before = sent.size();
+    connection->on_segment(*make_incoming_segment_win(501, 1002, FLAG_ACK, 65535));
+    bool released = false;
+    for (size_t i = before; i < sent.size(); i++)
+    {
+        released = released || sent[i].payload.size() >= 4;
+    }
+    test_assert(released, "an ack covering the accepted probe byte must reopen the window and release the data");
+}

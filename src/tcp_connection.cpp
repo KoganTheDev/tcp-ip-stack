@@ -68,7 +68,7 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
                              uint32_t initial_seq, SendSegmentFn send_segment, uint16_t local_mss,
                              CongestionControlAlgorithm algorithm)
     : _id(g_next_connection_id.fetch_add(1)), _local_port(local_port), _remote_ip(remote_ip), _remote_port(remote_port),
-      _state(TcpState::LISTEN), _send_next(initial_seq), _recv_next(0),
+      _state(TcpState::LISTEN), _send_next(initial_seq), _send_max(initial_seq), _recv_next(0),
       // Kept in declaration order. Members are initialised in the order they
       // are declared regardless of the order written here, so any divergence
       // is a lie about what actually happens - and a real hazard the moment
@@ -269,6 +269,10 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
     if (flags & FLAG_FIN)
         consumed += 1;
     _send_next = seq + static_cast<uint32_t>(consumed);
+    if (!seq_at_or_before(_send_next, _send_max))
+    {
+        _send_max = _send_next;
+    }
 
     InFlightSegment entry;
     entry.seq = seq;
@@ -565,6 +569,12 @@ void TcpConnection::_send_zero_window_probe()
     Bytes probe = _send_queue.front().slice(0, 1);
     LOG_DEBUG("TcpConnection[" << _id << "] zero-window probe at seq=" << _send_next);
     _send_segment(_build_header(FLAG_ACK, _send_next), probe);
+    // The byte did go on the wire, so an ack covering it is legitimate - see
+    // _send_max - even though SND.NXT stays put.
+    if (!seq_at_or_before(_send_next + 1, _send_max))
+    {
+        _send_max = _send_next + 1;
+    }
 }
 
 void TcpConnection::set_keepalive(bool enabled)
@@ -1125,6 +1135,18 @@ void TcpConnection::on_segment(const Tcp& segment)
             _ts_recent = their_timestamp;
             _have_ts_recent = true;
         }
+    }
+
+    // RFC 9293 3.10.7.4: an ack for something not yet sent is answered with an
+    // ack of where we really are, and the segment is otherwise dropped. Taken
+    // at face value it would retire in-flight data the peer never received -
+    // never to be retransmitted - and feed the RTT estimator a bogus sample.
+    if (segment.get_ack() && !seq_at_or_before(segment.get_acknowledgement_number(), _send_max))
+    {
+        LOG_DEBUG("TcpConnection[" << _id << "] dropping a segment acking " << segment.get_acknowledgement_number()
+                                   << ", beyond anything sent (SND.MAX " << _send_max << ")");
+        _send_pure_ack();
+        return;
     }
 
     if (segment.get_ack())
