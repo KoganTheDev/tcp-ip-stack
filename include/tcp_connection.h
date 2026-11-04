@@ -243,6 +243,13 @@ public:
     // because it is the number an application needs to reason about how much
     // it can afford not to read.
     static constexpr uint32_t RECEIVE_BUFFER_CAPACITY = 131072; // 128 KiB
+    // How many out-of-order segments the reorder buffer may hold, whatever
+    // their size. The window bounds the bytes but not the count, and each entry
+    // costs a map node and a step of every SACK report - so a peer sending
+    // one-byte segments could otherwise pin memory and CPU far beyond what the
+    // window suggests. A 128 KiB window holds ~90 full-sized segments, so
+    // legitimate traffic never comes near this.
+    static constexpr uint32_t MAX_REORDER_SEGMENTS = 1024;
     // Subscribes to state changes. Additive, not a single slot: NetworkStack
     // installs its own here to know when a connection has finished closing and
     // can be reaped, so a single slot meant an application that registered one

@@ -1220,7 +1220,10 @@ void TcpConnection::on_segment(const Tcp& segment)
                 // RCV.NXT again: that duplicate ack is the signal a sender's
                 // fast retransmit depends on, so it must be sent *immediately*,
                 // never delayed
-                if (_reorder_buffer.find(seq) == _reorder_buffer.end() && _seq_in_receive_window(seq))
+                // ...and within MAX_REORDER_SEGMENTS: past it the segment is
+                // dropped like one outside the window, and the peer resends it
+                if (_reorder_buffer.find(seq) == _reorder_buffer.end() && _seq_in_receive_window(seq)
+                    && _reorder_buffer.size() < MAX_REORDER_SEGMENTS)
                 {
                     _reorder_buffer[seq] = payload;
                     _reorder_buffered_bytes += payload.size();

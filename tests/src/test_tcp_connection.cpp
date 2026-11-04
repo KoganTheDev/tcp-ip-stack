@@ -1867,16 +1867,15 @@ TEST(AnAckForAnAcceptedZeroWindowProbeIsHonoured)
     test_assert(released, "an ack covering the accepted probe byte must reopen the window and release the data");
 }
 
-// The worst case for draining the reorder buffer: tens of thousands of tiny
-// segments straddling the 2^32 wrap. The buffer is keyed by raw uint32_t, so
-// the post-wrap entries sort FIRST while being LAST in sequence order - a
-// drain that rescans from the start walks past all of them for every
-// pre-wrap entry it resolves, quadratic in the entry count, all chosen by the
-// peer (its ISN sets where the wrap falls). Correctness is asserted here; the
-// cost is what the commit that added this measured.
+// Draining many segments straddling the 2^32 wrap. The buffer is keyed by raw
+// uint32_t, so the post-wrap entries sort FIRST while being LAST in sequence
+// order; the drain has to start from the sequence-earliest entry, not from
+// begin(), or it finds a post-wrap entry first, sees it beyond RCV.NXT and
+// stops with the stream incomplete. Sized to fit MAX_REORDER_SEGMENTS (it was
+// once 60,000 segments, measuring the drain's cost before the cap existed).
 TEST(DrainingManySegmentsAcrossTheWrapDeliversTheWholeStreamInOrder)
 {
-    const uint32_t before_wrap = 30000;
+    const uint32_t before_wrap = (TcpConnection::MAX_REORDER_SEGMENTS - 1) / 2;
     const uint32_t rcv_nxt = static_cast<uint32_t>(0x100000000ull - before_wrap);
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent, rcv_nxt - 1);
@@ -1964,4 +1963,46 @@ TEST(LossRightAfterAnAcceptedProbeIsRecoveredByFastRetransmit)
                 "the lost data must be fast-retransmitted on duplicate acks, not left to the timeout");
     test_assert(sent.back().seq == 1002 && sent.back().payload.to_hex() == Bytes::from_hex("656c6c6f").to_hex(),
                 "and what is resent is exactly what the peer lacks: \"ello\" at 1002, not the byte it acked");
+}
+
+// The reorder buffer holds at most MAX_REORDER_SEGMENTS entries. The window
+// bounds its bytes, but not how many segments those bytes arrive in: a peer
+// sending one-byte segments made tens of thousands of map nodes (each far
+// larger than its byte), and every ack sent walks them all to build its SACK
+// blocks. Past the cap a segment is dropped, as when it falls outside the
+// window, and the peer retransmits it.
+TEST(TheReorderBufferHoldsABoundedNumberOfSegments)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent); // RCV.NXT = 501
+
+    Bytes received;
+    connection->set_data_ready_callback([&received, &connection]() { received |= connection->read(); });
+
+    const uint32_t offered = 2 * TcpConnection::MAX_REORDER_SEGMENTS;
+    for (uint32_t i = 1; i <= offered; i++)
+    {
+        connection->on_segment(*make_incoming_segment(501 + i, 1001, FLAG_ACK, Bytes(1)));
+    }
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes(1)));
+
+    test_assert(received.size() == 1 + TcpConnection::MAX_REORDER_SEGMENTS,
+                "only MAX_REORDER_SEGMENTS segments may have been held, got " + std::to_string(received.size() - 1));
+}
+
+// The cost scenario for the cap above: SACK negotiated, and tens of thousands
+// of one-byte segments with a hole after each, so nothing merges and every
+// ack's SACK blocks are built from the whole buffer. Correctness is asserted;
+// the cost is what the commit adding the cap measured.
+TEST(ManyTinyOutOfOrderSegmentsWithSackStayCheap)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_sack_connection(sent); // RCV.NXT = 501
+
+    for (uint32_t i = 0; i < 40000; i++)
+    {
+        connection->on_segment(*make_incoming_segment(503 + 2 * i, 1001, FLAG_ACK, Bytes(1)));
+    }
+    test_assert(!sent.empty() && sent.back().payload.empty() && sent.back().ack == 501,
+                "every out-of-order segment is still answered with a duplicate ack of RCV.NXT");
 }
