@@ -578,6 +578,8 @@ bool NetworkStack::poll()
 
 void NetworkStack::on_time_passed(uint32_t elapsed_ms)
 {
+    this->_now_ms += elapsed_ms;
+
     for (auto& entry : this->_connections)
     {
         try
@@ -1082,13 +1084,33 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
         // it gave up. Dropped silently for the same reason as above.
         //
         auto half_open_it = this->_half_open_per_port.find(key.local_port);
-        size_t half_open = half_open_it == this->_half_open_per_port.end() ? 0 : half_open_it->second;
+        size_t half_open = half_open_it == this->_half_open_per_port.end() ? 0 : half_open_it->second.size();
         if (half_open >= MAX_HALF_OPEN_PER_PORT)
         {
-            LOG_WARNING("NetworkStack: dropping a SYN for port " << key.local_port << " - " << half_open
-                                                                 << " connections are already half-open there."
-                                                                    " This is most likely a SYN flood.");
-            return;
+            // Full. If the oldest has waited far longer than a real client
+            // takes to answer, it is almost certainly a flood's: evict it and
+            // give this SYN its slot. fail() is a transition out of
+            // SYN_RECEIVED, so _track_half_open's callback removes the record;
+            // no RST goes out, and if that client does answer late it gets the
+            // ordinary RST for a segment matching no connection.
+            uint64_t oldest_id = half_open_it->second.begin()->first;
+            uint64_t oldest_created = half_open_it->second.begin()->second;
+            TcpConnection* oldest = this->find_connection(oldest_id);
+            if (oldest != nullptr && this->_now_ms - oldest_created >= HALF_OPEN_EVICT_AGE_MS)
+            {
+                LOG_WARNING("NetworkStack: port " << key.local_port << " has " << half_open
+                                                  << " half-open connections - evicting the oldest, "
+                                                  << (this->_now_ms - oldest_created) << " ms old");
+                oldest->fail();
+            }
+            else
+            {
+                LOG_WARNING("NetworkStack: dropping a SYN for port "
+                            << key.local_port << " - " << half_open
+                            << " connections are already half-open there, none of them stale."
+                               " This is most likely a SYN flood.");
+                return;
+            }
         }
     }
 
@@ -1137,26 +1159,28 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
 
 void NetworkStack::_track_half_open(TcpConnection& connection, uint16_t local_port)
 {
-    this->_half_open_per_port[local_port] += 1;
-    // `counted` makes the decrement happen exactly once: on the first
-    // transition out of SYN_RECEIVED, whichever one that is. It lives behind a
-    // shared_ptr rather than as mutable lambda state on purpose -
-    // TcpConnection::_transition() invokes a *copy* of each subscriber (so a
-    // subscriber can register another without invalidating the iteration), and
-    // state kept inside the lambda would be updated on that throwaway copy and
-    // lost, decrementing again on every later transition. The connection is
+    uint64_t id = connection.get_id();
+    this->_half_open_per_port[local_port][id] = this->_now_ms;
+    // Erasing by id is idempotent, so later transitions (ESTABLISHED ->
+    // CLOSE_WAIT -> ...) need no guard: only the first one out of
+    // SYN_RECEIVED finds the record to remove. (A counter needed a once-only
+    // flag here, and keeping that flag inside the lambda was a bug -
+    // _transition() invokes a copy of each subscriber.) The connection is
     // owned by this stack, so `this` outlives every call.
-    auto counted = std::make_shared<bool>(true);
     connection.add_state_changed_callback(
-        [this, local_port, counted](TcpState new_state)
+        [this, local_port, id](TcpState new_state)
         {
-            if (!*counted || new_state == TcpState::SYN_RECEIVED)
+            if (new_state == TcpState::SYN_RECEIVED)
             {
                 return;
             }
-            *counted = false;
             auto it = this->_half_open_per_port.find(local_port);
-            if (it != this->_half_open_per_port.end() && --it->second == 0)
+            if (it == this->_half_open_per_port.end())
+            {
+                return;
+            }
+            it->second.erase(id);
+            if (it->second.empty())
             {
                 this->_half_open_per_port.erase(it);
             }

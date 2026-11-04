@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <deque>
@@ -191,6 +192,10 @@ public:
     // complete) builds unbounded connections. SYNs beyond it are dropped
     // silently, so a real client's own retransmission gets through later.
     static constexpr size_t MAX_HALF_OPEN_PER_PORT = 64;
+    // When the cap above is full, the oldest half-open connection is evicted
+    // for a new SYN if it has waited at least this long - far longer than a
+    // real client takes to answer a SYN-ACK, so almost certainly a flood's.
+    static constexpr uint32_t HALF_OPEN_EVICT_AGE_MS = 3000;
 
     // Pops one ESTABLISHED connection waiting on this port, or nullptr if
     // none are ready. The returned pointer is owned by NetworkStack for the
@@ -348,9 +353,10 @@ private:
     // method. The actual erase happens later, safely, in
     // _reap_closed_connections().
     void _watch_for_close(TcpConnection& connection);
-    // Counts a freshly accepted SYN_RECEIVED connection against its port, and
-    // uncounts it on its first transition anywhere else - completion, RST,
-    // give-up - which is every way out of the state, so the count cannot leak.
+    // Records a freshly accepted SYN_RECEIVED connection against its port, and
+    // removes it on its first transition anywhere else - completion, RST,
+    // give-up, eviction - which is every way out of the state, so the record
+    // cannot leak.
     void _track_half_open(TcpConnection& connection, uint16_t local_port);
 
     // dont_fragment sets the DF bit, which is what asks the network to report
@@ -586,12 +592,15 @@ private:
     EchoReplyFn _on_echo_reply;
     std::unordered_map<uint16_t, size_t> _listening_ports; // port -> backlog
     std::unordered_map<uint16_t, std::deque<ConnectionKey>> _pending_accepts;
-    // Connections in SYN_RECEIVED per local port, for MAX_HALF_OPEN_PER_PORT.
-    // Kept as a counter so the check on every SYN is O(1) rather than a walk
-    // of the whole connection table - which, under exactly the flood the cap
-    // exists for, would make each SYN cost time proportional to every
-    // connection open. See _track_half_open() for how it stays right.
-    std::unordered_map<uint16_t, size_t> _half_open_per_port;
+    // Connections in SYN_RECEIVED, per local port: connection id -> the stack
+    // clock when it was created. Ids only ever increase, so the map's order is
+    // creation order - begin() is the oldest, which is what eviction needs -
+    // and its size is the half-open count, so the cap check is O(1) rather
+    // than a walk of the whole connection table.
+    std::unordered_map<uint16_t, std::map<uint64_t, uint64_t>> _half_open_per_port;
+    // Milliseconds of on_time_passed() so far - the stack's own clock, for
+    // ageing half-open connections.
+    uint64_t _now_ms = 0;
     std::unordered_map<uint16_t, std::unique_ptr<UdpSocket>> _udp_sockets;
     // Ports bound by the DNS resolver for its outstanding queries. bind_udp()
     // refuses them; the resolver binds through _bind_udp_socket() instead.

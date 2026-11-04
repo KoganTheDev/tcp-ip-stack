@@ -3146,3 +3146,51 @@ TEST(AFragmentationNeededQuotingNoSegmentInFlightIsIgnored)
                 "a report quoting a sequence number never sent must be ignored, got MSS " +
                     std::to_string(connection->get_effective_mss()));
 }
+
+TEST(AStaleHalfOpenConnectionIsEvictedToMakeRoomForANewSyn)
+{
+    // With the cap full, a new SYN used to be dropped whatever was holding the
+    // slots. A half-open connection that has waited far longer than any real
+    // client takes to answer is almost certainly a flood's; the oldest such
+    // is evicted so the new SYN gets a full, option-preserving slot. Only the
+    // oldest goes - younger handshakes are left to complete.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    stack->listen(80);
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+    channel->clear_outbound();
+
+    channel->push_inbound(build_tcp(FLAG_SYN, 1000, 0, 30000, 80)); // the oldest
+    stack->poll();
+    stack->on_time_passed(NetworkStack::HALF_OPEN_EVICT_AGE_MS);
+    for (size_t i = 1; i < NetworkStack::MAX_HALF_OPEN_PER_PORT; i++)
+    {
+        channel->push_inbound(build_tcp(FLAG_SYN, 1000, 0, static_cast<uint16_t>(30000 + i), 80));
+    }
+    for (int i = 0; i < 50; i++)
+    {
+        stack->poll();
+    }
+    uint32_t younger_isn = 0;
+    for (const Bytes& frame : channel->outbound_frames())
+    {
+        TcpView v = view_tcp(frame);
+        if (v.is_tcp && v.syn && v.ack_flag && v.dest_port == 30001)
+        {
+            younger_isn = v.seq;
+        }
+    }
+
+    channel->clear_outbound();
+    channel->push_inbound(build_tcp(FLAG_SYN, 5000, 0, 20000, 80));
+    stack->poll();
+    TcpView answer = find_tcp(channel->outbound_frames());
+    test_assert(answer.is_tcp && answer.syn && answer.ack_flag && answer.dest_port == 20000,
+                "with the oldest half-open connection stale, a new SYN must be answered");
+
+    // a younger handshake was not the one evicted: it still completes
+    channel->push_inbound(build_tcp(FLAG_ACK, 1001, younger_isn + 1, 30001, 80));
+    stack->poll();
+    test_assert(stack->accept(80) != nullptr, "a younger half-open connection must survive the eviction");
+}
