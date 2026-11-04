@@ -2869,3 +2869,72 @@ TEST(ConnectNeverReplacesALiveConnectionWhenThePortCounterWraps)
     test_assert(syn.is_tcp && syn.syn && syn.dest_port == 80, "precondition: the second connect sent its SYN");
     test_assert(found->get_state() == TcpState::SYN_SENT, "and the first is still connecting, untouched");
 }
+
+// --- the reassembly timeout's Time Exceeded obeys the same rules -------------
+//
+// It is the fourth ICMP error sender, and it skipped every rule the other three
+// apply - it only ever knew the source address. A single fragment sent to a
+// broadcast address with a spoofed source then drew Time Exceeded from every
+// host that heard it, all aimed at the victim. RFC 1122 3.3.2 adds one more
+// rule of its own: no reassembly Time Exceeded unless fragment zero arrived.
+
+namespace
+{
+    bool time_exceeded_after_reassembly_timeout(NetworkStack& stack, FakePacketChannel& channel)
+    {
+        stack.poll();
+        channel.clear_outbound();
+        for (int i = 0; i < 40; i++)
+        {
+            stack.on_time_passed(TEST_TICK_MS);
+        }
+        IcmpView icmp = find_icmp(channel.outbound_frames());
+        return icmp.is_icmp && icmp.type == IcmpType::ICMP_TIME_EXCEEDED;
+    }
+}
+
+TEST(AReassemblyTimeoutWithoutFragmentZeroDrawsNoTimeExceeded)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    channel->push_inbound(build_arp_request());
+    channel->push_inbound(build_ip_frame(PEER_IP, LOCAL_IP, 64, IpProtocol::UDP, Bytes(16), 0, 10)); // last piece only
+    test_assert(!time_exceeded_after_reassembly_timeout(*stack, *channel),
+                "without fragment zero there is nothing to quote and no Time Exceeded may be sent");
+}
+
+TEST(AReassemblyTimeoutForABroadcastDrawsNoTimeExceeded)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    channel->push_inbound(build_arp_request());
+    channel->push_inbound(build_ip_frame(PEER_IP, IPv4Address("255.255.255.255"), 64, IpProtocol::UDP, Bytes(16),
+                                         IP_FLAG_MORE_FRAGMENTS, 0, MacAddress::BROADCAST));
+    test_assert(!time_exceeded_after_reassembly_timeout(*stack, *channel),
+                "a fragment sent to a broadcast must not draw an error from every host that heard it");
+}
+
+TEST(AReassemblyTimeoutFromANonUnicastSourceDrawsNoTimeExceeded)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    channel->push_inbound(build_arp_request());
+    channel->push_inbound(build_ip_frame(IPv4Address("255.255.255.255"), LOCAL_IP, 64, IpProtocol::UDP, Bytes(16),
+                                         IP_FLAG_MORE_FRAGMENTS, 0));
+    test_assert(!time_exceeded_after_reassembly_timeout(*stack, *channel),
+                "an error to a broadcast source would go to the whole segment");
+}
+
+TEST(AReassemblyTimeoutOfAnIcmpErrorDrawsNoTimeExceeded)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    channel->push_inbound(build_arp_request());
+    Icmp unreachable(IcmpType::ICMP_DESTINATION_UNREACHABLE, 1, 0, 0, Bytes());
+    unreachable /= std::make_unique<Raw>(Bytes(28));
+    unreachable.compute_checksum();
+    channel->push_inbound(build_ip_frame(PEER_IP, LOCAL_IP, 64, IpProtocol::ICMP,
+                                         unreachable.to_bytes().slice(0, 16), IP_FLAG_MORE_FRAGMENTS, 0));
+    test_assert(!time_exceeded_after_reassembly_timeout(*stack, *channel),
+                "an ICMP error must not draw another, even one that never finished reassembling");
+}

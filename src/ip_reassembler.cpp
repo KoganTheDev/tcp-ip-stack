@@ -174,7 +174,7 @@ void IpReassembler::_drop(const Key& key)
     this->_partials.erase(it);
 }
 
-void IpReassembler::age(uint32_t elapsed_ms, std::vector<IPv4Address>& expired_sources)
+void IpReassembler::age(uint32_t elapsed_ms, std::vector<Expired>& expired)
 {
     for (auto it = this->_partials.begin(); it != this->_partials.end();)
     {
@@ -183,7 +183,16 @@ void IpReassembler::age(uint32_t elapsed_ms, std::vector<IPv4Address>& expired_s
         {
             LOG_WARNING("IpReassembler: a partial datagram from " << it->second.source.to_string() << " timed out with "
                                                                   << it->second.received_bytes << " bytes buffered");
-            expired_sources.push_back(it->second.source);
+            Expired dropped;
+            dropped.source = it->first.source;
+            dropped.destination = it->first.destination;
+            dropped.protocol = it->first.protocol;
+            auto first = it->second.fragments.find(0);
+            if (first != it->second.fragments.end())
+            {
+                dropped.first_bytes = first->second.slice(0, std::min<size_t>(8, first->second.size()));
+            }
+            expired.push_back(dropped);
             this->_buffered_bytes -= it->second.received_bytes;
             it = this->_partials.erase(it);
         }

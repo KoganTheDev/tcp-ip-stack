@@ -576,11 +576,26 @@ void NetworkStack::on_time_passed(uint32_t elapsed_ms)
     // A datagram whose remaining fragments never arrived is dropped, and the
     // sender told: RFC 792 Time Exceeded, code 1. Without it the peer waits on
     // something nobody will ever deliver.
-    std::vector<IPv4Address> expired;
+    //
+    // Subject to the same rules as every other error (see
+    // _may_report_error_for), plus RFC 1122 3.3.2's own: only if fragment zero
+    // arrived. Without these, one fragment sent to a broadcast with a spoofed
+    // source drew Time Exceeded from every host that heard it.
+    std::vector<IpReassembler::Expired> expired;
     this->_reassembler.age(elapsed_ms, expired);
-    for (const IPv4Address& source : expired)
+    for (const IpReassembler::Expired& datagram : expired)
     {
-        this->_send_icmp_fragment_reassembly_time_exceeded(source);
+        if (datagram.first_bytes.empty())
+        {
+            continue;
+        }
+        bool about_icmp_error =
+            datagram.protocol == IpProtocol::ICMP && is_icmp_error_type(datagram.first_bytes[0]);
+        if (!this->_may_report_error_for(datagram.source, datagram.destination, about_icmp_error))
+        {
+            continue;
+        }
+        this->_send_icmp_fragment_reassembly_time_exceeded(datagram.source);
     }
 
     // Per interface, because an unanswered request on one link says nothing
@@ -1990,14 +2005,13 @@ void NetworkStack::_send_icmp_message(const IPv4Address& dest_ip, const Icmp& he
     this->_send_ip_packet(dest_ip, IpProtocol::ICMP, message.to_bytes());
 }
 
-bool NetworkStack::_may_report_error_about(const Ip& ip) const
+bool NetworkStack::_may_report_error_for(const IPv4Address& source, const IPv4Address& destination,
+                                        bool about_icmp_error) const
 {
     // RFC 1122 3.2.2 and RFC 1812 4.3.2.7: the packets an ICMP error must
     // never be sent about. Separate from _may_send_icmp_error(), which limits
     // how many legitimate errors go out - these are never legitimate, and are
     // checked first so they do not spend that budget either.
-    IPv4Address source(ip.get_src_address());
-    IPv4Address destination(ip.get_dest_address());
 
     // Not to a single host: there is nobody, or everybody, to send it to.
     if (source == IPv4Address("0.0.0.0") || (source.get_address()[0] == 127) || is_multicast(source) ||
@@ -2012,6 +2026,13 @@ bool NetworkStack::_may_report_error_about(const Ip& ip) const
         return false;
     }
 
+    // Never about an error: two hosts that each think the other is wrong
+    // would trade them indefinitely.
+    return !about_icmp_error;
+}
+
+bool NetworkStack::_may_report_error_about(const Ip& ip) const
+{
     // Only about the first fragment - it alone carries the transport header
     // a quote is for, and one error per datagram is enough.
     if (ip.get_fragment_offset() != 0)
@@ -2019,14 +2040,12 @@ bool NetworkStack::_may_report_error_about(const Ip& ip) const
         return false;
     }
 
-    // Never about an error: two hosts that each think the other is wrong
-    // would trade them indefinitely.
-    //
-    // The type is read from whichever form the payload is in. A complete
-    // datagram's is parsed into an Icmp, but a first fragment's is left as Raw
-    // by the codec - and offset 0 means the fragment rule above let it
-    // through. If the type cannot be read at all, refuse: an error not sent is
-    // a missed diagnostic, an error about an error is a potential loop.
+    // Whether this is itself an ICMP error. The type is read from whichever
+    // form the payload is in: a complete datagram's is parsed into an Icmp,
+    // but a first fragment's is left as Raw by the codec. If the type cannot
+    // be read at all, refuse: an error not sent is a missed diagnostic, an
+    // error about an error is a potential loop.
+    bool about_icmp_error = false;
     if (ip.get_protocol() == IpProtocol::ICMP)
     {
         if (!ip.has_next_layer())
@@ -2036,16 +2055,21 @@ bool NetworkStack::_may_report_error_about(const Ip& ip) const
         const ProtocolLayer& payload = ip.get_next_layer();
         if (const Icmp* icmp = dynamic_cast<const Icmp*>(&payload))
         {
-            return !is_icmp_error_type(icmp->get_type());
+            about_icmp_error = is_icmp_error_type(icmp->get_type());
         }
-        const Raw* raw = dynamic_cast<const Raw*>(&payload);
-        if (raw == nullptr || raw->get_data().empty())
+        else
         {
-            return false;
+            const Raw* raw = dynamic_cast<const Raw*>(&payload);
+            if (raw == nullptr || raw->get_data().empty())
+            {
+                return false;
+            }
+            about_icmp_error = is_icmp_error_type(raw->get_data()[0]);
         }
-        return !is_icmp_error_type(raw->get_data()[0]);
     }
-    return true;
+
+    return this->_may_report_error_for(IPv4Address(ip.get_src_address()), IPv4Address(ip.get_dest_address()),
+                                       about_icmp_error);
 }
 
 void NetworkStack::_send_icmp_time_exceeded(const Ip& ip)

@@ -145,7 +145,7 @@ TEST(IncompleteDatagramsExpireAndNameTheirSender)
     Bytes out;
     offer(reassembler, 0, true, filled(8, 0xAA), out);
 
-    std::vector<IPv4Address> expired;
+    std::vector<IpReassembler::Expired> expired;
     reassembler.age(TEST_TICK_MS, expired);
     reassembler.age(TEST_TICK_MS, expired);
     test_assert(expired.empty() && reassembler.pending_datagrams() == 1,
@@ -155,8 +155,10 @@ TEST(IncompleteDatagramsExpireAndNameTheirSender)
     test_assert(reassembler.pending_datagrams() == 0,
                 "a datagram whose fragments never arrived must not be held forever");
     test_assert(
-        expired.size() == 1 && expired[0] == SRC,
+        expired.size() == 1 && expired[0].source == SRC,
         "the sender must be reported so it can be told - it is otherwise waiting on a datagram nobody will deliver");
+    test_assert(expired[0].first_bytes == filled(8, 0xAA),
+                "with fragment zero's first bytes, which is what tells the caller it may report at all");
     test_assert(reassembler.buffered_bytes() == 0, "the buffer must be released");
 }
 

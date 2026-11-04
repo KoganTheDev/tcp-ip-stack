@@ -53,11 +53,22 @@ public:
     Result offer(const IPv4Address& source, const IPv4Address& destination, uint16_t identification, uint8_t protocol,
                  uint16_t fragment_offset, bool more_fragments, const Bytes& payload, Bytes& out_datagram);
 
-    // Ages every partial datagram and drops those that ran out of time. The
-    // source address of each expired one is appended to expired_sources, so the
-    // caller can send an ICMP Time Exceeded to each - this class knows nothing
-    // about ICMP and should not.
-    void age(uint32_t elapsed_ms, std::vector<IPv4Address>& expired_sources);
+    // What is known about a datagram that timed out - enough for the caller to
+    // decide whether an ICMP Time Exceeded may be sent about it at all (this
+    // class knows nothing about ICMP and should not).
+    struct Expired
+    {
+        IPv4Address source;
+        IPv4Address destination;
+        uint8_t protocol = 0;
+        // The first bytes (up to 8) of fragment zero, or empty if fragment
+        // zero never arrived - RFC 1122 3.3.2 allows the error only if it did.
+        Bytes first_bytes;
+    };
+
+    // Ages every partial datagram and drops those that ran out of time,
+    // appending each one dropped to `expired`.
+    void age(uint32_t elapsed_ms, std::vector<Expired>& expired);
 
     size_t pending_datagrams() const { return _partials.size(); }
     size_t buffered_bytes() const { return _buffered_bytes; }
