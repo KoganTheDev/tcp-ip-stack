@@ -2798,3 +2798,41 @@ TEST(AConnectionLeavesTheHalfOpenCountOnceNotOnEveryTransition)
     test_assert(answered == 1, "exactly one slot was freed, so exactly one new SYN may be answered, got " +
                                    std::to_string(answered));
 }
+
+TEST(ADirectedBroadcastLeavesByTheInterfaceWhoseNetworkItBelongsTo)
+{
+    // _route_for used to send every broadcast out of interface 0. For
+    // 192.168.5.255 - the second link's directed broadcast - interface 0 does
+    // not recognise it as a broadcast, so resolving it went to ARP, found
+    // nothing, and threw "No ARP entry" straight out of send_to() into the
+    // application.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_two_interface_stack(first, second);
+
+    UdpSocket* socket = stack->bind_udp(7000);
+    bool threw = false;
+    try
+    {
+        socket->send_to(IPv4Address("192.168.5.255"), 7001, Bytes::from_hex("aabb"));
+    }
+    catch (const std::exception&)
+    {
+        threw = true;
+    }
+    test_assert(!threw, "sending to a directed broadcast must not throw");
+
+    bool found = false;
+    for (const Bytes& frame : second->outbound_frames())
+    {
+        Ethernet eth(frame);
+        if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer()) continue;
+        const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
+        if (!ip || !(IPv4Address(ip->get_dest_address()) == IPv4Address("192.168.5.255"))) continue;
+        found = true;
+        test_assert(eth.get_dest() == MacAddress::BROADCAST, "a broadcast goes to the broadcast MAC");
+        test_assert(IPv4Address(ip->get_src_address()) == SECOND_IP, "from the second link's own address");
+    }
+    test_assert(found, "the datagram must leave by the second interface");
+    test_assert(!contains_udp(first->outbound_frames()), "and not by the first");
+}

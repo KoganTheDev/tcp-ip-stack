@@ -1399,8 +1399,21 @@ bool NetworkStack::_route_for(const IPv4Address& destination, IPv4Address& out_n
     // non-primary link is not mistaken for a unicast address that needs ARP.
     if (this->_is_broadcast_for_any_interface(destination))
     {
+        // Out of the link it is the broadcast OF: 192.168.5.255 belongs to
+        // whichever interface is on 192.168.5.0/24, and only that interface's
+        // _resolve_mac() recognises it as broadcast - any other would try to
+        // ARP for it and throw. The limited broadcast (255.255.255.255) is
+        // every interface's, so it takes the first one, as it always did.
         out_next_hop = destination;
         out_interface_index = 0;
+        for (size_t index = 0; index < this->_interfaces.size(); index++)
+        {
+            if (is_broadcast_address(destination, this->_interfaces[index]->config))
+            {
+                out_interface_index = index;
+                break;
+            }
+        }
         return true;
     }
 
