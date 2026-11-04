@@ -1,6 +1,7 @@
 #pragma once
 
 #include <unordered_map>
+#include <unordered_set>
 #include <deque>
 #include <vector>
 #include <memory>
@@ -214,7 +215,9 @@ public:
 
     // Binds a UdpSocket to a local port and returns it, owned by NetworkStack.
     // Calling this twice for the same port returns the same socket rather than
-    // creating a second one bound to it.
+    // creating a second one bound to it. Throws if the port is in use by an
+    // outstanding DNS query (resolve()): handing over that socket would let the
+    // resolver free it out from under the caller when the query finishes.
     UdpSocket* bind_udp(uint16_t port);
 
     // Releases a port bound by bind_udp(). Any datagram arriving for it
@@ -370,6 +373,8 @@ private:
     void _send_udp_datagram(const IPv4Address& dest_ip, const Udp& header, const Bytes& payload);
     // Flushes every datagram queued for ip once its MAC has just been learned.
     void _flush_pending_outbound_datagrams(size_t index, const IPv4Address& ip);
+    // bind_udp() without the resolver-port check - for the resolver itself.
+    UdpSocket* _bind_udp_socket(uint16_t port);
     // Rebuilds a fresh Icmp from header's type/code/rest_of_header (same
     // non-copyable-ProtocolLayer reason as _send_tcp_segment/
     // _send_udp_datagram), attaches payload, computes the checksum, and
@@ -589,6 +594,9 @@ private:
     // connection open. See _track_half_open() for how it stays right.
     std::unordered_map<uint16_t, size_t> _half_open_per_port;
     std::unordered_map<uint16_t, std::unique_ptr<UdpSocket>> _udp_sockets;
+    // Ports bound by the DNS resolver for its outstanding queries. bind_udp()
+    // refuses them; the resolver binds through _bind_udp_socket() instead.
+    std::unordered_set<uint16_t> _resolver_ports;
     std::unordered_map<ConnectionKey, std::unique_ptr<TcpConnection>, ConnectionKeyHash> _connections;
     // id -> key, not id -> TcpConnection* - find_connection() and reaping
     // both need to reach the owning entry in _connections (keyed by

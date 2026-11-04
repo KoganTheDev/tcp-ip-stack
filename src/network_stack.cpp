@@ -360,7 +360,8 @@ DnsResolver& NetworkStack::_ensure_dns_resolver()
             // fixed port for all DNS would hand an off-path attacker 16 bits
             // of the answer for free - the exact weakness Kaminsky's 2008 work
             // made unignorable.
-            UdpSocket* socket = this->bind_udp(source_port);
+            UdpSocket* socket = this->_bind_udp_socket(source_port);
+            this->_resolver_ports.insert(source_port);
             socket->set_datagram_received_callback(
                 [this, source_port](const IPv4Address& src, uint16_t src_port, const Bytes& data)
                 {
@@ -379,7 +380,12 @@ DnsResolver& NetworkStack::_ensure_dns_resolver()
 
     // The other half of "a fresh port per query". Without this the sockets
     // bound above accumulate one per lookup, forever - see unbind_udp().
-    this->_dns_resolver->set_release_port_callback([this](uint16_t source_port) { this->unbind_udp(source_port); });
+    this->_dns_resolver->set_release_port_callback(
+        [this](uint16_t source_port)
+        {
+            this->_resolver_ports.erase(source_port);
+            this->unbind_udp(source_port);
+        });
     // And the guard on that socket-per-query: never choose a port something
     // else already has bound, or bind_udp() above returns that socket.
     this->_dns_resolver->set_port_in_use_callback([this](uint16_t port)
@@ -463,6 +469,15 @@ DhcpClient* NetworkStack::start_dhcp()
 }
 
 UdpSocket* NetworkStack::bind_udp(uint16_t port)
+{
+    if (this->_resolver_ports.count(port) > 0)
+    {
+        throw EXCEPTION(BaseException, "UDP port " + std::to_string(port) + " is in use by a DNS query");
+    }
+    return this->_bind_udp_socket(port);
+}
+
+UdpSocket* NetworkStack::_bind_udp_socket(uint16_t port)
 {
     auto existing_it = this->_udp_sockets.find(port);
     if (existing_it != this->_udp_sockets.end())

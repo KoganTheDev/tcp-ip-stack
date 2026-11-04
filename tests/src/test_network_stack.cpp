@@ -3029,3 +3029,59 @@ TEST(ADirectedBroadcastForAnotherLinkIsNeitherForwardedNorResolved)
     test_assert(!find_ip_to(second->outbound_frames(), second_broadcast).found,
                 "a directed broadcast must not be relayed even once something claims that address");
 }
+
+TEST(TheApplicationCannotBindAPortADnsQueryIsUsing)
+{
+    // The reverse of ADnsQueryNeverTakesOverAPortTheApplicationBound. bind_udp()
+    // returns whatever socket already owns a port, so an application binding a
+    // port while a query owned it got the resolver's socket: it overwrote the
+    // callback, and when the query finished the resolver's unbind_udp() freed
+    // the socket the application was holding. Refused now, as bind() would
+    // with EADDRINUSE.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+    channel->clear_outbound();
+
+    stack->set_dns_servers({PEER_IP});
+    stack->resolve("example.com", [](const std::string&, const std::vector<IPv4Address>&) {});
+
+    uint16_t query_port = 0;
+    for (const Bytes& frame : channel->outbound_frames())
+    {
+        Ethernet eth(frame);
+        if (eth.get_ethernet_protocol() != EtherType::IPv4 || !eth.has_next_layer()) continue;
+        const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
+        if (!ip || ip->get_protocol() != IpProtocol::UDP || !ip->has_next_layer()) continue;
+        const Udp* udp = dynamic_cast<const Udp*>(&ip->get_next_layer());
+        if (udp && udp->get_dest_port() == 53) query_port = udp->get_src_port();
+    }
+    test_assert(query_port != 0, "precondition: the query went out");
+
+    bool refused = false;
+    try
+    {
+        stack->bind_udp(query_port);
+    }
+    catch (const std::exception&)
+    {
+        refused = true;
+    }
+    test_assert(refused, "binding a port an outstanding DNS query owns must be refused, not handed its socket");
+
+    // Once the query is over (here: it gives up), the port is free again.
+    for (int i = 0; i < 120; i++)
+    {
+        stack->on_time_passed(1000);
+    }
+    bool bound = false;
+    try
+    {
+        bound = stack->bind_udp(query_port) != nullptr;
+    }
+    catch (const std::exception&)
+    {
+    }
+    test_assert(bound, "a port the resolver has released must be bindable again");
+}
