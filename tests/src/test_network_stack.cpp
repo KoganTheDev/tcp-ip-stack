@@ -2372,3 +2372,184 @@ TEST(ADnsQueryNeverTakesOverAPortTheApplicationBound)
                     "the application's socket on port " + std::to_string(port) + " was torn down by the resolver");
     }
 }
+
+// --- when an ICMP error must NOT be sent (RFC 1122 3.2.2, RFC 1812 4.3.2.7) ---
+//
+// Errors exist to tell one sender about one of its packets. Sending one about a
+// broadcast or multicast multiplies a single packet into a reply from every
+// host that heard it; sending one about an error invites two hosts to answer
+// each other forever; sending one to a source that is not a single host has
+// nobody to go to. Each test below would draw an error without the rules.
+
+namespace
+{
+    Bytes build_ip_frame(const IPv4Address& source, const IPv4Address& destination, uint8_t ttl, uint8_t protocol,
+                         const Bytes& payload, uint8_t flags = 0, uint16_t fragment_offset = 0,
+                         const MacAddress& dest_mac = LOCAL_MAC)
+    {
+        auto ip = std::make_unique<Ip>(4, 5, 0, static_cast<uint16_t>(20 + payload.size()), 0x4242, flags,
+                                       fragment_offset, ttl, protocol, 0, source.get_address(),
+                                       destination.get_address());
+        *ip /= std::make_unique<Raw>(payload);
+        ip->compute_checksum();
+        Ethernet eth(PEER_MAC, dest_mac, EtherType::IPv4);
+        eth /= std::move(ip);
+        return eth.to_bytes();
+    }
+
+    Bytes udp_bytes(uint16_t src_port, uint16_t dest_port)
+    {
+        Udp udp(src_port, dest_port, 10, 0, Bytes());
+        udp /= std::make_unique<Raw>(Bytes::from_hex("d0d0"));
+        return udp.to_bytes();
+    }
+
+    bool any_icmp(const std::vector<Bytes>& frames) { return find_icmp(frames).is_icmp; }
+}
+
+TEST(ABroadcastToAnUnboundPortDrawsNoPortUnreachable)
+{
+    // RFC 1122 3.2.2. Every host on the segment hears the broadcast, and a host
+    // with nothing on that port answering it is how one datagram becomes a
+    // reply from the whole segment.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+    channel->clear_outbound();
+
+    channel->push_inbound(build_ip_frame(PEER_IP, IPv4Address("255.255.255.255"), 64, IpProtocol::UDP,
+                                         udp_bytes(40000, 9999), 0, 0, MacAddress::BROADCAST));
+    stack->poll();
+    test_assert(!any_icmp(channel->outbound_frames()), "no ICMP error may answer a broadcast");
+}
+
+TEST(AMulticastPacketIsNeitherForwardedNorAnsweredWithAnError)
+{
+    // Link-local multicast (LLMNR to 224.0.0.252, mDNS) routinely has TTL 1.
+    // The MAC filter accepts multicast frames, so without a check this reached
+    // the forwarding path as transit traffic and drew Time Exceeded - aimed at
+    // every LLMNR query on the segment. This stack does no multicast routing.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_router(first, second);
+    // A default route out of the second link, so that a multicast packet
+    // treated as unicast transit traffic really would be forwarded - without
+    // it, "not forwarded" holds trivially and proves nothing.
+    stack->add_route(IPv4Address("0.0.0.0"), 0, SECOND_PEER_IP, 1);
+
+    first->push_inbound(build_ip_frame(PEER_IP, IPv4Address("224.0.0.252"), 1, IpProtocol::UDP,
+                                       udp_bytes(40000, 5355), 0, 0, MacAddress("01:00:5e:00:00:fc")));
+    first->push_inbound(build_ip_frame(PEER_IP, IPv4Address("239.1.2.3"), 32, IpProtocol::UDP,
+                                       udp_bytes(40000, 5000), 0, 0, MacAddress("01:00:5e:01:02:03")));
+    stack->poll();
+
+    test_assert(!any_icmp(first->outbound_frames()), "multicast must not draw an ICMP error");
+    test_assert(!find_ip_to(second->outbound_frames(), IPv4Address("239.1.2.3")).found,
+                "and must not be forwarded - this stack does not route multicast");
+}
+
+TEST(AnExpiredPacketFromANonUnicastSourceDrawsNoTimeExceeded)
+{
+    // The error would go to 0.0.0.0 or to everyone - neither is one sender.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_router(first, second);
+
+    first->push_inbound(build_ip_frame(IPv4Address("0.0.0.0"), BEHIND_US, 1, IpProtocol::UDP, udp_bytes(1, 2)));
+    first->push_inbound(build_ip_frame(IPv4Address("255.255.255.255"), BEHIND_US, 1, IpProtocol::UDP,
+                                       udp_bytes(1, 2)));
+    first->push_inbound(build_ip_frame(IPv4Address("224.0.0.9"), BEHIND_US, 1, IpProtocol::UDP, udp_bytes(1, 2)));
+    stack->poll();
+
+    test_assert(!any_icmp(first->outbound_frames()) && !any_icmp(second->outbound_frames()),
+                "no error may be sent to an unspecified, broadcast or multicast source");
+}
+
+TEST(AnExpiredIcmpErrorDrawsNoTimeExceeded)
+{
+    // An error about an error is how two routers that each consider the other
+    // wrong end up exchanging them indefinitely.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_router(first, second);
+
+    Icmp unreachable(IcmpType::ICMP_DESTINATION_UNREACHABLE, 1, 0, 0, Bytes());
+    unreachable /= std::make_unique<Raw>(Bytes(28));
+    unreachable.compute_checksum();
+    first->push_inbound(build_ip_frame(PEER_IP, BEHIND_US, 1, IpProtocol::ICMP, unreachable.to_bytes()));
+    stack->poll();
+
+    test_assert(!any_icmp(first->outbound_frames()), "an ICMP error must never draw another ICMP error");
+}
+
+TEST(AnExpiredEchoRequestStillDrawsTimeExceeded)
+{
+    // The control for the test above: only ICMP *errors* are exempt. A ping
+    // that runs out of TTL is exactly what traceroute -I sends.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_router(first, second);
+
+    Icmp echo(IcmpType::ICMP_ECHO_REQUEST, ICMP_CODE_NONE, 0, 0x00010001, Bytes());
+    echo /= std::make_unique<Raw>(Bytes::from_hex("abcd"));
+    echo.compute_checksum();
+    first->push_inbound(build_ip_frame(PEER_IP, BEHIND_US, 1, IpProtocol::ICMP, echo.to_bytes()));
+    stack->poll();
+
+    IcmpView reply = find_icmp(first->outbound_frames());
+    test_assert(reply.is_icmp && reply.type == IcmpType::ICMP_TIME_EXCEEDED,
+                "an expiring echo request must still be reported");
+}
+
+TEST(AnExpiredNonFirstFragmentDrawsNoTimeExceeded)
+{
+    // Only the first fragment carries the transport header the quote is for,
+    // and one error per datagram is enough - not one per fragment.
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_router(first, second);
+
+    first->push_inbound(build_ip_frame(PEER_IP, BEHIND_US, 1, IpProtocol::UDP, Bytes(16), 0, 185));
+    stack->poll();
+
+    test_assert(!any_icmp(first->outbound_frames()), "a non-first fragment must not draw an ICMP error");
+}
+
+TEST(AnErrorQuotesTheWholeHeaderPlusEightBytesEvenWithOptions)
+{
+    // RFC 792: the quote is the offending IP header plus the first 8 bytes of
+    // its payload - which for UDP or TCP are the ports the sender needs to
+    // identify the flow. A fixed 28-byte quote of a 24-byte header keeps only
+    // 4 of those 8 bytes.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+    channel->clear_outbound();
+
+    Bytes frame = build_ip_frame(PEER_IP, LOCAL_IP, 64, IpProtocol::UDP, udp_bytes(40000, 9999));
+    const size_t ip_start = 14;
+    Bytes optioned = frame.slice(0, ip_start + 20);
+    optioned |= Bytes::from_hex("94040000"); // Router Alert
+    optioned |= frame.slice(ip_start + 20, frame.size() - ip_start - 20);
+    optioned[ip_start] = 0x46;
+    uint16_t total_length = static_cast<uint16_t>(optioned.size() - ip_start);
+    optioned[ip_start + 2] = static_cast<byte_t>(total_length >> 8);
+    optioned[ip_start + 3] = static_cast<byte_t>(total_length & 0xff);
+    optioned[ip_start + 10] = 0;
+    optioned[ip_start + 11] = 0;
+    uint16_t checksum = internet_checksum(optioned.slice(ip_start, 24));
+    optioned[ip_start + 10] = static_cast<byte_t>(checksum >> 8);
+    optioned[ip_start + 11] = static_cast<byte_t>(checksum & 0xff);
+
+    channel->push_inbound(optioned);
+    stack->poll();
+
+    IcmpView reply = find_icmp(channel->outbound_frames());
+    test_assert(reply.is_icmp && reply.code == ICMP_CODE_PORT_UNREACHABLE, "an unbound port draws Port Unreachable");
+    test_assert(reply.payload.size() == 24 + 8,
+                "the quote must be the 24-byte header plus 8 bytes, got " + std::to_string(reply.payload.size()));
+    test_assert(reply.payload.size() >= 28 && reply.payload.slice_int<uint16_t>(26) == 9999,
+                "including the destination port, which is what the sender matches on");
+}

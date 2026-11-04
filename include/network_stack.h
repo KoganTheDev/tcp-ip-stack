@@ -386,6 +386,12 @@ private:
     // that stream at somebody else by spoofing a source address. That is
     // reflection, and an error larger than its trigger makes it amplification.
     bool _may_send_icmp_error();
+    // Whether an ICMP error about this packet may be sent at all - never about
+    // a broadcast or multicast, a non-first fragment or another ICMP error, and
+    // never to a source that is not a single host (RFC 1122 3.2.2, RFC 1812
+    // 4.3.2.7). Checked before _may_send_icmp_error() so a forbidden error does
+    // not spend the rate-limit budget.
+    bool _may_report_error_about(const Ip& ip) const;
     // RFC 792 Time Exceeded, code 1: a datagram whose remaining fragments never
     // arrived, so the reassembly timer ran out. Unlike the other ICMP errors
     // this stack sends, there is no original packet left to quote back - the

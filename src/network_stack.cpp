@@ -35,6 +35,31 @@ namespace
     constexpr uint8_t FLAG_SYN = 0x02;
     constexpr uint8_t FLAG_FIN = 0x01;
 
+    // 224.0.0.0/4. Class E (240.0.0.0/4) is not multicast, but is no more a
+    // single host's address, so callers asking "is this one host" test both.
+    bool is_multicast(const IPv4Address& address) { return (address.get_address()[0] & 0xF0) == 0xE0; }
+    bool is_class_e(const IPv4Address& address) { return (address.get_address()[0] & 0xF0) == 0xF0; }
+
+    // The ICMP types that are themselves error reports (RFC 1122 3.2.2 lists
+    // them): Destination Unreachable, Source Quench, Redirect, Time Exceeded,
+    // Parameter Problem. Queries such as echo are not.
+    bool is_icmp_error_type(uint8_t type)
+    {
+        return type == 3 || type == 4 || type == 5 || type == 11 || type == 12;
+    }
+
+    // RFC 792: an error quotes the offending packet's IP header - all of it,
+    // options included - plus the first 8 bytes of its payload. Those 8 bytes
+    // are the ports (or ICMP id/sequence) the sender identifies the flow by,
+    // so a quote sized for a 20-byte header cuts them off whenever there are
+    // options.
+    Bytes icmp_error_quote(const Ip& ip)
+    {
+        Bytes original = const_cast<Ip&>(ip).to_bytes();
+        size_t wanted = static_cast<size_t>(ip.get_IHL()) * 4 + 8;
+        return original.slice(0, std::min(wanted, original.size()));
+    }
+
     // The MSS this stack advertises and the point at which a datagram has to
     // be fragmented both come from InterfaceConfig now - see local_mss() and
     // max_ip_payload() there. They were fixed at the 1500 an Ethernet TAP
@@ -775,6 +800,15 @@ void NetworkStack::_handle_ip(size_t ingress, const Ip& ip, const Bytes& ip_byte
             break;
         }
     }
+    // Multicast is accepted at the link layer (the MAC filter passes any group
+    // address), but this stack joins no groups and routes none. Without this it
+    // fell through to forwarding as if it were somebody else's unicast, which
+    // is how link-local multicast with TTL 1 drew a Time Exceeded per packet.
+    if (is_multicast(destination))
+    {
+        return;
+    }
+
     if (!addressed_to_us && !is_broadcast_address(destination, this->_interfaces.at(ingress)->config))
     {
         // Somebody else's packet. Forwarding is the whole of what separates a
@@ -1839,17 +1873,54 @@ void NetworkStack::_send_icmp_message(const IPv4Address& dest_ip, const Icmp& he
     this->_send_ip_packet(dest_ip, IpProtocol::ICMP, message.to_bytes());
 }
 
-namespace
+bool NetworkStack::_may_report_error_about(const Ip& ip) const
 {
-    // RFC 792: an error carries the offending IP header plus the first 8 bytes
-    // of its payload - enough for the sender to identify the flow (the ports
-    // for TCP/UDP, the identifier and sequence for an echo) without the router
-    // having to understand the protocol it is reporting on.
-    constexpr size_t ICMP_QUOTED_BYTES = 28;
+    // RFC 1122 3.2.2 and RFC 1812 4.3.2.7: the packets an ICMP error must
+    // never be sent about. Separate from _may_send_icmp_error(), which limits
+    // how many legitimate errors go out - these are never legitimate, and are
+    // checked first so they do not spend that budget either.
+    IPv4Address source(ip.get_src_address());
+    IPv4Address destination(ip.get_dest_address());
+
+    // Not to a single host: there is nobody, or everybody, to send it to.
+    if (source == IPv4Address("0.0.0.0") || (source.get_address()[0] == 127) || is_multicast(source) ||
+        is_class_e(source) || this->_is_broadcast_for_any_interface(source))
+    {
+        return false;
+    }
+
+    // Not about a packet sent to many hosts: each of them would answer.
+    if (is_multicast(destination) || this->_is_broadcast_for_any_interface(destination))
+    {
+        return false;
+    }
+
+    // Only about the first fragment - it alone carries the transport header
+    // a quote is for, and one error per datagram is enough.
+    if (ip.get_fragment_offset() != 0)
+    {
+        return false;
+    }
+
+    // Never about an error: two hosts that each think the other is wrong
+    // would trade them indefinitely.
+    if (ip.get_protocol() == IpProtocol::ICMP && ip.has_next_layer())
+    {
+        const Icmp* icmp = dynamic_cast<const Icmp*>(&ip.get_next_layer());
+        if (icmp != nullptr && is_icmp_error_type(icmp->get_type()))
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 void NetworkStack::_send_icmp_time_exceeded(const Ip& ip)
 {
+    if (!this->_may_report_error_about(ip))
+    {
+        return;
+    }
     if (!this->_may_send_icmp_error())
     {
         LOG_DEBUG("NetworkStack: suppressing an ICMP Time Exceeded - error budget exhausted");
@@ -1857,8 +1928,7 @@ void NetworkStack::_send_icmp_time_exceeded(const Ip& ip)
     }
 
     IPv4Address remote_ip(ip.get_src_address());
-    Bytes original = const_cast<Ip&>(ip).to_bytes();
-    Bytes embedded = original.slice(0, std::min<size_t>(ICMP_QUOTED_BYTES, original.size()));
+    Bytes embedded = icmp_error_quote(ip);
 
     Icmp header(IcmpType::ICMP_TIME_EXCEEDED, ICMP_CODE_TTL_EXCEEDED, 0, 0, Bytes());
     this->_send_icmp_message(remote_ip, header, embedded);
@@ -1866,6 +1936,10 @@ void NetworkStack::_send_icmp_time_exceeded(const Ip& ip)
 
 void NetworkStack::_send_icmp_net_unreachable(const Ip& ip)
 {
+    if (!this->_may_report_error_about(ip))
+    {
+        return;
+    }
     if (!this->_may_send_icmp_error())
     {
         LOG_DEBUG("NetworkStack: suppressing an ICMP Net Unreachable - error budget exhausted");
@@ -1873,8 +1947,7 @@ void NetworkStack::_send_icmp_net_unreachable(const Ip& ip)
     }
 
     IPv4Address remote_ip(ip.get_src_address());
-    Bytes original = const_cast<Ip&>(ip).to_bytes();
-    Bytes embedded = original.slice(0, std::min<size_t>(ICMP_QUOTED_BYTES, original.size()));
+    Bytes embedded = icmp_error_quote(ip);
 
     Icmp header(IcmpType::ICMP_DESTINATION_UNREACHABLE, ICMP_CODE_NET_UNREACHABLE, 0, 0, Bytes());
     this->_send_icmp_message(remote_ip, header, embedded);
@@ -1882,6 +1955,10 @@ void NetworkStack::_send_icmp_net_unreachable(const Ip& ip)
 
 void NetworkStack::_send_icmp_port_unreachable(const Ip& ip)
 {
+    if (!this->_may_report_error_about(ip))
+    {
+        return;
+    }
     if (!this->_may_send_icmp_error())
     {
         LOG_DEBUG("NetworkStack: suppressing an ICMP Port Unreachable - error budget exhausted");
@@ -1890,15 +1967,7 @@ void NetworkStack::_send_icmp_port_unreachable(const Ip& ip)
 
     IPv4Address remote_ip(ip.get_src_address());
 
-    // RFC 792: Destination Unreachable carries the original IP header plus
-    // the first 8 bytes of its payload. This stack's IP header is always
-    // exactly 20 bytes (no options), and to_bytes() serializes the header
-    // immediately followed by the payload - so the first 28 bytes of the
-    // original packet's own serialization are exactly "header + first 8
-    // bytes", letting the sender see which UDP port failed without
-    // reconstructing anything by hand.
-    Bytes original = const_cast<Ip&>(ip).to_bytes();
-    Bytes embedded = original.slice(0, std::min<size_t>(28, original.size()));
+    Bytes embedded = icmp_error_quote(ip);
 
     Icmp header(IcmpType::ICMP_DESTINATION_UNREACHABLE, ICMP_CODE_PORT_UNREACHABLE, 0, 0, Bytes());
     this->_send_icmp_message(remote_ip, header, embedded);
