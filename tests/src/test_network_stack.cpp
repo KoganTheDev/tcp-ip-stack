@@ -2466,6 +2466,10 @@ TEST(AnExpiredPacketFromANonUnicastSourceDrawsNoTimeExceeded)
     FakePacketChannel* first = nullptr;
     FakePacketChannel* second = nullptr;
     auto stack = make_router(first, second);
+    // A default route, so an error to any of these sources would have a way
+    // out - without one, "no error was sent" holds for lack of a route and
+    // says nothing about the rule.
+    stack->add_route(IPv4Address("0.0.0.0"), 0, SECOND_PEER_IP, 1);
 
     first->push_inbound(build_ip_frame(IPv4Address("0.0.0.0"), BEHIND_US, 1, IpProtocol::UDP, udp_bytes(1, 2)));
     first->push_inbound(build_ip_frame(IPv4Address("255.255.255.255"), BEHIND_US, 1, IpProtocol::UDP,
@@ -2727,6 +2731,13 @@ TEST(HalfOpenConnectionsThatTimeOutFreeTheirSlots)
     {
         stack->poll();
     }
+
+    // Precondition: the cap really is reached, or "a SYN is answered after the
+    // timeout" would hold even if nothing were ever counted.
+    channel->clear_outbound();
+    channel->push_inbound(build_tcp(FLAG_SYN, 4000, 0, 20001, 80));
+    stack->poll();
+    test_assert(!find_tcp(channel->outbound_frames()).is_tcp, "precondition: the port is at its half-open cap");
 
     // Let every SYN-ACK retransmission run out.
     for (int i = 0; i < 600; i++)

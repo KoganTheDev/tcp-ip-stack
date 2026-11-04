@@ -1545,10 +1545,10 @@ MacAddress NetworkStack::_resolve_mac(size_t interface_index, const IPv4Address&
 
 uint16_t NetworkStack::_allocate_ephemeral_port()
 {
-    // wraps back to FIRST_EPHEMERAL_PORT past uint16_t's range - no dedup
-    // against ports already in use, since a given local port only actually
-    // collides if it's reused against the exact same remote ip:port
-    // (ConnectionKey includes all three); fine for this stack's scale
+    // A plain wrapping counter over the ephemeral range. It does not check
+    // which ports are in use - connect(), its caller, skips any port whose
+    // four-tuple is still taken, since only the full four-tuple has to be
+    // unique and only connect() knows the remote side.
     uint16_t port = this->_next_ephemeral_port;
     this->_next_ephemeral_port =
         (this->_next_ephemeral_port == 65535) ? FIRST_EPHEMERAL_PORT : this->_next_ephemeral_port + 1;
