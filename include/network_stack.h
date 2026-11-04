@@ -202,7 +202,8 @@ public:
     // in SYN_SENT (or briefly LISTEN, if the peer's MAC still needs
     // resolving) - the handshake completes asynchronously as segments and
     // ARP replies arrive via poll(). The returned pointer has the same
-    // whole-lifetime ownership as accept()'s.
+    // whole-lifetime ownership as accept()'s. Returns nullptr if every
+    // ephemeral port is already connected to this same remote ip:port.
     TcpConnection* connect(const IPv4Address& remote_ip, uint16_t remote_port);
 
     // Looks a connection up by the stable id from TcpConnection::get_id(),

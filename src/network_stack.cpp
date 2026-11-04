@@ -253,7 +253,25 @@ TcpConnection* NetworkStack::accept(uint16_t port)
 
 TcpConnection* NetworkStack::connect(const IPv4Address& remote_ip, uint16_t remote_port)
 {
-    uint16_t local_port = this->_allocate_ephemeral_port();
+    // The allocator is a wrapping counter, so after one lap it hands out ports
+    // that may still be in use. Only the full four-tuple has to be unique, so
+    // skip a port only if it is in use to this same remote ip:port - storing
+    // under a live key would destroy that connection in place, leaving the
+    // application's pointer to it dangling and its id finding this one.
+    constexpr size_t EPHEMERAL_PORT_COUNT = 65536 - FIRST_EPHEMERAL_PORT;
+    uint16_t local_port = 0;
+    bool found_free_port = false;
+    for (size_t attempt = 0; attempt < EPHEMERAL_PORT_COUNT && !found_free_port; attempt++)
+    {
+        local_port = this->_allocate_ephemeral_port();
+        found_free_port = this->_connections.count(ConnectionKey{remote_ip, remote_port, local_port}) == 0;
+    }
+    if (!found_free_port)
+    {
+        LOG_WARNING("NetworkStack: every ephemeral port is already connected to " << remote_ip.to_string() << ":"
+                                                                                  << remote_port);
+        return nullptr;
+    }
     ConnectionKey key{remote_ip, remote_port, local_port};
 
     auto connection = std::make_unique<TcpConnection>(

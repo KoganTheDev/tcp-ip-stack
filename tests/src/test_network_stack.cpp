@@ -2836,3 +2836,36 @@ TEST(ADirectedBroadcastLeavesByTheInterfaceWhoseNetworkItBelongsTo)
     test_assert(found, "the datagram must leave by the second interface");
     test_assert(!contains_udp(first->outbound_frames()), "and not by the first");
 }
+
+TEST(ConnectNeverReplacesALiveConnectionWhenThePortCounterWraps)
+{
+    // The ephemeral port allocator is a counter that wraps after 16384 ports
+    // without checking which are in use, and connect() stored its new
+    // connection under the resulting key unconditionally. Once the counter came
+    // back round to a port still connected to the same remote ip:port, the old
+    // connection was destroyed in place: the application's pointer to it
+    // dangled, and its id now found the new connection instead.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    stack->add_static_arp_entry(PEER_IP, PEER_MAC);
+
+    TcpConnection* first = stack->connect(PEER_IP, 80);
+    uint64_t first_id = first->get_id();
+
+    // Walk the counter all the way round using a different remote port.
+    for (int i = 0; i < 65536 - 49152 - 1; i++)
+    {
+        stack->connect(PEER_IP, 81);
+    }
+    channel->clear_outbound();
+
+    TcpConnection* second = stack->connect(PEER_IP, 80); // the counter is back at first's port
+    test_assert(second != nullptr && second->get_id() != first_id, "precondition: a distinct new connection");
+
+    TcpConnection* found = stack->find_connection(first_id);
+    test_assert(found != nullptr && found->get_id() == first_id,
+                "the first connection must still exist under its own id - it was destroyed and its id re-pointed");
+    TcpView syn = find_tcp(channel->outbound_frames());
+    test_assert(syn.is_tcp && syn.syn && syn.dest_port == 80, "precondition: the second connect sent its SYN");
+    test_assert(found->get_state() == TcpState::SYN_SENT, "and the first is still connecting, untouched");
+}
