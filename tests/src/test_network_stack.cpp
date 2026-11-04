@@ -3356,3 +3356,28 @@ TEST(AnExpiredCookieIsRefused)
     stack->poll();
     test_assert(stack->accept(80) == nullptr, "a cookie past its two slots must not open a connection");
 }
+
+TEST(FailedCookieChecksAreCountedSoGuessingIsVisible)
+{
+    // In cookie mode a blind spoofer opens a connection by guessing a 24-bit
+    // hash (about 1 in 2^23 per try, with two valid slots). That cannot be made
+    // impossible without giving up what cookies are for, but it must not be
+    // silent: every failed check is counted, for an operator to watch.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_flooded_stack(channel);
+    TcpView answer = syn_for_a_cookie(*stack, *channel, 20000, 5000);
+    test_assert(stack->syn_cookie_check_failures() == 0, "nothing has failed yet");
+
+    for (uint32_t guess = 0; guess < 5; guess++)
+    {
+        channel->push_inbound(build_tcp_data(FLAG_ACK, 7001, 0x10000000 + guess, 21000, 80, Bytes()));
+    }
+    stack->poll();
+    test_assert(stack->syn_cookie_check_failures() == 5, "each forged cookie ACK is a counted failure, got "
+                                                             + std::to_string(stack->syn_cookie_check_failures()));
+
+    channel->push_inbound(build_tcp_data(FLAG_ACK, 5001, answer.seq + 1, 20000, 80, Bytes()));
+    stack->poll();
+    test_assert(stack->syn_cookie_check_failures() == 5 && stack->accept(80) != nullptr,
+                "a genuine cookie is not a failure");
+}

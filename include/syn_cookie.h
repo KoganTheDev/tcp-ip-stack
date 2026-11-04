@@ -24,6 +24,15 @@
 //
 // What does not fit is lost: a connection set up from a cookie has no window
 // scaling, SACK or timestamps. That is the price, and only paid under flood.
+//
+// The other price is spoof resistance. A normal handshake makes a blind
+// spoofer guess a 32-bit ISN; a cookie leaves 24 bits of hash, and with two
+// slots valid at once about 1 guess in 2^23 succeeds - a connection from an
+// address that never saw the SYN-ACK. NetworkStack narrows the exposure (it
+// checks ACKs as cookies only on a port that sent one in the last two slots)
+// and makes guessing visible (syn_cookie_check_failures(), and a warning when
+// failures pile up), but an application that trusts a peer by its source
+// address must not rely on that address for a connection made under flood.
 class SynCookies
 {
 public:

@@ -1209,6 +1209,23 @@ bool NetworkStack::_try_complete_cookie_handshake(const Ip& ip, const Tcp& tcp)
         this->_syn_cookies.check(local_ip, local_port, remote_ip, tcp.get_src_port(), peer_isn, cookie, this->_now_ms);
     if (mss == 0)
     {
+        // Forged or mangled. Counted, and warned about once per slot when they
+        // pile up: in cookie mode each failure may be a guess at the 24-bit
+        // hash, and guessing must not go unnoticed (see syn_cookie.h).
+        this->_syn_cookie_failures += 1;
+        uint64_t slot = this->_now_ms / SynCookies::SLOT_MS;
+        if (slot != this->_cookie_failure_slot)
+        {
+            this->_cookie_failure_slot = slot;
+            this->_cookie_failures_in_slot = 0;
+        }
+        this->_cookie_failures_in_slot += 1;
+        if (this->_cookie_failures_in_slot == COOKIE_FAILURE_WARNING_THRESHOLD)
+        {
+            LOG_WARNING("NetworkStack: " << COOKIE_FAILURE_WARNING_THRESHOLD
+                                         << " ACKs failed the SYN-cookie check on port " << local_port
+                                         << " within one cookie slot - someone may be guessing cookies");
+        }
         return false;
     }
 

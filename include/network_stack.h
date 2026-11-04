@@ -197,6 +197,14 @@ public:
     // for a new SYN if it has waited at least this long - far longer than a
     // real client takes to answer a SYN-ACK, so almost certainly a flood's.
     static constexpr uint32_t HALF_OPEN_EVICT_AGE_MS = 3000;
+    // Failed SYN-cookie checks in one cookie slot past which a warning is
+    // logged: at this rate someone is likely guessing cookies.
+    static constexpr uint64_t COOKIE_FAILURE_WARNING_THRESHOLD = 1024;
+
+    // ACKs that arrived on a port in cookie mode and failed the cookie check,
+    // since the stack started. Each is a forged or mangled ACK - a steadily
+    // climbing count is a blind spoofer guessing cookies (see syn_cookie.h).
+    uint64_t syn_cookie_check_failures() const { return _syn_cookie_failures; }
 
     // Pops one ESTABLISHED connection waiting on this port, or nullptr if
     // none are ready. The returned pointer is owned by NetworkStack for the
@@ -581,6 +589,10 @@ private:
     // stray-ACK flood would cost a SipHash per packet, and every ACK would be
     // a chance to guess a cookie, on a port that is not even under attack.
     std::unordered_map<uint16_t, uint64_t> _last_cookie_sent_ms;
+    uint64_t _syn_cookie_failures = 0;
+    // For the warning: failures counted within the current cookie slot.
+    uint64_t _cookie_failure_slot = 0;
+    uint64_t _cookie_failures_in_slot = 0;
 
     // Null until start_dhcp(). Owned here rather than by the application
     // because it reconfigures the interface, which is this class's state.
