@@ -1205,8 +1205,8 @@ bool NetworkStack::_try_complete_cookie_handshake(const Ip& ip, const Tcp& tcp)
     IPv4Address remote_ip(ip.get_src_address());
     uint32_t peer_isn = tcp.get_sequence_number() - 1;
     uint32_t cookie = tcp.get_acknowledgement_number() - 1;
-    uint16_t mss = this->_syn_cookies.check(local_ip, local_port, remote_ip, tcp.get_src_port(), peer_isn, cookie,
-                                            this->_now_ms);
+    uint16_t mss =
+        this->_syn_cookies.check(local_ip, local_port, remote_ip, tcp.get_src_port(), peer_isn, cookie, this->_now_ms);
     if (mss == 0)
     {
         return false;
@@ -1220,7 +1220,7 @@ bool NetworkStack::_try_complete_cookie_handshake(const Ip& ip, const Tcp& tcp)
     if (queued >= listening_it->second)
     {
         LOG_WARNING("NetworkStack: a valid SYN cookie for port " << local_port
-                                                                  << " arrived with the accept queue full - dropped");
+                                                                 << " arrived with the accept queue full - dropped");
         return true;
     }
 
@@ -1228,8 +1228,7 @@ bool NetworkStack::_try_complete_cookie_handshake(const Ip& ip, const Tcp& tcp)
     LOG_DEBUG("NetworkStack: completing a connection from " << remote_ip.to_string() << ":" << key.remote_port
                                                             << " by SYN cookie (MSS " << mss << ")");
     auto connection = std::make_unique<TcpConnection>(
-        local_port, remote_ip, key.remote_port, cookie,
-        [this, remote_ip](const Tcp& header, const Bytes& payload)
+        local_port, remote_ip, key.remote_port, cookie, [this, remote_ip](const Tcp& header, const Bytes& payload)
         { this->_send_tcp_segment(remote_ip, header, payload); }, this->_primary().config.local_mss());
     connection->accept_cookie_handshake(peer_isn, mss);
 

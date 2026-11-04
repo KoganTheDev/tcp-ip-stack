@@ -2597,11 +2597,20 @@ namespace
     // cannot - which is how these tests tell a slot from a cookie.
     Bytes syn_with_options(uint32_t isn, uint16_t peer_port)
     {
-        return build_tcp_with_options(FLAG_SYN, isn, 0, peer_port, 80, Bytes::from_hex("020405b4" "01" "030307"));
+        return build_tcp_with_options(FLAG_SYN, isn, 0, peer_port, 80,
+                                      Bytes::from_hex("020405b4"
+                                                      "01"
+                                                      "030307"));
     }
 
-    bool is_stateful_syn_ack(const TcpView& v) { return v.is_tcp && v.syn && v.ack_flag && v.has_window_scale; }
-    bool is_cookie_syn_ack(const TcpView& v) { return v.is_tcp && v.syn && v.ack_flag && !v.has_window_scale; }
+    bool is_stateful_syn_ack(const TcpView& v)
+    {
+        return v.is_tcp && v.syn && v.ack_flag && v.has_window_scale;
+    }
+    bool is_cookie_syn_ack(const TcpView& v)
+    {
+        return v.is_tcp && v.syn && v.ack_flag && !v.has_window_scale;
+    }
 }
 
 TEST(HalfOpenConnectionsPerListeningPortAreCapped)
@@ -2855,7 +2864,8 @@ TEST(AConnectionLeavesTheHalfOpenCountOnceNotOnEveryTransition)
         }
     }
     test_assert(answered == 1,
-                "exactly one slot was freed, so exactly one new SYN may get a slot (the other gets a cookie), got " + std::to_string(answered));
+                "exactly one slot was freed, so exactly one new SYN may get a slot (the other gets a cookie), got "
+                    + std::to_string(answered));
 }
 
 TEST(ADirectedBroadcastLeavesByTheInterfaceWhoseNetworkItBelongsTo)
@@ -3166,8 +3176,8 @@ TEST(AFragmentationNeededQuotingNoSegmentInFlightIsIgnored)
     channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 600, seq + 100000));
     stack->poll();
     test_assert(connection->get_effective_mss() == 1460,
-                "a report quoting a sequence number never sent must be ignored, got MSS " +
-                    std::to_string(connection->get_effective_mss()));
+                "a report quoting a sequence number never sent must be ignored, got MSS "
+                    + std::to_string(connection->get_effective_mss()));
 }
 
 TEST(AStaleHalfOpenConnectionIsEvictedToMakeRoomForANewSyn)
@@ -3250,7 +3260,11 @@ namespace
     }
 
     // MSS 1460, SACK-permitted, timestamps, NOP, window scale 7.
-    const Bytes ALL_OPTIONS = Bytes::from_hex("020405b4" "0402" "080a1122334400000000" "01" "030307");
+    const Bytes ALL_OPTIONS = Bytes::from_hex("020405b4"
+                                              "0402"
+                                              "080a1122334400000000"
+                                              "01"
+                                              "030307");
 
     // A listening stack whose port 80 is full of young half-open connections,
     // from peer ports 30000 upward.
@@ -3262,8 +3276,8 @@ namespace
         stack->poll();
         for (size_t i = 0; i < NetworkStack::MAX_HALF_OPEN_PER_PORT; i++)
         {
-            channel->push_inbound(build_tcp_with_options(FLAG_SYN, 1000, 0, static_cast<uint16_t>(30000 + i), 80,
-                                                         ALL_OPTIONS));
+            channel->push_inbound(
+                build_tcp_with_options(FLAG_SYN, 1000, 0, static_cast<uint16_t>(30000 + i), 80, ALL_OPTIONS));
         }
         for (int i = 0; i < 50; i++)
         {

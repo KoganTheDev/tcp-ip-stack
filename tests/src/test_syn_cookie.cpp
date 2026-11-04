@@ -11,7 +11,10 @@ namespace
     constexpr uint32_t PEER_ISN = 0x12345678;
     constexpr uint64_t NOW = 10 * SynCookies::SLOT_MS + 1234;
 
-    SynCookies keyed() { return SynCookies(0x0123456789abcdefull, 0xfedcba9876543210ull); }
+    SynCookies keyed()
+    {
+        return SynCookies(0x0123456789abcdefull, 0xfedcba9876543210ull);
+    }
 }
 
 TEST(ACookieRoundTripsToTheLargestTableMssNotAbovePeers)
@@ -64,13 +67,13 @@ TEST(ACookieExpiresAfterTheFollowingSlot)
 {
     SynCookies cookies = keyed();
     uint32_t cookie = cookies.make(LOCAL, LOCAL_PORT, REMOTE, REMOTE_PORT, PEER_ISN, 1460, NOW);
-    test_assert(cookies.check(LOCAL, LOCAL_PORT, REMOTE, REMOTE_PORT, PEER_ISN, cookie, NOW + SynCookies::SLOT_MS) ==
-                    1460,
+    test_assert(cookies.check(LOCAL, LOCAL_PORT, REMOTE, REMOTE_PORT, PEER_ISN, cookie, NOW + SynCookies::SLOT_MS)
+                    == 1460,
                 "still valid in the next slot - a client answering near a slot boundary is not refused");
-    test_assert(
-        cookies.check(LOCAL, LOCAL_PORT, REMOTE, REMOTE_PORT, PEER_ISN, cookie, NOW + 2 * SynCookies::SLOT_MS) == 0,
-        "but not after that - an old cookie cannot be saved up and used later");
-    test_assert(cookies.check(LOCAL, LOCAL_PORT, REMOTE, REMOTE_PORT, PEER_ISN, cookie, NOW + 32 * SynCookies::SLOT_MS) ==
-                    0,
+    test_assert(cookies.check(LOCAL, LOCAL_PORT, REMOTE, REMOTE_PORT, PEER_ISN, cookie, NOW + 2 * SynCookies::SLOT_MS)
+                    == 0,
+                "but not after that - an old cookie cannot be saved up and used later");
+    test_assert(cookies.check(LOCAL, LOCAL_PORT, REMOTE, REMOTE_PORT, PEER_ISN, cookie, NOW + 32 * SynCookies::SLOT_MS)
+                    == 0,
                 "including when the 5-bit slot counter has wrapped back to the same value");
 }

@@ -33,17 +33,17 @@ public:
     SynCookies(); // a fresh random key
     SynCookies(uint64_t key_low, uint64_t key_high);
 
-    uint32_t make(const IPv4Address& local_ip, uint16_t local_port, const IPv4Address& remote_ip,
-                  uint16_t remote_port, uint32_t peer_isn, uint16_t peer_mss, uint64_t now_ms) const;
+    uint32_t make(const IPv4Address& local_ip, uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port,
+                  uint32_t peer_isn, uint16_t peer_mss, uint64_t now_ms) const;
 
     // The MSS the cookie encodes if it is genuine and was made in this slot or
     // the one before; 0 otherwise.
-    uint16_t check(const IPv4Address& local_ip, uint16_t local_port, const IPv4Address& remote_ip,
-                   uint16_t remote_port, uint32_t peer_isn, uint32_t cookie, uint64_t now_ms) const;
+    uint16_t check(const IPv4Address& local_ip, uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port,
+                   uint32_t peer_isn, uint32_t cookie, uint64_t now_ms) const;
 
 private:
-    uint32_t _mac(const IPv4Address& local_ip, uint16_t local_port, const IPv4Address& remote_ip,
-                  uint16_t remote_port, uint32_t peer_isn, uint64_t slot, uint32_t mss_index) const;
+    uint32_t _mac(const IPv4Address& local_ip, uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port,
+                  uint32_t peer_isn, uint64_t slot, uint32_t mss_index) const;
 
     uint64_t _key_low;
     uint64_t _key_high;

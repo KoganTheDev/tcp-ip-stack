@@ -57,8 +57,8 @@ uint32_t SynCookies::make(const IPv4Address& local_ip, uint16_t local_port, cons
         }
     }
     uint64_t slot = now_ms / SLOT_MS;
-    return (static_cast<uint32_t>(slot & 0x1F) << 27) | (index << 24) |
-           _mac(local_ip, local_port, remote_ip, remote_port, peer_isn, slot, index);
+    return (static_cast<uint32_t>(slot & 0x1F) << 27) | (index << 24)
+           | _mac(local_ip, local_port, remote_ip, remote_port, peer_isn, slot, index);
 }
 
 uint16_t SynCookies::check(const IPv4Address& local_ip, uint16_t local_port, const IPv4Address& remote_ip,
