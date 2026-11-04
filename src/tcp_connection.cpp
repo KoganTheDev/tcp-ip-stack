@@ -108,13 +108,7 @@ void TcpConnection::_transition(TcpState new_state)
 
 uint32_t TcpConnection::_receive_buffer_occupied() const
 {
-    uint32_t occupied = 0;
-    for (const auto& entry : _reorder_buffer)
-    {
-        occupied += static_cast<uint32_t>(entry.second.size());
-    }
-    occupied += static_cast<uint32_t>(_receive_queued_bytes);
-    return occupied;
+    return static_cast<uint32_t>(_reorder_buffered_bytes + _receive_queued_bytes);
 }
 
 std::vector<Tcp::SackBlock> TcpConnection::_sack_blocks_to_report() const
@@ -473,6 +467,7 @@ void TcpConnection::_drain_reorder_buffer()
         }
         // erase before delivering: _deliver() runs the application's
         // callback, which must not find a half-processed entry here
+        _reorder_buffered_bytes -= it->second.size();
         _reorder_buffer.erase(it);
         if (!new_tail.empty())
         {
@@ -1196,6 +1191,7 @@ void TcpConnection::on_segment(const Tcp& segment)
                 if (_reorder_buffer.find(seq) == _reorder_buffer.end() && _seq_in_receive_window(seq))
                 {
                     _reorder_buffer[seq] = payload;
+                    _reorder_buffered_bytes += payload.size();
                     _last_out_of_order_seq = seq;
                 }
                 _send_pure_ack();

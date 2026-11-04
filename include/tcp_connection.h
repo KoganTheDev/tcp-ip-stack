@@ -547,6 +547,11 @@ private:
     // _recv_next/_deliver() as gaps fill in; bounded by
     // RECEIVE_BUFFER_CAPACITY via _receive_buffer_occupied()
     std::map<uint32_t, Bytes> _reorder_buffer;
+    // Total payload bytes in _reorder_buffer, kept alongside it like
+    // _receive_queued_bytes is for the receive queue. Summing the map instead
+    // was O(entries) on every segment received and every ack sent - quadratic
+    // over a buffer a peer can fill with tens of thousands of tiny segments.
+    size_t _reorder_buffered_bytes = 0;
 
     // --- congestion control ---
     //
