@@ -4,3 +4,6 @@
 
 # style: apply clang-format to every C++ source and header
 c606b24b70014e3b30b140f536baf5868af91649
+
+# style: clang-format the fixes since the last formatting pass
+101340eef20ddb64d4781d01fb5051e4e490034f
