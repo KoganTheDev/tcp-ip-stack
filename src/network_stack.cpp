@@ -1105,10 +1105,12 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
             }
             else
             {
-                LOG_WARNING("NetworkStack: dropping a SYN for port "
-                            << key.local_port << " - " << half_open
-                            << " connections are already half-open there, none of them stale."
-                               " This is most likely a SYN flood.");
+                // None stale: an active flood. Answer statelessly with a SYN
+                // cookie, so a real client still gets in however large it is.
+                LOG_WARNING("NetworkStack: port " << key.local_port << " has " << half_open
+                                                  << " half-open connections, none of them stale - answering with a "
+                                                     "SYN cookie. This is most likely a SYN flood.");
+                this->_send_syn_cookie(ip, tcp);
                 return;
             }
         }
@@ -1116,6 +1118,10 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
 
     if (!is_new_connection_request)
     {
+        if (this->_try_complete_cookie_handshake(ip, tcp))
+        {
+            return;
+        }
         if (!tcp.get_rst())
         {
             // no connection matches this 4-tuple, and it isn't a SYN to a
@@ -1155,6 +1161,88 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
     this->_track_half_open(*connection, key.local_port);
     this->_connections_by_id[connection->get_id()] = key;
     this->_connections[key] = std::move(connection);
+}
+
+void NetworkStack::_send_syn_cookie(const Ip& ip, const Tcp& tcp)
+{
+    IPv4Address local_ip(ip.get_dest_address());
+    IPv4Address remote_ip(ip.get_src_address());
+    uint16_t local_port = tcp.get_dest_port();
+    uint16_t peer_mss = tcp.has_mss_option() ? tcp.get_mss_option() : 536;
+
+    uint32_t cookie = this->_syn_cookies.make(local_ip, local_port, remote_ip, tcp.get_src_port(),
+                                              tcp.get_sequence_number(), peer_mss, this->_now_ms);
+    this->_last_cookie_sent_ms[local_port] = this->_now_ms;
+
+    // MSS only: window scaling, SACK and timestamps cannot be remembered in a
+    // cookie, so they must not be offered - the peer would otherwise use
+    // options this side will know nothing about. The window is unscaled.
+    Tcp syn_ack(local_port, tcp.get_src_port(), cookie, tcp.get_sequence_number() + 1, 5, 0x12 /* SYN|ACK */,
+                static_cast<uint16_t>(std::min<uint32_t>(TcpConnection::RECEIVE_BUFFER_CAPACITY, 0xFFFF)), 0, 0);
+    syn_ack.set_mss_option(this->_primary().config.local_mss());
+    this->_send_tcp_segment(remote_ip, syn_ack, Bytes());
+}
+
+bool NetworkStack::_try_complete_cookie_handshake(const Ip& ip, const Tcp& tcp)
+{
+    if (!tcp.get_ack() || tcp.get_syn() || tcp.get_rst())
+    {
+        return false;
+    }
+    uint16_t local_port = tcp.get_dest_port();
+    auto listening_it = this->_listening_ports.find(local_port);
+    if (listening_it == this->_listening_ports.end())
+    {
+        return false;
+    }
+    auto sent_it = this->_last_cookie_sent_ms.find(local_port);
+    if (sent_it == this->_last_cookie_sent_ms.end() || this->_now_ms - sent_it->second > 2 * SynCookies::SLOT_MS)
+    {
+        return false; // no cookie this port sent could still be valid
+    }
+
+    IPv4Address local_ip(ip.get_dest_address());
+    IPv4Address remote_ip(ip.get_src_address());
+    uint32_t peer_isn = tcp.get_sequence_number() - 1;
+    uint32_t cookie = tcp.get_acknowledgement_number() - 1;
+    uint16_t mss = this->_syn_cookies.check(local_ip, local_port, remote_ip, tcp.get_src_port(), peer_isn, cookie,
+                                            this->_now_ms);
+    if (mss == 0)
+    {
+        return false;
+    }
+
+    // Genuine. The accept queue still bounds it, exactly as for a handshake
+    // that completed the ordinary way; dropped silently like backlog
+    // overflow, so the client's retransmission can succeed later.
+    auto pending_it = this->_pending_accepts.find(local_port);
+    size_t queued = pending_it == this->_pending_accepts.end() ? 0 : pending_it->second.size();
+    if (queued >= listening_it->second)
+    {
+        LOG_WARNING("NetworkStack: a valid SYN cookie for port " << local_port
+                                                                  << " arrived with the accept queue full - dropped");
+        return true;
+    }
+
+    ConnectionKey key{remote_ip, tcp.get_src_port(), local_port};
+    LOG_DEBUG("NetworkStack: completing a connection from " << remote_ip.to_string() << ":" << key.remote_port
+                                                            << " by SYN cookie (MSS " << mss << ")");
+    auto connection = std::make_unique<TcpConnection>(
+        local_port, remote_ip, key.remote_port, cookie,
+        [this, remote_ip](const Tcp& header, const Bytes& payload)
+        { this->_send_tcp_segment(remote_ip, header, payload); }, this->_primary().config.local_mss());
+    connection->accept_cookie_handshake(peer_isn, mss);
+
+    TcpConnection* connection_ptr = connection.get();
+    this->_watch_for_close(*connection_ptr);
+    this->_connections_by_id[connection_ptr->get_id()] = key;
+    this->_connections[key] = std::move(connection);
+    this->_pending_accepts[local_port].push_back(key);
+
+    // The completing ACK may carry data (or its window), so it is processed
+    // like any segment of an established connection.
+    connection_ptr->on_segment(tcp);
+    return true;
 }
 
 void NetworkStack::_track_half_open(TcpConnection& connection, uint16_t local_port)

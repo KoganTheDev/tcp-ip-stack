@@ -11,6 +11,7 @@
 #include "raw.h"
 #include "utils.h"
 #include "network_addresses.h"
+#include "syn_cookie.h"
 
 #include <map>
 #include <memory>
@@ -2589,6 +2590,20 @@ TEST(AnErrorQuotesTheWholeHeaderPlusEightBytesEvenWithOptions)
                 "including the destination port, which is what the sender matches on");
 }
 
+namespace
+{
+    // SYNs in the half-open cap tests offer window scaling, so a STATEFUL
+    // SYN-ACK echoes it while a SYN-cookie one (sent once the cap is full)
+    // cannot - which is how these tests tell a slot from a cookie.
+    Bytes syn_with_options(uint32_t isn, uint16_t peer_port)
+    {
+        return build_tcp_with_options(FLAG_SYN, isn, 0, peer_port, 80, Bytes::from_hex("020405b4" "01" "030307"));
+    }
+
+    bool is_stateful_syn_ack(const TcpView& v) { return v.is_tcp && v.syn && v.ack_flag && v.has_window_scale; }
+    bool is_cookie_syn_ack(const TcpView& v) { return v.is_tcp && v.syn && v.ack_flag && !v.has_window_scale; }
+}
+
 TEST(HalfOpenConnectionsPerListeningPortAreCapped)
 {
     // The listen backlog bounds connections that finished the handshake and
@@ -2608,25 +2623,32 @@ TEST(HalfOpenConnectionsPerListeningPortAreCapped)
     const int flood = static_cast<int>(NetworkStack::MAX_HALF_OPEN_PER_PORT) + 36;
     for (int i = 0; i < flood; i++)
     {
-        channel->push_inbound(build_tcp(FLAG_SYN, 1000, 0, static_cast<uint16_t>(30000 + i), 80));
+        channel->push_inbound(syn_with_options(1000, static_cast<uint16_t>(30000 + i)));
     }
     for (int i = 0; i < 50; i++)
     {
         stack->poll(); // the poll budget is per call; drain them all
     }
 
-    std::map<uint16_t, uint32_t> syn_acks; // peer port -> our ISN
+    std::map<uint16_t, uint32_t> syn_acks; // peer port -> our ISN, stateful answers only
+    size_t cookies = 0;
     for (const Bytes& frame : channel->outbound_frames())
     {
         TcpView v = view_tcp(frame);
-        if (v.is_tcp && v.syn && v.ack_flag)
+        if (is_stateful_syn_ack(v))
         {
             syn_acks[v.dest_port] = v.seq;
         }
+        else if (is_cookie_syn_ack(v))
+        {
+            cookies++;
+        }
     }
     test_assert(syn_acks.size() == NetworkStack::MAX_HALF_OPEN_PER_PORT,
-                "only MAX_HALF_OPEN_PER_PORT SYNs may be answered while none completes, got "
+                "only MAX_HALF_OPEN_PER_PORT SYNs may get a half-open slot while none completes, got "
                     + std::to_string(syn_acks.size()));
+    test_assert(cookies == static_cast<size_t>(flood) - NetworkStack::MAX_HALF_OPEN_PER_PORT,
+                "and every SYN past the cap is answered with a SYN cookie instead");
 
     // The cap counts connections still half-open, not ever accepted: one
     // completing its handshake frees a slot for the next SYN.
@@ -2634,11 +2656,11 @@ TEST(HalfOpenConnectionsPerListeningPortAreCapped)
     channel->push_inbound(build_tcp(FLAG_ACK, 1001, completed->second + 1, completed->first, 80));
     stack->poll();
     channel->clear_outbound();
-    channel->push_inbound(build_tcp(FLAG_SYN, 5000, 0, 20000, 80));
+    channel->push_inbound(syn_with_options(5000, 20000));
     stack->poll();
     TcpView answer = find_tcp(channel->outbound_frames());
-    test_assert(answer.is_tcp && answer.syn && answer.ack_flag && answer.dest_port == 20000,
-                "a completed handshake must free its half-open slot");
+    test_assert(is_stateful_syn_ack(answer) && answer.dest_port == 20000,
+                "a completed handshake must free its half-open slot - the next SYN gets a slot, not a cookie");
 }
 
 TEST(AnExpiredIcmpErrorThatIsAFirstFragmentDrawsNoTimeExceeded)
@@ -2745,7 +2767,7 @@ TEST(HalfOpenConnectionsThatTimeOutFreeTheirSlots)
 
     for (size_t i = 0; i < NetworkStack::MAX_HALF_OPEN_PER_PORT; i++)
     {
-        channel->push_inbound(build_tcp(FLAG_SYN, 1000, 0, static_cast<uint16_t>(30000 + i), 80));
+        channel->push_inbound(syn_with_options(1000, static_cast<uint16_t>(30000 + i)));
     }
     for (int i = 0; i < 50; i++)
     {
@@ -2755,9 +2777,10 @@ TEST(HalfOpenConnectionsThatTimeOutFreeTheirSlots)
     // Precondition: the cap really is reached, or "a SYN is answered after the
     // timeout" would hold even if nothing were ever counted.
     channel->clear_outbound();
-    channel->push_inbound(build_tcp(FLAG_SYN, 4000, 0, 20001, 80));
+    channel->push_inbound(syn_with_options(4000, 20001));
     stack->poll();
-    test_assert(!find_tcp(channel->outbound_frames()).is_tcp, "precondition: the port is at its half-open cap");
+    test_assert(is_cookie_syn_ack(find_tcp(channel->outbound_frames())),
+                "precondition: the port is at its half-open cap - a new SYN gets a cookie, not a slot");
 
     // Let every SYN-ACK retransmission run out.
     for (int i = 0; i < 600; i++)
@@ -2771,11 +2794,11 @@ TEST(HalfOpenConnectionsThatTimeOutFreeTheirSlots)
     channel->push_inbound(build_arp_request());
     stack->poll();
     channel->clear_outbound();
-    channel->push_inbound(build_tcp(FLAG_SYN, 5000, 0, 20000, 80));
+    channel->push_inbound(syn_with_options(5000, 20000));
     stack->poll();
     TcpView answer = find_tcp(channel->outbound_frames());
-    test_assert(answer.is_tcp && answer.syn && answer.ack_flag && answer.dest_port == 20000,
-                "once the half-open connections have given up, a new SYN must be answered");
+    test_assert(is_stateful_syn_ack(answer) && answer.dest_port == 20000,
+                "once the half-open connections have given up, a new SYN must get a slot again");
 }
 
 TEST(AConnectionLeavesTheHalfOpenCountOnceNotOnEveryTransition)
@@ -2793,7 +2816,7 @@ TEST(AConnectionLeavesTheHalfOpenCountOnceNotOnEveryTransition)
 
     for (size_t i = 0; i < NetworkStack::MAX_HALF_OPEN_PER_PORT; i++)
     {
-        channel->push_inbound(build_tcp(FLAG_SYN, 1000, 0, static_cast<uint16_t>(30000 + i), 80));
+        channel->push_inbound(syn_with_options(1000, static_cast<uint16_t>(30000 + i)));
     }
     for (int i = 0; i < 50; i++)
     {
@@ -2817,8 +2840,8 @@ TEST(AConnectionLeavesTheHalfOpenCountOnceNotOnEveryTransition)
     stack->poll();
 
     channel->clear_outbound();
-    channel->push_inbound(build_tcp(FLAG_SYN, 5000, 0, 20000, 80));
-    channel->push_inbound(build_tcp(FLAG_SYN, 5000, 0, 20001, 80));
+    channel->push_inbound(syn_with_options(5000, 20000));
+    channel->push_inbound(syn_with_options(5000, 20001));
     stack->poll();
     stack->poll();
 
@@ -2826,13 +2849,13 @@ TEST(AConnectionLeavesTheHalfOpenCountOnceNotOnEveryTransition)
     for (const Bytes& frame : channel->outbound_frames())
     {
         TcpView v = view_tcp(frame);
-        if (v.is_tcp && v.syn && v.ack_flag && (v.dest_port == 20000 || v.dest_port == 20001))
+        if (is_stateful_syn_ack(v) && (v.dest_port == 20000 || v.dest_port == 20001))
         {
             answered++;
         }
     }
     test_assert(answered == 1,
-                "exactly one slot was freed, so exactly one new SYN may be answered, got " + std::to_string(answered));
+                "exactly one slot was freed, so exactly one new SYN may get a slot (the other gets a cookie), got " + std::to_string(answered));
 }
 
 TEST(ADirectedBroadcastLeavesByTheInterfaceWhoseNetworkItBelongsTo)
@@ -3161,12 +3184,12 @@ TEST(AStaleHalfOpenConnectionIsEvictedToMakeRoomForANewSyn)
     stack->poll();
     channel->clear_outbound();
 
-    channel->push_inbound(build_tcp(FLAG_SYN, 1000, 0, 30000, 80)); // the oldest
+    channel->push_inbound(syn_with_options(1000, 30000)); // the oldest
     stack->poll();
     stack->on_time_passed(NetworkStack::HALF_OPEN_EVICT_AGE_MS);
     for (size_t i = 1; i < NetworkStack::MAX_HALF_OPEN_PER_PORT; i++)
     {
-        channel->push_inbound(build_tcp(FLAG_SYN, 1000, 0, static_cast<uint16_t>(30000 + i), 80));
+        channel->push_inbound(syn_with_options(1000, static_cast<uint16_t>(30000 + i)));
     }
     for (int i = 0; i < 50; i++)
     {
@@ -3183,14 +3206,139 @@ TEST(AStaleHalfOpenConnectionIsEvictedToMakeRoomForANewSyn)
     }
 
     channel->clear_outbound();
-    channel->push_inbound(build_tcp(FLAG_SYN, 5000, 0, 20000, 80));
+    channel->push_inbound(syn_with_options(5000, 20000));
     stack->poll();
     TcpView answer = find_tcp(channel->outbound_frames());
-    test_assert(answer.is_tcp && answer.syn && answer.ack_flag && answer.dest_port == 20000,
-                "with the oldest half-open connection stale, a new SYN must be answered");
+    test_assert(is_stateful_syn_ack(answer) && answer.dest_port == 20000,
+                "with the oldest half-open connection stale, a new SYN must get its slot - options and all - "
+                "rather than a cookie");
 
     // a younger handshake was not the one evicted: it still completes
     channel->push_inbound(build_tcp(FLAG_ACK, 1001, younger_isn + 1, 30001, 80));
     stack->poll();
     test_assert(stack->accept(80) != nullptr, "a younger half-open connection must survive the eviction");
+}
+
+// --- SYN cookies under a flood ------------------------------------------------
+//
+// Once a port's half-open slots are full of young connections - an active
+// flood, so drop-oldest has nothing stale to evict - a SYN is answered with a
+// SYN cookie (syn_cookie.h) instead of being dropped. No state is kept; a real
+// client completes the handshake from its ACK, however large the flood.
+
+namespace
+{
+    Bytes build_tcp_data(uint8_t flags, uint32_t seq, uint32_t ack, uint16_t src_port, uint16_t dest_port,
+                         const Bytes& payload)
+    {
+        Bytes seg;
+        seg.append_int<uint16_t>(src_port);
+        seg.append_int<uint16_t>(dest_port);
+        seg.append_int<uint32_t>(seq);
+        seg.append_int<uint32_t>(ack);
+        seg.append_int<uint8_t>(5 << 4);
+        seg.append_int<uint8_t>(flags);
+        seg.append_int<uint16_t>(65535);
+        seg.append_int<uint16_t>(0);
+        seg.append_int<uint16_t>(0);
+        seg |= payload;
+        uint16_t checksum = transport_checksum(PEER_IP, LOCAL_IP, IpProtocol::TCP, seg);
+        Bytes cs = int_to_bytes<uint16_t>(checksum);
+        seg[16] = cs[0];
+        seg[17] = cs[1];
+        return wrap_ip(IpProtocol::TCP, seg);
+    }
+
+    // MSS 1460, SACK-permitted, timestamps, NOP, window scale 7.
+    const Bytes ALL_OPTIONS = Bytes::from_hex("020405b4" "0402" "080a1122334400000000" "01" "030307");
+
+    // A listening stack whose port 80 is full of young half-open connections,
+    // from peer ports 30000 upward.
+    std::unique_ptr<NetworkStack> make_flooded_stack(FakePacketChannel*& channel)
+    {
+        auto stack = make_stack(channel);
+        stack->listen(80);
+        channel->push_inbound(build_arp_request());
+        stack->poll();
+        for (size_t i = 0; i < NetworkStack::MAX_HALF_OPEN_PER_PORT; i++)
+        {
+            channel->push_inbound(build_tcp_with_options(FLAG_SYN, 1000, 0, static_cast<uint16_t>(30000 + i), 80,
+                                                         ALL_OPTIONS));
+        }
+        for (int i = 0; i < 50; i++)
+        {
+            stack->poll();
+        }
+        channel->clear_outbound();
+        return stack;
+    }
+
+    // Sends a SYN from peer_port to a flooded port 80; returns the cookie
+    // SYN-ACK's view (its seq is the cookie).
+    TcpView syn_for_a_cookie(NetworkStack& stack, FakePacketChannel& channel, uint16_t peer_port, uint32_t isn)
+    {
+        channel.clear_outbound();
+        channel.push_inbound(build_tcp_with_options(FLAG_SYN, isn, 0, peer_port, 80, ALL_OPTIONS));
+        stack.poll();
+        return find_tcp(channel.outbound_frames());
+    }
+}
+
+TEST(AFloodBeyondTheCapIsStillAnsweredWithCookieSynAcks)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_flooded_stack(channel);
+
+    TcpView answer = syn_for_a_cookie(*stack, *channel, 20000, 5000);
+    test_assert(answer.is_tcp && answer.syn && answer.ack_flag && answer.ack == 5001,
+                "a SYN past a full cap of young half-open connections must still be answered");
+    test_assert(!answer.has_window_scale && !answer.has_sack_permitted && !answer.has_timestamp,
+                "a cookie SYN-ACK can carry no options a cookie cannot remember");
+}
+
+TEST(AValidCookieAckCompletesTheConnection)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_flooded_stack(channel);
+    TcpView answer = syn_for_a_cookie(*stack, *channel, 20000, 5000);
+
+    channel->push_inbound(build_tcp_data(FLAG_ACK, 5001, answer.seq + 1, 20000, 80, Bytes::from_hex("6869")));
+    stack->poll();
+
+    TcpConnection* connection = stack->accept(80);
+    test_assert(connection != nullptr, "the ACK carrying a valid cookie must produce an acceptable connection");
+    test_assert(connection->get_state() == TcpState::ESTABLISHED, "already established");
+    test_assert(connection->read().to_hex() == "6869", "with the data that rode on that ACK");
+}
+
+TEST(AnAckWithAForgedCookieIsResetAndCreatesNothing)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_flooded_stack(channel);
+    TcpView answer = syn_for_a_cookie(*stack, *channel, 20000, 5000);
+
+    channel->clear_outbound();
+    channel->push_inbound(build_tcp_data(FLAG_ACK, 5001, answer.seq + 2, 20000, 80, Bytes()));
+    stack->poll();
+    test_assert(stack->accept(80) == nullptr, "a wrong cookie must not create a connection");
+    TcpView reply = find_tcp(channel->outbound_frames());
+    test_assert(reply.is_tcp && reply.rst, "and gets the ordinary RST for a segment matching nothing");
+}
+
+TEST(AnExpiredCookieIsRefused)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_flooded_stack(channel);
+    TcpView answer = syn_for_a_cookie(*stack, *channel, 20000, 5000);
+
+    for (uint64_t ms = 0; ms < 2 * SynCookies::SLOT_MS + 1000; ms += 1000)
+    {
+        stack->on_time_passed(1000);
+    }
+    channel->push_inbound(build_arp_request()); // keep the peer resolvable after that long
+    stack->poll();
+
+    channel->push_inbound(build_tcp_data(FLAG_ACK, 5001, answer.seq + 1, 20000, 80, Bytes()));
+    stack->poll();
+    test_assert(stack->accept(80) == nullptr, "a cookie past its two slots must not open a connection");
 }

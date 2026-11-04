@@ -28,6 +28,7 @@
 #include "udp.h"
 #include "udp_socket.h"
 #include "icmp.h"
+#include "syn_cookie.h"
 
 // Ties Ethernet/Arp/Ip/Tcp/Udp/Icmp together over a PacketChannel - a TAP
 // device or an AF_PACKET socket, indistinguishable from here - into something
@@ -358,6 +359,12 @@ private:
     // give-up, eviction - which is every way out of the state, so the record
     // cannot leak.
     void _track_half_open(TcpConnection& connection, uint16_t local_port);
+    // Answers a SYN with a stateless SYN-ACK whose ISN is a SYN cookie.
+    void _send_syn_cookie(const Ip& ip, const Tcp& tcp);
+    // For an ACK matching no connection: if it carries a valid cookie for a
+    // listening port that sent cookies recently, creates the connection
+    // (established) and returns true. False means: not a cookie ACK.
+    bool _try_complete_cookie_handshake(const Ip& ip, const Tcp& tcp);
 
     // dont_fragment sets the DF bit, which is what asks the network to report
     // a too-small link rather than silently splitting the packet. That report
@@ -566,6 +573,14 @@ private:
     // secret, which is the same as no secret at all for an attacker who only
     // needs to predict the connection in front of them.
     IsnGenerator _isn_generator;
+    // SYN cookies, for a listening port flooded with young half-open
+    // connections (see _send_syn_cookie / _try_complete_cookie_handshake).
+    SynCookies _syn_cookies;
+    // When each port last answered a SYN with a cookie. An ACK is checked as
+    // a possible cookie only on a port that sent one recently - otherwise a
+    // stray-ACK flood would cost a SipHash per packet, and every ACK would be
+    // a chance to guess a cookie, on a port that is not even under attack.
+    std::unordered_map<uint16_t, uint64_t> _last_cookie_sent_ms;
 
     // Null until start_dhcp(). Owned here rather than by the application
     // because it reconfigures the interface, which is this class's state.
