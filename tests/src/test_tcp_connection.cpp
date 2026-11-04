@@ -1867,3 +1867,44 @@ TEST(AnAckForAnAcceptedZeroWindowProbeIsHonoured)
     }
     test_assert(released, "an ack covering the accepted probe byte must reopen the window and release the data");
 }
+
+// The worst case for draining the reorder buffer: tens of thousands of tiny
+// segments straddling the 2^32 wrap. The buffer is keyed by raw uint32_t, so
+// the post-wrap entries sort FIRST while being LAST in sequence order - a
+// drain that rescans from the start walks past all of them for every
+// pre-wrap entry it resolves, quadratic in the entry count, all chosen by the
+// peer (its ISN sets where the wrap falls). Correctness is asserted here; the
+// cost is what the commit that added this measured.
+TEST(DrainingManySegmentsAcrossTheWrapDeliversTheWholeStreamInOrder)
+{
+    const uint32_t before_wrap = 30000;
+    const uint32_t rcv_nxt = static_cast<uint32_t>(0x100000000ull - before_wrap);
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent, rcv_nxt - 1);
+
+    Bytes received;
+    connection->set_data_ready_callback([&received, &connection]() { received |= connection->read(); });
+
+    // every byte but the first, one segment each, so it all waits on the gap
+    const uint32_t total = 2 * before_wrap + 1;
+    for (uint32_t i = 1; i < total; i++)
+    {
+        Bytes one;
+        one.append_int<uint8_t>(static_cast<uint8_t>(i & 0xFF));
+        connection->on_segment(*make_incoming_segment(rcv_nxt + i, 1001, FLAG_ACK, one));
+    }
+    test_assert(received.empty(), "nothing is deliverable while the first byte is missing");
+
+    Bytes first;
+    first.append_int<uint8_t>(0);
+    connection->on_segment(*make_incoming_segment(rcv_nxt, 1001, FLAG_ACK, first));
+
+    test_assert(received.size() == total, "the whole stream should be delivered, got " +
+                                              std::to_string(received.size()) + " of " + std::to_string(total));
+    bool in_order = true;
+    for (uint32_t i = 0; i < received.size() && in_order; i++)
+    {
+        in_order = received[i] == static_cast<byte_t>(i & 0xFF);
+    }
+    test_assert(in_order, "and in sequence order, across the wrap");
+}

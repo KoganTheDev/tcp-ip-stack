@@ -441,37 +441,42 @@ void TcpConnection::_drain_reorder_buffer()
     // retransmissions, say), that segment starts behind RCV.NXT, is never
     // matched, and sits counted against the receive window forever.
     //
-    // A rescan from the start after each step rather than a single ordered
-    // walk: the map is keyed by raw uint32_t, so near the 2^32 wrap its order
-    // is not sequence order. The buffer is bounded by the receive window, and
-    // each pass removes an entry, so this terminates.
-    bool progressed = true;
-    while (progressed)
+    // The entries are processed earliest-first in SEQUENCE order, which is
+    // not the map's order: it is keyed by raw uint32_t, so across the 2^32
+    // wrap the post-wrap entries sort first while coming last. Every entry
+    // lies within 2^31 of RCV.NXT, though, so sequence order is raw order
+    // rotated to start at RCV.NXT - 2^31 + 1: lower_bound() finds that start,
+    // and if nothing sorts at or after it the earliest is begin(). That keeps
+    // each step O(log n). A rescan from begin() was correct but quadratic -
+    // with the wrap placed by the peer's ISN, a peer could make one gap-filler
+    // cost tens of seconds of CPU.
+    while (!_reorder_buffer.empty())
     {
-        progressed = false;
-        for (auto it = _reorder_buffer.begin(); it != _reorder_buffer.end(); ++it)
+        uint32_t rotation_start = _recv_next - 0x7FFFFFFFu;
+        auto it = _reorder_buffer.lower_bound(rotation_start);
+        if (it == _reorder_buffer.end())
         {
-            uint32_t start = it->first;
-            if (!seq_at_or_before(start, _recv_next))
-            {
-                continue; // still beyond a gap
-            }
-            uint32_t end = start + static_cast<uint32_t>(it->second.size());
-            Bytes new_tail;
-            if (!seq_at_or_before(end, _recv_next))
-            {
-                uint32_t already_seen = _recv_next - start;
-                new_tail = it->second.slice(already_seen, it->second.size() - already_seen);
-            }
-            // erase before delivering: _deliver() runs the application's
-            // callback, which must not find a half-processed entry here
-            _reorder_buffer.erase(it);
-            if (!new_tail.empty())
-            {
-                _deliver(new_tail);
-            }
-            progressed = true;
-            break;
+            it = _reorder_buffer.begin();
+        }
+
+        uint32_t start = it->first;
+        if (!seq_at_or_before(start, _recv_next))
+        {
+            break; // the earliest entry is still beyond a gap, so all are
+        }
+        uint32_t end = start + static_cast<uint32_t>(it->second.size());
+        Bytes new_tail;
+        if (!seq_at_or_before(end, _recv_next))
+        {
+            uint32_t already_seen = _recv_next - start;
+            new_tail = it->second.slice(already_seen, it->second.size() - already_seen);
+        }
+        // erase before delivering: _deliver() runs the application's
+        // callback, which must not find a half-processed entry here
+        _reorder_buffer.erase(it);
+        if (!new_tail.empty())
+        {
+            _deliver(new_tail);
         }
     }
 }
