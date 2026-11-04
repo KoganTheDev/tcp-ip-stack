@@ -416,7 +416,9 @@ private:
     // Pulls the connection identified by an ICMP error's quoted packet out of
     // the connection table, or nullptr. Shared by the two handlers above, which
     // agree on how to identify the connection and disagree on what to do to it.
-    TcpConnection* _connection_from_icmp_quote(const Icmp& icmp) const;
+    // out_quoted_seq, if given, receives the sequence number of the quoted
+    // segment; a quote too short to contain it then matches no connection.
+    TcpConnection* _connection_from_icmp_quote(const Icmp& icmp, uint32_t* out_quoted_seq = nullptr) const;
     // The address to actually resolve to a MAC for a packet aimed at
     // destination. The same address for an on-link destination, the gateway for
     // anything else - the distinction between the address in the IP header and

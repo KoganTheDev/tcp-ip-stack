@@ -1212,7 +1212,7 @@ void NetworkStack::_send_icmp_fragment_reassembly_time_exceeded(const IPv4Addres
     this->_send_icmp_message(destination, message, Bytes());
 }
 
-TcpConnection* NetworkStack::_connection_from_icmp_quote(const Icmp& icmp) const
+TcpConnection* NetworkStack::_connection_from_icmp_quote(const Icmp& icmp, uint32_t* out_quoted_seq) const
 {
     // The error quotes the offending packet back: its IP header plus the first
     // 8 bytes of its payload (RFC 792). For TCP/UDP those 8 bytes begin with
@@ -1251,6 +1251,17 @@ TcpConnection* NetworkStack::_connection_from_icmp_quote(const Icmp& icmp) const
     IPv4Address original_dest(embedded.slice(16, 4)); // the peer we were trying to reach
     uint16_t local_port = embedded.slice_int<uint16_t>(ihl);       // our source port
     uint16_t remote_port = embedded.slice_int<uint16_t>(ihl + 2);  // the unreachable peer's port
+
+    if (out_quoted_seq != nullptr)
+    {
+        // RFC 792 guarantees 8 bytes of the original payload: for TCP that is
+        // the ports and the sequence number.
+        if (embedded.size() < ihl + 8)
+        {
+            return nullptr;
+        }
+        *out_quoted_seq = embedded.slice_int<uint32_t>(ihl + 4);
+    }
 
     ConnectionKey key{original_dest, remote_port, local_port};
     auto it = this->_connections.find(key);
@@ -1298,13 +1309,43 @@ void NetworkStack::_handle_icmp_error(const Icmp& icmp)
         return;
     }
 
-    TcpConnection* connection = this->_connection_from_icmp_quote(icmp);
-    if (connection != nullptr)
+    uint32_t quoted_seq = 0;
+    TcpConnection* connection = this->_connection_from_icmp_quote(icmp, &quoted_seq);
+    if (connection == nullptr)
     {
-        LOG_DEBUG("NetworkStack: failing a TCP connection on an ICMP error"
-                  " (it was going to time out otherwise)");
-        connection->fail(); // -> CLOSED, reaped on the next poll()/on_time_passed() pass
+        return;
     }
+
+    // RFC 5927: a genuine error is about a segment this side actually sent and
+    // still has outstanding. Anyone who can guess the four-tuple can forge the
+    // rest of an ICMP error, so without this one spoofed packet ends a
+    // connection.
+    if (!connection->has_sent_unacknowledged(quoted_seq))
+    {
+        LOG_DEBUG("NetworkStack: ignoring an ICMP error quoting sequence " << quoted_seq
+                                                                          << ", which this connection has not sent");
+        return;
+    }
+
+    // RFC 1122 4.2.3.9: net and host unreachable (and the rest) are soft
+    // errors, routinely transient while routing converges - a connection must
+    // not abort on one. Protocol and port unreachable are hard: nothing is
+    // listening there. Even those only abort a connection still in its
+    // handshake (RFC 5461); an established one learns that its peer is gone
+    // from the peer's RST, or from its own retransmission budget running out.
+    uint8_t code = icmp.get_code();
+    bool hard = code == 2 /* protocol unreachable */ || code == ICMP_CODE_PORT_UNREACHABLE;
+    TcpState state = connection->get_state();
+    bool handshaking = state == TcpState::SYN_SENT || state == TcpState::SYN_RECEIVED;
+    if (!hard || !handshaking)
+    {
+        LOG_DEBUG("NetworkStack: ICMP Destination Unreachable code " << static_cast<int>(code)
+                                                                     << " for a TCP connection - not fatal here");
+        return;
+    }
+
+    LOG_DEBUG("NetworkStack: failing a TCP connection on a hard ICMP error during its handshake");
+    connection->fail(); // -> CLOSED, reaped on the next poll()/on_time_passed() pass
 }
 
 IPv4Address NetworkStack::_next_hop_for(const IPv4Address& destination) const

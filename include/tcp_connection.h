@@ -135,6 +135,12 @@ public:
     // here or in flight. The answer to "has my data actually gone", which
     // nothing could previously ask.
     size_t bytes_unacked() const;
+    // Whether seq lies in [SND.UNA, SND.NXT) - i.e. names a segment this side
+    // sent and the peer has not yet acknowledged. RFC 5927's test for an ICMP
+    // error that claims to be about this connection: a genuine one quotes such
+    // a segment; an off-path forgery has to guess one. Always false with
+    // nothing in flight, since then no error can be about anything.
+    bool has_sent_unacknowledged(uint32_t seq) const;
     // Half-closes our side: sends a FIN and starts the shutdown sequence.
     void close();
 

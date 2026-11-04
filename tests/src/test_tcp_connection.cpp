@@ -1731,3 +1731,20 @@ TEST(OutOfOrderSegmentAcrossASequenceNumberWrapIsBuffered)
     test_assert(received.size() == 2 && received[1].to_hex() == second.to_hex(),
                 "and deliver it second, in sequence order");
 }
+
+// The range an ICMP error's quoted sequence number must fall in to be
+// believed: [SND.UNA, SND.NXT). SND.NXT itself is the next byte not yet sent,
+// so a quote naming it is about nothing this side ever transmitted.
+TEST(OnlySequenceNumbersInFlightCountAsSentAndUnacknowledged)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent); // our ISN is 1000, so SND.NXT is 1001
+
+    test_assert(!connection->has_sent_unacknowledged(1001), "nothing in flight: no sequence number qualifies");
+
+    connection->send(Bytes::from_hex("6869")); // in flight: [1001, 1003)
+    test_assert(connection->has_sent_unacknowledged(1001), "SND.UNA, the first unacknowledged byte, qualifies");
+    test_assert(connection->has_sent_unacknowledged(1002), "and so does the last byte in flight");
+    test_assert(!connection->has_sent_unacknowledged(1003), "SND.NXT does not - it has not been sent");
+    test_assert(!connection->has_sent_unacknowledged(1000), "nor does anything already acknowledged");
+}

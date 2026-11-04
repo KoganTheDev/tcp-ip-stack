@@ -1301,6 +1301,13 @@ size_t TcpConnection::send_space_available() const
     return _send_queued_bytes < SEND_BUFFER_CAPACITY ? SEND_BUFFER_CAPACITY - _send_queued_bytes : 0;
 }
 
+bool TcpConnection::has_sent_unacknowledged(uint32_t seq) const
+{
+    uint32_t snd_una = _in_flight.empty() ? _send_next : _in_flight.front().seq;
+    // modular: SND.UNA <= seq < SND.NXT, correct across the 2^32 wrap
+    return seq_at_or_before(snd_una, seq) && !seq_at_or_before(_send_next, seq);
+}
+
 size_t TcpConnection::bytes_unacked() const
 {
     return _send_queued_bytes + _bytes_in_flight();

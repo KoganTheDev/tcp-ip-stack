@@ -123,16 +123,20 @@ namespace
     // An ICMP Port Unreachable as the peer's stack would send it: it quotes back
     // our original outgoing packet (local -> peer), of which the first 28 bytes
     // are the IP header + the first 8 bytes of our TCP header (RFC 792).
-    Bytes build_icmp_port_unreachable_for_our_tcp(uint16_t local_port, uint16_t remote_port)
+    // quoted_seq is the sequence number of "our" segment the error claims to be
+    // about. RFC 5927: a genuine error quotes a segment we actually sent, so
+    // tests that expect the error to be acted on must pass the real one.
+    Bytes build_icmp_port_unreachable_for_our_tcp(uint16_t local_port, uint16_t remote_port, uint32_t quoted_seq = 0,
+                                                  uint8_t code = ICMP_CODE_PORT_UNREACHABLE)
     {
-        Tcp our_segment(local_port, remote_port, 0, 0, 5, 0x02 /* SYN */, 65535, 0, 0);
+        Tcp our_segment(local_port, remote_port, quoted_seq, 0, 5, 0x02 /* SYN */, 65535, 0, 0);
         auto embedded_ip = std::make_unique<Ip>(4, 5, 0, 40, 0, 0, 0, 64, IpProtocol::TCP, 0, LOCAL_IP.get_address(),
                                                 PEER_IP.get_address());
         *embedded_ip /= std::make_unique<Raw>(our_segment.to_bytes());
         embedded_ip->compute_checksum();
         Bytes embedded = embedded_ip->to_bytes().slice(0, 28);
 
-        Icmp icmp(IcmpType::ICMP_DESTINATION_UNREACHABLE, ICMP_CODE_PORT_UNREACHABLE, 0, 0, embedded);
+        Icmp icmp(IcmpType::ICMP_DESTINATION_UNREACHABLE, code, 0, 0, embedded);
         icmp.compute_checksum();
         return wrap_ip(IpProtocol::ICMP, icmp.to_bytes());
     }
@@ -596,7 +600,7 @@ TEST(IcmpPortUnreachableFailsTheMatchingTcpConnection)
     test_assert(stack->find_connection(id) != nullptr, "the connection should exist right after connect()");
 
     // the peer reports its port 80 is unreachable, quoting our SYN back
-    channel->push_inbound(build_icmp_port_unreachable_for_our_tcp(syn.src_port, 80));
+    channel->push_inbound(build_icmp_port_unreachable_for_our_tcp(syn.src_port, 80, syn.seq));
     stack->poll();
 
     test_assert(stack->find_connection(id) == nullptr,
@@ -1313,9 +1317,10 @@ TEST(OtherUnreachableCodesStillFailTheConnection)
 
     TcpConnection* connection = open_connection(*stack, 80);
     uint64_t id = connection->get_id();
-    uint16_t local_port = find_tcp(channel->outbound_frames()).src_port;
+    TcpView syn = find_tcp(channel->outbound_frames());
+    uint16_t local_port = syn.src_port;
 
-    channel->push_inbound(build_icmp_port_unreachable_for_our_tcp(local_port, 80));
+    channel->push_inbound(build_icmp_port_unreachable_for_our_tcp(local_port, 80, syn.seq));
     stack->poll();
 
     test_assert(stack->find_connection(id) == nullptr, "a genuine unreachable must still fail the connection fast "
@@ -2628,4 +2633,71 @@ TEST(AnExpiredIcmpErrorThatIsAFirstFragmentDrawsNoTimeExceeded)
 
     test_assert(!any_icmp(first->outbound_frames()),
                 "an ICMP error must not draw another even when it arrives as a first fragment");
+}
+
+// --- which ICMP errors may end a TCP connection ------------------------------
+//
+// Any Destination Unreachable that quoted a connection's ports used to call
+// fail(). Both the code and the quote matter: RFC 1122 4.2.3.9 makes
+// net/host unreachable "soft" errors that must never abort a connection,
+// RFC 5461 says even hard errors should not abort one already established,
+// and RFC 5927 says an error quoting a sequence number this side never sent
+// is forged. An off-path attacker who guesses the ports should not be able to
+// kill a connection with one spoofed packet.
+
+TEST(ASoftIcmpErrorDoesNotAbortAConnectionEvenDuringTheHandshake)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    TcpConnection* connection = open_connection(*stack, 80);
+    uint64_t id = connection->get_id();
+    TcpView syn = find_tcp(channel->outbound_frames());
+
+    channel->push_inbound(build_icmp_port_unreachable_for_our_tcp(syn.src_port, 80, syn.seq, 1 /* host unreachable */));
+    stack->poll();
+
+    test_assert(stack->find_connection(id) != nullptr,
+                "host unreachable is a soft error - often transient, so the connection keeps retrying");
+}
+
+TEST(AnIcmpErrorQuotingASequenceNumberNeverSentIsIgnored)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    TcpConnection* connection = open_connection(*stack, 80);
+    uint64_t id = connection->get_id();
+    TcpView syn = find_tcp(channel->outbound_frames());
+
+    // The right ports, a hard code, but a sequence number far outside what
+    // this side has in flight - what an attacker who guessed the ports but not
+    // the ISN would send.
+    channel->push_inbound(build_icmp_port_unreachable_for_our_tcp(syn.src_port, 80, syn.seq + 100000));
+    stack->poll();
+
+    test_assert(stack->find_connection(id) != nullptr,
+                "an error about a segment never sent must not end the connection (RFC 5927)");
+}
+
+TEST(AHardIcmpErrorDoesNotAbortAnEstablishedConnection)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+
+    TcpConnection* connection = accept_connection_with_peer_mss(*stack, *channel, 80, 40000);
+    test_assert(connection != nullptr && connection->get_state() == TcpState::ESTABLISHED, "precondition");
+    uint64_t id = connection->get_id();
+
+    channel->clear_outbound();
+    connection->send(Bytes::from_hex("6869")); // something in flight for the error to plausibly be about
+    TcpView data = find_tcp(channel->outbound_frames());
+    test_assert(data.is_tcp, "precondition: the data segment went out");
+
+    channel->push_inbound(build_icmp_port_unreachable_for_our_tcp(80, 40000, data.seq));
+    stack->poll();
+
+    test_assert(stack->find_connection(id) != nullptr,
+                "once established, even a hard error is reported, not fatal (RFC 5461) - "
+                "the peer's own RST is what ends a connection it no longer has");
 }
