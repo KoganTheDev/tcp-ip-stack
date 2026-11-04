@@ -278,6 +278,15 @@ public:
                              uint8_t peer_window_scale = 0, bool peer_supports_timestamps = false,
                              uint32_t peer_timestamp = 0, bool peer_permits_sack = false);
 
+    // Called by NetworkStack immediately after constructing this object for an
+    // ACK that carried a valid SYN cookie (see syn_cookie.h): the handshake is
+    // already complete, though no SYN_RECEIVED state ever existed, so this
+    // starts ESTABLISHED. The constructor's initial_seq must be the cookie,
+    // which was our SYN-ACK's ISN. No options are negotiated - a cookie has no
+    // room for window scaling, SACK or timestamps - and the MSS is the
+    // cookie's.
+    void accept_cookie_handshake(uint32_t peer_isn, uint16_t peer_mss);
+
     // Active open: sends a bare SYN (no ACK - there's nothing to acknowledge
     // yet) and moves to SYN_SENT. NetworkStack calls this once the peer's
     // MAC is resolved (or immediately, if it already was).

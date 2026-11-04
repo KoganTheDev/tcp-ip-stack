@@ -346,6 +346,24 @@ void TcpConnection::accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss, bo
     _send_flags(FLAG_SYN);
 }
 
+void TcpConnection::accept_cookie_handshake(uint32_t peer_isn, uint16_t peer_mss)
+{
+    // Our SYN-ACK (seq = initial_seq, the cookie) went out from no state at
+    // all, and the peer's ACK of it is what got us here - so its SYN is
+    // consumed and acknowledged, and nothing is in flight.
+    _send_next += 1;
+    _send_max = _send_next;
+    _recv_next = peer_isn + 1;
+    _peer_mss = peer_mss != 0 ? peer_mss : DEFAULT_PEER_MSS;
+    _effective_mss = std::min(_local_mss, _peer_mss);
+    _window_scaling_negotiated = false;
+    _peer_window_scale = 0;
+    _sack_permitted = false;
+    _timestamps_negotiated = false;
+    _congestion->on_established(_effective_mss);
+    _transition(TcpState::ESTABLISHED);
+}
+
 void TcpConnection::set_data_ready_callback(DataReadyFn callback)
 {
     _on_data_ready = std::move(callback);

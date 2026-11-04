@@ -2088,3 +2088,37 @@ TEST(AUserTimeoutOfZeroWaitsForeverAsBefore)
     pass_seconds(*connection, 4 * TcpConnection::DEFAULT_USER_TIMEOUT_MS / 1000);
     test_assert(connection->get_state() == TcpState::ESTABLISHED, "0 turns the timeout off");
 }
+
+// A connection whose handshake was completed by a SYN cookie: the SYN-ACK
+// went out with no connection behind it, so there was never a SYN_RECEIVED
+// state. It starts ESTABLISHED, with our ISN as the cookie, and with none of
+// the options - no window scaling, SACK or timestamps - because a cookie has
+// no room to remember them.
+TEST(AConnectionCompletedByACookieStartsEstablishedWithoutOptions)
+{
+    std::vector<RecordedSegment> sent;
+    TcpConnection connection(80, IPv4Address("10.0.0.1"), 40000, 7000 /* our ISN: the cookie */,
+                             [&sent](const Tcp& header, const Bytes& payload)
+                             {
+                                 sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(),
+                                                 flags_of(header), payload, header.get_window(),
+                                                 header.has_timestamp_option(), header.get_timestamp_value(),
+                                                 header.get_timestamp_echo()});
+                             });
+    connection.accept_cookie_handshake(500 /* the client's ISN */, 1400);
+    test_assert(connection.get_state() == TcpState::ESTABLISHED, "the handshake is already complete");
+    test_assert(sent.empty(), "and nothing needs sending to complete it");
+
+    Bytes received;
+    connection.set_data_ready_callback([&received, &connection]() { received |= connection.read(); });
+    connection.on_segment(*make_incoming_segment(501, 7001, FLAG_ACK, Bytes::from_hex("6869")));
+    test_assert(received.to_hex() == "6869", "data riding on the completing ACK is delivered");
+
+    connection.send(Bytes(2000));
+    test_assert(!sent.empty(), "precondition: data went out");
+    const RecordedSegment& data = sent.back();
+    test_assert(sent.front().seq == 7001, "our first byte is the cookie + 1 - the SYN-ACK consumed the cookie");
+    test_assert(sent.front().payload.size() <= 1400, "segments are capped by the MSS the cookie carried");
+    test_assert(!data.has_timestamp, "no timestamps on a cookie connection");
+    test_assert(connection.get_effective_mss() == 1400, "the effective MSS is the cookie's");
+}
