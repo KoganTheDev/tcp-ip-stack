@@ -986,6 +986,31 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
                         << "). The application is not accepting fast enough, or this is a SYN flood.");
             return;
         }
+
+        // And refuse once too many are still mid-handshake. The accept queue
+        // only ever holds connections that completed it; a SYN flood from
+        // spoofed sources never completes, so without this second bound each
+        // SYN built a connection that lived, retransmitting its SYN-ACK, until
+        // it gave up. Dropped silently for the same reason as above.
+        //
+        // A linear count rather than a maintained counter: it is bounded by the
+        // connection table, and a counter would have to be kept right on every
+        // path out of SYN_RECEIVED (completion, RST, timeout, reap).
+        size_t half_open = 0;
+        for (const auto& entry : this->_connections)
+        {
+            if (entry.first.local_port == key.local_port && entry.second->get_state() == TcpState::SYN_RECEIVED)
+            {
+                half_open++;
+            }
+        }
+        if (half_open >= MAX_HALF_OPEN_PER_PORT)
+        {
+            LOG_WARNING("NetworkStack: dropping a SYN for port " << key.local_port << " - " << half_open
+                                                                 << " connections are already half-open there."
+                                                                    " This is most likely a SYN flood.");
+            return;
+        }
     }
 
     if (!is_new_connection_request)

@@ -184,6 +184,12 @@ public:
     void listen(uint16_t port, size_t backlog = DEFAULT_LISTEN_BACKLOG);
 
     static constexpr size_t DEFAULT_LISTEN_BACKLOG = 128;
+    // Separate from the backlog above, which counts only connections that
+    // finished the handshake: how many may sit in SYN_RECEIVED on one listening
+    // port at once. Without it a SYN flood (whose spoofed sources never
+    // complete) builds unbounded connections. SYNs beyond it are dropped
+    // silently, so a real client's own retransmission gets through later.
+    static constexpr size_t MAX_HALF_OPEN_PER_PORT = 64;
 
     // Pops one ESTABLISHED connection waiting on this port, or nullptr if
     // none are ready. The returned pointer is owned by NetworkStack for the

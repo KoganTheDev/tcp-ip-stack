@@ -12,6 +12,7 @@
 #include "utils.h"
 #include "network_addresses.h"
 
+#include <map>
 #include <memory>
 #include <vector>
 #include <string>
@@ -2552,4 +2553,56 @@ TEST(AnErrorQuotesTheWholeHeaderPlusEightBytesEvenWithOptions)
                 "the quote must be the 24-byte header plus 8 bytes, got " + std::to_string(reply.payload.size()));
     test_assert(reply.payload.size() >= 28 && reply.payload.slice_int<uint16_t>(26) == 9999,
                 "including the destination port, which is what the sender matches on");
+}
+
+TEST(HalfOpenConnectionsPerListeningPortAreCapped)
+{
+    // The listen backlog bounds connections that finished the handshake and
+    // wait for accept(). Before they finish they sit in SYN_RECEIVED, and that
+    // stage was bounded by nothing: every SYN built a TcpConnection that then
+    // retransmitted its SYN-ACK until it gave up. A SYN flood from spoofed
+    // sources - which never complete - was unbounded memory and outbound
+    // traffic. This is the "SYN queue" Linux bounds separately from the
+    // accept queue.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    stack->listen(80);
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+    channel->clear_outbound();
+
+    const int flood = static_cast<int>(NetworkStack::MAX_HALF_OPEN_PER_PORT) + 36;
+    for (int i = 0; i < flood; i++)
+    {
+        channel->push_inbound(build_tcp(FLAG_SYN, 1000, 0, static_cast<uint16_t>(30000 + i), 80));
+    }
+    for (int i = 0; i < 50; i++)
+    {
+        stack->poll(); // the poll budget is per call; drain them all
+    }
+
+    std::map<uint16_t, uint32_t> syn_acks; // peer port -> our ISN
+    for (const Bytes& frame : channel->outbound_frames())
+    {
+        TcpView v = view_tcp(frame);
+        if (v.is_tcp && v.syn && v.ack_flag)
+        {
+            syn_acks[v.dest_port] = v.seq;
+        }
+    }
+    test_assert(syn_acks.size() == NetworkStack::MAX_HALF_OPEN_PER_PORT,
+                "only MAX_HALF_OPEN_PER_PORT SYNs may be answered while none completes, got " +
+                    std::to_string(syn_acks.size()));
+
+    // The cap counts connections still half-open, not ever accepted: one
+    // completing its handshake frees a slot for the next SYN.
+    auto completed = syn_acks.begin();
+    channel->push_inbound(build_tcp(FLAG_ACK, 1001, completed->second + 1, completed->first, 80));
+    stack->poll();
+    channel->clear_outbound();
+    channel->push_inbound(build_tcp(FLAG_SYN, 5000, 0, 20000, 80));
+    stack->poll();
+    TcpView answer = find_tcp(channel->outbound_frames());
+    test_assert(answer.is_tcp && answer.syn && answer.ack_flag && answer.dest_port == 20000,
+                "a completed handshake must free its half-open slot");
 }
