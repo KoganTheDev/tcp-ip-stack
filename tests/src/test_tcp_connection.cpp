@@ -1643,6 +1643,10 @@ TEST(KeepaliveLeavesAPeerWithAShutWindowAlone)
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
     connection->set_keepalive(true);
+    // This is about keepalive alone. A window shut for over two hours does
+    // trip the user timeout, by design (see the user timeout tests); turning
+    // it off keeps this test about the one thing it is named for.
+    connection->set_user_timeout(0);
 
     connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 0));
     connection->send(Bytes("data waiting on a window that never opens"));
@@ -2005,4 +2009,82 @@ TEST(ManyTinyOutOfOrderSegmentsWithSackStayCheap)
     }
     test_assert(!sent.empty() && sent.back().payload.empty() && sent.back().ack == 501,
                 "every out-of-order segment is still answered with a duplicate ack of RCV.NXT");
+}
+
+// --- the stall (user) timeout ------------------------------------------------
+//
+// A peer that stops reading but keeps answering zero-window probes with
+// "window 0" kept a connection - and the data queued on it - alive forever:
+// persist probing deliberately never gives up. Like Linux's TCP_USER_TIMEOUT,
+// a connection now fails once outstanding data has made no progress (no ack
+// moving SND.UNA) for user_timeout milliseconds.
+
+namespace
+{
+    void pass_seconds(TcpConnection& connection, uint32_t seconds)
+    {
+        for (uint32_t i = 0; i < seconds; i++)
+        {
+            connection.on_time_passed(1000);
+        }
+    }
+}
+
+TEST(APeerThatNeverReopensItsWindowIsGivenUpOnAfterTheUserTimeout)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 0)); // shut
+    connection->send(Bytes::from_hex("68656c6c6f"));
+
+    // probe after probe, each answered "still window 0"
+    for (uint32_t s = 0; s * 1000 < TcpConnection::DEFAULT_USER_TIMEOUT_MS + 10000; s += 10)
+    {
+        pass_seconds(*connection, 10);
+        connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 0));
+    }
+    test_assert(connection->get_state() == TcpState::CLOSED,
+                "data that has made no progress for the user timeout must end the connection");
+}
+
+TEST(ASlowPeerThatKeepsMakingProgressIsNeverGivenUpOn)
+{
+    // Slow, not dead: the peer acks promptly but reads slowly, so its window
+    // stays shut for long stretches and opens just enough to take each chunk.
+    // (A peer that does not ack in-flight data at all is a different case -
+    // the retransmission timer gives up on it long before this one would.)
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 0)); // shut
+    uint32_t acked = 1001;
+    for (int round = 0; round < 6; round++) // 6 x 200 s = 4x the default timeout
+    {
+        connection->send(Bytes(10)); // queued behind the shut window
+        pass_seconds(*connection, 200);
+        connection->on_segment(*make_incoming_segment_win(501, acked, FLAG_ACK, 65535)); // reads, reopens
+        acked += 10;
+        connection->on_segment(*make_incoming_segment_win(501, acked, FLAG_ACK, 0)); // acks it, shuts again
+    }
+    test_assert(connection->get_state() == TcpState::ESTABLISHED,
+                "each ack that moves SND.UNA is progress and restarts the timeout");
+}
+
+TEST(AnIdleConnectionWithNothingOutstandingIsNeverGivenUpOn)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    pass_seconds(*connection, 4 * TcpConnection::DEFAULT_USER_TIMEOUT_MS / 1000);
+    test_assert(connection->get_state() == TcpState::ESTABLISHED,
+                "with nothing to send there is nothing to stall - idleness is not a failure");
+}
+
+TEST(AUserTimeoutOfZeroWaitsForeverAsBefore)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->set_user_timeout(0);
+    connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 0));
+    connection->send(Bytes::from_hex("68656c6c6f"));
+    pass_seconds(*connection, 4 * TcpConnection::DEFAULT_USER_TIMEOUT_MS / 1000);
+    test_assert(connection->get_state() == TcpState::ESTABLISHED, "0 turns the timeout off");
 }

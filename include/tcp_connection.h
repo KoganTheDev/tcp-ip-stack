@@ -194,6 +194,14 @@ public:
     // this when an active open's ARP resolution exhausts its retries.
     void fail() { _transition(TcpState::CLOSED); }
 
+    // Like Linux's TCP_USER_TIMEOUT (RFC 5482): the connection is failed once
+    // data it has to send - in flight or queued - has made no progress, i.e.
+    // no ack has moved SND.UNA, for this long. Zero-window probes answered
+    // with "still zero" are not progress, which is the case it exists for: a
+    // peer that stops reading would otherwise hold the connection forever.
+    // 0 turns it off. Defaults to DEFAULT_USER_TIMEOUT_MS.
+    void set_user_timeout(uint32_t ms) { _user_timeout_ms = ms; }
+
     // A stable identity that outlives any single TcpConnection* - safe to
     // hand across a thread boundary and look up again later via
     // NetworkStack::find_connection(), unlike the pointer itself, which
@@ -250,6 +258,9 @@ public:
     // window suggests. A 128 KiB window holds ~90 full-sized segments, so
     // legitimate traffic never comes near this.
     static constexpr uint32_t MAX_REORDER_SEGMENTS = 1024;
+    // How long outstanding data may make no progress before the connection
+    // is failed (see set_user_timeout()).
+    static constexpr uint32_t DEFAULT_USER_TIMEOUT_MS = 300000;
     // Subscribes to state changes. Additive, not a single slot: NetworkStack
     // installs its own here to know when a connection has finished closing and
     // can be reaped, so a single slot meant an application that registered one
@@ -559,6 +570,10 @@ private:
     // was O(entries) on every segment received and every ack sent - quadratic
     // over a buffer a peer can fill with tens of thousands of tiny segments.
     size_t _reorder_buffered_bytes = 0;
+    uint32_t _user_timeout_ms = DEFAULT_USER_TIMEOUT_MS;
+    // How long outstanding data has gone without progress. Reset by any ack
+    // that moves SND.UNA, and whenever nothing is outstanding.
+    uint64_t _stalled_ms = 0;
 
     // --- congestion control ---
     //

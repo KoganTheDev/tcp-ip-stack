@@ -908,6 +908,11 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         }
     }
 
+    if (acked_anything)
+    {
+        _stalled_ms = 0; // SND.UNA moved: progress, so the user timeout starts over
+    }
+
     // A timestamp echo beats the ack clock, and beats it precisely where the
     // ack clock fails. Karn's algorithm has to throw away the sample from a
     // retransmitted segment because an ack cannot say which transmission it
@@ -1293,6 +1298,27 @@ void TcpConnection::on_time_passed(uint32_t elapsed_ms)
         {
             _send_pure_ack();
         }
+    }
+
+    // The user timeout (see set_user_timeout): counts only while there is
+    // something to deliver. Persist probing never gives up by design, and the
+    // retransmit give-up only watches segments in flight, so without this a
+    // peer that stops reading but answers every probe held the connection,
+    // and everything queued on it, forever.
+    if (_user_timeout_ms > 0 && (!_in_flight.empty() || !_send_queue.empty()))
+    {
+        _stalled_ms += elapsed_ms;
+        if (_stalled_ms >= _user_timeout_ms)
+        {
+            LOG_WARNING("TcpConnection[" << _id << "] no progress on outstanding data for " << _stalled_ms
+                                         << " ms - giving up");
+            _transition(TcpState::CLOSED);
+            return;
+        }
+    }
+    else
+    {
+        _stalled_ms = 0;
     }
 
     if (_in_flight.empty())
