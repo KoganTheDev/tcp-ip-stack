@@ -119,16 +119,36 @@ NetworkStack::NetworkStack(std::unique_ptr<PacketChannel> channel, const MacAddr
     : NetworkStack(std::move(channel), single_segment_config(local_mac, local_ip))
 {}
 
+namespace
+{
+    // A group MAC (broadcast or multicast: bit 0 of the first byte) is never a
+    // station's own address - no NIC can have one, and frames to it carrying
+    // unicast IP are discarded by design (RFC 1122 3.3.6, see _handle_ip). A
+    // stack configured with one would silently drop every unicast packet
+    // meant for it, so refuse it up front with a reason.
+    void require_unicast_mac(const MacAddress& mac)
+    {
+        if ((mac.get_address()[0] & 0x01) != 0)
+        {
+            throw EXCEPTION(BaseException, "interface MAC " + mac.to_string() +
+                                               " is a group (multicast) address and cannot be a station's own; "
+                                               "use a unicast one, e.g. a locally administered 02:...");
+        }
+    }
+}
+
 NetworkStack::NetworkStack(std::unique_ptr<PacketChannel> channel, const InterfaceConfig& config)
     : _next_ephemeral_port(FIRST_EPHEMERAL_PORT), _next_ip_id(1), _reassembler(FRAGMENT_TIMEOUT_MS),
       _icmp_error_tokens_scaled(ICMP_ERROR_BURST * MS_PER_SECOND)
 {
+    require_unicast_mac(config.mac);
     this->_interfaces.push_back(std::make_unique<Interface>(std::move(channel), config, ARP_ENTRY_TTL_MS));
     this->configure_interface(config);
 }
 
 void NetworkStack::configure_interface(const InterfaceConfig& config)
 {
+    require_unicast_mac(config.mac);
     this->_primary().config = config;
 
     // Rebuild the routes that follow from the addressing rather than adding to
@@ -175,6 +195,7 @@ void NetworkStack::configure_interface(const InterfaceConfig& config)
 
 size_t NetworkStack::add_interface(std::unique_ptr<PacketChannel> channel, const InterfaceConfig& config)
 {
+    require_unicast_mac(config.mac);
     this->_interfaces.push_back(std::make_unique<Interface>(std::move(channel), config, ARP_ENTRY_TTL_MS));
     size_t index = this->_interfaces.size() - 1;
 
@@ -721,7 +742,10 @@ void NetworkStack::_handle_frame(size_t ingress, const Bytes& frame)
                 // The Ethernet header is a fixed 14 bytes here - this stack neither
                 // emits nor parses VLAN tags - so what follows it is the IP
                 // packet as received, which forwarding needs verbatim.
-                this->_handle_ip(ingress, *ip, frame.slice(ETHERNET_HEADER_SIZE));
+                // The group bit of the destination MAC: set for broadcast and
+                // multicast frames, which _handle_ip needs to know about.
+                bool link_layer_group = (ethernet.get_dest().get_address()[0] & 0x01) != 0;
+                this->_handle_ip(ingress, *ip, frame.slice(ETHERNET_HEADER_SIZE), link_layer_group);
             }
         }
     }
@@ -809,8 +833,20 @@ void NetworkStack::_handle_arp(size_t ingress, const Arp& arp)
     interface.channel->write(reply.to_bytes());
 }
 
-void NetworkStack::_handle_ip(size_t ingress, const Ip& ip, const Bytes& ip_bytes)
+void NetworkStack::_handle_ip(size_t ingress, const Ip& ip, const Bytes& ip_bytes, bool link_layer_group)
 {
+    // RFC 1122 3.3.6: a datagram that arrived as a link-layer broadcast or
+    // multicast but names a unicast IP destination is silently discarded.
+    // Answering it would draw an error from every host that heard it, and
+    // forwarding it is forbidden outright (RFC 1812 5.3.4).
+    {
+        IPv4Address destination(ip.get_dest_address());
+        if (link_layer_group && !is_multicast(destination) && !this->_is_broadcast_for_any_interface(destination))
+        {
+            return;
+        }
+    }
+
     // Ours if it names our address, or if it is a broadcast for this segment.
     // Broadcast has to be accepted separately because it is by definition not
     // our address - and refusing it is what would make an address-configuration

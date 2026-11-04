@@ -677,7 +677,12 @@ TEST(ReceivedIpTrafficKeepsArpEntryFresh)
 TEST(TwoStacksHandshakeExchangeDataAndHalfClose)
 {
     const MacAddress MAC_A("aa:aa:aa:aa:aa:aa");
-    const MacAddress MAC_B("bb:bb:bb:bb:bb:bb");
+    // Not bb:bb:..., which it used to be: 0xbb has the group bit set, so that
+    // is a multicast address no interface can have, and since frames to a
+    // group MAC carrying unicast IP are discarded (RFC 1122 3.3.6) it stopped
+    // working the moment that rule existed. 02:... is locally administered
+    // unicast.
+    const MacAddress MAC_B("02:bb:bb:bb:bb:bb");
     const IPv4Address IP_A("10.0.0.1");
     const IPv4Address IP_B("10.0.0.2");
 
@@ -2937,4 +2942,56 @@ TEST(AReassemblyTimeoutOfAnIcmpErrorDrawsNoTimeExceeded)
                                          unreachable.to_bytes().slice(0, 16), IP_FLAG_MORE_FRAGMENTS, 0));
     test_assert(!time_exceeded_after_reassembly_timeout(*stack, *channel),
                 "an ICMP error must not draw another, even one that never finished reassembling");
+}
+
+// RFC 1122 3.3.6: a datagram that arrives as a link-layer broadcast but names
+// a unicast IP destination is silently discarded - by a host, which must not
+// answer it with an error from every machine that heard it, and by a router,
+// which must not forward it (RFC 1812 5.3.4).
+TEST(AUnicastDatagramInALinkLayerBroadcastIsDiscarded)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+    channel->clear_outbound();
+
+    channel->push_inbound(build_ip_frame(PEER_IP, LOCAL_IP, 64, IpProtocol::UDP, udp_bytes(40000, 9999), 0, 0,
+                                         MacAddress::BROADCAST));
+    stack->poll();
+    test_assert(!any_icmp(channel->outbound_frames()),
+                "a unicast datagram that arrived as a link-layer broadcast draws no Port Unreachable");
+}
+
+TEST(ARouterNeverForwardsAUnicastDatagramThatArrivedAsALinkLayerBroadcast)
+{
+    FakePacketChannel* first = nullptr;
+    FakePacketChannel* second = nullptr;
+    auto stack = make_router(first, second);
+
+    first->push_inbound(build_ip_frame(PEER_IP, BEHIND_US, 64, IpProtocol::UDP, udp_bytes(1, 2), 0, 0,
+                                       MacAddress::BROADCAST));
+    first->push_inbound(build_ip_frame(PEER_IP, BEHIND_US, 1, IpProtocol::UDP, udp_bytes(3, 4), 0, 0,
+                                       MacAddress::BROADCAST));
+    stack->poll();
+
+    test_assert(!find_ip_to(second->outbound_frames(), BEHIND_US).found, "it must not be forwarded");
+    test_assert(!any_icmp(first->outbound_frames()), "nor draw Time Exceeded from every router on the segment");
+}
+
+TEST(AGroupMacIsRefusedAsAnInterfacesOwnAddress)
+{
+    // Frames to a group MAC carrying unicast IP are discarded, so a stack whose
+    // own MAC were one would drop everything sent to it without a word. Fail
+    // loudly at configuration instead.
+    bool threw = false;
+    try
+    {
+        NetworkStack stack(std::make_unique<FakePacketChannel>(), MacAddress("bb:bb:bb:bb:bb:bb"), LOCAL_IP);
+    }
+    catch (const std::exception&)
+    {
+        threw = true;
+    }
+    test_assert(threw, "bb:bb:... has the group bit set and must be refused as an interface's own MAC");
 }

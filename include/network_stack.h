@@ -322,7 +322,8 @@ private:
     // than it went in - which is the same re-serialization trap that made every
     // inbound checksum fail before the receive path was fixed to verify over
     // the bytes as received.
-    void _handle_ip(size_t ingress, const Ip& ip, const Bytes& ip_bytes);
+    // link_layer_group: the frame was sent to a broadcast or multicast MAC.
+    void _handle_ip(size_t ingress, const Ip& ip, const Bytes& ip_bytes, bool link_layer_group);
     // Feeds one fragment to the reassembler and, if that completed a datagram,
     // rebuilds it and sends it on to _dispatch_transport as though it had
     // arrived whole.
