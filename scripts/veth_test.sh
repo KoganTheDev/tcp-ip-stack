@@ -171,6 +171,20 @@ else
 fi
 rm -f /tmp/echo.out
 
+# nc closed its socket after the answer, sending a FIN with no data. The server
+# must close its side in turn. If it never does, the client's (now orphaned)
+# socket sits in FIN-WAIT-2 - which is exactly what epoll-server used to do: a
+# bare FIN fired no callback, so nothing ever called close(), and the server's
+# own connection stayed in CLOSE_WAIT for the life of the process. Once the
+# server closes, the client moves on to TIME-WAIT instead.
+sleep 1
+lingering=$(ip netns exec "$NS" ss -tanH state fin-wait-2 dst "$STACK_IP:$PORT" | wc -l)
+if [ "$lingering" -eq 0 ]; then
+    pass "the server closed its side after the client's FIN (nothing left in FIN-WAIT-2)"
+else
+    fail "$lingering client socket(s) stuck in FIN-WAIT-2 - the server never closed its side"
+fi
+
 # A UDP datagram to a port nothing is bound to should draw ICMP port
 # unreachable, and must not disturb the stack.
 echo "x" | timeout 5 ip netns exec "$NS" nc -u -w 1 "$STACK_IP" 9999 >/dev/null 2>&1

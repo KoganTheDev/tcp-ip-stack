@@ -5,6 +5,7 @@
 #include <csignal>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "network_stack.h"
 #include "channel_factory.h"
@@ -90,6 +91,12 @@ private:
     // Retries every held response. Called after anything that can free send
     // buffer room: poll() (acks arrive) and a timer tick.
     void _flush_unsent();
+    // Closes our side of a connection whose peer has sent its FIN, once
+    // nothing of it is in flight or unread. The one place that decides it.
+    void _close_if_finished(uint64_t connection_id);
+    // Runs _close_if_finished() for every connection whose FIN arrived since
+    // the last call. Called from run() after poll().
+    void _close_finished_peers();
 
     uint16_t _port;
     NetworkStack _network_stack;
@@ -132,4 +139,8 @@ private:
     // The part of a response send() could not take yet, per connection. Only
     // present while that connection is also in _in_flight.
     std::unordered_map<uint64_t, Bytes> _unsent;
+
+    // Connections whose peer's FIN arrived (they entered CLOSE_WAIT), recorded
+    // by a state-changed callback and acted on by _close_finished_peers().
+    std::vector<uint64_t> _peers_finished_sending;
 };

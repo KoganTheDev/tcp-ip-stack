@@ -140,6 +140,7 @@ void Server::run(const volatile std::sig_atomic_t& stop_flag)
                 polled_this_round = true;
                 this->_handle_new_connections();
                 this->_flush_unsent(); // acks just processed may have freed send room
+                this->_close_finished_peers();
             }
             else if (event.data.fd == this->_timer_fd)
             {
@@ -178,6 +179,7 @@ void Server::run(const volatile std::sig_atomic_t& stop_flag)
             stack_has_more_frames = !this->_network_stack.poll();
             this->_handle_new_connections();
             this->_flush_unsent();
+            this->_close_finished_peers();
         }
     }
 }
@@ -187,7 +189,26 @@ void Server::_handle_new_connections()
     while (TcpConnection* connection = this->_network_stack.accept(this->_port))
     {
         uint64_t connection_id = connection->get_id();
+        // A FIN with no data behind it never fires data-ready, so without this
+        // nothing ever closed a connection whose client simply hung up after
+        // its last answer: it sat in CLOSE_WAIT for the life of the process.
+        // Recorded rather than acted on here - this runs inside the stack's
+        // processing of that FIN, and closing from there would send our FIN
+        // ahead of the ACK of theirs. run() handles the list after poll().
+        connection->add_state_changed_callback(
+            [this, connection_id](TcpState new_state)
+            {
+                if (new_state == TcpState::CLOSE_WAIT)
+                {
+                    this->_peers_finished_sending.push_back(connection_id);
+                }
+            });
         connection->set_data_ready_callback([this, connection_id]() { this->_try_dispatch(connection_id); });
+        if (connection->get_state() == TcpState::CLOSE_WAIT)
+        {
+            // the FIN arrived before accept() - the callback above missed it
+            this->_peers_finished_sending.push_back(connection_id);
+        }
     }
 }
 
@@ -301,15 +322,6 @@ void Server::_continue_response(uint64_t connection_id)
         // at all and send() would return 0 forever - holding the tail then
         // would keep this connection in flight, and unread, for good.
         this->_unsent.erase(unsent_it);
-
-        // the peer already sent its FIN (CLOSE_WAIT) and we've now handed over
-        // everything we had for it - safe to close our side. TcpConnection
-        // defers this itself if this send is still in flight, so this is
-        // never premature.
-        if (state == TcpState::CLOSE_WAIT)
-        {
-            connection->close();
-        }
     }
     catch (const std::exception& e)
     {
@@ -328,6 +340,43 @@ void Server::_continue_response(uint64_t connection_id)
     // what reopens the window and lets the peer continue - so the cycle is
     // "read, work, respond, read again" with the window doing the pacing.
     this->_try_dispatch(connection_id);
+
+    // Only now can it be known whether this connection is finished: closing
+    // before the read above would send our FIN ahead of the answer to data
+    // that arrived, with the peer's FIN, while this chunk was in the pool.
+    this->_close_if_finished(connection_id);
+}
+
+void Server::_close_if_finished(uint64_t connection_id)
+{
+    // Finished means: the peer has sent its FIN (CLOSE_WAIT), nothing of its
+    // is still being worked on or waiting for send room (in flight), and
+    // nothing it sent is still unread (anything unread would have been
+    // dispatched, and so be in flight, by the time this runs).
+    TcpConnection* connection = this->_network_stack.find_connection(connection_id);
+    if (connection == nullptr || this->_in_flight.count(connection_id) > 0 ||
+        connection->get_state() != TcpState::CLOSE_WAIT)
+    {
+        return;
+    }
+    try
+    {
+        connection->close(); // TcpConnection defers the FIN until queued data is sent
+    }
+    catch (const std::exception& e)
+    {
+        LOG_ERROR("Server: closing connection " << connection_id << " failed: " << e.what());
+    }
+}
+
+void Server::_close_finished_peers()
+{
+    std::vector<uint64_t> finished;
+    finished.swap(this->_peers_finished_sending);
+    for (uint64_t connection_id : finished)
+    {
+        this->_close_if_finished(connection_id);
+    }
 }
 
 void Server::_flush_unsent()
