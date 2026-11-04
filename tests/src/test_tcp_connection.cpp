@@ -1908,3 +1908,25 @@ TEST(DrainingManySegmentsAcrossTheWrapDeliversTheWholeStreamInOrder)
     }
     test_assert(in_order, "and in sequence order, across the wrap");
 }
+
+// RFC 7323: TS.Recent is updated only from a segment that is accepted. A
+// segment dropped because it acks data never sent must not move it - if it
+// could, one such segment carrying a far-future timestamp would make PAWS
+// discard every genuine segment of the peer's until its clock caught up.
+TEST(ASegmentDroppedForAckingUnsentDataDoesNotAdvanceTheTimestampEcho)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_timestamped_connection(sent);
+
+    std::vector<Bytes> received;
+    connection->set_data_ready_callback([&received, &connection]() { received.push_back(connection->read()); });
+
+    // at RCV.NXT, timestamp 2^30 ahead, acking 2^30 past anything sent
+    connection->on_segment(*make_segment_ts(501, 1001 + (1u << 30), FLAG_ACK, 6000 + (1u << 30), 0,
+                                            Bytes::from_hex("eeee")));
+    test_assert(received.empty(), "precondition: the segment acking unsent data is dropped");
+
+    connection->on_segment(*make_segment_ts(501, 1001, FLAG_ACK, 6000, 0, Bytes::from_hex("aabb")));
+    test_assert(received.size() == 1 && received[0].to_hex() == "aabb",
+                "the peer's genuine segment must still be accepted - the dropped one must not have moved TS.Recent");
+}

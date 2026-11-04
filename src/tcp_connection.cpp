@@ -1104,6 +1104,21 @@ void TcpConnection::on_segment(const Tcp& segment)
         return;
     }
 
+    // RFC 9293 3.10.7.4: an ack for something not yet sent is answered with an
+    // ack of where we really are, and the segment is otherwise dropped. Taken
+    // at face value it would retire in-flight data the peer never received -
+    // never to be retransmitted - and feed the RTT estimator a bogus sample.
+    // Checked before the timestamp handling below: RFC 7323 updates TS.Recent
+    // only from an acceptable segment, and a dropped one carrying a far-future
+    // timestamp would otherwise make PAWS discard the peer's genuine segments.
+    if (segment.get_ack() && !seq_at_or_before(segment.get_acknowledgement_number(), _send_max))
+    {
+        LOG_DEBUG("TcpConnection[" << _id << "] dropping a segment acking " << segment.get_acknowledgement_number()
+                                   << ", beyond anything sent (SND.MAX " << _send_max << ")");
+        _send_pure_ack();
+        return;
+    }
+
     if (_timestamps_negotiated && segment.has_timestamp_option())
     {
         uint32_t their_timestamp = segment.get_timestamp_value();
@@ -1135,18 +1150,6 @@ void TcpConnection::on_segment(const Tcp& segment)
             _ts_recent = their_timestamp;
             _have_ts_recent = true;
         }
-    }
-
-    // RFC 9293 3.10.7.4: an ack for something not yet sent is answered with an
-    // ack of where we really are, and the segment is otherwise dropped. Taken
-    // at face value it would retire in-flight data the peer never received -
-    // never to be retransmitted - and feed the RTT estimator a bogus sample.
-    if (segment.get_ack() && !seq_at_or_before(segment.get_acknowledgement_number(), _send_max))
-    {
-        LOG_DEBUG("TcpConnection[" << _id << "] dropping a segment acking " << segment.get_acknowledgement_number()
-                                   << ", beyond anything sent (SND.MAX " << _send_max << ")");
-        _send_pure_ack();
-        return;
     }
 
     if (segment.get_ack())
