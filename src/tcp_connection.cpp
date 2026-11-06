@@ -251,6 +251,17 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
     if (_sack_permitted && !(flags & FLAG_SYN))
     {
         std::vector<Tcp::SackBlock> blocks = _sack_blocks_to_report();
+        // RFC 6691: data plus options must fit the MSS. The payload was
+        // already sized to leave room for the timestamp; SACK blocks take
+        // whatever is left, and the oldest are the ones dropped (they are
+        // repeats the peer has most likely seen).
+        size_t used = payload.size() + (_timestamps_negotiated ? TIMESTAMP_OPTION_BYTES : 0);
+        size_t room = used < _effective_mss ? _effective_mss - used : 0;
+        size_t fit = room >= SACK_OPTION_OVERHEAD_BYTES ? (room - SACK_OPTION_OVERHEAD_BYTES) / SACK_BLOCK_BYTES : 0;
+        if (blocks.size() > fit)
+        {
+            blocks.resize(fit);
+        }
         if (!blocks.empty())
         {
             header.set_sack_blocks(blocks);
@@ -583,7 +594,7 @@ void TcpConnection::_send_queued_while_window_allows()
         // still unacked - it goes out once the pipe drains (or the window/cwnd
         // frees up enough for a full segment). A full-sized segment is never
         // held.
-        if (_send_queue.front().size() < _effective_mss && _bytes_in_flight() > 0)
+        if (_send_queue.front().size() < _max_segment_payload() && _bytes_in_flight() > 0)
         {
             break;
         }
@@ -1626,14 +1637,14 @@ size_t TcpConnection::send(const Bytes& data)
     size_t offset = 0;
     while (offset < accepted)
     {
-        size_t chunk_size = std::min<size_t>(_effective_mss, accepted - offset);
+        size_t chunk_size = std::min<size_t>(_max_segment_payload(), accepted - offset);
         Bytes chunk = data.slice(offset, chunk_size);
 
         // Nagle (RFC 896): a sub-MSS segment waits while earlier data is still
         // in flight, so small writes coalesce into fewer, larger segments
         // instead of dribbling out one tiny packet at a time. A full-sized
         // segment, or one sent with an empty pipe, always goes immediately.
-        bool nagle_holds = chunk.size() < _effective_mss && _bytes_in_flight() > 0;
+        bool nagle_holds = chunk.size() < _max_segment_payload() && _bytes_in_flight() > 0;
 
         // once anything is queued, everything after it must queue too -
         // otherwise a later, smaller chunk could jump ahead of an earlier

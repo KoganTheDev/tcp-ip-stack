@@ -2396,3 +2396,50 @@ TEST(TcpConnection, ARstInTimeWaitIsIgnored)
     advance_ms(*connection, TIME_WAIT_MS);
     ASSERT_TRUE(connection->get_state() == TcpState::CLOSED) << "TIME_WAIT still ends after its full 2*MSL";
 }
+
+// RFC 6691: the MSS counts payload only, and "the sender MUST reduce the TCP
+// data length to account for any IP or TCP options that it is including".
+// With timestamps negotiated every segment carries 12 option bytes, and SACK
+// blocks add 4 + 8 per block, so a segment of a full MSS of data plus options
+// exceeds the path MTU - with DF set it is simply dropped, and a bulk
+// transfer to a peer that negotiated timestamps (every Linux peer) stalls.
+TEST(TcpConnection, DataPlusOptionsNeverExceedsTheMss)
+{
+    struct Sent
+    {
+        size_t payload;
+        size_t option_bytes;
+    };
+    std::vector<Sent> sent;
+    auto connection = std::make_unique<TcpConnection>(8080, IPv4Address("10.0.0.1"), 12345, 1000,
+                                                      [&sent](const Tcp& header, const Bytes& payload)
+                                                      {
+                                                          size_t blocks = header.get_sack_blocks().size();
+                                                          size_t options = (header.has_timestamp_option() ? 12 : 0)
+                                                                           + (blocks > 0 ? 4 + 8 * blocks : 0);
+                                                          sent.push_back({payload.size(), options});
+                                                      });
+    connection->accept_incoming_syn(500, 1460, false, 0, true, 100, true);
+    auto completing = make_incoming_segment(501, 1001, FLAG_ACK);
+    completing->set_timestamp_option(101, 1);
+    connection->on_segment(*completing);
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED) << "precondition";
+
+    // two out-of-order ranges held, so data segments would carry SACK blocks
+    connection->set_data_ready_callback([&connection]() { connection->read(); });
+    for (uint32_t seq : std::vector<uint32_t>{600, 700})
+    {
+        auto ooo = make_incoming_segment(seq, 1001, FLAG_ACK, Bytes::from_hex("aabb"));
+        ooo->set_timestamp_option(102, 1);
+        connection->on_segment(*ooo);
+    }
+    sent.clear();
+
+    connection->send(Bytes(6000));
+    ASSERT_TRUE(!sent.empty()) << "precondition: data went out";
+    for (const Sent& segment : sent)
+    {
+        ASSERT_TRUE(segment.payload + segment.option_bytes <= 1460)
+            << "payload " << segment.payload << " + options " << segment.option_bytes << " exceeds the 1460 MSS";
+    }
+}

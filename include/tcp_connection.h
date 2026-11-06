@@ -313,6 +313,15 @@ private:
     // open: every other segment this stack ever sends acks something.
     void _send_flags(uint8_t flags, const Bytes& payload = Bytes(), bool include_ack = true);
     void _send_pure_ack();
+    // The most data one segment carries: the MSS less the options every
+    // segment carries (RFC 6691 - the MSS counts payload only, so the sender
+    // makes room for its own options). Timestamps, once negotiated, are on
+    // every segment; SACK blocks come and go and are trimmed to fit instead.
+    size_t _max_segment_payload() const
+    {
+        size_t options = _timestamps_negotiated ? TIMESTAMP_OPTION_BYTES : 0;
+        return _effective_mss > options ? _effective_mss - options : 1;
+    }
     // RFC 5961's challenge ACK - a pure ACK of where this side really is -
     // unless the challenge-ACK gate says the stack-wide budget is spent.
     void _send_challenge_ack();
@@ -656,6 +665,11 @@ private:
     static constexpr uint16_t DEFAULT_LOCAL_MSS = 1460; // 1500 (typical Ethernet MTU) - 20 (IP) - 20 (TCP)
     static constexpr uint16_t DEFAULT_PEER_MSS = 536; // RFC 793's fallback when a peer's SYN carries no MSS option
     static constexpr uint8_t WINDOW_SCALE_SHIFT = 1; // this stack's advertised shift
+    // Option sizes as Tcp serializes them: timestamps are two NOPs + 10
+    // bytes; SACK is two NOPs + kind + length, then 8 bytes per block.
+    static constexpr size_t TIMESTAMP_OPTION_BYTES = 12;
+    static constexpr size_t SACK_OPTION_OVERHEAD_BYTES = 4;
+    static constexpr size_t SACK_BLOCK_BYTES = 8;
     // Three, not two, and not one. One or two duplicate acks are what ordinary
     // reordering looks like - the network delivered a later segment first, and
     // the missing one is still on its way. Three in a row is the point at which
