@@ -321,6 +321,9 @@ private:
     // Records what the peer's SYN (or SYN-ACK) negotiated: MSS, window scale,
     // SACK-permitted and timestamps.
     void _take_peer_syn_options(const Tcp& segment);
+    // Whether a SYN-ACK completing a simultaneous open carries the same
+    // options as the SYN recorded by _take_peer_syn_options().
+    bool _matches_recorded_syn_options(const Tcp& segment) const;
     // Delayed ACK (RFC 1122 4.2.3.2): rather than acking every in-order data
     // segment immediately, coalesce - send the ack when a second segment
     // arrives, when the delay timer fires, or piggybacked on any segment we

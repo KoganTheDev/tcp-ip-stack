@@ -324,6 +324,19 @@ void TcpConnection::_take_peer_syn_options(const Tcp& segment)
     }
 }
 
+bool TcpConnection::_matches_recorded_syn_options(const Tcp& segment) const
+{
+    // Compared through what _take_peer_syn_options() derived from the SYN.
+    // The timestamp's value is a clock reading and differs by design; only
+    // its presence has to agree.
+    uint16_t mss = segment.has_mss_option() ? segment.get_mss_option() : DEFAULT_PEER_MSS;
+    bool window_scale_agrees =
+        segment.has_window_scale_option() == _window_scaling_negotiated
+        && (!_window_scaling_negotiated || segment.get_window_scale_option() == _peer_window_scale);
+    return mss == _peer_mss && window_scale_agrees && segment.has_sack_permitted_option() == _sack_permitted
+           && segment.has_timestamp_option() == _timestamps_negotiated;
+}
+
 void TcpConnection::_send_pure_ack()
 {
     // an ACK with nothing new to say is never itself acknowledged - it isn't
@@ -1223,19 +1236,51 @@ void TcpConnection::on_segment(const Tcp& segment)
 
     if (_state == TcpState::SYN_RECEIVED)
     {
-        if (segment.get_ack() && segment.get_acknowledgement_number() == _send_next)
+        // RFC 9293 3.10.7.4: the sequence number is checked before the ACK.
+        // Only two segments may complete the handshake: one at exactly
+        // RCV.NXT, or - in a simultaneous open - the peer's SYN-ACK, which
+        // repeats the SYN already taken and so sits at IRS (RCV.NXT - 1) and
+        // carries the same options. Anything else gets a challenge ACK and
+        // changes nothing; matching the ACK alone would let a blind attacker
+        // who guessed it complete the open from a sequence number of its
+        // choosing.
+        //
+        // The options check is the defence against a spoofed bare SYN in
+        // SYN_SENT: that SYN proved nothing (it acked none of ours), so its
+        // options were only provisional, and a SYN-ACK that does ack our SYN
+        // but contradicts them means the SYN was not the peer's. The open is
+        // then refused rather than committed with the planted options; it
+        // fails and is retried instead of being steered.
+        uint32_t seq = segment.get_sequence_number();
+        bool acceptable = segment.get_syn()
+                              ? (_active_open && seq == _recv_next - 1 && _matches_recorded_syn_options(segment))
+                              : seq == _recv_next;
+        if (!acceptable)
         {
-            _in_flight.clear(); // only the SYN-ACK could have been in flight here
-            _unsacked_in_flight_bytes = 0;
-            // After a simultaneous open the completing segment is the peer's
-            // SYN-ACK, whose window is unscaled like that of any SYN.
-            uint8_t peer_shift = (_window_scaling_negotiated && !segment.get_syn()) ? _peer_window_scale : 0;
-            _set_peer_window(static_cast<uint32_t>(segment.get_window()) << peer_shift);
-            // The MSS is only now negotiated, and the window is denominated in
-            // it, so this is where congestion control actually starts.
-            _congestion->on_established(_effective_mss);
-            _transition(TcpState::ESTABLISHED);
+            _send_challenge_ack();
+            return;
         }
+        if (!segment.get_ack())
+        {
+            return;
+        }
+        if (segment.get_acknowledgement_number() != _send_next)
+        {
+            // RFC 9293 3.10.7.4, fifth check in SYN_RECEIVED: an unacceptable
+            // ACK on an otherwise acceptable segment draws <SEQ=SEG.ACK><CTL=RST>
+            _send_reset(segment.get_acknowledgement_number());
+            return;
+        }
+        _in_flight.clear(); // only the SYN-ACK could have been in flight here
+        _unsacked_in_flight_bytes = 0;
+        // After a simultaneous open the completing segment is the peer's
+        // SYN-ACK, whose window is unscaled like that of any SYN.
+        uint8_t peer_shift = (_window_scaling_negotiated && !segment.get_syn()) ? _peer_window_scale : 0;
+        _set_peer_window(static_cast<uint32_t>(segment.get_window()) << peer_shift);
+        // The MSS is only now negotiated, and the window is denominated in
+        // it, so this is where congestion control actually starts.
+        _congestion->on_established(_effective_mss);
+        _transition(TcpState::ESTABLISHED);
         return;
     }
 

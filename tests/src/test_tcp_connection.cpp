@@ -2305,3 +2305,69 @@ TEST(TcpConnection, ASegmentAckingTooFarBehindIsDroppedAndAcked)
     connection->on_segment(*make_incoming_segment(501, 1001 - 1000, FLAG_ACK, Bytes::from_hex("6869")));
     ASSERT_TRUE(received.to_hex() == "6869") << "an old ACK within MAX.SND.WND of SND.UNA is still acceptable";
 }
+
+// RFC 9293 3.10.7.4 checks the sequence number before the ACK, in
+// SYN_RECEIVED too. The segment that completes a passive open must sit at
+// RCV.NXT; one that only gets the ACK right is answered with an ACK and
+// changes nothing.
+TEST(TcpConnection, ThePassiveOpenCompletesOnlyFromASegmentAtRcvNxt)
+{
+    std::vector<RecordedSegment> sent;
+    TcpConnection connection(8080, IPv4Address("10.0.0.1"), 12345, 1000, recorder(sent));
+    connection.accept_incoming_syn(500); // RCV.NXT 501, our SYN-ACK at 1000
+    sent.clear();
+
+    connection.on_segment(*make_incoming_segment(600, 1001, FLAG_ACK));
+    ASSERT_TRUE(connection.get_state() == TcpState::SYN_RECEIVED) << "an ACK off RCV.NXT must not complete the open";
+    ASSERT_TRUE(sent.size() == 1 && sent[0].flags == FLAG_ACK && sent[0].ack == 501) << "it is answered with an ACK";
+
+    connection.on_segment(*make_incoming_segment(501, 1001, FLAG_ACK));
+    ASSERT_TRUE(connection.get_state() == TcpState::ESTABLISHED) << "the segment at RCV.NXT completes it";
+}
+
+// The same in a simultaneous open: the peer's completing SYN-ACK repeats the
+// SYN already taken, so its sequence number must be exactly IRS (RCV.NXT - 1).
+// Getting only the ACK of our SYN right is not enough.
+TEST(TcpConnection, ASimultaneousOpenCompletesOnlyFromASynAckRepeatingTheIrs)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_syn_sent_connection(sent);
+    connection->on_segment(*make_incoming_segment(9000, 0, FLAG_SYN));
+    ASSERT_TRUE(connection->get_state() == TcpState::SYN_RECEIVED) << "precondition";
+    sent.clear();
+
+    connection->on_segment(*make_incoming_segment(7777, 2001, FLAG_SYN | FLAG_ACK));
+    ASSERT_TRUE(connection->get_state() == TcpState::SYN_RECEIVED) << "a SYN-ACK at another sequence number is refused";
+    ASSERT_TRUE(sent.size() == 1 && sent[0].flags == FLAG_ACK && sent[0].ack == 9001) << "with a challenge ACK";
+
+    connection->on_segment(*make_incoming_segment(9000, 2001, FLAG_SYN | FLAG_ACK));
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED) << "the SYN-ACK at IRS completes it";
+}
+
+// A bare SYN in SYN_SENT proves nothing - it acknowledges none of ours - so
+// anyone who knows the four-tuple can send one first. Its options are only
+// provisional: the completing SYN-ACK, which does acknowledge our SYN, must
+// carry the same ones, or the open does not complete with them.
+TEST(TcpConnection, ASimultaneousOpenRefusesASynAckWhoseOptionsDifferFromTheSyn)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_syn_sent_connection(sent);
+    auto spoofed = make_incoming_segment(9000, 0, FLAG_SYN);
+    spoofed->set_mss_option(600);
+    connection->on_segment(*spoofed);
+    sent.clear();
+
+    auto real = make_incoming_segment(9000, 2001, FLAG_SYN | FLAG_ACK);
+    real->set_mss_option(1400);
+    real->set_timestamp_option(42, 0);
+    connection->on_segment(*real);
+    ASSERT_TRUE(connection->get_state() == TcpState::SYN_RECEIVED)
+        << "options the SYN-ACK contradicts must not be committed to";
+    ASSERT_TRUE(sent.size() == 1 && sent[0].flags == FLAG_ACK) << "the mismatch draws a challenge ACK";
+
+    auto consistent = make_incoming_segment(9000, 2001, FLAG_SYN | FLAG_ACK);
+    consistent->set_mss_option(600);
+    connection->on_segment(*consistent);
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED) << "a SYN-ACK agreeing with the SYN completes";
+    ASSERT_TRUE(connection->get_effective_mss() == 600) << "with the options both carried";
+}
