@@ -81,6 +81,24 @@ simultaneous close rather than folding it into `FIN_WAIT_2`. On top of that:
 - Checksum verification on receive, over the bytes *as received* rather than a
   re-serialization, and RFC 793 section 3.4 RST generation for segments matching no
   connection
+- **Segment acceptance per RFC 9293 and RFC 5961.** In `SYN_SENT` a RST counts only if
+  it acknowledges our SYN, and a bad ACK is answered with `<SEQ=SEG.ACK><CTL=RST>`;
+  simultaneous open goes through `SYN_RECEIVED`, completing only from a segment at the
+  expected sequence number (and, for the peer's SYN-ACK, with the options its SYN
+  offered). On an open connection a RST resets only at exactly RCV.NXT, and an
+  in-window RST off it, a SYN, or an ACK more than the peer's largest window behind
+  SND.UNA draws a **challenge ACK** instead - throttled per stack to about 1000 a
+  second, each second's limit randomised (Linux's CVE-2016-5696 fix), and counted
+- **`TIME_WAIT` ignores RST** (RFC 1337): RFC 9293 still closes on one and names RFC
+  1337 as optional; this stack takes its side, because closing early is the hazard
+  `TIME_WAIT` exists to prevent
+- `abort()` (RFC 9293 ABORT: a RST at SND.NXT, every queue flushed) alongside `close()`,
+  which is a half close - `shutdown(SHUT_WR)`, not POSIX `close()`
+- Data is sized so that payload plus options fits the MSS (RFC 6691); urgent data is
+  delivered inline and URG is never sent (RFC 6093)
+- A frame the device drops for a passing reason (`ENOBUFS`, `EAGAIN`, a link that is
+  down) is counted as loss and recovered by retransmission rather than thrown at the
+  application; only a device that is gone surfaces, as `FatalChannelError`
 
 **IP.** Header parse and serialize, checksum computation and verification, and
 fragmentation in both directions - splitting oversized outbound datagrams, and
@@ -314,7 +332,7 @@ and applies itself. See its own README for the full reasoning.
 
 ## Testing
 
-Over 340 GoogleTest unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
+Over 370 GoogleTest unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
 estimation, congestion control, flow control, keepalive, ISN generation, DHCP lease
 acquisition and renewal, DNS parsing and anti-spoofing, routing, fragment reassembly,
 ARP ageing, UDP, ICMP, the thread pool and completion queue, and the logger, plus a fuzz
