@@ -46,7 +46,8 @@ void Tcp::_parse()
     _acknowledgement_number = data.slice_int<uint32_t>(8);
     _data_offset = data[12] >> 4; // Get left nibble
 
-    size_t header_length = _data_offset * 4; // Data offset represents the header length in 32-bit words
+    size_t header_length =
+        static_cast<size_t>(_data_offset) * 4; // Data offset represents the header length in 32-bit words
     if (_data_offset < 5 || header_length > data.size())
     {
         throw EXCEPTION(BaseException, "Invalid TCP data offset\\header length");

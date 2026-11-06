@@ -12,6 +12,7 @@ Logger& Logger::instance()
 
 Logger::Logger() : _min_level(LogLevel::INFO)
 {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): runs once in the singleton constructor; nothing in the program calls setenv
     const char* level_env = std::getenv("LOG_LEVEL");
     if (level_env)
     {
@@ -28,6 +29,7 @@ Logger::Logger() : _min_level(LogLevel::INFO)
         // rather than fail the program over a malformed env var
     }
 
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): runs once in the singleton constructor; nothing in the program calls setenv
     const char* file_env = std::getenv("LOG_FILE");
     if (file_env)
     {
@@ -35,7 +37,8 @@ Logger::Logger() : _min_level(LogLevel::INFO)
         if (!this->_file_sink.is_open())
         {
             std::cerr << "Logger: failed to open LOG_FILE=\"" << file_env << "\" - continuing with console-only logging"
-                      << std::endl;
+                      << '\n'
+                      << std::flush;
         }
     }
 }
@@ -69,7 +72,7 @@ std::string Logger::_timestamp()
     localtime_r(&now, &local_tm); // thread-safe, unlike ctime()/localtime()
 
     char buffer[32];
-    std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &local_tm);
+    static_cast<void>(std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &local_tm));
     return std::string(buffer);
 }
 
@@ -86,9 +89,9 @@ void Logger::log(LogLevel level, const std::string& message, const std::string& 
               << "): " << message;
 
     std::lock_guard<std::mutex> lock(this->_mutex);
-    std::cerr << formatted.str() << std::endl;
+    std::cerr << formatted.str() << '\n' << std::flush;
     if (this->_file_sink.is_open())
     {
-        this->_file_sink << formatted.str() << std::endl;
+        this->_file_sink << formatted.str() << '\n' << std::flush;
     }
 }

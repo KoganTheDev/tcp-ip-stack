@@ -2,6 +2,7 @@
 #include "exceptions.h"
 #include "utils.h"
 
+// NOLINTNEXTLINE(bugprone-throwing-static-initialization,cert-err58-cpp): constant literal parsed at startup; cannot fail
 const MacAddress MacAddress::BROADCAST = MacAddress("ff:ff:ff:ff:ff:ff");
 
 
@@ -29,7 +30,7 @@ MacAddress::MacAddress(const std::string& address)
     }
 
     std::string address_hex = string_replace_all(address, ":", "");
-    if (address_hex.size() != 6 * 2)
+    if (address_hex.size() != size_t{6} * 2)
     {
         throw EXCEPTION(BaseException, "Invalid MAC address format");
     }
@@ -93,6 +94,7 @@ const Bytes& IPv4Address::get_address() const
     return this->_address;
 }
 
+// NOLINTNEXTLINE(bugprone-std-namespace-modification,cert-dcl58-cpp): specialising std::hash for a user type is explicitly permitted
 std::size_t std::hash<IPv4Address>::operator()(const IPv4Address& ip_address) const noexcept
 {
     return std::hash<uint32_t>{}(bytes_to_int<uint32_t>(ip_address.get_address()));

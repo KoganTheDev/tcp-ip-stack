@@ -812,7 +812,7 @@ void NetworkStack::_handle_arp(size_t ingress, const Arp& arp)
         return;
     }
 
-    IPv4Address sender_ip = arp.get_sender_protocol_address();
+    const IPv4Address& sender_ip = arp.get_sender_protocol_address();
     if (!interface.arp_table.learn(sender_ip, arp.get_sender_hardware_address()))
     {
         LOG_WARNING("NetworkStack: ARP table full (" << ArpTable::MAX_ENTRIES << " entries), refusing to learn "

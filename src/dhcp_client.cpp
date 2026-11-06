@@ -286,7 +286,7 @@ void DhcpClient::_apply_ack(const Dhcp& message)
     uint32_t t2_seconds =
         message.get_option_uint32(DHCP_OPTION_REBINDING_TIME, granted.lease_seconds * T2_NUMERATOR / T2_DENOMINATOR);
 
-    _lease = granted;
+    _lease = std::move(granted);
     _state = DhcpClientState::BOUND;
     _renewal_ms_remaining = lease_seconds_to_ms(t1_seconds);
     _rebinding_ms_remaining = lease_seconds_to_ms(t2_seconds);
