@@ -1,0 +1,18 @@
+# The stack opens and then closes first: FIN_WAIT_1, FIN_WAIT_2 once its FIN
+# is ACKed, TIME_WAIT on the peer's FIN, and CLOSED after 2*MSL (60 s here).
+0      connect 9000
++0     > S 0:0(0) win 65535 <mss 1460,sackOK,TS val * ecr 0,wscale 1>
++0.010 < S. 0:0(0) ack 1 win 65535 <mss 1460>
++0     > . 1:1(0) ack 1
++0     state ESTABLISHED
+
++0.100 close
++0     > F. 1:1(0) ack 1
++0     state FIN_WAIT_1
++0.010 < . 1:1(0) ack 2 win 65535
++0     state FIN_WAIT_2
++0.010 < F. 1:1(0) ack 2 win 65535
++0     > . 2:2(0) ack 2
++0     state TIME_WAIT
++59.9  state TIME_WAIT
++0.2   state CLOSED

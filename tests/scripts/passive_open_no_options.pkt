@@ -1,0 +1,9 @@
+# A SYN with no options: the SYN-ACK carries MSS and nothing else, because
+# window scale, SACK-permitted and timestamps are used only if both SYNs
+# offered them.
+0      listen 8080
++0     < S 0:0(0) win 65535
++0     > S. 0:0(0) ack 1 win 65535 <mss 1460>
++0.010 < . 1:1(0) ack 1 win 65535
++0     accept
++0     state ESTABLISHED

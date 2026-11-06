@@ -1,0 +1,16 @@
+# The peer closes first: its FIN is ACKed, the application closes, and the
+# ACK of the stack's FIN takes LAST_ACK to CLOSED.
+0      listen 8080
++0     < S 0:0(0) win 65535 <mss 1460>
++0     > S. 0:0(0) ack 1 <mss 1460>
++0.010 < . 1:1(0) ack 1 win 65535
++0     accept
+
++0     < F. 1:1(0) ack 1 win 65535
++0     > . 1:1(0) ack 2
++0     state CLOSE_WAIT
++0.100 close
++0     > F. 1:1(0) ack 2
++0     state LAST_ACK
++0.010 < . 2:2(0) ack 2 win 65535
++0     state CLOSED
