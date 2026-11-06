@@ -17,6 +17,8 @@
 #   make run_tests  - same; the test runner is build/debug/run_tests
 #   make test       - build and run the whole test suite (exit status is
 #                     nonzero if any test fails)
+#   make sim        - only the simulator's seeded property tests, SIM_SEEDS
+#                     of them (default 200), sharded over SIM_JOBS processes
 #   make asan       - full rebuild, then run the suite under ASan + UBSan
 #   make tsan       - full rebuild, then run the suite under ThreadSanitizer
 #   make strict     - build everything with -Wextra -Werror, then run the suite
@@ -40,6 +42,37 @@ run_tests: all
 # answer.
 test: all
 	./build/debug/run_tests
+
+# The network simulator's seeded property tests (gtest suites *SimTransfer*,
+# ctest label `sim`) and nothing else. `make test` runs them too, at the
+# default 200 seeds; this target exists for running many more - the nightly
+# workflow does SIM_SEEDS=100000 - and to rerun a window of seeds
+# (SIM_SEED_START=1055 SIM_SEEDS=1 make sim). Both variables reach the binary
+# through the environment.
+#
+# The binary is run directly rather than through ctest: ctest starts one
+# process per test, which at 100000 seeds would be most of the run. Instead
+# GoogleTest's own sharding splits the seeds over SIM_JOBS processes (one per
+# CPU by default), each logging to build/debug/sim-shard-<n>.log. Every shard
+# is waited for before failing, so one bad seed does not hide the others;
+# failing seeds leave their pcaps in build/debug/sim-pcaps.
+SIM_JOBS ?= $(shell nproc 2>/dev/null || echo 1)
+
+sim: all
+	@status=0; logs=""; \
+	for i in $$(seq 0 $$(($(SIM_JOBS) - 1))); do \
+	    logs="$$logs build/debug/sim-shard-$$i.log"; \
+	    GTEST_TOTAL_SHARDS=$(SIM_JOBS) GTEST_SHARD_INDEX=$$i \
+	        ./build/debug/run_tests --gtest_filter='*SimTransfer*' > build/debug/sim-shard-$$i.log 2>&1 & \
+	done; \
+	for job in $$(jobs -p); do wait $$job || status=1; done; \
+	grep -h -E '^\[==========\] .* ran' $$logs; \
+	if [ $$status -ne 0 ]; then \
+	    echo "sim: failing seeds:"; \
+	    grep -h -E '^\[  FAILED  \] .*GetParam' $$logs | grep -v ' ms)$$' | sort -u; \
+	    echo "sim: details in build/debug/sim-shard-*.log, captures in build/debug/sim-pcaps/"; \
+	fi; \
+	exit $$status
 
 # Configure a preset the first time it is used, and again whenever the presets
 # file changes (re-running `cmake --preset` re-applies its cache variables).
@@ -149,4 +182,4 @@ clean:
 	rm -rf build bin tests/bin
 	rm -f run_tests tcpipstack
 
-.PHONY: all run_tests test asan tsan strict coverage clean
+.PHONY: all run_tests test sim asan tsan strict coverage clean
