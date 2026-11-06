@@ -51,9 +51,18 @@ public:
 
     virtual void test() = 0;
 
-    static void run_all_tests()
+    // Returns the number of tests that failed, which main() turns into the
+    // process exit status. It used to return nothing and main() returned 0, so
+    // `make test`, CI and the build gate all passed with failing tests: the only
+    // record of a failure was a line in the output nobody was required to read.
+    //
+    // Every exception is caught per test, not just BaseException. A
+    // std::out_of_range from .at() or a bad_alloc used to escape, terminate the
+    // whole run, and hide every test after it.
+    static int run_all_tests()
     {
         int passed_count = 0;
+        int failed_count = 0;
         std::string last_file = ""; // Used to print the file name only once
         for (BaseTest* test : get_tests())
         {
@@ -71,9 +80,21 @@ public:
             catch (const BaseException& e)
             {
                 std::cout << "Test '" << test->_name << "' failed with exception: " << e.what() << std::endl;
+                failed_count++;
+            }
+            catch (const std::exception& e)
+            {
+                std::cout << "Test '" << test->_name << "' failed with std::exception: " << e.what() << std::endl;
+                failed_count++;
+            }
+            catch (...)
+            {
+                std::cout << "Test '" << test->_name << "' failed with a non-standard exception" << std::endl;
+                failed_count++;
             }
         }
         std::cout << std::endl << passed_count << " / " << get_tests().size() << " tests passed" << std::endl;
+        return failed_count;
     }
 
 private:
