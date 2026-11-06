@@ -1,4 +1,4 @@
-#include "test.h"
+#include "test_support.h"
 #include "tcp_connection.h"
 #include "raw.h"
 
@@ -107,7 +107,7 @@ namespace
     }
 }
 
-TEST(HandshakeSendsSynAckWithCorrectSeqAndAck)
+TEST(TcpConnection, HandshakeSendsSynAckWithCorrectSeqAndAck)
 {
     std::vector<RecordedSegment> sent;
     TcpConnection connection(8080, IPv4Address("10.0.0.1"), 12345, 1000,
@@ -121,17 +121,18 @@ TEST(HandshakeSendsSynAckWithCorrectSeqAndAck)
 
     connection.accept_incoming_syn(500);
 
-    test_assert(sent.size() == 1, "accept_incoming_syn() should send exactly one segment");
-    test_assert(sent[0].flags == (FLAG_SYN | FLAG_ACK), "SYN-ACK should have SYN and ACK set");
-    test_assert(sent[0].seq == 1000, "SYN-ACK should use our chosen ISN as its sequence number");
-    test_assert(sent[0].ack == 501, "SYN-ACK should ack the peer's ISN + 1");
-    test_assert(connection.get_state() == TcpState::SYN_RECEIVED, "should move to SYN_RECEIVED after sending SYN-ACK");
+    ASSERT_TRUE(sent.size() == 1) << "accept_incoming_syn() should send exactly one segment";
+    ASSERT_TRUE(sent[0].flags == (FLAG_SYN | FLAG_ACK)) << "SYN-ACK should have SYN and ACK set";
+    ASSERT_TRUE(sent[0].seq == 1000) << "SYN-ACK should use our chosen ISN as its sequence number";
+    ASSERT_TRUE(sent[0].ack == 501) << "SYN-ACK should ack the peer's ISN + 1";
+    ASSERT_TRUE(connection.get_state() == TcpState::SYN_RECEIVED)
+        << "should move to SYN_RECEIVED after sending SYN-ACK";
 }
 
 // Active open (connect()'s side): initiate_connect() should send a bare
 // SYN - no ACK, since there's nothing to acknowledge yet - and the
 // SYN-ACK response should complete the handshake with our own final ACK.
-TEST(ActiveOpenSendsBareSynThenCompletesHandshake)
+TEST(TcpConnection, ActiveOpenSendsBareSynThenCompletesHandshake)
 {
     std::vector<RecordedSegment> sent;
     TcpConnection connection(54321, IPv4Address("10.0.0.2"), 8080, 2000,
@@ -145,27 +146,27 @@ TEST(ActiveOpenSendsBareSynThenCompletesHandshake)
 
     connection.initiate_connect();
 
-    test_assert(sent.size() == 1, "initiate_connect() should send exactly one segment");
-    test_assert(sent[0].flags == FLAG_SYN,
-                "an active open's first SYN must not have ACK set - there's nothing to ack yet");
-    test_assert(sent[0].seq == 2000, "the SYN should use our chosen ISN");
-    test_assert(connection.get_state() == TcpState::SYN_SENT, "initiate_connect() should move to SYN_SENT");
+    ASSERT_TRUE(sent.size() == 1) << "initiate_connect() should send exactly one segment";
+    ASSERT_TRUE(sent[0].flags == FLAG_SYN)
+        << "an active open's first SYN must not have ACK set - there's nothing to ack yet";
+    ASSERT_TRUE(sent[0].seq == 2000) << "the SYN should use our chosen ISN";
+    ASSERT_TRUE(connection.get_state() == TcpState::SYN_SENT) << "initiate_connect() should move to SYN_SENT";
 
     // peer replies with SYN-ACK
     connection.on_segment(*make_incoming_segment(9000, 2001, FLAG_SYN | FLAG_ACK));
 
-    test_assert(connection.get_state() == TcpState::ESTABLISHED,
-                "a valid SYN-ACK in SYN_SENT should move to ESTABLISHED");
-    test_assert(sent.size() == 2, "completing the handshake should send our final ACK");
-    test_assert(sent[1].flags == FLAG_ACK, "the handshake-completing segment should be a pure ACK");
-    test_assert(sent[1].ack == 9001, "the final ACK should ack the peer's ISN + 1");
+    ASSERT_TRUE(connection.get_state() == TcpState::ESTABLISHED)
+        << "a valid SYN-ACK in SYN_SENT should move to ESTABLISHED";
+    ASSERT_TRUE(sent.size() == 2) << "completing the handshake should send our final ACK";
+    ASSERT_TRUE(sent[1].flags == FLAG_ACK) << "the handshake-completing segment should be a pure ACK";
+    ASSERT_TRUE(sent[1].ack == 9001) << "the final ACK should ack the peer's ISN + 1";
 }
 
-TEST(FinalHandshakeAckMovesToEstablished)
+TEST(TcpConnection, FinalHandshakeAckMovesToEstablished)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
-    test_assert(connection->get_state() == TcpState::ESTABLISHED, "final handshake ACK should move to ESTABLISHED");
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED) << "final handshake ACK should move to ESTABLISHED";
 }
 
 // Regression test for a load-testing find: under a burst of many connections, a
@@ -180,7 +181,7 @@ TEST(FinalHandshakeAckMovesToEstablished)
 // notification and one read() returns everything waiting, instead of one
 // delivery per segment. The guarantee worth asserting is that no byte is lost
 // and the order is preserved, not how many chunks it arrives in.
-TEST(DataArrivingBeforeCallbackRegisteredIsNotLost)
+TEST(TcpConnection, DataArrivingBeforeCallbackRegisteredIsNotLost)
 {
     std::vector<RecordedSegment> sent;
 
@@ -206,20 +207,20 @@ TEST(DataArrivingBeforeCallbackRegisteredIsNotLost)
     std::vector<Bytes> received;
     connection->set_data_ready_callback([&received, &connection]() { received.push_back(connection->read()); });
 
-    test_assert(received.size() == 1, "registering should fire one notification for everything already waiting");
-    test_assert(received[0].to_hex() == (first_chunk.to_hex() + second_chunk.to_hex()),
-                "every byte that arrived before anyone was listening must still be readable, in arrival order");
+    ASSERT_TRUE(received.size() == 1) << "registering should fire one notification for everything already waiting";
+    ASSERT_TRUE(received[0].to_hex() == (first_chunk.to_hex() + second_chunk.to_hex()))
+        << "every byte that arrived before anyone was listening must still be readable, in arrival order";
 
     // data arriving after the callback is set should notify straight away
     Bytes third_chunk = Bytes::from_hex("2131");           // "!1"
     connection->on_segment(*make_incoming_segment(511, 1001, FLAG_ACK, third_chunk));
-    test_assert(received.size() == 2, "data arriving after the callback is set should notify immediately");
-    test_assert(received[1].to_hex() == third_chunk.to_hex(), "and read() should return just the new data");
+    ASSERT_TRUE(received.size() == 2) << "data arriving after the callback is set should notify immediately";
+    ASSERT_TRUE(received[1].to_hex() == third_chunk.to_hex()) << "and read() should return just the new data";
 
-    test_assert(connection->bytes_available() == 0, "everything read leaves nothing queued");
+    ASSERT_TRUE(connection->bytes_available() == 0) << "everything read leaves nothing queued";
 }
 
-TEST(InboundDataTriggersCallbackAndAcksCorrectly)
+TEST(TcpConnection, InboundDataTriggersCallbackAndAcksCorrectly)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -230,54 +231,54 @@ TEST(InboundDataTriggersCallbackAndAcksCorrectly)
     Bytes payload = Bytes::from_hex("68656c6c6f"); // "hello"
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, payload));
 
-    test_assert(received.to_hex() == payload.to_hex(),
-                "the readiness callback should fire and read() should return the exact payload");
+    ASSERT_TRUE(received.to_hex() == payload.to_hex())
+        << "the readiness callback should fire and read() should return the exact payload";
     // delayed ACK: a single in-order segment's ack is held, not sent at once
-    test_assert(sent.empty(), "an in-order segment's ack should be delayed, not sent immediately");
+    ASSERT_TRUE(sent.empty()) << "an in-order segment's ack should be delayed, not sent immediately";
 
     connection->on_time_passed(TEST_TICK_MS); // the delay timer fires
-    test_assert(sent.size() == 1, "the delayed ack should be flushed on the next tick");
-    test_assert(sent[0].flags == FLAG_ACK, "the flushed ack should be a pure ACK");
-    test_assert(sent[0].ack == 501 + payload.size(), "the ack should advance past the received payload");
+    ASSERT_TRUE(sent.size() == 1) << "the delayed ack should be flushed on the next tick";
+    ASSERT_TRUE(sent[0].flags == FLAG_ACK) << "the flushed ack should be a pure ACK";
+    ASSERT_TRUE(sent[0].ack == 501 + payload.size()) << "the ack should advance past the received payload";
 }
 
 // RFC 1122: at most one ack may be outstanding - a second in-order segment
 // forces the delayed ack out immediately (ack-every-other-segment).
-TEST(DelayedAckIsSentImmediatelyOnSecondSegment)
+TEST(TcpConnection, DelayedAckIsSentImmediatelyOnSecondSegment)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
     connection->set_data_ready_callback([&connection]() { connection->read(); });
 
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes::from_hex("68656c6c6f"))); // seq 501..505
-    test_assert(sent.empty(), "the first in-order segment's ack should be delayed");
+    ASSERT_TRUE(sent.empty()) << "the first in-order segment's ack should be delayed";
 
     connection->on_segment(*make_incoming_segment(506, 1001, FLAG_ACK, Bytes::from_hex("776f726c64"))); // seq 506..510
-    test_assert(sent.size() == 1, "a second in-order segment should force the delayed ack out at once");
-    test_assert(sent[0].ack == 511, "the ack should cover both segments (RCV.NXT past the second)");
+    ASSERT_TRUE(sent.size() == 1) << "a second in-order segment should force the delayed ack out at once";
+    ASSERT_TRUE(sent[0].ack == 511) << "the ack should cover both segments (RCV.NXT past the second)";
 }
 
 // A delayed ack should never cost an extra segment when we have data to send:
 // the outgoing data carries the ack, so no separate pure ACK goes out.
-TEST(DelayedAckIsPiggybackedOnOutgoingData)
+TEST(TcpConnection, DelayedAckIsPiggybackedOnOutgoingData)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
     connection->set_data_ready_callback([&connection]() { connection->read(); });
 
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes::from_hex("68656c6c6f")));
-    test_assert(sent.empty(), "the ack should be pending, not yet sent");
+    ASSERT_TRUE(sent.empty()) << "the ack should be pending, not yet sent";
 
     connection->send(Bytes::from_hex("6f6b")); // "ok" - a data segment goes out
-    test_assert(sent.size() == 1, "sending data should not also produce a separate pure ack");
-    test_assert(sent[0].payload.to_hex() == "6f6b", "the segment should carry our data");
-    test_assert(sent[0].ack == 506, "the data segment should piggyback the pending ack (RCV.NXT)");
+    ASSERT_TRUE(sent.size() == 1) << "sending data should not also produce a separate pure ack";
+    ASSERT_TRUE(sent[0].payload.to_hex() == "6f6b") << "the segment should carry our data";
+    ASSERT_TRUE(sent[0].ack == 506) << "the data segment should piggyback the pending ack (RCV.NXT)";
 
     connection->on_time_passed(TEST_TICK_MS);
-    test_assert(sent.size() == 1, "no delayed ack should fire after it was already piggybacked");
+    ASSERT_TRUE(sent.size() == 1) << "no delayed ack should fire after it was already piggybacked";
 }
 
-TEST(SendProducesDataSegmentAtCorrectSequence)
+TEST(TcpConnection, SendProducesDataSegmentAtCorrectSequence)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -285,16 +286,16 @@ TEST(SendProducesDataSegmentAtCorrectSequence)
     Bytes payload = Bytes::from_hex("6f6b"); // "ok"
     connection->send(payload);
 
-    test_assert(sent.size() == 1, "send() should produce exactly one segment when nothing is in flight");
-    test_assert(sent[0].seq == 1001, "the first data segment should start at our ISN + 1 (after the SYN)");
-    test_assert(sent[0].payload.to_hex() == payload.to_hex(), "the sent segment should carry the exact payload");
+    ASSERT_TRUE(sent.size() == 1) << "send() should produce exactly one segment when nothing is in flight";
+    ASSERT_TRUE(sent[0].seq == 1001) << "the first data segment should start at our ISN + 1 (after the SYN)";
+    ASSERT_TRUE(sent[0].payload.to_hex() == payload.to_hex()) << "the sent segment should carry the exact payload";
 }
 
 // Regression test for the CLOSE_WAIT/async-echo race found by testing
 // against a real kernel client (see tcp-ip-stack's Bugs Found & Fixed):
 // a peer's FIN must not force our side closed before we've had a chance to
 // still send a response - CLOSE_WAIT should wait for an explicit close().
-TEST(PeerFinDoesNotForceCloseBeforeOurResponse)
+TEST(TcpConnection, PeerFinDoesNotForceCloseBeforeOurResponse)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -302,35 +303,35 @@ TEST(PeerFinDoesNotForceCloseBeforeOurResponse)
     // peer is done sending
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK | FLAG_FIN));
 
-    test_assert(connection->get_state() == TcpState::CLOSE_WAIT, "a peer FIN should move ESTABLISHED to CLOSE_WAIT");
-    test_assert(sent.size() == 1, "the FIN should only be ack'd, not answered with our own FIN yet");
-    test_assert(sent[0].flags == FLAG_ACK, "CLOSE_WAIT must not auto-send a FIN before the app responds");
+    ASSERT_TRUE(connection->get_state() == TcpState::CLOSE_WAIT) << "a peer FIN should move ESTABLISHED to CLOSE_WAIT";
+    ASSERT_TRUE(sent.size() == 1) << "the FIN should only be ack'd, not answered with our own FIN yet";
+    ASSERT_TRUE(sent[0].flags == FLAG_ACK) << "CLOSE_WAIT must not auto-send a FIN before the app responds";
 
     // application (Server) sends its response, then closes since the peer
     // already FIN'd - both steps this test asserts didn't happen prematurely
     connection->send(Bytes::from_hex("6f6b"));
     connection->close();
 
-    test_assert(sent.size() == 2, "send() after the peer's FIN should still produce a data segment");
-    test_assert(sent[1].payload.to_hex() == "6f6b", "the queued response should have gone out, not been dropped");
-    test_assert(connection->get_state() == TcpState::CLOSE_WAIT,
-                "close() must defer while the response is still awaiting its own ack - not send FIN early");
+    ASSERT_TRUE(sent.size() == 2) << "send() after the peer's FIN should still produce a data segment";
+    ASSERT_TRUE(sent[1].payload.to_hex() == "6f6b") << "the queued response should have gone out, not been dropped";
+    ASSERT_TRUE(connection->get_state() == TcpState::CLOSE_WAIT)
+        << "close() must defer while the response is still awaiting its own ack - not send FIN early";
 
     // peer acks the response - only now should the deferred close proceed
     connection->on_segment(*make_incoming_segment(503, sent[1].seq + 2, FLAG_ACK));
 
-    test_assert(sent.size() == 3, "the deferred FIN should be sent once the response is acked");
-    test_assert(sent[2].flags == (FLAG_ACK | FLAG_FIN), "the deferred close should now send our FIN");
-    test_assert(connection->get_state() == TcpState::LAST_ACK, "should move to LAST_ACK after sending our own FIN");
+    ASSERT_TRUE(sent.size() == 3) << "the deferred FIN should be sent once the response is acked";
+    ASSERT_TRUE(sent[2].flags == (FLAG_ACK | FLAG_FIN)) << "the deferred close should now send our FIN";
+    ASSERT_TRUE(connection->get_state() == TcpState::LAST_ACK) << "should move to LAST_ACK after sending our own FIN";
 }
 
-TEST(RetransmitsUnackedSegmentAfterTimeout)
+TEST(TcpConnection, RetransmitsUnackedSegmentAfterTimeout)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
     connection->send(Bytes::from_hex("6f6b"));
-    test_assert(sent.size() == 1, "send() should produce one segment");
+    ASSERT_TRUE(sent.size() == 1) << "send() should produce one segment";
 
     // RETRANSMIT_TIMEOUT_TICKS is 3 (see tcp_connection.cpp) - tick past it
     // with no ack in between
@@ -338,12 +339,13 @@ TEST(RetransmitsUnackedSegmentAfterTimeout)
     connection->on_time_passed(TEST_TICK_MS);
     connection->on_time_passed(TEST_TICK_MS);
 
-    test_assert(sent.size() == 2, "an unacked segment should be retransmitted after enough ticks with no ack");
-    test_assert(sent[1].seq == sent[0].seq, "the retransmission must reuse the original sequence number");
-    test_assert(sent[1].payload.to_hex() == sent[0].payload.to_hex(), "the retransmission must carry the same payload");
+    ASSERT_TRUE(sent.size() == 2) << "an unacked segment should be retransmitted after enough ticks with no ack";
+    ASSERT_TRUE(sent[1].seq == sent[0].seq) << "the retransmission must reuse the original sequence number";
+    ASSERT_TRUE(sent[1].payload.to_hex() == sent[0].payload.to_hex())
+        << "the retransmission must carry the same payload";
 }
 
-TEST(GivesUpAndClosesAfterMaxRetransmitAttempts)
+TEST(TcpConnection, GivesUpAndClosesAfterMaxRetransmitAttempts)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -362,40 +364,41 @@ TEST(GivesUpAndClosesAfterMaxRetransmitAttempts)
         ticks++;
     }
 
-    test_assert(connection->get_state() == TcpState::CLOSED,
-                "should give up and close after exceeding max retransmit attempts");
-    test_assert(ticks > 20,
-                "with exponential backoff the give-up point must be well past the un-backed-off 5 * 3 ticks");
+    ASSERT_TRUE(connection->get_state() == TcpState::CLOSED)
+        << "should give up and close after exceeding max retransmit attempts";
+    ASSERT_TRUE(ticks > 20)
+        << "with exponential backoff the give-up point must be well past the un-backed-off 5 * 3 ticks";
 }
 
-TEST(OurCloseThenPeerFinMovesToTimeWaitThenCloses)
+TEST(TcpConnection, OurCloseThenPeerFinMovesToTimeWaitThenCloses)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
     connection->close(); // our side initiates: sends FIN, -> FIN_WAIT_1
-    test_assert(connection->get_state() == TcpState::FIN_WAIT_1, "close() from ESTABLISHED should move to FIN_WAIT_1");
+    ASSERT_TRUE(connection->get_state() == TcpState::FIN_WAIT_1)
+        << "close() from ESTABLISHED should move to FIN_WAIT_1";
 
     // peer acks our FIN -> FIN_WAIT_2
     connection->on_segment(*make_incoming_segment(501, sent[0].seq + 1, FLAG_ACK));
-    test_assert(connection->get_state() == TcpState::FIN_WAIT_2, "peer acking our FIN should move to FIN_WAIT_2");
+    ASSERT_TRUE(connection->get_state() == TcpState::FIN_WAIT_2) << "peer acking our FIN should move to FIN_WAIT_2";
 
     // peer sends its own FIN -> TIME_WAIT, not straight to CLOSED
     connection->on_segment(*make_incoming_segment(501, sent[0].seq + 1, FLAG_ACK | FLAG_FIN));
-    test_assert(connection->get_state() == TcpState::TIME_WAIT,
-                "peer's FIN in FIN_WAIT_2 should move to TIME_WAIT, not CLOSED directly");
+    ASSERT_TRUE(connection->get_state() == TcpState::TIME_WAIT)
+        << "peer's FIN in FIN_WAIT_2 should move to TIME_WAIT, not CLOSED directly";
 
     // TIME_WAIT runs for a real 2*MSL, so almost all of it must pass with the
     // connection still held open - that holding is the entire mechanism.
     advance_ms(*connection, TIME_WAIT_MS - TEST_TICK_MS);
-    test_assert(connection->get_state() == TcpState::TIME_WAIT,
-                "should remain in TIME_WAIT for the whole 2*MSL, not merely for a few timer calls");
+    ASSERT_TRUE(connection->get_state() == TcpState::TIME_WAIT)
+        << "should remain in TIME_WAIT for the whole 2*MSL, not merely for a few timer calls";
 
     advance_ms(*connection, TEST_TICK_MS);
-    test_assert(connection->get_state() == TcpState::CLOSED, "should close once a full 2*MSL has elapsed");
+    ASSERT_TRUE(connection->get_state() == TcpState::CLOSED) << "should close once a full 2*MSL has elapsed";
 }
 
-TEST(DuplicateFinDuringTimeWaitReAcksAndRestartsWait)
+TEST(TcpConnection, DuplicateFinDuringTimeWaitReAcksAndRestartsWait)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -403,8 +406,8 @@ TEST(DuplicateFinDuringTimeWaitReAcksAndRestartsWait)
     connection->close();
     connection->on_segment(*make_incoming_segment(501, sent[0].seq + 1, FLAG_ACK));
     connection->on_segment(*make_incoming_segment(501, sent[0].seq + 1, FLAG_ACK | FLAG_FIN));
-    test_assert(connection->get_state() == TcpState::TIME_WAIT,
-                "should be in TIME_WAIT before the duplicate FIN test begins");
+    ASSERT_TRUE(connection->get_state() == TcpState::TIME_WAIT)
+        << "should be in TIME_WAIT before the duplicate FIN test begins";
 
     size_t sent_before_duplicate = sent.size();
 
@@ -415,82 +418,82 @@ TEST(DuplicateFinDuringTimeWaitReAcksAndRestartsWait)
     connection->on_time_passed(TEST_TICK_MS);
     connection->on_segment(*make_incoming_segment(501, sent[0].seq + 1, FLAG_ACK | FLAG_FIN));
 
-    test_assert(sent.size() == sent_before_duplicate + 1, "a duplicate FIN in TIME_WAIT should be re-acked");
-    test_assert(connection->get_state() == TcpState::TIME_WAIT,
-                "a duplicate FIN should not itself close the connection");
+    ASSERT_TRUE(sent.size() == sent_before_duplicate + 1) << "a duplicate FIN in TIME_WAIT should be re-acked";
+    ASSERT_TRUE(connection->get_state() == TcpState::TIME_WAIT)
+        << "a duplicate FIN should not itself close the connection";
 
     // the wait should have restarted - one more tick should NOT be enough to close
     connection->on_time_passed(TEST_TICK_MS);
-    test_assert(connection->get_state() == TcpState::TIME_WAIT,
-                "the wait timer should have restarted, not continued from before the duplicate");
+    ASSERT_TRUE(connection->get_state() == TcpState::TIME_WAIT)
+        << "the wait timer should have restarted, not continued from before the duplicate";
 }
 
 // The fixed-count window (MAX_IN_FLIGHT_SEGMENTS) is gone - flow control is
 // now min(cwnd, peer's advertised window), in bytes. make_established_connection's
 // peer segments never carry an MSS option, so both the effective MSS and
 // the initial congestion window fall back to DEFAULT_PEER_MSS (536).
-TEST(SendQueuesOnceBytesInFlightWouldExceedTheCongestionWindow)
+TEST(TcpConnection, SendQueuesOnceBytesInFlightWouldExceedTheCongestionWindow)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
     connection->send(Bytes(400)); // fits: 0 + 400 <= 536
-    test_assert(sent.size() == 1, "a send within the congestion window should go out immediately");
+    ASSERT_TRUE(sent.size() == 1) << "a send within the congestion window should go out immediately";
 
     connection->send(Bytes(200)); // doesn't fit: 400 + 200 > 536
-    test_assert(sent.size() == 1, "a send that would exceed the congestion window should queue instead of going out");
+    ASSERT_TRUE(sent.size() == 1) << "a send that would exceed the congestion window should queue instead of going out";
 
     // acking the whole first segment frees enough room for the queued one
     connection->on_segment(*make_incoming_segment(501, sent[0].seq + 400, FLAG_ACK));
-    test_assert(sent.size() == 2, "acking enough of the window should let the queued send go out");
+    ASSERT_TRUE(sent.size() == 2) << "acking enough of the window should let the queued send go out";
 }
 
 // Slow start (RFC 5681): the congestion window starts at one MSS and grows
 // by the full number of bytes acked each time - roughly doubling per RTT.
-TEST(SlowStartRoughlyDoublesCongestionWindowPerRtt)
+TEST(TcpConnection, SlowStartRoughlyDoublesCongestionWindowPerRtt)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
     connection->send(Bytes(536)); // exactly one MSS - the initial window
-    test_assert(sent.size() == 1, "the initial congestion window (1 MSS) should let exactly one full segment out");
+    ASSERT_TRUE(sent.size() == 1) << "the initial congestion window (1 MSS) should let exactly one full segment out";
 
     // acking it grows cwnd by the 536 bytes just acked: 536 -> 1072
     connection->on_segment(*make_incoming_segment(501, sent[0].seq + 536, FLAG_ACK));
 
     connection->send(Bytes(536));
     connection->send(Bytes(536));
-    test_assert(sent.size() == 3,
-                "after slow start doubles the window, two more full-size segments should pipeline immediately");
+    ASSERT_TRUE(sent.size() == 3)
+        << "after slow start doubles the window, two more full-size segments should pipeline immediately";
 }
 
 // Classic Reno's fast retransmit: three acks that don't advance SND.UNA
 // (duplicate acks) trigger an immediate retransmit of the oldest unacked
 // segment, without waiting for RETRANSMIT_TIMEOUT_TICKS to elapse.
-TEST(ThreeDuplicateAcksTriggerImmediateFastRetransmit)
+TEST(TcpConnection, ThreeDuplicateAcksTriggerImmediateFastRetransmit)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
     connection->send(Bytes::from_hex("6f6b")); // "ok" - one segment in flight
-    test_assert(sent.size() == 1, "send() should produce one segment");
+    ASSERT_TRUE(sent.size() == 1) << "send() should produce one segment";
     uint32_t snd_una = sent[0].seq;
 
     connection->on_segment(*make_incoming_segment(501, snd_una, FLAG_ACK));
     connection->on_segment(*make_incoming_segment(501, snd_una, FLAG_ACK));
-    test_assert(sent.size() == 1, "fewer than 3 duplicate acks should not trigger a retransmit yet");
+    ASSERT_TRUE(sent.size() == 1) << "fewer than 3 duplicate acks should not trigger a retransmit yet";
 
     connection->on_segment(*make_incoming_segment(501, snd_una, FLAG_ACK));
-    test_assert(sent.size() == 2,
-                "the 3rd duplicate ack should trigger an immediate retransmit, without waiting for a timeout");
-    test_assert(sent[1].seq == snd_una,
-                "the fast retransmit must resend the oldest unacked segment at its original sequence number");
+    ASSERT_TRUE(sent.size() == 2)
+        << "the 3rd duplicate ack should trigger an immediate retransmit, without waiting for a timeout";
+    ASSERT_TRUE(sent[1].seq == snd_una)
+        << "the fast retransmit must resend the oldest unacked segment at its original sequence number";
 }
 
 // Classic Reno's "slow start restart": a real timeout (unlike duplicate
 // acks, which mean something is still getting through) collapses the
 // congestion window all the way back to one MSS.
-TEST(RetransmitTimeoutCollapsesCongestionWindowToOneSegment)
+TEST(TcpConnection, RetransmitTimeoutCollapsesCongestionWindowToOneSegment)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -499,41 +502,41 @@ TEST(RetransmitTimeoutCollapsesCongestionWindowToOneSegment)
     connection->on_time_passed(TEST_TICK_MS);
     connection->on_time_passed(TEST_TICK_MS);
     connection->on_time_passed(TEST_TICK_MS); // RETRANSMIT_TIMEOUT_TICKS is 3
-    test_assert(sent.size() == 2, "the timeout should have triggered exactly one retransmission");
+    ASSERT_TRUE(sent.size() == 2) << "the timeout should have triggered exactly one retransmission";
 
     // with cwnd collapsed back to one MSS (536 bytes) and 2 bytes already
     // outstanding from the retransmitted segment, a payload bigger than the
     // remaining room should queue instead of pipelining straight out
     connection->send(Bytes(600));
-    test_assert(sent.size() == 2,
-                "with cwnd collapsed to one segment, a send this size should queue rather than pipeline");
+    ASSERT_TRUE(sent.size() == 2)
+        << "with cwnd collapsed to one segment, a send this size should queue rather than pipeline";
 }
 
 // Full-sized (MSS) segments so the congestion *window*, not Nagle, governs
 // what can be in flight: the initial window is one MSS (536 here), so the
 // first full segment goes out and the second must queue until an ack frees
 // room, then drains.
-TEST(CumulativeAckDrainsQueueIntoWindow)
+TEST(TcpConnection, CumulativeAckDrainsQueueIntoWindow)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
     connection->send(Bytes(536)); // one MSS - fills the initial congestion window, goes out
     connection->send(Bytes(536)); // second full segment - queued, window is full
-    test_assert(sent.size() == 1, "the second full segment should queue behind the full congestion window");
+    ASSERT_TRUE(sent.size() == 1) << "the second full segment should queue behind the full congestion window";
 
     // acking the first frees the window
     connection->on_segment(*make_incoming_segment(501, sent[0].seq + 536, FLAG_ACK));
 
-    test_assert(sent.size() == 2, "acking the in-flight segment should let the queued one go out");
-    test_assert(sent[1].payload.size() == 536, "the drained segment should be the full queued payload");
+    ASSERT_TRUE(sent.size() == 2) << "acking the in-flight segment should let the queued one go out";
+    ASSERT_TRUE(sent[1].payload.size() == 536) << "the drained segment should be the full queued payload";
 }
 
 // Two full-MSS segments in flight at once (Nagle only holds sub-MSS ones), so
 // a timeout has more than one unacked segment to choose from - and must
 // retransmit only the oldest. The congestion window is first grown to 2 MSS so
 // both fit.
-TEST(RetransmitOnlyRetransmitsOldestSegmentInWindow)
+TEST(TcpConnection, RetransmitOnlyRetransmitsOldestSegmentInWindow)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -545,38 +548,38 @@ TEST(RetransmitOnlyRetransmitsOldestSegmentInWindow)
 
     connection->send(Bytes(536));
     connection->send(Bytes(536));
-    test_assert(sent.size() == 2, "two full segments should be in flight at once under the 2-MSS window");
+    ASSERT_TRUE(sent.size() == 2) << "two full segments should be in flight at once under the 2-MSS window";
 
     // let the initial RTO elapse with neither acked
     advance_ms(*connection, INITIAL_RTO_MS);
 
-    test_assert(sent.size() == 3, "only one retransmission should happen per timeout, not one per in-flight segment");
-    test_assert(sent[2].seq == sent[0].seq,
-                "the retransmission must be of the oldest (first) unacked segment, not the newer one");
+    ASSERT_TRUE(sent.size() == 3) << "only one retransmission should happen per timeout, not one per in-flight segment";
+    ASSERT_TRUE(sent[2].seq == sent[0].seq)
+        << "the retransmission must be of the oldest (first) unacked segment, not the newer one";
 }
 
 // Nagle: a small (sub-MSS) write waits while earlier data is unacked, then goes
 // out once that data is acked - coalescing rather than dribbling tiny packets.
-TEST(NagleHoldsSmallSegmentWhileDataIsInFlight)
+TEST(TcpConnection, NagleHoldsSmallSegmentWhileDataIsInFlight)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
     connection->send(Bytes::from_hex("01")); // empty pipe - a small segment goes out at once
-    test_assert(sent.size() == 1, "the first small write goes out immediately (nothing in flight)");
+    ASSERT_TRUE(sent.size() == 1) << "the first small write goes out immediately (nothing in flight)";
 
     connection->send(Bytes::from_hex("02")); // data now in flight - Nagle holds this small write
-    test_assert(sent.size() == 1, "a second small write should be held by Nagle while the first is unacked");
+    ASSERT_TRUE(sent.size() == 1) << "a second small write should be held by Nagle while the first is unacked";
 
     connection->on_segment(*make_incoming_segment(501, sent[0].seq + 1, FLAG_ACK)); // ack the first
-    test_assert(sent.size() == 2, "once the in-flight data is acked, Nagle releases the held segment");
-    test_assert(sent[1].payload.to_hex() == "02", "the released segment should carry the held data");
+    ASSERT_TRUE(sent.size() == 2) << "once the in-flight data is acked, Nagle releases the held segment";
+    ASSERT_TRUE(sent[1].payload.to_hex() == "02") << "the released segment should carry the held data";
 }
 
 // Out-of-order reassembly: a segment arriving ahead of RCV.NXT must be
 // buffered, not delivered or dropped, and only released once the gap in
 // front of it is filled.
-TEST(OutOfOrderSegmentIsBufferedThenDeliveredOnceGapFills)
+TEST(TcpConnection, OutOfOrderSegmentIsBufferedThenDeliveredOnceGapFills)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -589,54 +592,56 @@ TEST(OutOfOrderSegmentIsBufferedThenDeliveredOnceGapFills)
 
     // "world" arrives first - out of order, since RCV.NXT is still 501
     connection->on_segment(*make_incoming_segment(506, 1001, FLAG_ACK, second));
-    test_assert(received.empty(), "an out-of-order segment must not be delivered before the gap ahead of it is filled");
+    ASSERT_TRUE(received.empty())
+        << "an out-of-order segment must not be delivered before the gap ahead of it is filled";
 
     // the gap-filler arrives - both chunks should now deliver, in order
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, first));
-    test_assert(received.size() == 2, "the gap-filler should trigger delivery of both the new and the buffered chunk");
-    test_assert(received[0].to_hex() == first.to_hex(),
-                "chunks must be delivered in sequence order, not arrival order");
-    test_assert(received[1].to_hex() == second.to_hex(),
-                "chunks must be delivered in sequence order, not arrival order");
+    ASSERT_TRUE(received.size() == 2)
+        << "the gap-filler should trigger delivery of both the new and the buffered chunk";
+    ASSERT_TRUE(received[0].to_hex() == first.to_hex())
+        << "chunks must be delivered in sequence order, not arrival order";
+    ASSERT_TRUE(received[1].to_hex() == second.to_hex())
+        << "chunks must be delivered in sequence order, not arrival order";
 }
 
 // Simultaneous close: both sides send FIN before seeing the other's ack.
 // This used to fold into the normal FIN_WAIT_2 path; it now passes through
 // its own CLOSING state instead.
-TEST(SimultaneousCloseGoesThroughClosingState)
+TEST(TcpConnection, SimultaneousCloseGoesThroughClosingState)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
     connection->close(); // -> FIN_WAIT_1, sends our FIN
-    test_assert(connection->get_state() == TcpState::FIN_WAIT_1, "close() should move to FIN_WAIT_1");
+    ASSERT_TRUE(connection->get_state() == TcpState::FIN_WAIT_1) << "close() should move to FIN_WAIT_1";
 
     // the peer's FIN arrives before it has acked ours
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK | FLAG_FIN));
-    test_assert(connection->get_state() == TcpState::CLOSING,
-                "a peer FIN in FIN_WAIT_1 (before our own FIN is acked) should move to CLOSING, not FIN_WAIT_2");
+    ASSERT_TRUE(connection->get_state() == TcpState::CLOSING)
+        << "a peer FIN in FIN_WAIT_1 (before our own FIN is acked) should move to CLOSING, not FIN_WAIT_2";
 
     // now the peer acks our FIN
     connection->on_segment(*make_incoming_segment(502, sent[0].seq + 1, FLAG_ACK));
-    test_assert(connection->get_state() == TcpState::TIME_WAIT,
-                "CLOSING should move to TIME_WAIT once our own FIN is acked");
+    ASSERT_TRUE(connection->get_state() == TcpState::TIME_WAIT)
+        << "CLOSING should move to TIME_WAIT once our own FIN is acked";
 }
 
 // RFC 793 SS3.9: a reset whose sequence number falls outside the receive
 // window must be ignored, not blindly trusted - a real segment couldn't
 // legitimately be that far from what's actually expected next.
-TEST(RstOutsideReceiveWindowIsIgnored)
+TEST(TcpConnection, RstOutsideReceiveWindowIsIgnored)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
     connection->on_segment(*make_incoming_segment(999999, 1001, FLAG_ACK | FLAG_RST));
-    test_assert(connection->get_state() == TcpState::ESTABLISHED,
-                "an RST whose sequence number is outside the receive window must be ignored");
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED)
+        << "an RST whose sequence number is outside the receive window must be ignored";
 
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK | FLAG_RST));
-    test_assert(connection->get_state() == TcpState::CLOSED,
-                "an RST at the current RCV.NXT should still close the connection");
+    ASSERT_TRUE(connection->get_state() == TcpState::CLOSED)
+        << "an RST at the current RCV.NXT should still close the connection";
 }
 
 // Zero-window persist timer (RFC 1122 4.2.2.17): when the peer advertises a
@@ -644,7 +649,7 @@ TEST(RstOutsideReceiveWindowIsIgnored)
 // retransmit timer never runs - if the peer's later window-update ack is lost,
 // the connection would deadlock forever. The persist timer prevents that by
 // periodically probing, and (unlike retransmit) never gives up.
-TEST(ZeroWindowStallsThenPersistProbesUntilWindowReopens)
+TEST(TcpConnection, ZeroWindowStallsThenPersistProbesUntilWindowReopens)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -654,16 +659,16 @@ TEST(ZeroWindowStallsThenPersistProbesUntilWindowReopens)
 
     // the application's data must all queue - nothing may go on the wire
     connection->send(Bytes::from_hex("68656c6c6f")); // "hello"
-    test_assert(sent.empty(), "with a shut peer window, send() must not put anything on the wire");
-    test_assert(connection->get_state() == TcpState::ESTABLISHED, "a shut window must not close the connection");
+    ASSERT_TRUE(sent.empty()) << "with a shut peer window, send() must not put anything on the wire";
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED) << "a shut window must not close the connection";
 
     // PERSIST_BASE_TICKS is 2 - the first probe fires on the second tick
     connection->on_time_passed(TEST_TICK_MS);
-    test_assert(sent.empty(), "the persist timer must not probe before its interval elapses");
+    ASSERT_TRUE(sent.empty()) << "the persist timer must not probe before its interval elapses";
     connection->on_time_passed(TEST_TICK_MS);
-    test_assert(sent.size() == 1, "the persist timer should send a probe once its interval elapses");
-    test_assert(sent[0].payload.size() == 1, "a zero-window probe carries exactly one byte");
-    test_assert(sent[0].seq == 1001, "the probe sits at SND.NXT (our next unsent sequence number)");
+    ASSERT_TRUE(sent.size() == 1) << "the persist timer should send a probe once its interval elapses";
+    ASSERT_TRUE(sent[0].payload.size() == 1) << "a zero-window probe carries exactly one byte";
+    ASSERT_TRUE(sent[0].seq == 1001) << "the probe sits at SND.NXT (our next unsent sequence number)";
 
     // the critical property: persist NEVER gives up, unlike retransmit
     // (MAX_RETRANSMIT_ATTEMPTS is 5). Tick far past that many probes.
@@ -671,23 +676,23 @@ TEST(ZeroWindowStallsThenPersistProbesUntilWindowReopens)
     {
         connection->on_time_passed(TEST_TICK_MS);
     }
-    test_assert(connection->get_state() == TcpState::ESTABLISHED,
-                "the persist timer must probe indefinitely, never closing the connection the way retransmit does");
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED)
+        << "the persist timer must probe indefinitely, never closing the connection the way retransmit does";
 
     // the peer finally reopens its window - the queued data must now flow, even
     // though this ack advances nothing (it acks no new data of ours)
     size_t before = sent.size();
     connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 65535));
-    test_assert(sent.size() == before + 1, "reopening the window should release the queued data");
-    test_assert(sent.back().payload.to_hex() == "68656c6c6f",
-                "the released segment should carry the full queued payload");
-    test_assert(sent.back().seq == 1001, "the released data starts at SND.NXT");
+    ASSERT_TRUE(sent.size() == before + 1) << "reopening the window should release the queued data";
+    ASSERT_TRUE(sent.back().payload.to_hex() == "68656c6c6f")
+        << "the released segment should carry the full queued payload";
+    ASSERT_TRUE(sent.back().seq == 1001) << "the released data starts at SND.NXT";
 }
 
 // MSS negotiation: a peer's SYN advertising a small MSS should cap every
 // segment this side sends to that size, splitting a larger payload instead
 // of ignoring the negotiated limit.
-TEST(NegotiatedMssCapsSentSegmentSize)
+TEST(TcpConnection, NegotiatedMssCapsSentSegmentSize)
 {
     std::vector<RecordedSegment> sent;
     TcpConnection connection(8080, IPv4Address("10.0.0.1"), 12345, 1000,
@@ -707,10 +712,10 @@ TEST(NegotiatedMssCapsSentSegmentSize)
     // only the first chunk goes out immediately - the rest queues, which is
     // exactly slow start's IW=1MSS behavior, not a segmentation bug
     connection.send(Bytes(250));
-    test_assert(sent.size() == 1,
-                "only the first MSS-sized chunk should go out under the initial (1 MSS) congestion window");
-    test_assert(sent[0].payload.size() == 100,
-                "the sent chunk must be capped at the negotiated 100-byte MSS, not sent as one 250-byte segment");
+    ASSERT_TRUE(sent.size() == 1)
+        << "only the first MSS-sized chunk should go out under the initial (1 MSS) congestion window";
+    ASSERT_TRUE(sent[0].payload.size() == 100)
+        << "the sent chunk must be capped at the negotiated 100-byte MSS, not sent as one 250-byte segment";
 }
 
 // --- RTT estimation / adaptive RTO (RFC 6298 + Karn's algorithm) ---
@@ -719,24 +724,24 @@ TEST(NegotiatedMssCapsSentSegmentSize)
 // on_time_passed(TEST_TICK_MS) is the only clock TcpConnection has, so "a 2-tick round trip"
 // means send, tick twice, then deliver the ack.
 
-TEST(RtoStartsAtTheFixedInitialValueBeforeAnySample)
+TEST(TcpConnection, RtoStartsAtTheFixedInitialValueBeforeAnySample)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
     // RFC 6298 rule 2.1: with no measurement yet there is nothing to derive a
     // timeout from, so it must be the fixed conservative default
-    test_assert(connection->get_rto_ms() == static_cast<int>(INITIAL_RTO_MS),
-                "RTO should start at RFC 6298's one second before any RTT sample");
+    ASSERT_TRUE(connection->get_rto_ms() == static_cast<int>(INITIAL_RTO_MS))
+        << "RTO should start at RFC 6298's one second before any RTT sample";
 }
 
-TEST(RtoAdaptsToAMeasuredRoundTrip)
+TEST(TcpConnection, RtoAdaptsToAMeasuredRoundTrip)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
     connection->send(Bytes::from_hex("6f6b"));
-    test_assert(sent.size() == 1, "send() should produce one segment");
+    ASSERT_TRUE(sent.size() == 1) << "send() should produce one segment";
 
     // 800 ms, staying under the initial 1 s RTO so the segment is never
     // retransmitted - the sample must stay unambiguous for Karn to accept it
@@ -745,11 +750,11 @@ TEST(RtoAdaptsToAMeasuredRoundTrip)
 
     // first sample (RFC 6298 rule 2.2): SRTT = 800 ms, RTTVAR = half of it,
     // so RTO = SRTT + 4*RTTVAR = 2400 ms - measurably adapted, not the default
-    test_assert(connection->get_rto_ms() == 2400,
-                "RTO should be recomputed from the measured round trip, not left at the default");
+    ASSERT_TRUE(connection->get_rto_ms() == 2400)
+        << "RTO should be recomputed from the measured round trip, not left at the default";
 }
 
-TEST(RtoConvergesAsRoundTripsStayConsistent)
+TEST(TcpConnection, RtoConvergesAsRoundTripsStayConsistent)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -779,12 +784,12 @@ TEST(RtoConvergesAsRoundTripsStayConsistent)
     // variance term decays and the timeout settles closer to the true round
     // trip - it must come down, and must never fall below the measured RTT.
     int settled = connection->get_rto_ms();
-    test_assert(settled < rto_after_first_sample,
-                "RTO should converge downward as repeated samples show a steady path");
-    test_assert(settled >= 800, "RTO must never settle below the measured 800 ms round trip");
+    ASSERT_TRUE(settled < rto_after_first_sample)
+        << "RTO should converge downward as repeated samples show a steady path";
+    ASSERT_TRUE(settled >= 800) << "RTO must never settle below the measured 800 ms round trip";
 }
 
-TEST(RtoBacksOffExponentiallyOnConsecutiveTimeouts)
+TEST(TcpConnection, RtoBacksOffExponentiallyOnConsecutiveTimeouts)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -793,18 +798,18 @@ TEST(RtoBacksOffExponentiallyOnConsecutiveTimeouts)
 
     // first timeout at the initial 1 s RTO
     advance_ms(*connection, INITIAL_RTO_MS);
-    test_assert(sent.size() == 2, "the segment should be retransmitted once the initial RTO elapses");
-    test_assert(connection->get_rto_ms() == 2000, "RTO should double on the first timeout");
+    ASSERT_TRUE(sent.size() == 2) << "the segment should be retransmitted once the initial RTO elapses";
+    ASSERT_TRUE(connection->get_rto_ms() == 2000) << "RTO should double on the first timeout";
 
     // the second timeout now takes the doubled 2 s, not the original 1 s
     advance_ms(*connection, 1500);
-    test_assert(sent.size() == 2, "the next retransmission must wait the full backed-off RTO, not the original one");
+    ASSERT_TRUE(sent.size() == 2) << "the next retransmission must wait the full backed-off RTO, not the original one";
     advance_ms(*connection, 500);
-    test_assert(sent.size() == 3, "the segment should be retransmitted again once the backed-off RTO elapses");
-    test_assert(connection->get_rto_ms() == 4000, "RTO should double again on the second consecutive timeout");
+    ASSERT_TRUE(sent.size() == 3) << "the segment should be retransmitted again once the backed-off RTO elapses";
+    ASSERT_TRUE(connection->get_rto_ms() == 4000) << "RTO should double again on the second consecutive timeout";
 }
 
-TEST(KarnsAlgorithmRejectsTheAmbiguousSampleFromARetransmittedSegment)
+TEST(TcpConnection, KarnsAlgorithmRejectsTheAmbiguousSampleFromARetransmittedSegment)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -812,19 +817,19 @@ TEST(KarnsAlgorithmRejectsTheAmbiguousSampleFromARetransmittedSegment)
     connection->send(Bytes::from_hex("6f6b"));
 
     advance_ms(*connection, INITIAL_RTO_MS);
-    test_assert(sent.size() == 2, "the segment should have been retransmitted");
-    test_assert(connection->get_rto_ms() == 2000, "RTO should have backed off on the timeout");
+    ASSERT_TRUE(sent.size() == 2) << "the segment should have been retransmitted";
+    ASSERT_TRUE(connection->get_rto_ms() == 2000) << "RTO should have backed off on the timeout";
 
     // Now the peer acks. This ack cannot be attributed to either transmission,
     // so it must produce no RTT sample at all - the backed-off RTO has to
     // survive it untouched. (Were the sample taken, the 1000 ms age of the
     // original transmission would seed the estimator and move the RTO to 3000.)
     connection->on_segment(*make_incoming_segment(501, 1003, FLAG_ACK));
-    test_assert(connection->get_rto_ms() == 2000,
-                "an ack for a retransmitted segment is ambiguous and must not update the RTO");
+    ASSERT_TRUE(connection->get_rto_ms() == 2000)
+        << "an ack for a retransmitted segment is ambiguous and must not update the RTO";
 }
 
-TEST(RtoIsRecomputedFromTheFirstUnambiguousSampleAfterABackoff)
+TEST(TcpConnection, RtoIsRecomputedFromTheFirstUnambiguousSampleAfterABackoff)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -833,8 +838,8 @@ TEST(RtoIsRecomputedFromTheFirstUnambiguousSampleAfterABackoff)
     connection->send(Bytes::from_hex("6f6b"));
     advance_ms(*connection, INITIAL_RTO_MS);
     connection->on_segment(*make_incoming_segment(501, 1003, FLAG_ACK));
-    test_assert(connection->get_rto_ms() == 2000,
-                "precondition: RTO backed off and Karn rejected the ambiguous sample");
+    ASSERT_TRUE(connection->get_rto_ms() == 2000)
+        << "precondition: RTO backed off and Karn rejected the ambiguous sample";
 
     // a fresh segment, never retransmitted, acked after 500 ms - this one is
     // unambiguous, so it seeds the estimator and replaces the backed-off value
@@ -843,8 +848,8 @@ TEST(RtoIsRecomputedFromTheFirstUnambiguousSampleAfterABackoff)
     advance_ms(*connection, 500);
     connection->on_segment(*make_incoming_segment(501, 1005, FLAG_ACK));
 
-    test_assert(connection->get_rto_ms() == 1500,
-                "a clean sample after a backoff should recompute the RTO from the measured round trip");
+    ASSERT_TRUE(connection->get_rto_ms() == 1500)
+        << "a clean sample after a backoff should recompute the RTO from the measured round trip";
 }
 
 // A FIN only consumes a sequence number if it sits exactly at RCV.NXT. A
@@ -854,60 +859,59 @@ TEST(RtoIsRecomputedFromTheFirstUnambiguousSampleAfterABackoff)
 // in CLOSE_WAIT the duplicate advanced RCV.NXT a second time and sent nothing
 // back, so our ack numbers desynchronised permanently and the peer's FIN was
 // never acknowledged, leaving its retransmit timer unable to ever be satisfied.
-TEST(DuplicateFinInCloseWaitIsReAckedWithoutAdvancingSequence)
+TEST(TcpConnection, DuplicateFinInCloseWaitIsReAckedWithoutAdvancingSequence)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_FIN | FLAG_ACK));
-    test_assert(connection->get_state() == TcpState::CLOSE_WAIT,
-                "a peer FIN in ESTABLISHED should move us to CLOSE_WAIT");
-    test_assert(sent.size() == 1, "the FIN should be acked");
-    test_assert(sent[0].ack == 502, "the ack must cover the FIN's one sequence number");
+    ASSERT_TRUE(connection->get_state() == TcpState::CLOSE_WAIT)
+        << "a peer FIN in ESTABLISHED should move us to CLOSE_WAIT";
+    ASSERT_TRUE(sent.size() == 1) << "the FIN should be acked";
+    ASSERT_TRUE(sent[0].ack == 502) << "the ack must cover the FIN's one sequence number";
 
     // the same FIN again, exactly as a peer whose ack was lost would resend it
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_FIN | FLAG_ACK));
 
-    test_assert(connection->get_state() == TcpState::CLOSE_WAIT, "a duplicate FIN must not change state");
-    test_assert(sent.size() == 2, "a duplicate FIN must still be acked, or the peer retransmits forever");
-    test_assert(
-        sent[1].ack == 502,
-        "the re-ack must repeat 502, not advance to 503 - the FIN consumes one sequence number, not one per copy");
+    ASSERT_TRUE(connection->get_state() == TcpState::CLOSE_WAIT) << "a duplicate FIN must not change state";
+    ASSERT_TRUE(sent.size() == 2) << "a duplicate FIN must still be acked, or the peer retransmits forever";
+    ASSERT_TRUE(sent[1].ack == 502)
+        << "the re-ack must repeat 502, not advance to 503 - the FIN consumes one sequence number, not one per copy";
 }
 
 // Same guarantee on the simultaneous-close path, which reaches CLOSING rather
 // than CLOSE_WAIT and was equally unguarded.
-TEST(DuplicateFinInClosingIsReAckedWithoutAdvancingSequence)
+TEST(TcpConnection, DuplicateFinInClosingIsReAckedWithoutAdvancingSequence)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
     connection->close(); // our FIN goes out, we are in FIN_WAIT_1
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_FIN | FLAG_ACK)); // simultaneous close
-    test_assert(connection->get_state() == TcpState::CLOSING,
-                "both sides sending FIN before acking should reach CLOSING");
+    ASSERT_TRUE(connection->get_state() == TcpState::CLOSING)
+        << "both sides sending FIN before acking should reach CLOSING";
     uint32_t ack_after_first_fin = sent.back().ack;
 
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_FIN | FLAG_ACK));
 
-    test_assert(connection->get_state() == TcpState::CLOSING, "a duplicate FIN must not change state");
-    test_assert(sent.back().ack == ack_after_first_fin,
-                "the re-ack must not advance past the single sequence number the FIN consumed");
+    ASSERT_TRUE(connection->get_state() == TcpState::CLOSING) << "a duplicate FIN must not change state";
+    ASSERT_TRUE(sent.back().ack == ack_after_first_fin)
+        << "the re-ack must not advance past the single sequence number the FIN consumed";
 }
 
 // A segment carrying both data and FIN puts the FIN one past the end of that
 // data, so the check above has to be against the FIN's own position, not the
 // segment's sequence number.
-TEST(FinCarriedAlongsideDataIsConsumedAtTheEndOfThatData)
+TEST(TcpConnection, FinCarriedAlongsideDataIsConsumedAtTheEndOfThatData)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_FIN | FLAG_ACK, Bytes::from_hex("6f6b")));
 
-    test_assert(connection->get_state() == TcpState::CLOSE_WAIT,
-                "a data-carrying FIN should still close the peer's direction");
-    test_assert(sent.back().ack == 504, "the ack must cover 2 payload bytes plus the FIN: 501 + 2 + 1");
+    ASSERT_TRUE(connection->get_state() == TcpState::CLOSE_WAIT)
+        << "a data-carrying FIN should still close the peer's direction";
+    ASSERT_TRUE(sent.back().ack == 504) << "the ack must cover 2 payload bytes plus the FIN: 501 + 2 + 1";
 }
 
 // The cumulative-ack retirement loop must use TCP's modular sequence
@@ -922,7 +926,7 @@ TEST(FinCarriedAlongsideDataIsConsumedAtTheEndOfThatData)
 // FIRST ends just below 2^32 and the ack lands just above it - then the ack is
 // numerically smaller than an end_seq it logically covers, the loop stops at the
 // front entry, and nothing is retired at all.
-TEST(CumulativeAckRetiresSegmentsAcrossASequenceNumberWrap)
+TEST(TcpConnection, CumulativeAckRetiresSegmentsAcrossASequenceNumberWrap)
 {
     std::vector<RecordedSegment> sent;
     // chosen so that, after the SYN and one 8-byte segment, the next two
@@ -939,23 +943,23 @@ TEST(CumulativeAckRetiresSegmentsAcrossASequenceNumberWrap)
     // an 8-byte peer MSS keeps the segments small enough to place precisely
     connection->accept_incoming_syn(500, 8);
     connection->on_segment(*make_incoming_segment(501, isn + 1, FLAG_ACK));
-    test_assert(connection->get_state() == TcpState::ESTABLISHED,
-                "handshake should complete regardless of where the ISN sits");
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED)
+        << "handshake should complete regardless of where the ISN sits";
     sent.clear();
 
     // one full-MSS segment, acked, to grow cwnd to two segments' worth
     connection->send(Bytes(8));
-    test_assert(sent.size() == 1, "the first 8-byte segment should go out under the initial 1-MSS window");
+    ASSERT_TRUE(sent.size() == 1) << "the first 8-byte segment should go out under the initial 1-MSS window";
     connection->on_segment(*make_incoming_segment(501, isn + 9, FLAG_ACK));
 
     // now two full-MSS segments fit at once: 0xFFFFFFF6..0xFFFFFFFE and
     // 0xFFFFFFFE..0x00000006. Both are exactly MSS, so Nagle does not hold them.
     connection->send(Bytes(16));
-    test_assert(sent.size() == 3, "two more full-MSS segments should be in flight once cwnd has grown");
+    ASSERT_TRUE(sent.size() == 3) << "two more full-MSS segments should be in flight once cwnd has grown";
     uint32_t first_end = sent[1].seq + 8;
     uint32_t second_end = sent[2].seq + 8;
-    test_assert(first_end == 0xFFFFFFFEu, "precondition: the first of the two must end just below the wrap");
-    test_assert(second_end == 0x00000006u, "precondition: the second must end just past the wrap");
+    ASSERT_TRUE(first_end == 0xFFFFFFFEu) << "precondition: the first of the two must end just below the wrap";
+    ASSERT_TRUE(second_end == 0x00000006u) << "precondition: the second must end just past the wrap";
 
     // one cumulative ack covering both - numerically 6, which is *less than*
     // the first segment's end_seq of 0xFFFFFFFE despite logically following it
@@ -967,10 +971,10 @@ TEST(CumulativeAckRetiresSegmentsAcrossASequenceNumberWrap)
     {
         connection->on_time_passed(TEST_TICK_MS);
     }
-    test_assert(sent.size() == 3, "a cumulative ack that wrapped past 2^32 must retire both segments - any "
-                                  "retransmission means the loop compared sequence numbers non-modularly");
-    test_assert(connection->get_state() == TcpState::ESTABLISHED,
-                "the connection must survive a sequence-number wraparound, not die after MAX_RETRANSMIT_ATTEMPTS");
+    ASSERT_TRUE(sent.size() == 3) << "a cumulative ack that wrapped past 2^32 must retire both segments - any "
+                                     "retransmission means the loop compared sequence numbers non-modularly";
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED)
+        << "the connection must survive a sequence-number wraparound, not die after MAX_RETRANSMIT_ATTEMPTS";
 }
 
 // Fast retransmit resends a segment, so it must restart that segment's
@@ -978,30 +982,30 @@ TEST(CumulativeAckRetiresSegmentsAcrossASequenceNumberWrap)
 // timer carries on from wherever it already was and the timeout path fires
 // moments later for the same segment - collapsing cwnd to one MSS and
 // cancelling fast recovery, a second and far harsher reaction to one loss.
-TEST(FastRetransmitRestartsTheRetransmitTimer)
+TEST(TcpConnection, FastRetransmitRestartsTheRetransmitTimer)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
     connection->send(Bytes::from_hex("6f6b"));
-    test_assert(sent.size() == 1, "send() should produce one segment");
+    ASSERT_TRUE(sent.size() == 1) << "send() should produce one segment";
     uint32_t snd_una = sent[0].seq;
 
     // burn most of the initial 1 s RTO before the duplicate acks arrive,
     // leaving only 200 ms on the clock
     advance_ms(*connection, 800);
-    test_assert(sent.size() == 1, "800 ms should not yet have reached the 1 s timeout");
+    ASSERT_TRUE(sent.size() == 1) << "800 ms should not yet have reached the 1 s timeout";
 
     connection->on_segment(*make_incoming_segment(501, snd_una, FLAG_ACK));
     connection->on_segment(*make_incoming_segment(501, snd_una, FLAG_ACK));
     connection->on_segment(*make_incoming_segment(501, snd_una, FLAG_ACK));
-    test_assert(sent.size() == 2, "the 3rd duplicate ack should trigger a fast retransmit");
+    ASSERT_TRUE(sent.size() == 2) << "the 3rd duplicate ack should trigger a fast retransmit";
 
     // 500 ms more would have run out the un-reset 200 ms remainder; against a
     // restarted full RTO it is not close
     advance_ms(*connection, 500);
-    test_assert(sent.size() == 2, "the timer must have been restarted by the fast retransmit, so a further 500 ms "
-                                  "cannot trigger a timeout retransmit of the same segment");
+    ASSERT_TRUE(sent.size() == 2) << "the timer must have been restarted by the fast retransmit, so a further 500 ms "
+                                     "cannot trigger a timeout retransmit of the same segment";
 }
 
 // --- flow control that actually exists ---
@@ -1011,7 +1015,7 @@ TEST(FastRetransmitRestartsTheRetransmitTimer)
 // the window reopened for bytes nobody had consumed. An application that stopped
 // reading could not slow a sender down at all. These cover the real thing.
 
-TEST(UnreadDataShrinksTheAdvertisedWindow)
+TEST(TcpConnection, UnreadDataShrinksTheAdvertisedWindow)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -1028,18 +1032,18 @@ TEST(UnreadDataShrinksTheAdvertisedWindow)
         seq += 1000;
     }
 
-    test_assert(connection->bytes_available() >= 70000, "unread data should be sitting in the receive queue");
+    ASSERT_TRUE(connection->bytes_available() >= 70000) << "unread data should be sitting in the receive queue";
 
     // force an ack out so the advertised window is observable on the wire
     connection->on_time_passed(TEST_TICK_MS);
-    test_assert(!sent.empty(), "the delayed ack should have gone out by now");
-    test_assert(
-        sent.back().window < 65535,
-        "the advertised window must shrink to account for data the application has not read - before the receive queue "
-        "existed it stayed wide open, because delivery advanced RCV.NXT and handed the bytes away in one step");
+    ASSERT_TRUE(!sent.empty()) << "the delayed ack should have gone out by now";
+    ASSERT_TRUE(sent.back().window < 65535)
+        << "the advertised window must shrink to account for data the application has not read - before the receive "
+           "queue "
+           "existed it stayed wide open, because delivery advanced RCV.NXT and handed the bytes away in one step";
 }
 
-TEST(ReadingReopensTheWindowAndTellsThePeer)
+TEST(TcpConnection, ReadingReopensTheWindowAndTellsThePeer)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -1054,20 +1058,20 @@ TEST(ReadingReopensTheWindowAndTellsThePeer)
     }
 
     connection->on_time_passed(TEST_TICK_MS);
-    test_assert(!sent.empty() && sent.back().window == 0,
-                "with the receive buffer full of unread data the advertised window must be zero - this is the sender "
-                "being told to stop");
+    ASSERT_TRUE(!sent.empty() && sent.back().window == 0)
+        << "with the receive buffer full of unread data the advertised window must be zero - this is the sender "
+           "being told to stop";
 
     size_t sent_before = sent.size();
     Bytes taken = connection->read(4000);
 
-    test_assert(taken.size() == 4000, "read() should return exactly what was asked for when that much is queued");
-    test_assert(sent.size() == sent_before + 1,
-                "reopening a window that was shut must send a window update, not wait for the peer's next probe");
-    test_assert(sent.back().window > 0, "the update must advertise the freed space");
+    ASSERT_TRUE(taken.size() == 4000) << "read() should return exactly what was asked for when that much is queued";
+    ASSERT_TRUE(sent.size() == sent_before + 1)
+        << "reopening a window that was shut must send a window update, not wait for the peer's next probe";
+    ASSERT_TRUE(sent.back().window > 0) << "the update must advertise the freed space";
 }
 
-TEST(ReadTakesInOrderAndCanBePartial)
+TEST(TcpConnection, ReadTakesInOrderAndCanBePartial)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -1076,12 +1080,12 @@ TEST(ReadTakesInOrderAndCanBePartial)
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes::from_hex("aaaa")));
     connection->on_segment(*make_incoming_segment(503, 1001, FLAG_ACK, Bytes::from_hex("bbbb")));
 
-    test_assert(connection->read(3).to_hex() == "aaaabb",
-                "a partial read should span chunk boundaries and stop exactly at the limit");
-    test_assert(connection->bytes_available() == 1, "the remainder should stay queued");
-    test_assert(connection->read().to_hex() == "bb", "the rest should come back in order on the next read");
-    test_assert(connection->read().empty(),
-                "reading an empty queue should return nothing rather than blocking or faulting");
+    ASSERT_TRUE(connection->read(3).to_hex() == "aaaabb")
+        << "a partial read should span chunk boundaries and stop exactly at the limit";
+    ASSERT_TRUE(connection->bytes_available() == 1) << "the remainder should stay queued";
+    ASSERT_TRUE(connection->read().to_hex() == "bb") << "the rest should come back in order on the next read";
+    ASSERT_TRUE(connection->read().empty())
+        << "reading an empty queue should return nothing rather than blocking or faulting";
 }
 
 // --- state-change notification is additive ---
@@ -1092,7 +1096,7 @@ TEST(ReadTakesInOrderAndCanBePartial)
 // connections were never reaped. Two subscribers with different concerns is the
 // normal case here, not an edge one.
 
-TEST(EveryStateChangeSubscriberIsNotified)
+TEST(TcpConnection, EveryStateChangeSubscriberIsNotified)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -1104,10 +1108,10 @@ TEST(EveryStateChangeSubscriberIsNotified)
 
     connection->close();
 
-    test_assert(first.size() == 1 && first[0] == TcpState::FIN_WAIT_1,
-                "the first subscriber should see the transition");
-    test_assert(second.size() == 1 && second[0] == TcpState::FIN_WAIT_1,
-                "the second subscriber must see it too - registering one must not replace another");
+    ASSERT_TRUE(first.size() == 1 && first[0] == TcpState::FIN_WAIT_1)
+        << "the first subscriber should see the transition";
+    ASSERT_TRUE(second.size() == 1 && second[0] == TcpState::FIN_WAIT_1)
+        << "the second subscriber must see it too - registering one must not replace another";
 }
 
 // --- send-side backpressure ---
@@ -1116,7 +1120,7 @@ TEST(EveryStateChangeSubscriberIsNotified)
 // old bug pointed the other way: an application writing faster than the network
 // drains grew the queue until memory ran out, with no way to know.
 
-TEST(SendAcceptsOnlyWhatFitsAndReportsHowMuch)
+TEST(TcpConnection, SendAcceptsOnlyWhatFitsAndReportsHowMuch)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -1124,14 +1128,13 @@ TEST(SendAcceptsOnlyWhatFitsAndReportsHowMuch)
     size_t offered = TcpConnection::SEND_BUFFER_CAPACITY * 2;
     size_t accepted = connection->send(Bytes(static_cast<unsigned int>(offered)));
 
-    test_assert(accepted > 0, "some of it should be accepted");
-    test_assert(accepted < offered, "send() must not accept more than the send buffer can hold");
-    test_assert(
-        accepted == TcpConnection::SEND_BUFFER_CAPACITY,
-        "it should accept exactly the buffer's worth and report that, so the caller knows what is left to retry");
+    ASSERT_TRUE(accepted > 0) << "some of it should be accepted";
+    ASSERT_TRUE(accepted < offered) << "send() must not accept more than the send buffer can hold";
+    ASSERT_TRUE(accepted == TcpConnection::SEND_BUFFER_CAPACITY)
+        << "it should accept exactly the buffer's worth and report that, so the caller knows what is left to retry";
 }
 
-TEST(SendReportsZeroAndUnwritableWhenTheQueueIsFull)
+TEST(TcpConnection, SendReportsZeroAndUnwritableWhenTheQueueIsFull)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -1140,27 +1143,26 @@ TEST(SendReportsZeroAndUnwritableWhenTheQueueIsFull)
     connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 0));
     connection->send(Bytes(static_cast<unsigned int>(TcpConnection::SEND_BUFFER_CAPACITY)));
 
-    test_assert(!connection->writable(), "with the queue full the connection must report itself unwritable");
-    test_assert(connection->send(Bytes::from_hex("aabb")) == 0,
-                "a send with no room must accept nothing and say so, rather than queueing without bound");
-    test_assert(connection->bytes_unacked() > 0, "the queued data should be reported as still unacknowledged");
+    ASSERT_TRUE(!connection->writable()) << "with the queue full the connection must report itself unwritable";
+    ASSERT_TRUE(connection->send(Bytes::from_hex("aabb")) == 0)
+        << "a send with no room must accept nothing and say so, rather than queueing without bound";
+    ASSERT_TRUE(connection->bytes_unacked() > 0) << "the queued data should be reported as still unacknowledged";
 }
 
-TEST(DrainingTheSendQueueMakesRoomAgain)
+TEST(TcpConnection, DrainingTheSendQueueMakesRoomAgain)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
     connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 0));
     connection->send(Bytes(static_cast<unsigned int>(TcpConnection::SEND_BUFFER_CAPACITY)));
-    test_assert(connection->send_space_available() == 0, "precondition: the queue is full");
+    ASSERT_TRUE(connection->send_space_available() == 0) << "precondition: the queue is full";
 
     // the peer reopens its window, which lets queued data go out
     connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 65535));
 
-    test_assert(
-        connection->send_space_available() > 0,
-        "once queued data has gone out the space must be reusable - otherwise the connection is writable exactly once");
+    ASSERT_TRUE(connection->send_space_available() > 0) << "once queued data has gone out the space must be reusable - "
+                                                           "otherwise the connection is writable exactly once";
 }
 
 // --- RFC 7323 timestamps and PAWS ---
@@ -1196,7 +1198,7 @@ namespace
     }
 }
 
-TEST(TimestampsAreUsedOnlyIfThePeerOfferedThem)
+TEST(TcpConnection, TimestampsAreUsedOnlyIfThePeerOfferedThem)
 {
     std::vector<RecordedSegment> sent;
     // peer's SYN carried no timestamp, so neither should anything we send after
@@ -1204,33 +1206,33 @@ TEST(TimestampsAreUsedOnlyIfThePeerOfferedThem)
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes::from_hex("aabb")));
     connection->on_time_passed(TEST_TICK_MS);
 
-    test_assert(!sent.empty(), "an ack should have gone out");
-    test_assert(!sent.back().has_timestamp, "a peer that did not offer timestamps would not echo them, so sending them "
-                                            "is pointless - same rule as window scaling");
+    ASSERT_TRUE(!sent.empty()) << "an ack should have gone out";
+    ASSERT_TRUE(!sent.back().has_timestamp)
+        << "a peer that did not offer timestamps would not echo them, so sending them "
+           "is pointless - same rule as window scaling";
 }
 
-TEST(EverySegmentCarriesATimestampOnceNegotiated)
+TEST(TcpConnection, EverySegmentCarriesATimestampOnceNegotiated)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_timestamped_connection(sent);
 
     connection->send(Bytes::from_hex("aabb"));
-    test_assert(
-        !sent.empty() && sent.back().has_timestamp,
-        "a data segment must carry a timestamp - unlike MSS, it is a fresh reading rather than a one-time parameter");
+    ASSERT_TRUE(!sent.empty() && sent.back().has_timestamp)
+        << "a data segment must carry a timestamp - unlike MSS, it is a fresh reading rather than a one-time parameter";
 
     connection->on_segment(*make_segment_ts(501, 1003, FLAG_ACK, 5100, 0, Bytes::from_hex("ccdd")));
     connection->on_time_passed(TEST_TICK_MS);
-    test_assert(sent.back().has_timestamp, "so must an ack");
-    test_assert(sent.back().timestamp_echo == 5100,
-                "and it must echo the newest timestamp received, which is what lets the peer time its own round trip");
+    ASSERT_TRUE(sent.back().has_timestamp) << "so must an ack";
+    ASSERT_TRUE(sent.back().timestamp_echo == 5100)
+        << "and it must echo the newest timestamp received, which is what lets the peer time its own round trip";
 }
 
 // The payoff. Karn's algorithm has to discard the sample from a retransmitted
 // segment, because an ack cannot say which transmission it answers - and that
 // blinds the estimator during loss recovery, exactly when the path is changing.
 // An echoed timestamp says which, so the sample is usable.
-TEST(TimestampEchoYieldsAnRttSampleEvenAfterARetransmit)
+TEST(TcpConnection, TimestampEchoYieldsAnRttSampleEvenAfterARetransmit)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_timestamped_connection(sent);
@@ -1241,19 +1243,19 @@ TEST(TimestampEchoYieldsAnRttSampleEvenAfterARetransmit)
     connection->on_time_passed(TEST_TICK_MS);
     connection->on_time_passed(TEST_TICK_MS);
     connection->on_time_passed(TEST_TICK_MS);
-    test_assert(sent.size() == 2, "precondition: the segment was retransmitted");
+    ASSERT_TRUE(sent.size() == 2) << "precondition: the segment was retransmitted";
     int rto_after_backoff = connection->get_rto_ms();
 
     // the peer acks, echoing the timestamp from when we first sent it
     uint32_t original_send_time = 1; // the tick clock starts at 1, so 0 can mean "no echo"
     connection->on_segment(*make_segment_ts(501, 1003, FLAG_ACK, 5200, original_send_time));
 
-    test_assert(connection->get_rto_ms() != rto_after_backoff,
-                "the echo identifies which transmission the ack answers, so a round trip can be measured where Karn's "
-                "algorithm would have had to discard it");
+    ASSERT_TRUE(connection->get_rto_ms() != rto_after_backoff)
+        << "the echo identifies which transmission the ack answers, so a round trip can be measured where Karn's "
+           "algorithm would have had to discard it";
 }
 
-TEST(PawsDropsASegmentWhoseTimestampPredatesTheNewestSeen)
+TEST(TcpConnection, PawsDropsASegmentWhoseTimestampPredatesTheNewestSeen)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_timestamped_connection(sent);
@@ -1262,18 +1264,17 @@ TEST(PawsDropsASegmentWhoseTimestampPredatesTheNewestSeen)
     connection->set_data_ready_callback([&received, &connection]() { received.push_back(connection->read()); });
 
     connection->on_segment(*make_segment_ts(501, 1001, FLAG_ACK, 6000, 0, Bytes::from_hex("aabb")));
-    test_assert(received.size() == 1, "a current segment should be accepted");
+    ASSERT_TRUE(received.size() == 1) << "a current segment should be accepted";
 
     // an old duplicate whose sequence number nonetheless looks plausible
     connection->on_segment(*make_segment_ts(503, 1001, FLAG_ACK, 5500, 0, Bytes::from_hex("ccdd")));
 
-    test_assert(
-        received.size() == 1,
-        "a segment older than the newest timestamp seen is a straggler from earlier in the connection and must be "
-        "dropped, however plausible its sequence number - on a fast path the sequence space wraps in seconds");
+    ASSERT_TRUE(received.size() == 1)
+        << "a segment older than the newest timestamp seen is a straggler from earlier in the connection and must be "
+           "dropped, however plausible its sequence number - on a fast path the sequence space wraps in seconds";
 }
 
-TEST(PawsStillAcksWhatItDrops)
+TEST(TcpConnection, PawsStillAcksWhatItDrops)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_timestamped_connection(sent);
@@ -1283,8 +1284,8 @@ TEST(PawsStillAcksWhatItDrops)
     sent.clear();
 
     connection->on_segment(*make_segment_ts(503, 1001, FLAG_ACK, 5500, 0, Bytes::from_hex("ccdd")));
-    test_assert(!sent.empty(), "a dropped segment must still be acked - the peer may simply be out of date, and "
-                               "silence would leave it retransmitting forever");
+    ASSERT_TRUE(!sent.empty()) << "a dropped segment must still be acked - the peer may simply be out of date, and "
+                                  "silence would leave it retransmitting forever";
 }
 
 // --- selective acknowledgement (RFC 2018) ---
@@ -1322,7 +1323,7 @@ namespace
     }
 }
 
-TEST(SackIsUsedOnlyIfThePeerPermittedIt)
+TEST(TcpConnection, SackIsUsedOnlyIfThePeerPermittedIt)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent); // peer sent no SACK-permitted
@@ -1331,13 +1332,13 @@ TEST(SackIsUsedOnlyIfThePeerPermittedIt)
     // an out-of-order segment would normally produce blocks
     connection->on_segment(*make_incoming_segment(600, 1001, FLAG_ACK, Bytes::from_hex("aabb")));
 
-    test_assert(!sent.empty(), "an out-of-order segment should draw an immediate duplicate ack");
-    test_assert(sent.back().flags == FLAG_ACK, "it should be a pure ack");
+    ASSERT_TRUE(!sent.empty()) << "an out-of-order segment should draw an immediate duplicate ack";
+    ASSERT_TRUE(sent.back().flags == FLAG_ACK) << "it should be a pure ack";
 }
 
 // The receiver's half: report what arrived out of order, so the sender can tell
 // which holes are real.
-TEST(OutOfOrderDataIsReportedAsSackBlocks)
+TEST(TcpConnection, OutOfOrderDataIsReportedAsSackBlocks)
 {
     std::vector<RecordedSegment> sent;
     std::vector<Tcp::SackBlock> reported;
@@ -1357,12 +1358,12 @@ TEST(OutOfOrderDataIsReportedAsSackBlocks)
     // a gap: 501-503 is missing, 503-505 arrives
     connection->on_segment(*make_incoming_segment(503, 1001, FLAG_ACK, Bytes::from_hex("aabb")));
 
-    test_assert(reported.size() == 1, "the out-of-order range should be reported as one block");
-    test_assert(reported[0].start == 503 && reported[0].end == 505,
-                "the block must name exactly the bytes held, as a half-open range");
+    ASSERT_TRUE(reported.size() == 1) << "the out-of-order range should be reported as one block";
+    ASSERT_TRUE(reported[0].start == 503 && reported[0].end == 505)
+        << "the block must name exactly the bytes held, as a half-open range";
 }
 
-TEST(AdjacentOutOfOrderSegmentsAreMergedIntoOneBlock)
+TEST(TcpConnection, AdjacentOutOfOrderSegmentsAreMergedIntoOneBlock)
 {
     std::vector<RecordedSegment> sent;
     std::vector<Tcp::SackBlock> reported;
@@ -1382,15 +1383,15 @@ TEST(AdjacentOutOfOrderSegmentsAreMergedIntoOneBlock)
     connection->on_segment(*make_incoming_segment(505, 1001, FLAG_ACK, Bytes::from_hex("aabb")));
     connection->on_segment(*make_incoming_segment(507, 1001, FLAG_ACK, Bytes::from_hex("ccdd")));
 
-    test_assert(reported.size() == 1, "two adjacent ranges are one contiguous run and must be reported as a single "
-                                      "block - the option space is far too small to spend describing it twice");
-    test_assert(reported[0].start == 505 && reported[0].end == 509, "and the merged block must span both");
+    ASSERT_TRUE(reported.size() == 1) << "two adjacent ranges are one contiguous run and must be reported as a single "
+                                         "block - the option space is far too small to spend describing it twice";
+    ASSERT_TRUE(reported[0].start == 505 && reported[0].end == 509) << "and the merged block must span both";
 }
 
 // The sender's half, and the reason the in-flight accounting had to change: a
 // SACKed segment is not travelling any more, so continuing to count it would
 // leave the sender refusing to send while the network is actually empty.
-TEST(SackedSegmentsStopCountingAsInFlight)
+TEST(TcpConnection, SackedSegmentsStopCountingAsInFlight)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_sack_connection(sent);
@@ -1402,7 +1403,7 @@ TEST(SackedSegmentsStopCountingAsInFlight)
     sent.clear();
 
     connection->send(Bytes(200u)); // two 100-byte segments, both in flight
-    test_assert(sent.size() == 2, "precondition: two segments in flight");
+    ASSERT_TRUE(sent.size() == 2) << "precondition: two segments in flight";
     uint32_t second_seq = sent[1].seq;
 
     size_t unacked_before = connection->bytes_unacked();
@@ -1410,14 +1411,14 @@ TEST(SackedSegmentsStopCountingAsInFlight)
     // the peer reports holding the SECOND segment, while the first is still missing
     connection->on_segment(*make_segment_sack(501, sent[0].seq, FLAG_ACK, {{second_seq, second_seq + 100}}));
 
-    test_assert(connection->bytes_unacked() == unacked_before - 100,
-                "a SACKed segment is not travelling any more and must stop being counted - continuing to count it "
-                "leaves the sender refusing to send while the network is actually empty");
+    ASSERT_TRUE(connection->bytes_unacked() == unacked_before - 100)
+        << "a SACKed segment is not travelling any more and must stop being counted - continuing to count it "
+           "leaves the sender refusing to send while the network is actually empty";
 }
 
 // Without SACK a retransmission resends the front of the queue. With it, the
 // front may already be sitting in the peer's reorder buffer.
-TEST(RetransmissionSkipsSegmentsThePeerAlreadyHolds)
+TEST(TcpConnection, RetransmissionSkipsSegmentsThePeerAlreadyHolds)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_sack_connection(sent);
@@ -1429,7 +1430,7 @@ TEST(RetransmissionSkipsSegmentsThePeerAlreadyHolds)
     sent.clear();
 
     connection->send(Bytes(200u));
-    test_assert(sent.size() == 2, "precondition: two segments in flight");
+    ASSERT_TRUE(sent.size() == 2) << "precondition: two segments in flight";
     uint32_t first_seq = sent[0].seq;
     uint32_t second_seq = sent[1].seq;
     size_t segments_sent = sent.size();
@@ -1441,10 +1442,10 @@ TEST(RetransmissionSkipsSegmentsThePeerAlreadyHolds)
     connection->on_segment(*make_segment_sack(501, first_seq, FLAG_ACK, blocks));
     connection->on_segment(*make_segment_sack(501, first_seq, FLAG_ACK, blocks));
 
-    test_assert(sent.size() > segments_sent, "a fast retransmit should have happened");
-    test_assert(sent.back().seq == second_seq, "it must resend the segment the peer has NOT reported holding");
-    test_assert(sent.back().seq != first_seq,
-                "and must not resend the one it just said it holds - that is the waste SACK exists to prevent");
+    ASSERT_TRUE(sent.size() > segments_sent) << "a fast retransmit should have happened";
+    ASSERT_TRUE(sent.back().seq == second_seq) << "it must resend the segment the peer has NOT reported holding";
+    ASSERT_TRUE(sent.back().seq != first_seq)
+        << "and must not resend the one it just said it holds - that is the waste SACK exists to prevent";
 }
 
 // --- timers denominated in real time, not in calls ---
@@ -1456,7 +1457,7 @@ TEST(RetransmissionSkipsSegmentsThePeerAlreadyHolds)
 // The first: how often the caller polls must not change how long a timeout is.
 // Under the old scheme it changed it proportionally - halving the application's
 // timer interval halved every RTO in the stack, silently.
-TEST(TimeoutsMeasureElapsedTimeNotTheNumberOfCalls)
+TEST(TcpConnection, TimeoutsMeasureElapsedTimeNotTheNumberOfCalls)
 {
     std::vector<RecordedSegment> fine_sent;
     auto fine = make_established_connection(fine_sent);
@@ -1476,14 +1477,14 @@ TEST(TimeoutsMeasureElapsedTimeNotTheNumberOfCalls)
     {
         coarse->on_time_passed(300);
     }
-    test_assert(fine_sent.size() == 1 && coarse_sent.size() == 1,
-                "neither should have retransmitted yet - 900 ms is short of the 1 s initial RTO, at any polling rate");
+    ASSERT_TRUE(fine_sent.size() == 1 && coarse_sent.size() == 1)
+        << "neither should have retransmitted yet - 900 ms is short of the 1 s initial RTO, at any polling rate";
 
     // and the same 100 ms more, which crosses the RTO for both
     fine->on_time_passed(100);
     coarse->on_time_passed(100);
-    test_assert(fine_sent.size() == 2 && coarse_sent.size() == 2,
-                "both should retransmit at 1 s of elapsed time regardless of how many calls it took to get there");
+    ASSERT_TRUE(fine_sent.size() == 2 && coarse_sent.size() == 2)
+        << "both should retransmit at 1 s of elapsed time regardless of how many calls it took to get there";
 }
 
 // The second, and the reason a plain "tick duration" constant handed to the
@@ -1493,21 +1494,21 @@ TEST(TimeoutsMeasureElapsedTimeNotTheNumberOfCalls)
 // calls concludes one interval passed. Retransmissions then run late by
 // exactly however overloaded the machine was, which is the worst possible
 // moment for them to be late.
-TEST(ASingleLateCallCatchesUpOnEverythingItSleptThrough)
+TEST(TcpConnection, ASingleLateCallCatchesUpOnEverythingItSleptThrough)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
     connection->send(Bytes::from_hex("6f6b"));
-    test_assert(sent.size() == 1, "send() should produce one segment");
+    ASSERT_TRUE(sent.size() == 1) << "send() should produce one segment";
 
     // one call, reporting a two-second stall. That is two full initial RTOs.
     connection->on_time_passed(2000);
 
-    test_assert(sent.size() == 2, "a single call reporting more than an RTO of elapsed time must fire the "
-                                  "retransmission immediately, not one RTO's worth of calls later");
-    test_assert(connection->get_rto_ms() == 2000,
-                "and must back the RTO off exactly once, for the one timeout that expired");
+    ASSERT_TRUE(sent.size() == 2) << "a single call reporting more than an RTO of elapsed time must fire the "
+                                     "retransmission immediately, not one RTO's worth of calls later";
+    ASSERT_TRUE(connection->get_rto_ms() == 2000)
+        << "and must back the RTO off exactly once, for the one timeout that expired";
 }
 
 // --- keepalive (RFC 1122 4.2.3.6) -------------------------------------------
@@ -1540,7 +1541,7 @@ namespace
     }
 }
 
-TEST(KeepaliveIsOffByDefault)
+TEST(TcpConnection, KeepaliveIsOffByDefault)
 {
     // RFC 1122 4.2.3.6 says it MUST default to off, and the reason is not
     // politeness: probing a connection that nobody wants to use turns a
@@ -1548,32 +1549,32 @@ TEST(KeepaliveIsOffByDefault)
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
-    test_assert(!connection->keepalive_enabled(), "keepalive should be off unless asked for");
+    ASSERT_TRUE(!connection->keepalive_enabled()) << "keepalive should be off unless asked for";
 
     advance_ms(*connection, KEEPALIVE_IDLE_MS + KEEPALIVE_PROBE_INTERVAL_MS);
 
-    test_assert(sent.empty(), "an idle connection must stay silent with keepalive off");
-    test_assert(connection->get_state() == TcpState::ESTABLISHED, "and must stay open");
+    ASSERT_TRUE(sent.empty()) << "an idle connection must stay silent with keepalive off";
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED) << "and must stay open";
 }
 
-TEST(KeepaliveProbesAnIdleConnectionOnceTheIdleTimerExpires)
+TEST(TcpConnection, KeepaliveProbesAnIdleConnectionOnceTheIdleTimerExpires)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
     connection->set_keepalive(true);
 
     advance_ms(*connection, KEEPALIVE_IDLE_MS - 1000);
-    test_assert(sent.empty(), "nothing should go out before the idle timer expires");
+    ASSERT_TRUE(sent.empty()) << "nothing should go out before the idle timer expires";
 
     advance_ms(*connection, 2000);
 
-    test_assert(sent.size() == 1, "exactly one probe should follow the idle timer");
-    test_assert(is_keepalive_probe(sent[0]),
-                "the probe must be a bare ack one byte behind SND.NXT - the only segment that "
-                "compels a reply without moving the stream");
+    ASSERT_TRUE(sent.size() == 1) << "exactly one probe should follow the idle timer";
+    ASSERT_TRUE(is_keepalive_probe(sent[0]))
+        << "the probe must be a bare ack one byte behind SND.NXT - the only segment that "
+           "compels a reply without moving the stream";
 }
 
-TEST(HearingAnythingFromThePeerRestartsTheIdleTimer)
+TEST(TcpConnection, HearingAnythingFromThePeerRestartsTheIdleTimer)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -1587,17 +1588,17 @@ TEST(HearingAnythingFromThePeerRestartsTheIdleTimer)
     // well past two probes' worth of time.
     advance_ms(*connection, KEEPALIVE_IDLE_MS - 1000);
 
-    test_assert(count_keepalive_probes(sent) == 0, "a segment from the peer means the connection is not idle");
+    ASSERT_TRUE(count_keepalive_probes(sent) == 0) << "a segment from the peer means the connection is not idle";
 }
 
-TEST(AnAnsweredProbeStopsTheProbingAndResetsTheCount)
+TEST(TcpConnection, AnAnsweredProbeStopsTheProbingAndResetsTheCount)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
     connection->set_keepalive(true);
 
     advance_ms(*connection, KEEPALIVE_IDLE_MS + 1000);
-    test_assert(count_keepalive_probes(sent) == 1, "the first probe should have gone out");
+    ASSERT_TRUE(count_keepalive_probes(sent) == 1) << "the first probe should have gone out";
 
     // The peer answers, which is the entire point of picking a sequence number
     // it has already acknowledged.
@@ -1608,11 +1609,11 @@ TEST(AnAnsweredProbeStopsTheProbingAndResetsTheCount)
     // connection is back to idle-timing rather than probe-timing.
     advance_ms(*connection, KEEPALIVE_PROBE_INTERVAL_MS * 4);
 
-    test_assert(count_keepalive_probes(sent) == 0, "an answered probe must stop the probing");
-    test_assert(connection->get_state() == TcpState::ESTABLISHED, "and must not close anything");
+    ASSERT_TRUE(count_keepalive_probes(sent) == 0) << "an answered probe must stop the probing";
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED) << "and must not close anything";
 }
 
-TEST(AnUnansweredKeepaliveEventuallyClosesTheConnection)
+TEST(TcpConnection, AnUnansweredKeepaliveEventuallyClosesTheConnection)
 {
     // The case the mechanism exists for: a peer whose machine was switched
     // off. Nothing else in TCP will ever tell this side about it.
@@ -1623,18 +1624,17 @@ TEST(AnUnansweredKeepaliveEventuallyClosesTheConnection)
     advance_ms(*connection, KEEPALIVE_IDLE_MS + 1000);
     advance_ms(*connection, KEEPALIVE_PROBE_INTERVAL_MS * (KEEPALIVE_MAX_PROBES - 1) + 1000);
 
-    test_assert(count_keepalive_probes(sent) == static_cast<size_t>(KEEPALIVE_MAX_PROBES),
-                "it should give up only after the full probe budget, sent "
-                    + std::to_string(count_keepalive_probes(sent)));
-    test_assert(connection->get_state() == TcpState::ESTABLISHED,
-                "the last probe still deserves an interval to be answered in");
+    ASSERT_TRUE(count_keepalive_probes(sent) == static_cast<size_t>(KEEPALIVE_MAX_PROBES))
+        << "it should give up only after the full probe budget, sent " + std::to_string(count_keepalive_probes(sent));
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED)
+        << "the last probe still deserves an interval to be answered in";
 
     advance_ms(*connection, KEEPALIVE_PROBE_INTERVAL_MS + 1000);
 
-    test_assert(connection->get_state() == TcpState::CLOSED, "an unanswered probe budget means the peer is gone");
+    ASSERT_TRUE(connection->get_state() == TcpState::CLOSED) << "an unanswered probe budget means the peer is gone";
 }
 
-TEST(KeepaliveLeavesAPeerWithAShutWindowAlone)
+TEST(TcpConnection, KeepaliveLeavesAPeerWithAShutWindowAlone)
 {
     // A peer advertising a zero window is demonstrably alive - it is answering
     // persist probes, it just has nowhere to put anything. Counting that as
@@ -1654,10 +1654,10 @@ TEST(KeepaliveLeavesAPeerWithAShutWindowAlone)
 
     advance_ms(*connection, KEEPALIVE_IDLE_MS + KEEPALIVE_PROBE_INTERVAL_MS * KEEPALIVE_MAX_PROBES);
 
-    test_assert(connection->get_state() == TcpState::ESTABLISHED,
-                "a peer with a shut window must not be declared dead");
-    test_assert(count_keepalive_probes(sent) == 0, "persist owns this connection's timing, not keepalive");
-    test_assert(!sent.empty(), "persist should still be probing throughout");
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED)
+        << "a peer with a shut window must not be declared dead";
+    ASSERT_TRUE(count_keepalive_probes(sent) == 0) << "persist owns this connection's timing, not keepalive";
+    ASSERT_TRUE(!sent.empty()) << "persist should still be probing throughout";
 }
 
 namespace
@@ -1679,23 +1679,24 @@ namespace
 // itself sending - a request/response protocol, say - piggybacks the same ack
 // on every data segment; counting those as duplicates fires a spurious fast
 // retransmit and halves cwnd for a loss that never happened.
-TEST(DataSegmentsCarryingTheSameAckAreNotDuplicateAcks)
+TEST(TcpConnection, DataSegmentsCarryingTheSameAckAreNotDuplicateAcks)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
     connection->send(Bytes::from_hex("6f6b"));
-    test_assert(count_data_segments(sent) == 1, "one data segment in flight");
+    ASSERT_TRUE(count_data_segments(sent) == 1) << "one data segment in flight";
     uint32_t snd_una = sent[0].seq;
 
     for (uint32_t i = 0; i < 3; i++)
     {
         connection->on_segment(*make_incoming_segment(501 + i, snd_una, FLAG_ACK, Bytes::from_hex("aa")));
     }
-    test_assert(count_data_segments(sent) == 1, "data segments that repeat SND.UNA must not trigger a fast retransmit");
+    ASSERT_TRUE(count_data_segments(sent) == 1)
+        << "data segments that repeat SND.UNA must not trigger a fast retransmit";
 }
 
-TEST(WindowUpdatesAreNotDuplicateAcks)
+TEST(TcpConnection, WindowUpdatesAreNotDuplicateAcks)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -1706,8 +1707,8 @@ TEST(WindowUpdatesAreNotDuplicateAcks)
     connection->on_segment(*make_incoming_segment_win(501, snd_una, FLAG_ACK, 30000));
     connection->on_segment(*make_incoming_segment_win(501, snd_una, FLAG_ACK, 40000));
     connection->on_segment(*make_incoming_segment_win(501, snd_una, FLAG_ACK, 50000));
-    test_assert(count_data_segments(sent) == 1,
-                "an ack that changes the advertised window is a window update, not a duplicate");
+    ASSERT_TRUE(count_data_segments(sent) == 1)
+        << "an ack that changes the advertised window is a window update, not a duplicate";
 }
 
 // The receive side of a sequence-number wrap. With RCV.NXT at 0xFFFFFFFB, a
@@ -1715,7 +1716,7 @@ TEST(WindowUpdatesAreNotDuplicateAcks)
 // as 4 GiB behind, takes the "already seen" branch, and drops it. Every
 // out-of-order segment straddling the wrap is then lost, and recovery costs a
 // full retransmit instead of a buffered gap-fill.
-TEST(OutOfOrderSegmentAcrossASequenceNumberWrapIsBuffered)
+TEST(TcpConnection, OutOfOrderSegmentAcrossASequenceNumberWrapIsBuffered)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent, 0xFFFFFFFA); // RCV.NXT = 0xFFFFFFFB
@@ -1727,30 +1728,31 @@ TEST(OutOfOrderSegmentAcrossASequenceNumberWrapIsBuffered)
     Bytes second = Bytes::from_hex("776f726c64"); // "world" - seq 0..4, past the wrap
 
     connection->on_segment(*make_incoming_segment(0, 1001, FLAG_ACK, second));
-    test_assert(received.empty(), "the segment past the wrap is out of order, not deliverable yet");
+    ASSERT_TRUE(received.empty()) << "the segment past the wrap is out of order, not deliverable yet";
 
     connection->on_segment(*make_incoming_segment(0xFFFFFFFB, 1001, FLAG_ACK, first));
-    test_assert(received.size() == 2, "the gap-filler should release the buffered segment from past the wrap too, got "
-                                          + std::to_string(received.size()) + " chunk(s)");
-    test_assert(received.size() == 2 && received[1].to_hex() == second.to_hex(),
-                "and deliver it second, in sequence order");
+    ASSERT_TRUE(received.size() == 2)
+        << "the gap-filler should release the buffered segment from past the wrap too, got "
+               + std::to_string(received.size()) + " chunk(s)";
+    ASSERT_TRUE(received.size() == 2 && received[1].to_hex() == second.to_hex())
+        << "and deliver it second, in sequence order";
 }
 
 // The range an ICMP error's quoted sequence number must fall in to be
 // believed: [SND.UNA, SND.NXT). SND.NXT itself is the next byte not yet sent,
 // so a quote naming it is about nothing this side ever transmitted.
-TEST(OnlySequenceNumbersInFlightCountAsSentAndUnacknowledged)
+TEST(TcpConnection, OnlySequenceNumbersInFlightCountAsSentAndUnacknowledged)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent); // our ISN is 1000, so SND.NXT is 1001
 
-    test_assert(!connection->has_sent_unacknowledged(1001), "nothing in flight: no sequence number qualifies");
+    ASSERT_TRUE(!connection->has_sent_unacknowledged(1001)) << "nothing in flight: no sequence number qualifies";
 
     connection->send(Bytes::from_hex("6869")); // in flight: [1001, 1003)
-    test_assert(connection->has_sent_unacknowledged(1001), "SND.UNA, the first unacknowledged byte, qualifies");
-    test_assert(connection->has_sent_unacknowledged(1002), "and so does the last byte in flight");
-    test_assert(!connection->has_sent_unacknowledged(1003), "SND.NXT does not - it has not been sent");
-    test_assert(!connection->has_sent_unacknowledged(1000), "nor does anything already acknowledged");
+    ASSERT_TRUE(connection->has_sent_unacknowledged(1001)) << "SND.UNA, the first unacknowledged byte, qualifies";
+    ASSERT_TRUE(connection->has_sent_unacknowledged(1002)) << "and so does the last byte in flight";
+    ASSERT_TRUE(!connection->has_sent_unacknowledged(1003)) << "SND.NXT does not - it has not been sent";
+    ASSERT_TRUE(!connection->has_sent_unacknowledged(1000)) << "nor does anything already acknowledged";
 }
 
 // A peer may retransmit differently than it first sent - Linux collapses
@@ -1759,7 +1761,7 @@ TEST(OnlySequenceNumbersInFlightCountAsSentAndUnacknowledged)
 // entries are now behind RCV.NXT. Draining only by an exact match on RCV.NXT
 // never finds them: they stay buffered forever, still counted as occupying the
 // receive buffer, and the advertised window shrinks for good.
-TEST(ACoalescedRetransmissionDrainsTheOutOfOrderSegmentsItCovers)
+TEST(TcpConnection, ACoalescedRetransmissionDrainsTheOutOfOrderSegmentsItCovers)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent); // RCV.NXT = 501
@@ -1775,27 +1777,28 @@ TEST(ACoalescedRetransmissionDrainsTheOutOfOrderSegmentsItCovers)
     {
         connection->on_segment(*make_incoming_segment(501 + i * chunk, 1001, FLAG_ACK, Bytes(chunk)));
     }
-    test_assert(delivered == 0, "nothing is deliverable while the first chunk is missing");
+    ASSERT_TRUE(delivered == 0) << "nothing is deliverable while the first chunk is missing";
 
     // The retransmission covers the hole AND everything after it, in one go.
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes((chunks + 1) * chunk)));
-    test_assert(delivered == (chunks + 1) * chunk,
-                "the whole range is delivered once, got " + std::to_string(delivered) + " bytes");
+    ASSERT_TRUE(delivered == (chunks + 1) * chunk)
+        << "the whole range is delivered once, got " + std::to_string(delivered) + " bytes";
 
     // Everything was read, so the whole buffer is free again and the window
     // is back at its (field-clamped) maximum.
     sent.clear();
     connection->send(Bytes::from_hex("6869"));
-    test_assert(!sent.empty(), "precondition: a segment went out");
-    test_assert(sent.back().window == 65535, "the window must reopen fully, got " + std::to_string(sent.back().window)
-                                                 + " - buffered segments behind RCV.NXT are still being counted");
+    ASSERT_TRUE(!sent.empty()) << "precondition: a segment went out";
+    ASSERT_TRUE(sent.back().window == 65535) << "the window must reopen fully, got "
+                                                    + std::to_string(sent.back().window)
+                                                    + " - buffered segments behind RCV.NXT are still being counted";
 }
 
 // The partial case: in-order data that reaches into a buffered segment without
 // covering it. Only the part past RCV.NXT is new - delivering the whole entry
 // would hand the application the overlap twice, and dropping it would lose
 // the tail until the peer retransmitted it.
-TEST(InOrderDataOverlappingABufferedSegmentDeliversOnlyItsNewTail)
+TEST(TcpConnection, InOrderDataOverlappingABufferedSegmentDeliversOnlyItsNewTail)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent); // RCV.NXT = 501
@@ -1808,29 +1811,29 @@ TEST(InOrderDataOverlappingABufferedSegmentDeliversOnlyItsNewTail)
     // in order: "abcdefghij" at 501..510 - overlaps the first five buffered bytes
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes::from_hex("6162636465666768696a")));
 
-    test_assert(received.to_hex() == Bytes::from_hex("6162636465666768696a6b6c6d6e6f").to_hex(),
-                "expected \"abcdefghijklmno\" exactly once each, got hex " + received.to_hex());
+    ASSERT_TRUE(received.to_hex() == Bytes::from_hex("6162636465666768696a6b6c6d6e6f").to_hex())
+        << "expected \"abcdefghijklmno\" exactly once each, got hex " + received.to_hex();
 }
 
 // RFC 9293 3.10.7.4: an ACK for something not yet sent is answered with an ACK
 // and otherwise ignored. Before, it went straight to the cumulative-ack loop,
 // which retired every in-flight segment it "covered" - data the peer never
 // received, never to be retransmitted - and took an RTT sample from it.
-TEST(AnAckForDataNeverSentIsAnsweredAndIgnored)
+TEST(TcpConnection, AnAckForDataNeverSentIsAnsweredAndIgnored)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent); // SND.NXT = 1001
 
     connection->send(Bytes::from_hex("6869")); // in flight: [1001, 1003)
-    test_assert(sent.size() == 1, "precondition: the data went out");
+    ASSERT_TRUE(sent.size() == 1) << "precondition: the data went out";
 
     // 2^30 ahead: "after" SND.NXT in modular arithmetic, so it reads as an ack
     // of everything outstanding and then some
     sent.clear();
     connection->on_segment(*make_incoming_segment(501, 1001 + (1u << 30), FLAG_ACK));
-    test_assert(sent.size() == 1 && sent[0].payload.empty() && sent[0].ack == 501,
-                "the bogus ack should be answered with a plain ACK of what we have");
-    test_assert(connection->bytes_unacked() == 2, "and must retire nothing - those 2 bytes are still unacknowledged");
+    ASSERT_TRUE(sent.size() == 1 && sent[0].payload.empty() && sent[0].ack == 501)
+        << "the bogus ack should be answered with a plain ACK of what we have";
+    ASSERT_TRUE(connection->bytes_unacked() == 2) << "and must retire nothing - those 2 bytes are still unacknowledged";
 
     // The data is still outstanding, so the retransmit timer still covers it.
     sent.clear();
@@ -1838,8 +1841,8 @@ TEST(AnAckForDataNeverSentIsAnsweredAndIgnored)
     {
         connection->on_time_passed(TEST_TICK_MS);
     }
-    test_assert(!sent.empty() && sent[0].seq == 1001 && sent[0].payload.size() == 2,
-                "the unacknowledged data must still be retransmitted");
+    ASSERT_TRUE(!sent.empty() && sent[0].seq == 1001 && sent[0].payload.size() == 2)
+        << "the unacknowledged data must still be retransmitted";
 }
 
 // The guard on the rule above. A zero-window probe sends one byte at SND.NXT
@@ -1847,7 +1850,7 @@ TEST(AnAckForDataNeverSentIsAnsweredAndIgnored)
 // SND.NXT + 1. That ack is for data that WAS sent; treating it as "never sent"
 // would drop the window update it carries, the probe would fire again, draw
 // the same ack, and the connection would stall forever.
-TEST(AnAckForAnAcceptedZeroWindowProbeIsHonoured)
+TEST(TcpConnection, AnAckForAnAcceptedZeroWindowProbeIsHonoured)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -1858,7 +1861,7 @@ TEST(AnAckForAnAcceptedZeroWindowProbeIsHonoured)
     {
         connection->on_time_passed(TEST_TICK_MS);
     }
-    test_assert(sent.size() == 1 && sent[0].seq == 1001 && sent[0].payload.size() == 1, "precondition: one probe");
+    ASSERT_TRUE(sent.size() == 1 && sent[0].seq == 1001 && sent[0].payload.size() == 1) << "precondition: one probe";
 
     // The peer took the probe byte and reopened: it acks 1002, past SND.NXT.
     size_t before = sent.size();
@@ -1868,7 +1871,7 @@ TEST(AnAckForAnAcceptedZeroWindowProbeIsHonoured)
     {
         released = released || sent[i].payload.size() >= 4;
     }
-    test_assert(released, "an ack covering the accepted probe byte must reopen the window and release the data");
+    ASSERT_TRUE(released) << "an ack covering the accepted probe byte must reopen the window and release the data";
 }
 
 // Draining many segments straddling the 2^32 wrap. The buffer is keyed by raw
@@ -1877,7 +1880,7 @@ TEST(AnAckForAnAcceptedZeroWindowProbeIsHonoured)
 // begin(), or it finds a post-wrap entry first, sees it beyond RCV.NXT and
 // stops with the stream incomplete. Sized to fit MAX_REORDER_SEGMENTS (it was
 // once 60,000 segments, measuring the drain's cost before the cap existed).
-TEST(DrainingManySegmentsAcrossTheWrapDeliversTheWholeStreamInOrder)
+TEST(TcpConnection, DrainingManySegmentsAcrossTheWrapDeliversTheWholeStreamInOrder)
 {
     const uint32_t before_wrap = (TcpConnection::MAX_REORDER_SEGMENTS - 1) / 2;
     const uint32_t rcv_nxt = static_cast<uint32_t>(0x100000000ull - before_wrap);
@@ -1895,27 +1898,27 @@ TEST(DrainingManySegmentsAcrossTheWrapDeliversTheWholeStreamInOrder)
         one.append_int<uint8_t>(static_cast<uint8_t>(i & 0xFF));
         connection->on_segment(*make_incoming_segment(rcv_nxt + i, 1001, FLAG_ACK, one));
     }
-    test_assert(received.empty(), "nothing is deliverable while the first byte is missing");
+    ASSERT_TRUE(received.empty()) << "nothing is deliverable while the first byte is missing";
 
     Bytes first;
     first.append_int<uint8_t>(0);
     connection->on_segment(*make_incoming_segment(rcv_nxt, 1001, FLAG_ACK, first));
 
-    test_assert(received.size() == total, "the whole stream should be delivered, got " + std::to_string(received.size())
-                                              + " of " + std::to_string(total));
+    ASSERT_TRUE(received.size() == total) << "the whole stream should be delivered, got "
+                                                 + std::to_string(received.size()) + " of " + std::to_string(total);
     bool in_order = true;
     for (uint32_t i = 0; i < received.size() && in_order; i++)
     {
         in_order = received[i] == static_cast<byte_t>(i & 0xFF);
     }
-    test_assert(in_order, "and in sequence order, across the wrap");
+    ASSERT_TRUE(in_order) << "and in sequence order, across the wrap";
 }
 
 // RFC 7323: TS.Recent is updated only from a segment that is accepted. A
 // segment dropped because it acks data never sent must not move it - if it
 // could, one such segment carrying a far-future timestamp would make PAWS
 // discard every genuine segment of the peer's until its clock caught up.
-TEST(ASegmentDroppedForAckingUnsentDataDoesNotAdvanceTheTimestampEcho)
+TEST(TcpConnection, ASegmentDroppedForAckingUnsentDataDoesNotAdvanceTheTimestampEcho)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_timestamped_connection(sent);
@@ -1926,11 +1929,11 @@ TEST(ASegmentDroppedForAckingUnsentDataDoesNotAdvanceTheTimestampEcho)
     // at RCV.NXT, timestamp 2^30 ahead, acking 2^30 past anything sent
     connection->on_segment(
         *make_segment_ts(501, 1001 + (1u << 30), FLAG_ACK, 6000 + (1u << 30), 0, Bytes::from_hex("eeee")));
-    test_assert(received.empty(), "precondition: the segment acking unsent data is dropped");
+    ASSERT_TRUE(received.empty()) << "precondition: the segment acking unsent data is dropped";
 
     connection->on_segment(*make_segment_ts(501, 1001, FLAG_ACK, 6000, 0, Bytes::from_hex("aabb")));
-    test_assert(received.size() == 1 && received[0].to_hex() == "aabb",
-                "the peer's genuine segment must still be accepted - the dropped one must not have moved TS.Recent");
+    ASSERT_TRUE(received.size() == 1 && received[0].to_hex() == "aabb")
+        << "the peer's genuine segment must still be accepted - the dropped one must not have moved TS.Recent";
 }
 
 // After a zero-window probe byte is accepted the peer acks SND.NXT + 1, but
@@ -1940,7 +1943,7 @@ TEST(ASegmentDroppedForAckingUnsentDataDoesNotAdvanceTheTimestampEcho)
 // recovery fell to the retransmission timeout. An ack inside the front
 // segment is a partial ack of it and moves SND.UNA, after which the
 // duplicates count.
-TEST(LossRightAfterAnAcceptedProbeIsRecoveredByFastRetransmit)
+TEST(TcpConnection, LossRightAfterAnAcceptedProbeIsRecoveredByFastRetransmit)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -1951,22 +1954,22 @@ TEST(LossRightAfterAnAcceptedProbeIsRecoveredByFastRetransmit)
     {
         connection->on_time_passed(TEST_TICK_MS);
     }
-    test_assert(sent.size() == 1 && sent[0].payload.size() == 1, "precondition: one probe byte at 1001");
+    ASSERT_TRUE(sent.size() == 1 && sent[0].payload.size() == 1) << "precondition: one probe byte at 1001";
 
     // the probe byte is accepted and the window reopens: the data goes out
     connection->on_segment(*make_incoming_segment_win(501, 1002, FLAG_ACK, 65535));
     size_t released = sent.size();
-    test_assert(released >= 2 && sent.back().payload.size() >= 4, "precondition: the queued data was released");
+    ASSERT_TRUE(released >= 2 && sent.back().payload.size() >= 4) << "precondition: the queued data was released";
 
     // ...and is lost. The peer, holding only byte 1001, keeps acking 1002.
     for (int i = 0; i < 5 && sent.size() == released; i++)
     {
         connection->on_segment(*make_incoming_segment_win(501, 1002, FLAG_ACK, 65535));
     }
-    test_assert(sent.size() > released && !sent.back().payload.empty(),
-                "the lost data must be fast-retransmitted on duplicate acks, not left to the timeout");
-    test_assert(sent.back().seq == 1002 && sent.back().payload.to_hex() == Bytes::from_hex("656c6c6f").to_hex(),
-                "and what is resent is exactly what the peer lacks: \"ello\" at 1002, not the byte it acked");
+    ASSERT_TRUE(sent.size() > released && !sent.back().payload.empty())
+        << "the lost data must be fast-retransmitted on duplicate acks, not left to the timeout";
+    ASSERT_TRUE(sent.back().seq == 1002 && sent.back().payload.to_hex() == Bytes::from_hex("656c6c6f").to_hex())
+        << "and what is resent is exactly what the peer lacks: \"ello\" at 1002, not the byte it acked";
 }
 
 // The reorder buffer holds at most MAX_REORDER_SEGMENTS entries. The window
@@ -1975,7 +1978,7 @@ TEST(LossRightAfterAnAcceptedProbeIsRecoveredByFastRetransmit)
 // larger than its byte), and every ack sent walks them all to build its SACK
 // blocks. Past the cap a segment is dropped, as when it falls outside the
 // window, and the peer retransmits it.
-TEST(TheReorderBufferHoldsABoundedNumberOfSegments)
+TEST(TcpConnection, TheReorderBufferHoldsABoundedNumberOfSegments)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent); // RCV.NXT = 501
@@ -1990,15 +1993,15 @@ TEST(TheReorderBufferHoldsABoundedNumberOfSegments)
     }
     connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes(1)));
 
-    test_assert(received.size() == 1 + TcpConnection::MAX_REORDER_SEGMENTS,
-                "only MAX_REORDER_SEGMENTS segments may have been held, got " + std::to_string(received.size() - 1));
+    ASSERT_TRUE(received.size() == 1 + TcpConnection::MAX_REORDER_SEGMENTS)
+        << "only MAX_REORDER_SEGMENTS segments may have been held, got " + std::to_string(received.size() - 1);
 }
 
 // The cost scenario for the cap above: SACK negotiated, and tens of thousands
 // of one-byte segments with a hole after each, so nothing merges and every
 // ack's SACK blocks are built from the whole buffer. Correctness is asserted;
 // the cost is what the commit adding the cap measured.
-TEST(ManyTinyOutOfOrderSegmentsWithSackStayCheap)
+TEST(TcpConnection, ManyTinyOutOfOrderSegmentsWithSackStayCheap)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_sack_connection(sent); // RCV.NXT = 501
@@ -2007,8 +2010,8 @@ TEST(ManyTinyOutOfOrderSegmentsWithSackStayCheap)
     {
         connection->on_segment(*make_incoming_segment(503 + 2 * i, 1001, FLAG_ACK, Bytes(1)));
     }
-    test_assert(!sent.empty() && sent.back().payload.empty() && sent.back().ack == 501,
-                "every out-of-order segment is still answered with a duplicate ack of RCV.NXT");
+    ASSERT_TRUE(!sent.empty() && sent.back().payload.empty() && sent.back().ack == 501)
+        << "every out-of-order segment is still answered with a duplicate ack of RCV.NXT";
 }
 
 // --- the stall (user) timeout ------------------------------------------------
@@ -2030,7 +2033,7 @@ namespace
     }
 }
 
-TEST(APeerThatNeverReopensItsWindowIsGivenUpOnAfterTheUserTimeout)
+TEST(TcpConnection, APeerThatNeverReopensItsWindowIsGivenUpOnAfterTheUserTimeout)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -2043,11 +2046,11 @@ TEST(APeerThatNeverReopensItsWindowIsGivenUpOnAfterTheUserTimeout)
         pass_seconds(*connection, 10);
         connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 0));
     }
-    test_assert(connection->get_state() == TcpState::CLOSED,
-                "data that has made no progress for the user timeout must end the connection");
+    ASSERT_TRUE(connection->get_state() == TcpState::CLOSED)
+        << "data that has made no progress for the user timeout must end the connection";
 }
 
-TEST(ASlowPeerThatKeepsMakingProgressIsNeverGivenUpOn)
+TEST(TcpConnection, ASlowPeerThatKeepsMakingProgressIsNeverGivenUpOn)
 {
     // Slow, not dead: the peer acks promptly but reads slowly, so its window
     // stays shut for long stretches and opens just enough to take each chunk.
@@ -2065,20 +2068,20 @@ TEST(ASlowPeerThatKeepsMakingProgressIsNeverGivenUpOn)
         acked += 10;
         connection->on_segment(*make_incoming_segment_win(501, acked, FLAG_ACK, 0)); // acks it, shuts again
     }
-    test_assert(connection->get_state() == TcpState::ESTABLISHED,
-                "each ack that moves SND.UNA is progress and restarts the timeout");
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED)
+        << "each ack that moves SND.UNA is progress and restarts the timeout";
 }
 
-TEST(AnIdleConnectionWithNothingOutstandingIsNeverGivenUpOn)
+TEST(TcpConnection, AnIdleConnectionWithNothingOutstandingIsNeverGivenUpOn)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
     pass_seconds(*connection, 4 * TcpConnection::DEFAULT_USER_TIMEOUT_MS / 1000);
-    test_assert(connection->get_state() == TcpState::ESTABLISHED,
-                "with nothing to send there is nothing to stall - idleness is not a failure");
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED)
+        << "with nothing to send there is nothing to stall - idleness is not a failure";
 }
 
-TEST(AUserTimeoutOfZeroWaitsForeverAsBefore)
+TEST(TcpConnection, AUserTimeoutOfZeroWaitsForeverAsBefore)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
@@ -2086,7 +2089,7 @@ TEST(AUserTimeoutOfZeroWaitsForeverAsBefore)
     connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 0));
     connection->send(Bytes::from_hex("68656c6c6f"));
     pass_seconds(*connection, 4 * TcpConnection::DEFAULT_USER_TIMEOUT_MS / 1000);
-    test_assert(connection->get_state() == TcpState::ESTABLISHED, "0 turns the timeout off");
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED) << "0 turns the timeout off";
 }
 
 // A connection whose handshake was completed by a SYN cookie: the SYN-ACK
@@ -2094,7 +2097,7 @@ TEST(AUserTimeoutOfZeroWaitsForeverAsBefore)
 // state. It starts ESTABLISHED, with our ISN as the cookie, and with none of
 // the options - no window scaling, SACK or timestamps - because a cookie has
 // no room to remember them.
-TEST(AConnectionCompletedByACookieStartsEstablishedWithoutOptions)
+TEST(TcpConnection, AConnectionCompletedByACookieStartsEstablishedWithoutOptions)
 {
     std::vector<RecordedSegment> sent;
     TcpConnection connection(80, IPv4Address("10.0.0.1"), 40000, 7000 /* our ISN: the cookie */,
@@ -2106,19 +2109,19 @@ TEST(AConnectionCompletedByACookieStartsEstablishedWithoutOptions)
                                                  header.get_timestamp_echo()});
                              });
     connection.accept_cookie_handshake(500 /* the client's ISN */, 1400);
-    test_assert(connection.get_state() == TcpState::ESTABLISHED, "the handshake is already complete");
-    test_assert(sent.empty(), "and nothing needs sending to complete it");
+    ASSERT_TRUE(connection.get_state() == TcpState::ESTABLISHED) << "the handshake is already complete";
+    ASSERT_TRUE(sent.empty()) << "and nothing needs sending to complete it";
 
     Bytes received;
     connection.set_data_ready_callback([&received, &connection]() { received |= connection.read(); });
     connection.on_segment(*make_incoming_segment(501, 7001, FLAG_ACK, Bytes::from_hex("6869")));
-    test_assert(received.to_hex() == "6869", "data riding on the completing ACK is delivered");
+    ASSERT_TRUE(received.to_hex() == "6869") << "data riding on the completing ACK is delivered";
 
     connection.send(Bytes(2000));
-    test_assert(!sent.empty(), "precondition: data went out");
+    ASSERT_TRUE(!sent.empty()) << "precondition: data went out";
     const RecordedSegment& data = sent.back();
-    test_assert(sent.front().seq == 7001, "our first byte is the cookie + 1 - the SYN-ACK consumed the cookie");
-    test_assert(sent.front().payload.size() <= 1400, "segments are capped by the MSS the cookie carried");
-    test_assert(!data.has_timestamp, "no timestamps on a cookie connection");
-    test_assert(connection.get_effective_mss() == 1400, "the effective MSS is the cookie's");
+    ASSERT_TRUE(sent.front().seq == 7001) << "our first byte is the cookie + 1 - the SYN-ACK consumed the cookie";
+    ASSERT_TRUE(sent.front().payload.size() <= 1400) << "segments are capped by the MSS the cookie carried";
+    ASSERT_TRUE(!data.has_timestamp) << "no timestamps on a cookie connection";
+    ASSERT_TRUE(connection.get_effective_mss() == 1400) << "the effective MSS is the cookie's";
 }

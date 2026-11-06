@@ -1,4 +1,4 @@
-#include "test.h"
+#include "test_support.h"
 #include "network_stack.h"
 #include "fake_packet_channel.h"
 #include "loopback_channel.h"
@@ -329,7 +329,7 @@ namespace
     }
 }
 
-TEST(ArpRequestForUsGetsAReply)
+TEST(NetworkStack, ArpRequestForUsGetsAReply)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -338,13 +338,13 @@ TEST(ArpRequestForUsGetsAReply)
     stack->poll();
 
     ArpView reply = find_arp(channel->outbound_frames());
-    test_assert(reply.is_arp, "an ARP request for our IP should produce an ARP frame");
-    test_assert(reply.op == ArpOperation::REPLY, "the ARP frame should be a REPLY");
-    test_assert(reply.sender_mac == LOCAL_MAC.to_string(), "the reply should carry our MAC as the answer");
-    test_assert(reply.sender_ip == LOCAL_IP.to_string(), "the reply should carry our IP");
+    ASSERT_TRUE(reply.is_arp) << "an ARP request for our IP should produce an ARP frame";
+    ASSERT_TRUE(reply.op == ArpOperation::REPLY) << "the ARP frame should be a REPLY";
+    ASSERT_TRUE(reply.sender_mac == LOCAL_MAC.to_string()) << "the reply should carry our MAC as the answer";
+    ASSERT_TRUE(reply.sender_ip == LOCAL_IP.to_string()) << "the reply should carry our IP";
 }
 
-TEST(SynToListeningPortGetsSynAckAndCompletesHandshake)
+TEST(NetworkStack, SynToListeningPortGetsSynAckAndCompletesHandshake)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -357,10 +357,11 @@ TEST(SynToListeningPortGetsSynAckAndCompletesHandshake)
     stack->poll();
 
     TcpView syn_ack = find_tcp(channel->outbound_frames());
-    test_assert(syn_ack.is_tcp, "a SYN to a listening port should produce a TCP segment");
-    test_assert(syn_ack.syn && syn_ack.ack_flag, "the reply to a SYN should be a SYN-ACK");
-    test_assert(syn_ack.ack == 1001, "the SYN-ACK should acknowledge the peer's ISN + 1");
-    test_assert(stack->accept(80) == nullptr, "accept() should not return a connection until the handshake completes");
+    ASSERT_TRUE(syn_ack.is_tcp) << "a SYN to a listening port should produce a TCP segment";
+    ASSERT_TRUE(syn_ack.syn && syn_ack.ack_flag) << "the reply to a SYN should be a SYN-ACK";
+    ASSERT_TRUE(syn_ack.ack == 1001) << "the SYN-ACK should acknowledge the peer's ISN + 1";
+    ASSERT_TRUE(stack->accept(80) == nullptr)
+        << "accept() should not return a connection until the handshake completes";
 
     // complete the handshake: ACK the server's ISN
     uint32_t server_isn = syn_ack.seq;
@@ -369,11 +370,11 @@ TEST(SynToListeningPortGetsSynAckAndCompletesHandshake)
     stack->poll();
 
     TcpConnection* connection = stack->accept(80);
-    test_assert(connection != nullptr, "accept() should return the connection once it reaches ESTABLISHED");
-    test_assert(connection->get_state() == TcpState::ESTABLISHED, "the accepted connection should be ESTABLISHED");
+    ASSERT_TRUE(connection != nullptr) << "accept() should return the connection once it reaches ESTABLISHED";
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED) << "the accepted connection should be ESTABLISHED";
 }
 
-TEST(SegmentMatchingNoConnectionGetsRst)
+TEST(NetworkStack, SegmentMatchingNoConnectionGetsRst)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -384,11 +385,11 @@ TEST(SegmentMatchingNoConnectionGetsRst)
     stack->poll();
 
     TcpView rst = find_tcp(channel->outbound_frames());
-    test_assert(rst.is_tcp, "a segment matching no connection should produce a TCP segment");
-    test_assert(rst.rst, "that segment should be an RST");
+    ASSERT_TRUE(rst.is_tcp) << "a segment matching no connection should produce a TCP segment";
+    ASSERT_TRUE(rst.rst) << "that segment should be an RST";
 }
 
-TEST(IcmpEchoRequestGetsEchoReply)
+TEST(NetworkStack, IcmpEchoRequestGetsEchoReply)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -400,12 +401,13 @@ TEST(IcmpEchoRequestGetsEchoReply)
     stack->poll();
 
     IcmpView reply = find_icmp(channel->outbound_frames());
-    test_assert(reply.is_icmp, "an echo request should produce an ICMP frame");
-    test_assert(reply.type == IcmpType::ICMP_ECHO_REPLY, "the reply should be an Echo Reply");
-    test_assert(reply.payload.to_hex() == echo_payload.to_hex(), "the echo reply should mirror the request's payload");
+    ASSERT_TRUE(reply.is_icmp) << "an echo request should produce an ICMP frame";
+    ASSERT_TRUE(reply.type == IcmpType::ICMP_ECHO_REPLY) << "the reply should be an Echo Reply";
+    ASSERT_TRUE(reply.payload.to_hex() == echo_payload.to_hex())
+        << "the echo reply should mirror the request's payload";
 }
 
-TEST(UdpToUnboundPortGetsPortUnreachable)
+TEST(NetworkStack, UdpToUnboundPortGetsPortUnreachable)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -416,12 +418,12 @@ TEST(UdpToUnboundPortGetsPortUnreachable)
     stack->poll();
 
     IcmpView reply = find_icmp(channel->outbound_frames());
-    test_assert(reply.is_icmp, "a UDP datagram to an unbound port should produce an ICMP frame");
-    test_assert(reply.type == IcmpType::ICMP_DESTINATION_UNREACHABLE, "it should be Destination Unreachable");
-    test_assert(reply.code == ICMP_CODE_PORT_UNREACHABLE, "with the Port Unreachable code");
+    ASSERT_TRUE(reply.is_icmp) << "a UDP datagram to an unbound port should produce an ICMP frame";
+    ASSERT_TRUE(reply.type == IcmpType::ICMP_DESTINATION_UNREACHABLE) << "it should be Destination Unreachable";
+    ASSERT_TRUE(reply.code == ICMP_CODE_PORT_UNREACHABLE) << "with the Port Unreachable code";
 }
 
-TEST(UdpToBoundPortReachesTheSocket)
+TEST(NetworkStack, UdpToBoundPortReachesTheSocket)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -435,14 +437,14 @@ TEST(UdpToBoundPortReachesTheSocket)
     channel->push_inbound(build_udp(40000, 8080, payload));
     stack->poll();
 
-    test_assert(received.size() == 1, "a datagram to a bound port should reach the socket's callback exactly once");
-    test_assert(received[0].to_hex() == payload.to_hex(), "the callback should receive the exact payload");
+    ASSERT_TRUE(received.size() == 1) << "a datagram to a bound port should reach the socket's callback exactly once";
+    ASSERT_TRUE(received[0].to_hex() == payload.to_hex()) << "the callback should receive the exact payload";
 }
 
 // Part B: a UDP send to a peer whose MAC isn't cached yet must resolve it the
 // same way connect() does - queue the datagram, ARP for the peer, then flush
 // once the reply arrives, instead of dropping the send outright.
-TEST(UdpSendToUnresolvedPeerArpsThenFlushes)
+TEST(NetworkStack, UdpSendToUnresolvedPeerArpsThenFlushes)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -451,10 +453,10 @@ TEST(UdpSendToUnresolvedPeerArpsThenFlushes)
     socket->send_to(PEER_IP, 9000, Bytes::from_hex("6f6b")); // "ok" - peer MAC not yet known
 
     ArpView request = find_arp(channel->outbound_frames());
-    test_assert(request.is_arp && request.op == ArpOperation::REQUEST,
-                "sending to an unresolved peer should emit an ARP request");
-    test_assert(request.target_ip == PEER_IP.to_string(), "the ARP request should be for the unresolved peer");
-    test_assert(find_tcp(channel->outbound_frames()).is_tcp == false, "nothing else should have gone out yet");
+    ASSERT_TRUE(request.is_arp && request.op == ArpOperation::REQUEST)
+        << "sending to an unresolved peer should emit an ARP request";
+    ASSERT_TRUE(request.target_ip == PEER_IP.to_string()) << "the ARP request should be for the unresolved peer";
+    ASSERT_TRUE(find_tcp(channel->outbound_frames()).is_tcp == false) << "nothing else should have gone out yet";
 
     // the peer answers - the queued datagram should now be flushed
     channel->clear_outbound();
@@ -471,12 +473,12 @@ TEST(UdpSendToUnresolvedPeerArpsThenFlushes)
         if (ip && ip->get_protocol() == IpProtocol::UDP)
             found_udp = true;
     }
-    test_assert(found_udp, "the queued UDP datagram should be sent once ARP resolution completes");
+    ASSERT_TRUE(found_udp) << "the queued UDP datagram should be sent once ARP resolution completes";
 }
 
 // Part B, active-open counterpart: connect() to an unresolved peer ARPs, and
 // the SYN goes out once the reply arrives.
-TEST(ConnectToUnresolvedPeerArpsThenSendsSyn)
+TEST(NetworkStack, ConnectToUnresolvedPeerArpsThenSendsSyn)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -484,16 +486,16 @@ TEST(ConnectToUnresolvedPeerArpsThenSendsSyn)
     stack->connect(PEER_IP, 80);
 
     ArpView request = find_arp(channel->outbound_frames());
-    test_assert(request.is_arp && request.op == ArpOperation::REQUEST,
-                "connect() to an unresolved peer should emit an ARP request");
-    test_assert(find_tcp(channel->outbound_frames()).is_tcp == false, "the SYN should not go out before resolution");
+    ASSERT_TRUE(request.is_arp && request.op == ArpOperation::REQUEST)
+        << "connect() to an unresolved peer should emit an ARP request";
+    ASSERT_TRUE(find_tcp(channel->outbound_frames()).is_tcp == false) << "the SYN should not go out before resolution";
 
     channel->clear_outbound();
     channel->push_inbound(build_arp_reply());
     stack->poll();
 
     TcpView syn = find_tcp(channel->outbound_frames());
-    test_assert(syn.is_tcp && syn.syn && !syn.ack_flag, "a bare SYN should go out once the peer's MAC is resolved");
+    ASSERT_TRUE(syn.is_tcp && syn.syn && !syn.ack_flag) << "a bare SYN should go out once the peer's MAC is resolved";
 }
 
 // Regression test for a bug found only by running against a real Linux kernel:
@@ -504,7 +506,7 @@ TEST(ConnectToUnresolvedPeerArpsThenSendsSyn)
 // form. Verifying over the received bytes fixes it. This crafts a SYN with a
 // SACK-permitted option (which the codec skips) and a correct checksum, and
 // asserts the stack accepts it (sends a SYN-ACK) rather than dropping it.
-TEST(SynWithUnmodeledOptionsIsAcceptedNotDroppedAsBadChecksum)
+TEST(NetworkStack, SynWithUnmodeledOptionsIsAcceptedNotDroppedAsBadChecksum)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -521,9 +523,9 @@ TEST(SynWithUnmodeledOptionsIsAcceptedNotDroppedAsBadChecksum)
     stack->poll();
 
     TcpView syn_ack = find_tcp(channel->outbound_frames());
-    test_assert(syn_ack.is_tcp, "a SYN with unmodeled options and a valid checksum must not be dropped");
-    test_assert(syn_ack.syn && syn_ack.ack_flag, "the stack should answer such a SYN with a SYN-ACK");
-    test_assert(syn_ack.ack == 2001, "the SYN-ACK should acknowledge the peer's ISN + 1");
+    ASSERT_TRUE(syn_ack.is_tcp) << "a SYN with unmodeled options and a valid checksum must not be dropped";
+    ASSERT_TRUE(syn_ack.syn && syn_ack.ack_flag) << "the stack should answer such a SYN with a SYN-ACK";
+    ASSERT_TRUE(syn_ack.ack == 2001) << "the SYN-ACK should acknowledge the peer's ISN + 1";
 }
 
 // A UDP datagram larger than the link MTU must be split into IP fragments
@@ -531,7 +533,7 @@ TEST(SynWithUnmodeledOptionsIsAcceptedNotDroppedAsBadChecksum)
 // is MSS-capped so only UDP hits this. The fragments must share one
 // identification, carry ascending 8-byte offsets, set More-Fragments on all but
 // the last, and reassemble back into the original datagram.
-TEST(OversizedUdpDatagramIsFragmented)
+TEST(NetworkStack, OversizedUdpDatagramIsFragmented)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -555,36 +557,36 @@ TEST(OversizedUdpDatagramIsFragmented)
         if (v.is_ipv4 && v.protocol == IpProtocol::UDP)
             frags.push_back(v);
     }
-    test_assert(frags.size() >= 2, "an oversized UDP datagram should be split into multiple IP fragments");
+    ASSERT_TRUE(frags.size() >= 2) << "an oversized UDP datagram should be split into multiple IP fragments";
 
     uint16_t id = frags[0].identification;
     Bytes reassembled;
     size_t expected_offset = 0;
     for (size_t i = 0; i < frags.size(); i++)
     {
-        test_assert(frags[i].identification == id, "all fragments of one datagram must share the identification");
-        test_assert(frags[i].frag_offset * 8u == expected_offset,
-                    "each fragment's offset should follow the previous one");
+        ASSERT_TRUE(frags[i].identification == id) << "all fragments of one datagram must share the identification";
+        ASSERT_TRUE(frags[i].frag_offset * 8u == expected_offset)
+            << "each fragment's offset should follow the previous one";
         bool is_last = (i + 1 == frags.size());
-        test_assert(frags[i].mf == !is_last, "More-Fragments should be set on every fragment except the last");
+        ASSERT_TRUE(frags[i].mf == !is_last) << "More-Fragments should be set on every fragment except the last";
         reassembled |= frags[i].payload;
         expected_offset += frags[i].payload.size();
     }
-    test_assert(reassembled.size() == 8 + payload.size(),
-                "the fragments should reassemble into the whole UDP datagram");
+    ASSERT_TRUE(reassembled.size() == 8 + payload.size())
+        << "the fragments should reassemble into the whole UDP datagram";
 
     Udp datagram(reassembled); // parses only because the reassembled length now matches
-    test_assert(datagram.get_src_port() == 8080, "the reassembled datagram should carry the socket's source port");
-    test_assert(datagram.get_dest_port() == 9000, "the reassembled datagram should carry the destination port");
+    ASSERT_TRUE(datagram.get_src_port() == 8080) << "the reassembled datagram should carry the socket's source port";
+    ASSERT_TRUE(datagram.get_dest_port() == 9000) << "the reassembled datagram should carry the destination port";
     const Raw* raw = datagram.has_next_layer() ? dynamic_cast<const Raw*>(&datagram.get_next_layer()) : nullptr;
-    test_assert(raw != nullptr && raw->get_data().to_hex() == payload.to_hex(),
-                "the reassembled payload should equal the original data byte for byte");
+    ASSERT_TRUE(raw != nullptr && raw->get_data().to_hex() == payload.to_hex())
+        << "the reassembled payload should equal the original data byte for byte";
 }
 
 // An incoming ICMP Destination/Port Unreachable for a segment we sent should
 // fail the matching TCP connection immediately, rather than dropping the ICMP
 // and leaving the connection to grind through its whole retransmit budget.
-TEST(IcmpPortUnreachableFailsTheMatchingTcpConnection)
+TEST(NetworkStack, IcmpPortUnreachableFailsTheMatchingTcpConnection)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -597,22 +599,22 @@ TEST(IcmpPortUnreachableFailsTheMatchingTcpConnection)
     TcpConnection* client = stack->connect(PEER_IP, 80);
     uint64_t id = client->get_id();
     TcpView syn = find_tcp(channel->outbound_frames());
-    test_assert(syn.is_tcp && syn.syn, "connect() to an already-resolved peer should send a SYN");
-    test_assert(stack->find_connection(id) != nullptr, "the connection should exist right after connect()");
+    ASSERT_TRUE(syn.is_tcp && syn.syn) << "connect() to an already-resolved peer should send a SYN";
+    ASSERT_TRUE(stack->find_connection(id) != nullptr) << "the connection should exist right after connect()";
 
     // the peer reports its port 80 is unreachable, quoting our SYN back
     channel->push_inbound(build_icmp_port_unreachable_for_our_tcp(syn.src_port, 80, syn.seq));
     stack->poll();
 
-    test_assert(stack->find_connection(id) == nullptr,
-                "an ICMP Port Unreachable for our SYN should fail (and reap) the connection, not leave it hanging");
+    ASSERT_TRUE(stack->find_connection(id) == nullptr)
+        << "an ICMP Port Unreachable for our SYN should fail (and reap) the connection, not leave it hanging";
 }
 
 // ARP entries must not live forever: a peer that goes silent (rebooted,
 // moved, reassigned its IP) would otherwise leave a stale IP->MAC mapping
 // blackholing traffic. After its TTL of idle ticks the entry is evicted, so
 // the next send to that peer re-resolves it via a fresh ARP request.
-TEST(ArpEntryExpiresWhenPeerGoesSilentAndIsReArped)
+TEST(NetworkStack, ArpEntryExpiresWhenPeerGoesSilentAndIsReArped)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -624,8 +626,9 @@ TEST(ArpEntryExpiresWhenPeerGoesSilentAndIsReArped)
     // while the mapping is fresh, a send goes straight out - no re-resolution
     channel->clear_outbound();
     socket->send_to(PEER_IP, 9000, Bytes::from_hex("01"));
-    test_assert(contains_udp(channel->outbound_frames()), "a send to a freshly-learned peer should go out immediately");
-    test_assert(!find_arp(channel->outbound_frames()).is_arp, "a resolved send must not emit an ARP request");
+    ASSERT_TRUE(contains_udp(channel->outbound_frames()))
+        << "a send to a freshly-learned peer should go out immediately";
+    ASSERT_TRUE(!find_arp(channel->outbound_frames()).is_arp) << "a resolved send must not emit an ARP request";
 
     // ARP_ENTRY_TTL_TICKS is 120 - tick well past it with no traffic from the peer
     for (int i = 0; i < 130; i++)
@@ -636,16 +639,16 @@ TEST(ArpEntryExpiresWhenPeerGoesSilentAndIsReArped)
     channel->clear_outbound();
     socket->send_to(PEER_IP, 9001, Bytes::from_hex("02"));
     ArpView request = find_arp(channel->outbound_frames());
-    test_assert(request.is_arp && request.op == ArpOperation::REQUEST,
-                "once the entry has expired, a send should re-resolve the peer with a fresh ARP request");
-    test_assert(request.target_ip == PEER_IP.to_string(), "the re-resolution should target the now-expired peer");
+    ASSERT_TRUE(request.is_arp && request.op == ArpOperation::REQUEST)
+        << "once the entry has expired, a send should re-resolve the peer with a fresh ARP request";
+    ASSERT_TRUE(request.target_ip == PEER_IP.to_string()) << "the re-resolution should target the now-expired peer";
 }
 
 // The flip side: a peer we keep hearing from must never age out mid-
 // conversation. Its data/acks arrive as IP frames (not ARP), so received IP
 // traffic has to refresh the entry - otherwise an active connection's ARP
 // mapping would expire out from under it after TTL ticks.
-TEST(ReceivedIpTrafficKeepsArpEntryFresh)
+TEST(NetworkStack, ReceivedIpTrafficKeepsArpEntryFresh)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -665,17 +668,17 @@ TEST(ReceivedIpTrafficKeepsArpEntryFresh)
 
     channel->clear_outbound();
     socket->send_to(PEER_IP, 9000, Bytes::from_hex("01"));
-    test_assert(contains_udp(channel->outbound_frames()),
-                "a peer that keeps sending traffic should stay resolved, so the send goes straight out");
-    test_assert(!find_arp(channel->outbound_frames()).is_arp,
-                "received traffic must keep the ARP entry fresh - no re-resolution should be needed");
+    ASSERT_TRUE(contains_udp(channel->outbound_frames()))
+        << "a peer that keeps sending traffic should stay resolved, so the send goes straight out";
+    ASSERT_TRUE(!find_arp(channel->outbound_frames()).is_arp)
+        << "received traffic must keep the ARP entry fresh - no re-resolution should be needed";
 }
 
 // Whole-stack integration: two NetworkStacks wired back to back over crossed
 // LoopbackChannels run a real ARP resolution, TCP 3-way handshake, bidirectional
 // data exchange, and half-close against each other - no crafted frames, no OS.
 // This is the end-to-end path the earlier tests only exercise one side of.
-TEST(TwoStacksHandshakeExchangeDataAndHalfClose)
+TEST(NetworkStack, TwoStacksHandshakeExchangeDataAndHalfClose)
 {
     const MacAddress MAC_A("aa:aa:aa:aa:aa:aa");
     // Not bb:bb:..., which it used to be: 0xbb has the group bit set, so that
@@ -715,12 +718,12 @@ TEST(TwoStacksHandshakeExchangeDataAndHalfClose)
     TcpConnection* client = stack_a.connect(IP_B, 80);
     pump();
 
-    test_assert(client->get_state() == TcpState::ESTABLISHED,
-                "the client should reach ESTABLISHED through a real ARP + 3-way handshake");
+    ASSERT_TRUE(client->get_state() == TcpState::ESTABLISHED)
+        << "the client should reach ESTABLISHED through a real ARP + 3-way handshake";
 
     TcpConnection* server = stack_b.accept(80);
-    test_assert(server != nullptr, "the server should have an accepted connection once the handshake completes");
-    test_assert(server->get_state() == TcpState::ESTABLISHED, "the accepted server connection should be ESTABLISHED");
+    ASSERT_TRUE(server != nullptr) << "the server should have an accepted connection once the handshake completes";
+    ASSERT_TRUE(server->get_state() == TcpState::ESTABLISHED) << "the accepted server connection should be ESTABLISHED";
 
     // server echoes whatever it receives
     std::vector<Bytes> server_received;
@@ -738,19 +741,19 @@ TEST(TwoStacksHandshakeExchangeDataAndHalfClose)
     client->send(message);
     pump();
 
-    test_assert(server_received.size() == 1 && server_received[0].to_hex() == message.to_hex(),
-                "the server should receive exactly the bytes the client sent");
-    test_assert(client_received.size() == 1 && client_received[0].to_hex() == message.to_hex(),
-                "the client should receive the echoed bytes back");
+    ASSERT_TRUE(server_received.size() == 1 && server_received[0].to_hex() == message.to_hex())
+        << "the server should receive exactly the bytes the client sent";
+    ASSERT_TRUE(client_received.size() == 1 && client_received[0].to_hex() == message.to_hex())
+        << "the client should receive the echoed bytes back";
 
     // client half-closes; the FIN must propagate and move both sides forward
     client->close();
     pump();
 
-    test_assert(client->get_state() == TcpState::FIN_WAIT_2,
-                "after close() and the peer's ack of our FIN, the client should be in FIN_WAIT_2");
-    test_assert(server->get_state() == TcpState::CLOSE_WAIT,
-                "the server should see the client's FIN and move to CLOSE_WAIT");
+    ASSERT_TRUE(client->get_state() == TcpState::FIN_WAIT_2)
+        << "after close() and the peer's ack of our FIN, the client should be in FIN_WAIT_2";
+    ASSERT_TRUE(server->get_state() == TcpState::CLOSE_WAIT)
+        << "the server should see the client's FIN and move to CLOSE_WAIT";
 }
 
 // Ethernet pads frames up to a 60-byte minimum, so a short datagram legitimately
@@ -761,7 +764,7 @@ TEST(TwoStacksHandshakeExchangeDataAndHalfClose)
 // UDP is where that became visible: Udp::from_bytes hard-requires its length
 // field to equal the buffer it is handed, so every padded (i.e. every short) UDP
 // datagram threw as "Invalid UDP header size" and was dropped.
-TEST(PaddedShortUdpDatagramStillReachesTheSocket)
+TEST(NetworkStack, PaddedShortUdpDatagramStillReachesTheSocket)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -773,7 +776,7 @@ TEST(PaddedShortUdpDatagramStillReachesTheSocket)
 
     Bytes payload = Bytes::from_hex("68656c6c6f"); // "hello" - 5 bytes, well under the minimum
     Bytes frame = build_udp(40000, 8080, payload);
-    test_assert(frame.size() < 60, "precondition: this frame is short enough that a real NIC would pad it");
+    ASSERT_TRUE(frame.size() < 60) << "precondition: this frame is short enough that a real NIC would pad it";
 
     // pad exactly as Ethernet would, without touching the IP header's total_length
     Bytes padded = frame;
@@ -784,10 +787,10 @@ TEST(PaddedShortUdpDatagramStillReachesTheSocket)
     channel->push_inbound(padded);
     stack->poll();
 
-    test_assert(received.size() == 1, "a padded short datagram must still reach the socket - the payload has to be "
-                                      "trimmed to IP's total_length, not to the end of the frame");
-    test_assert(received[0].to_hex() == payload.to_hex(),
-                "the trailing padding must not be delivered as part of the payload");
+    ASSERT_TRUE(received.size() == 1) << "a padded short datagram must still reach the socket - the payload has to be "
+                                         "trimmed to IP's total_length, not to the end of the frame";
+    ASSERT_TRUE(received[0].to_hex() == payload.to_hex())
+        << "the trailing padding must not be delivered as part of the payload";
 }
 
 // _reap_closed_connections() erases from _connections but never from
@@ -795,7 +798,7 @@ TEST(PaddedShortUdpDatagramStillReachesTheSocket)
 // key queued. accept() used to pop exactly one key and return nullptr on a miss,
 // which hides every genuinely ready connection queued behind it: a caller that
 // treats nullptr as "nothing pending" simply moves on.
-TEST(AcceptSkipsStaleQueueEntriesAndReturnsTheReadyConnection)
+TEST(NetworkStack, AcceptSkipsStaleQueueEntriesAndReturnsTheReadyConnection)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -824,11 +827,10 @@ TEST(AcceptSkipsStaleQueueEntriesAndReturnsTheReadyConnection)
 
     TcpConnection* accepted = stack->accept(80);
 
-    test_assert(
-        accepted != nullptr,
-        "accept() must skip the stale key and return the connection queued behind it, not report nothing pending");
-    test_assert(accepted->get_state() == TcpState::ESTABLISHED,
-                "the returned connection should be the live, established one");
+    ASSERT_TRUE(accepted != nullptr)
+        << "accept() must skip the stale key and return the connection queued behind it, not report nothing pending";
+    ASSERT_TRUE(accepted->get_state() == TcpState::ESTABLISHED)
+        << "the returned connection should be the live, established one";
 }
 
 // --- inbound filtering: what makes this stack safe on a shared segment ---
@@ -840,7 +842,7 @@ TEST(AcceptSkipsStaleQueueEntriesAndReturnsTheReadyConnection)
 // A frame carrying our IP but addressed to somebody else's MAC must be ignored
 // outright. Without the check it is fully parsed and answered - here it would
 // draw a SYN-ACK, and a segment matching no connection would draw a RST.
-TEST(FrameAddressedToAnotherHostsMacIsIgnored)
+TEST(NetworkStack, FrameAddressedToAnotherHostsMacIsIgnored)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -866,14 +868,14 @@ TEST(FrameAddressedToAnotherHostsMacIsIgnored)
     channel->push_inbound(frame);
     stack->poll();
 
-    test_assert(channel->outbound_frames().empty(),
-                "a frame addressed to another host's MAC must be dropped at L2, not parsed and answered");
-    test_assert(stack->accept(80) == nullptr, "no connection should have been created");
+    ASSERT_TRUE(channel->outbound_frames().empty())
+        << "a frame addressed to another host's MAC must be dropped at L2, not parsed and answered";
+    ASSERT_TRUE(stack->accept(80) == nullptr) << "no connection should have been created";
 }
 
 // Multicast and broadcast still have to get through - ARP requests arrive that
 // way, and dropping them would break passive open entirely.
-TEST(BroadcastFrameIsStillAccepted)
+TEST(NetworkStack, BroadcastFrameIsStillAccepted)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -881,15 +883,14 @@ TEST(BroadcastFrameIsStillAccepted)
     channel->push_inbound(build_arp_request()); // sent to ff:ff:ff:ff:ff:ff
     stack->poll();
 
-    test_assert(
-        !channel->outbound_frames().empty(),
-        "a broadcast ARP request for our IP must still be answered - the L2 filter must accept group addresses");
+    ASSERT_TRUE(!channel->outbound_frames().empty())
+        << "a broadcast ARP request for our IP must still be answered - the L2 filter must accept group addresses";
 }
 
 // ARP that does not target our IP is somebody else's conversation. Acting on it
 // lets any host on the segment populate our table, overwrite mappings we are
 // using, and cancel our own in-flight resolution retries.
-TEST(ArpForAThirdPartyIsNeitherAnsweredNorLearned)
+TEST(NetworkStack, ArpForAThirdPartyIsNeitherAnsweredNorLearned)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -900,25 +901,26 @@ TEST(ArpForAThirdPartyIsNeitherAnsweredNorLearned)
     channel->push_inbound(eth.to_bytes());
     stack->poll();
 
-    test_assert(channel->outbound_frames().empty(), "an ARP request that does not target our IP must not be answered");
+    ASSERT_TRUE(channel->outbound_frames().empty())
+        << "an ARP request that does not target our IP must not be answered";
 
     // and it must not have taught us PEER's mapping either. Proof: connecting
     // to PEER now has to resolve its MAC first, so the stack emits an ARP
     // request rather than going straight to a SYN.
     stack->connect(PEER_IP, 9999);
-    test_assert(channel->outbound_frames().size() == 1,
-                "connect() to an unresolved peer should emit exactly one frame");
+    ASSERT_TRUE(channel->outbound_frames().size() == 1)
+        << "connect() to an unresolved peer should emit exactly one frame";
 
     Ethernet out(channel->outbound_frames()[0]);
-    test_assert(out.get_ethernet_protocol() == EtherType::ARP,
-                "the peer's MAC must not have been learned from third-party ARP - connect() should have to resolve it, "
-                "emitting an ARP request rather than a SYN");
+    ASSERT_TRUE(out.get_ethernet_protocol() == EtherType::ARP)
+        << "the peer's MAC must not have been learned from third-party ARP - connect() should have to resolve it, "
+           "emitting an ARP request rather than a SYN";
 }
 
 // A static ARP entry never ages out and is never replaced by anything learned
 // from the wire. Operationally it pins a peer that must not be spoofable; for
 // tests it takes address resolution out of the picture entirely.
-TEST(StaticArpEntryLetsConnectSkipResolutionEntirely)
+TEST(NetworkStack, StaticArpEntryLetsConnectSkipResolutionEntirely)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -926,10 +928,10 @@ TEST(StaticArpEntryLetsConnectSkipResolutionEntirely)
     stack->add_static_arp_entry(PEER_IP, PEER_MAC);
     stack->connect(PEER_IP, 80);
 
-    test_assert(channel->outbound_frames().size() == 1, "connect() should emit exactly one frame");
+    ASSERT_TRUE(channel->outbound_frames().size() == 1) << "connect() should emit exactly one frame";
     TcpView syn = view_tcp(channel->outbound_frames()[0]);
-    test_assert(syn.is_tcp && syn.syn, "with the peer's MAC already known statically, connect() should send the SYN "
-                                       "straight out rather than an ARP request first");
+    ASSERT_TRUE(syn.is_tcp && syn.syn) << "with the peer's MAC already known statically, connect() should send the SYN "
+                                          "straight out rather than an ARP request first";
 }
 
 // poll() used to drain unconditionally, so a peer sending faster than the stack
@@ -937,7 +939,7 @@ TEST(StaticArpEntryLetsConnectSkipResolutionEntirely)
 // caller multiplexes, the retransmit timer most importantly. It now stops on a
 // frame budget and reports that it did, and the caller is required to come back
 // because the fd is edge-triggered and will not notify again for queued frames.
-TEST(PollStopsOnItsBudgetAndReportsThatFramesRemain)
+TEST(NetworkStack, PollStopsOnItsBudgetAndReportsThatFramesRemain)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -949,24 +951,24 @@ TEST(PollStopsOnItsBudgetAndReportsThatFramesRemain)
         channel->push_inbound(build_arp_request());
     }
 
-    test_assert(stack->poll() == false,
-                "poll() must report false when it stopped on the budget with frames still queued");
-    test_assert(static_cast<int>(channel->outbound_frames().size()) == NetworkStack::POLL_FRAME_BUDGET,
-                "exactly the budgeted number of frames should have been processed in the first pass");
+    ASSERT_TRUE(stack->poll() == false)
+        << "poll() must report false when it stopped on the budget with frames still queued";
+    ASSERT_TRUE(static_cast<int>(channel->outbound_frames().size()) == NetworkStack::POLL_FRAME_BUDGET)
+        << "exactly the budgeted number of frames should have been processed in the first pass";
 
-    test_assert(stack->poll() == true, "a second poll() should drain the remainder and report the channel empty");
-    test_assert(static_cast<int>(channel->outbound_frames().size()) == total,
-                "every queued frame should be processed once the caller comes back");
+    ASSERT_TRUE(stack->poll() == true) << "a second poll() should drain the remainder and report the channel empty";
+    ASSERT_TRUE(static_cast<int>(channel->outbound_frames().size()) == total)
+        << "every queued frame should be processed once the caller comes back";
 }
 
-TEST(PollReportsDrainedWhenItEmptiesTheChannel)
+TEST(NetworkStack, PollReportsDrainedWhenItEmptiesTheChannel)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
 
     channel->push_inbound(build_arp_request());
-    test_assert(stack->poll() == true, "poll() must report true when it emptied the channel - the common case");
-    test_assert(stack->poll() == true, "polling an already-empty channel must also report drained");
+    ASSERT_TRUE(stack->poll() == true) << "poll() must report true when it emptied the channel - the common case";
+    ASSERT_TRUE(stack->poll() == true) << "polling an already-empty channel must also report drained";
 }
 
 // --- next-hop routing: reaching beyond the local segment ---
@@ -993,23 +995,23 @@ namespace
     }
 }
 
-TEST(ConnectingOffLinkResolvesTheGatewayNotTheDestination)
+TEST(NetworkStack, ConnectingOffLinkResolvesTheGatewayNotTheDestination)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_routed_stack(channel);
 
     stack->connect(IPv4Address("8.8.8.8"), 443);
 
-    test_assert(channel->outbound_frames().size() == 1,
-                "connect() to an unresolved next hop should emit one ARP request");
+    ASSERT_TRUE(channel->outbound_frames().size() == 1)
+        << "connect() to an unresolved next hop should emit one ARP request";
     ArpView arp = view_arp(channel->outbound_frames()[0]);
-    test_assert(arp.is_arp && arp.op == ArpOperation::REQUEST, "it should be an ARP request");
-    test_assert(arp.target_ip == PEER_IP.to_string(),
-                "the request must ask for the GATEWAY's MAC. Asking for 8.8.8.8 is the old behaviour and can never be "
-                "answered - no host on this segment owns it");
+    ASSERT_TRUE(arp.is_arp && arp.op == ArpOperation::REQUEST) << "it should be an ARP request";
+    ASSERT_TRUE(arp.target_ip == PEER_IP.to_string())
+        << "the request must ask for the GATEWAY's MAC. Asking for 8.8.8.8 is the old behaviour and can never be "
+           "answered - no host on this segment owns it";
 }
 
-TEST(GatewayArpReplyReleasesTheOffLinkConnection)
+TEST(NetworkStack, GatewayArpReplyReleasesTheOffLinkConnection)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_routed_stack(channel);
@@ -1023,20 +1025,19 @@ TEST(GatewayArpReplyReleasesTheOffLinkConnection)
     stack->poll();
 
     TcpView syn = find_tcp(channel->outbound_frames());
-    test_assert(syn.is_tcp && syn.syn, "the gateway's ARP reply should release the queued SYN");
-    test_assert(syn.dest_port == 443, "the SYN should be addressed to the original destination's port");
+    ASSERT_TRUE(syn.is_tcp && syn.syn) << "the gateway's ARP reply should release the queued SYN";
+    ASSERT_TRUE(syn.dest_port == 443) << "the SYN should be addressed to the original destination's port";
 
     // and the frame must be addressed to the gateway's MAC while the IP header
     // still names the real destination
     Ethernet eth(channel->outbound_frames()[0]);
-    test_assert(eth.get_dest() == PEER_MAC, "the frame goes to the gateway's MAC");
+    ASSERT_TRUE(eth.get_dest() == PEER_MAC) << "the frame goes to the gateway's MAC";
     const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
-    test_assert(
-        ip != nullptr && IPv4Address(ip->get_dest_address()) == IPv4Address("8.8.8.8"),
-        "the IP header must still name 8.8.8.8 - the L3 destination and the L2 destination are different things");
+    ASSERT_TRUE(ip != nullptr && IPv4Address(ip->get_dest_address()) == IPv4Address("8.8.8.8"))
+        << "the IP header must still name 8.8.8.8 - the L3 destination and the L2 destination are different things";
 }
 
-TEST(OnLinkDestinationsStillResolveThemselvesWithAGatewayPresent)
+TEST(NetworkStack, OnLinkDestinationsStillResolveThemselvesWithAGatewayPresent)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_routed_stack(channel);
@@ -1044,11 +1045,11 @@ TEST(OnLinkDestinationsStillResolveThemselvesWithAGatewayPresent)
     stack->connect(IPv4Address("10.0.0.55"), 80);
 
     ArpView arp = view_arp(channel->outbound_frames()[0]);
-    test_assert(arp.is_arp && arp.target_ip == "10.0.0.55",
-                "a neighbour must still be resolved directly - the default route must not swallow on-link traffic");
+    ASSERT_TRUE(arp.is_arp && arp.target_ip == "10.0.0.55")
+        << "a neighbour must still be resolved directly - the default route must not swallow on-link traffic";
 }
 
-TEST(BroadcastIsSentWithoutResolutionAndAcceptedInbound)
+TEST(NetworkStack, BroadcastIsSentWithoutResolutionAndAcceptedInbound)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_routed_stack(channel);
@@ -1057,10 +1058,10 @@ TEST(BroadcastIsSentWithoutResolutionAndAcceptedInbound)
     UdpSocket* socket = stack->bind_udp(68);
     socket->send_to(IPv4Address("255.255.255.255"), 67, Bytes::from_hex("abcd"));
 
-    test_assert(channel->outbound_frames().size() == 1,
-                "a broadcast datagram should go straight out, with no ARP request first");
+    ASSERT_TRUE(channel->outbound_frames().size() == 1)
+        << "a broadcast datagram should go straight out, with no ARP request first";
     Ethernet eth(channel->outbound_frames()[0]);
-    test_assert(eth.get_dest() == MacAddress::BROADCAST, "it must be addressed to the broadcast MAC");
+    ASSERT_TRUE(eth.get_dest() == MacAddress::BROADCAST) << "it must be addressed to the broadcast MAC";
 
     // inbound: a broadcast datagram is not addressed to our IP, and must be
     // accepted anyway or a host could never be reached before it has an address
@@ -1085,8 +1086,8 @@ TEST(BroadcastIsSentWithoutResolutionAndAcceptedInbound)
     channel->push_inbound(frame);
     stack->poll();
 
-    test_assert(received.size() == 1,
-                "a broadcast datagram must be accepted even though it is not addressed to our own IP");
+    ASSERT_TRUE(received.size() == 1)
+        << "a broadcast datagram must be accepted even though it is not addressed to our own IP";
 }
 
 // The accept queue was unbounded, which is where a SYN flood lands: a remote
@@ -1094,7 +1095,7 @@ TEST(BroadcastIsSentWithoutResolutionAndAcceptedInbound)
 // packet each. A bound is also what makes the SYN-cookie conversation coherent -
 // cookies are the fallback for when the limit is hit, not a substitute for
 // having one.
-TEST(SynsBeyondTheListenBacklogAreDropped)
+TEST(NetworkStack, SynsBeyondTheListenBacklogAreDropped)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -1116,20 +1117,19 @@ TEST(SynsBeyondTheListenBacklogAreDropped)
     channel->push_inbound(build_tcp(FLAG_SYN, 2000, 0, 40001, 80));
     stack->poll();
 
-    test_assert(channel->outbound_frames().empty(),
-                "a SYN beyond the backlog must be dropped silently - not answered with a SYN-ACK, and not RST either, "
-                "so the peer's own retransmission can succeed once the application drains");
+    ASSERT_TRUE(channel->outbound_frames().empty())
+        << "a SYN beyond the backlog must be dropped silently - not answered with a SYN-ACK, and not RST either, "
+           "so the peer's own retransmission can succeed once the application drains";
 
     // once the application accepts, there is room again
-    test_assert(stack->accept(80) != nullptr, "the queued connection should still be acceptable");
+    ASSERT_TRUE(stack->accept(80) != nullptr) << "the queued connection should still be acceptable";
     channel->clear_outbound();
     channel->push_inbound(build_tcp(FLAG_SYN, 3000, 0, 40002, 80));
     stack->poll();
 
     TcpView syn_ack = find_tcp(channel->outbound_frames());
-    test_assert(
-        syn_ack.is_tcp && syn_ack.syn && syn_ack.ack_flag,
-        "with the queue drained a new SYN must be answered again - the backlog is a limit, not a permanent refusal");
+    ASSERT_TRUE(syn_ack.is_tcp && syn_ack.syn && syn_ack.ack_flag)
+        << "with the queue drained a new SYN must be answered again - the backlog is a limit, not a permanent refusal";
 }
 
 // --- receive-side reassembly, end to end ---
@@ -1158,7 +1158,7 @@ namespace
     }
 }
 
-TEST(FragmentedUdpDatagramIsReassembledAndDelivered)
+TEST(NetworkStack, FragmentedUdpDatagramIsReassembledAndDelivered)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -1183,17 +1183,17 @@ TEST(FragmentedUdpDatagramIsReassembledAndDelivered)
 
     channel->push_inbound(build_ip_fragment(IpProtocol::UDP, datagram.slice(0, 16), 0, true, 77));
     stack->poll();
-    test_assert(received.empty(), "one fragment is not a datagram - nothing should be delivered yet");
+    ASSERT_TRUE(received.empty()) << "one fragment is not a datagram - nothing should be delivered yet";
 
     channel->push_inbound(build_ip_fragment(IpProtocol::UDP, datagram.slice(16), 2, false, 77));
     stack->poll();
 
-    test_assert(received.size() == 1, "the second fragment should complete the datagram and deliver it");
-    test_assert(received[0].to_hex() == payload.to_hex(),
-                "the reassembled payload must be exactly what was sent, in order");
+    ASSERT_TRUE(received.size() == 1) << "the second fragment should complete the datagram and deliver it";
+    ASSERT_TRUE(received[0].to_hex() == payload.to_hex())
+        << "the reassembled payload must be exactly what was sent, in order";
 }
 
-TEST(AFragmentThatNeverCompletesDrawsIcmpTimeExceeded)
+TEST(NetworkStack, AFragmentThatNeverCompletesDrawsIcmpTimeExceeded)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -1210,10 +1210,10 @@ TEST(AFragmentThatNeverCompletesDrawsIcmpTimeExceeded)
     }
 
     IcmpView icmp = find_icmp(channel->outbound_frames());
-    test_assert(icmp.is_icmp, "the sender should be told rather than left waiting on a datagram nobody will deliver");
-    test_assert(icmp.type == IcmpType::ICMP_TIME_EXCEEDED, "it should be ICMP Time Exceeded");
-    test_assert(icmp.code == ICMP_CODE_FRAGMENT_REASSEMBLY_TIME_EXCEEDED,
-                "code 1 - the timer that ran out is the reassembly timer, not the TTL (code 0 is a router's business)");
+    ASSERT_TRUE(icmp.is_icmp) << "the sender should be told rather than left waiting on a datagram nobody will deliver";
+    ASSERT_TRUE(icmp.type == IcmpType::ICMP_TIME_EXCEEDED) << "it should be ICMP Time Exceeded";
+    ASSERT_TRUE(icmp.code == ICMP_CODE_FRAGMENT_REASSEMBLY_TIME_EXCEEDED)
+        << "code 1 - the timer that ran out is the reassembly timer, not the TTL (code 0 is a router's business)";
 }
 
 // --- path MTU discovery ---
@@ -1288,32 +1288,32 @@ namespace
     }
 }
 
-TEST(FragmentationNeededLowersTheMssInsteadOfKillingTheConnection)
+TEST(NetworkStack, FragmentationNeededLowersTheMssInsteadOfKillingTheConnection)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
 
     TcpConnection* connection = accept_connection_with_peer_mss(*stack, *channel, 80, 40000);
-    test_assert(connection != nullptr, "precondition: the connection was accepted");
+    ASSERT_TRUE(connection != nullptr) << "precondition: the connection was accepted";
     uint16_t mss_before = connection->get_effective_mss();
-    test_assert(mss_before == 1460,
-                "precondition: the peer advertised a full-sized MSS, so there is room to come down from");
+    ASSERT_TRUE(mss_before == 1460)
+        << "precondition: the peer advertised a full-sized MSS, so there is room to come down from";
     uint32_t seq = send_one_segment(*connection, *channel);
 
     channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 1000, seq));
     stack->poll();
 
-    test_assert(stack->find_connection(connection->get_id()) != nullptr,
-                "Fragmentation Needed must NOT fail the connection - the destination is reachable, the packet was just "
-                "too big");
-    test_assert(connection->get_effective_mss() < mss_before, "it must lower the segment size instead");
-    test_assert(connection->get_effective_mss() == 1000 - 40,
-                "the new MSS should be the reported next-hop MTU less an IP and a TCP header");
+    ASSERT_TRUE(stack->find_connection(connection->get_id()) != nullptr)
+        << "Fragmentation Needed must NOT fail the connection - the destination is reachable, the packet was just "
+           "too big";
+    ASSERT_TRUE(connection->get_effective_mss() < mss_before) << "it must lower the segment size instead";
+    ASSERT_TRUE(connection->get_effective_mss() == 1000 - 40)
+        << "the new MSS should be the reported next-hop MTU less an IP and a TCP header";
 }
 
 // Only ever downward. Raising it on a later, larger report would mean trusting
 // an unauthenticated ICMP message to make this stack send bigger packets.
-TEST(FragmentationNeededNeverRaisesTheMss)
+TEST(NetworkStack, FragmentationNeededNeverRaisesTheMss)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -1322,15 +1322,16 @@ TEST(FragmentationNeededNeverRaisesTheMss)
     uint32_t seq = send_one_segment(*connection, *channel);
     channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 1000, seq));
     stack->poll();
-    test_assert(connection->get_effective_mss() == 960, "precondition: lowered once");
+    ASSERT_TRUE(connection->get_effective_mss() == 960) << "precondition: lowered once";
 
     channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 9000, seq));
     stack->poll();
-    test_assert(connection->get_effective_mss() == 960, "a report claiming a larger MTU must be ignored - an attacker "
-                                                        "could otherwise talk this stack into oversized segments");
+    ASSERT_TRUE(connection->get_effective_mss() == 960)
+        << "a report claiming a larger MTU must be ignored - an attacker "
+           "could otherwise talk this stack into oversized segments";
 }
 
-TEST(OtherUnreachableCodesStillFailTheConnection)
+TEST(NetworkStack, OtherUnreachableCodesStillFailTheConnection)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -1343,30 +1344,30 @@ TEST(OtherUnreachableCodesStillFailTheConnection)
     channel->push_inbound(build_icmp_port_unreachable_for_our_tcp(local_port, 80, syn.seq));
     stack->poll();
 
-    test_assert(stack->find_connection(id) == nullptr, "a genuine unreachable must still fail the connection fast "
-                                                       "rather than letting it grind through its retransmit budget");
+    ASSERT_TRUE(stack->find_connection(id) == nullptr) << "a genuine unreachable must still fail the connection fast "
+                                                          "rather than letting it grind through its retransmit budget";
 }
 
 // Routers predating RFC 1191 report the failure without saying how small is
 // small enough, which is what made path MTU discovery notoriously unreliable.
-TEST(FragmentationNeededWithoutAnMtuFallsBackToTheMinimum)
+TEST(NetworkStack, FragmentationNeededWithoutAnMtuFallsBackToTheMinimum)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
 
     TcpConnection* connection = accept_connection_with_peer_mss(*stack, *channel, 80, 40000);
-    test_assert(connection->get_effective_mss() == 1460, "precondition: starting from a full-sized MSS");
+    ASSERT_TRUE(connection->get_effective_mss() == 1460) << "precondition: starting from a full-sized MSS";
     uint32_t seq = send_one_segment(*connection, *channel);
 
     channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 0, seq));
     stack->poll();
 
-    test_assert(connection->get_effective_mss() == 576 - 40,
-                "with no MTU reported the conservative answer is the smallest datagram every IPv4 host must handle");
+    ASSERT_TRUE(connection->get_effective_mss() == 576 - 40)
+        << "with no MTU reported the conservative answer is the smallest datagram every IPv4 host must handle";
 }
 
 // TCP sets DF, because that report is the only way the path MTU can be learned.
-TEST(TcpSegmentsAreSentWithDontFragmentSet)
+TEST(NetworkStack, TcpSegmentsAreSentWithDontFragmentSet)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -1374,8 +1375,9 @@ TEST(TcpSegmentsAreSentWithDontFragmentSet)
 
     Ethernet eth(channel->outbound_frames()[0]);
     const Ip* ip = dynamic_cast<const Ip*>(&eth.get_next_layer());
-    test_assert(ip != nullptr && ip->get_ip_flag_d(), "a TCP segment must carry DF - without it a small link silently "
-                                                      "fragments and the sender never learns the path MTU");
+    ASSERT_TRUE(ip != nullptr && ip->get_ip_flag_d())
+        << "a TCP segment must carry DF - without it a small link silently "
+           "fragments and the sender never learns the path MTU";
 }
 
 // --- ICMP as a control plane: rate limiting, a ping client, and smurf ---
@@ -1383,7 +1385,7 @@ TEST(TcpSegmentsAreSentWithDontFragmentSet)
 // An error generator with no bound lets a peer set the rate at which this stack
 // emits errors - and, by spoofing a source address, aim that stream at somebody
 // else. That is reflection; an error larger than its trigger is amplification.
-TEST(GeneratedIcmpErrorsAreRateLimited)
+TEST(NetworkStack, GeneratedIcmpErrorsAreRateLimited)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -1408,8 +1410,8 @@ TEST(GeneratedIcmpErrorsAreRateLimited)
         }
     }
 
-    test_assert(errors > 0, "some errors should still be sent - the budget is a limit, not a mute");
-    test_assert(errors < 40, "a peer must not be able to set the rate at which this stack emits ICMP errors");
+    ASSERT_TRUE(errors > 0) << "some errors should still be sent - the budget is a limit, not a mute";
+    ASSERT_TRUE(errors < 40) << "a peer must not be able to set the rate at which this stack emits ICMP errors";
 
     // the budget refills over time rather than being spent once and gone
     channel->clear_outbound();
@@ -1421,13 +1423,13 @@ TEST(GeneratedIcmpErrorsAreRateLimited)
     stack->poll();
 
     IcmpView after_refill = find_icmp(channel->outbound_frames());
-    test_assert(after_refill.is_icmp, "after refilling, errors should be sent again");
+    ASSERT_TRUE(after_refill.is_icmp) << "after refilling, errors should be sent again";
 }
 
 // One broadcast ping draws a reply from every host on the segment, so an
 // attacker spoofing a victim's address turns the segment into an amplifier
 // aimed at it. Only reachable at all since broadcast started being accepted.
-TEST(BroadcastPingIsIgnored)
+TEST(NetworkStack, BroadcastPingIsIgnored)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -1438,7 +1440,7 @@ TEST(BroadcastPingIsIgnored)
     // a normal ping is answered
     channel->push_inbound(build_icmp_echo_request(0x00010001, Bytes::from_hex("beef")));
     stack->poll();
-    test_assert(find_icmp(channel->outbound_frames()).is_icmp, "precondition: a unicast ping is answered");
+    ASSERT_TRUE(find_icmp(channel->outbound_frames()).is_icmp) << "precondition: a unicast ping is answered";
 
     // the same ping addressed to the broadcast address is not
     channel->clear_outbound();
@@ -1456,12 +1458,11 @@ TEST(BroadcastPingIsIgnored)
     channel->push_inbound(eth.to_bytes());
     stack->poll();
 
-    test_assert(
-        channel->outbound_frames().empty(),
-        "a ping to the broadcast address must be ignored - answering makes this host one voice in an amplifier");
+    ASSERT_TRUE(channel->outbound_frames().empty())
+        << "a ping to the broadcast address must be ignored - answering makes this host one voice in an amplifier";
 }
 
-TEST(EchoRequestIsSentAndItsReplyReported)
+TEST(NetworkStack, EchoRequestIsSentAndItsReplyReported)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -1470,7 +1471,7 @@ TEST(EchoRequestIsSentAndItsReplyReported)
     stack->send_echo_request(PEER_IP, 0x1234, 7, Bytes::from_hex("cafe"));
 
     IcmpView sent = find_icmp(channel->outbound_frames());
-    test_assert(sent.is_icmp && sent.type == IcmpType::ICMP_ECHO_REQUEST, "an echo request should go out");
+    ASSERT_TRUE(sent.is_icmp && sent.type == IcmpType::ICMP_ECHO_REQUEST) << "an echo request should go out";
 
     // the peer echoes identifier, sequence and payload back untouched
     struct Reply
@@ -1489,14 +1490,14 @@ TEST(EchoRequestIsSentAndItsReplyReported)
     channel->push_inbound(wrap_ip(IpProtocol::ICMP, reply.to_bytes()));
     stack->poll();
 
-    test_assert(replies.size() == 1, "the reply should be reported to the application");
-    test_assert(replies[0].id == 0x1234 && replies[0].seq == 7,
-                "identifier and sequence come back untouched, which is how a reply is matched to its request");
-    test_assert(replies[0].payload.to_hex() == "cafe",
-                "and the payload verbatim, which is what lets a ping time a round trip");
+    ASSERT_TRUE(replies.size() == 1) << "the reply should be reported to the application";
+    ASSERT_TRUE(replies[0].id == 0x1234 && replies[0].seq == 7)
+        << "identifier and sequence come back untouched, which is how a reply is matched to its request";
+    ASSERT_TRUE(replies[0].payload.to_hex() == "cafe")
+        << "and the payload verbatim, which is what lets a ping time a round trip";
 }
 
-TEST(APingFromAnUnresolvedPeerArpsForItInsteadOfThrowing)
+TEST(NetworkStack, APingFromAnUnresolvedPeerArpsForItInsteadOfThrowing)
 {
     // The test above primes the ARP table with a request from the peer before
     // pinging, which is the common case and hid this for a long time. Here the
@@ -1514,15 +1515,16 @@ TEST(APingFromAnUnresolvedPeerArpsForItInsteadOfThrowing)
     channel->push_inbound(build_icmp_echo_request(0x00010001, Bytes::from_hex("41")));
     stack->poll();
 
-    test_assert(!find_icmp(channel->outbound_frames()).is_icmp, "no reply can be sent to a peer whose MAC is unknown");
+    ASSERT_TRUE(!find_icmp(channel->outbound_frames()).is_icmp)
+        << "no reply can be sent to a peer whose MAC is unknown";
 
     ArpView request = find_arp(channel->outbound_frames());
-    test_assert(request.is_arp && request.op == ArpOperation::REQUEST,
-                "but the stack must ARP for it, so the next ping can be answered");
-    test_assert(request.target_ip == PEER_IP.to_string(), "and ARP for the peer that pinged us");
+    ASSERT_TRUE(request.is_arp && request.op == ArpOperation::REQUEST)
+        << "but the stack must ARP for it, so the next ping can be answered";
+    ASSERT_TRUE(request.target_ip == PEER_IP.to_string()) << "and ARP for the peer that pinged us";
 }
 
-TEST(ThePingAfterResolutionIsAnswered)
+TEST(NetworkStack, ThePingAfterResolutionIsAnswered)
 {
     // The other half: dropping the first ping is only acceptable because the
     // resolution it kicks off makes the next one work, and ping re-sends every
@@ -1542,9 +1544,9 @@ TEST(ThePingAfterResolutionIsAnswered)
     stack->poll();
 
     IcmpView reply = find_icmp(channel->outbound_frames());
-    test_assert(reply.is_icmp && reply.type == IcmpType::ICMP_ECHO_REPLY,
-                "once the mapping is known the ping must be answered");
-    test_assert(reply.payload.to_hex() == "42", "with the right payload");
+    ASSERT_TRUE(reply.is_icmp && reply.type == IcmpType::ICMP_ECHO_REPLY)
+        << "once the mapping is known the ping must be answered";
+    ASSERT_TRUE(reply.payload.to_hex() == "42") << "with the right payload";
 }
 
 namespace
@@ -1589,7 +1591,7 @@ namespace
     }
 }
 
-TEST(ADirectedBroadcastWithARealChecksumIsAccepted)
+TEST(NetworkStack, ADirectedBroadcastWithARealChecksumIsAccepted)
 {
     // The pseudo-header destination has to come from the IP header, not from
     // this interface's address. They are the same for unicast and different for
@@ -1612,11 +1614,11 @@ TEST(ADirectedBroadcastWithARealChecksumIsAccepted)
                                                    Bytes::from_hex("cafe")));
     stack->poll();
 
-    test_assert(received, "a directed broadcast with a correct checksum must be delivered, "
-                          "not dropped for failing a check against the wrong destination");
+    ASSERT_TRUE(received) << "a directed broadcast with a correct checksum must be delivered, "
+                             "not dropped for failing a check against the wrong destination";
 }
 
-TEST(AUnicastDatagramWithARealChecksumStillVerifies)
+TEST(NetworkStack, AUnicastDatagramWithARealChecksumStillVerifies)
 {
     // The other half: taking the destination from the header must not break the
     // ordinary case, where it equals this interface's address.
@@ -1631,10 +1633,10 @@ TEST(AUnicastDatagramWithARealChecksumStillVerifies)
     channel->push_inbound(build_checksummed_udp_to(LOCAL_IP, LOCAL_MAC, 5000, 9999, Bytes::from_hex("cafe")));
     stack->poll();
 
-    test_assert(received, "a correctly checksummed unicast datagram must still be delivered");
+    ASSERT_TRUE(received) << "a correctly checksummed unicast datagram must still be delivered";
 }
 
-TEST(ACorruptedChecksumIsStillRejected)
+TEST(NetworkStack, ACorruptedChecksumIsStillRejected)
 {
     // And the check must still actually check something.
     FakePacketChannel* channel = nullptr;
@@ -1650,23 +1652,23 @@ TEST(ACorruptedChecksumIsStillRejected)
     channel->push_inbound(frame);
     stack->poll();
 
-    test_assert(!received, "a datagram whose payload was altered must fail the checksum");
+    ASSERT_TRUE(!received) << "a datagram whose payload was altered must fail the checksum";
 }
 
-TEST(UnbindUdpReleasesThePortAndTheSocketWithIt)
+TEST(NetworkStack, UnbindUdpReleasesThePortAndTheSocketWithIt)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
 
     UdpSocket* first = stack->bind_udp(4444);
-    test_assert(first != nullptr, "bind should return a socket");
-    test_assert(stack->bind_udp(4444) == first, "binding twice returns the same socket");
+    ASSERT_TRUE(first != nullptr) << "bind should return a socket";
+    ASSERT_TRUE(stack->bind_udp(4444) == first) << "binding twice returns the same socket";
 
-    test_assert(stack->unbind_udp(4444), "unbinding a bound port reports success");
-    test_assert(!stack->unbind_udp(4444), "unbinding it twice reports that nothing was there");
+    ASSERT_TRUE(stack->unbind_udp(4444)) << "unbinding a bound port reports success";
+    ASSERT_TRUE(!stack->unbind_udp(4444)) << "unbinding it twice reports that nothing was there";
 
     UdpSocket* second = stack->bind_udp(4444);
-    test_assert(second != nullptr, "the port must be bindable again after release");
+    ASSERT_TRUE(second != nullptr) << "the port must be bindable again after release";
 }
 
 // --- multiple interfaces ----------------------------------------------------
@@ -1715,7 +1717,7 @@ namespace
     }
 }
 
-TEST(APacketLeavesByTheInterfaceItsRouteNames)
+TEST(NetworkStack, APacketLeavesByTheInterfaceItsRouteNames)
 {
     FakePacketChannel* first = nullptr;
     FakePacketChannel* second = nullptr;
@@ -1730,12 +1732,12 @@ TEST(APacketLeavesByTheInterfaceItsRouteNames)
     UdpSocket* socket = stack->bind_udp(7000);
     socket->send_to(SECOND_PEER_IP, 7001, Bytes::from_hex("aabb"));
 
-    test_assert(contains_udp(second->outbound_frames()),
-                "a datagram for 192.168.5.9 must go out of the interface that network is on");
-    test_assert(!contains_udp(first->outbound_frames()), "and must not go out of the other one");
+    ASSERT_TRUE(contains_udp(second->outbound_frames()))
+        << "a datagram for 192.168.5.9 must go out of the interface that network is on";
+    ASSERT_TRUE(!contains_udp(first->outbound_frames())) << "and must not go out of the other one";
 }
 
-TEST(TheSourceAddressIsTheEgressInterfacesOwn)
+TEST(NetworkStack, TheSourceAddressIsTheEgressInterfacesOwn)
 {
     // The subtle one, and the reason this test was written before the code.
     //
@@ -1765,27 +1767,28 @@ TEST(TheSourceAddressIsTheEgressInterfacesOwn)
         if (!ip || ip->get_protocol() != IpProtocol::UDP)
             continue;
 
-        test_assert(eth.get_src() == SECOND_MAC, "the frame must carry the egress interface's MAC, not the primary's");
-        test_assert(IPv4Address(ip->get_src_address()) == SECOND_IP,
-                    "the IP header must carry the egress interface's address, not the primary's");
+        ASSERT_TRUE(eth.get_src() == SECOND_MAC)
+            << "the frame must carry the egress interface's MAC, not the primary's";
+        ASSERT_TRUE(IPv4Address(ip->get_src_address()) == SECOND_IP)
+            << "the IP header must carry the egress interface's address, not the primary's";
 
         // And the checksum must have been computed over that same address.
         // This is the assertion that catches the two falling out of step, and
         // it verifies exactly the way _handle_udp does on the receiving side:
         // a correct checksum makes the sum over the pseudo-header come to zero.
         const Udp* udp = dynamic_cast<const Udp*>(&ip->get_next_layer());
-        test_assert(udp != nullptr, "the datagram should parse as UDP");
+        ASSERT_TRUE(udp != nullptr) << "the datagram should parse as UDP";
         Bytes segment = const_cast<Udp*>(udp)->to_bytes();
-        test_assert(transport_checksum(SECOND_IP, SECOND_PEER_IP, IpProtocol::UDP, segment) == 0,
-                    "the UDP checksum must verify against the egress source address - "
-                    "if it does not, the packet is discarded by every peer while looking "
-                    "correct in a local capture");
+        ASSERT_TRUE(transport_checksum(SECOND_IP, SECOND_PEER_IP, IpProtocol::UDP, segment) == 0)
+            << "the UDP checksum must verify against the egress source address - "
+               "if it does not, the packet is discarded by every peer while looking "
+               "correct in a local capture";
         checked = true;
     }
-    test_assert(checked, "a UDP datagram should have gone out of the second interface");
+    ASSERT_TRUE(checked) << "a UDP datagram should have gone out of the second interface";
 }
 
-TEST(EachInterfaceResolvesAgainstItsOwnArpTable)
+TEST(NetworkStack, EachInterfaceResolvesAgainstItsOwnArpTable)
 {
     // The hazard that was silently wrong rather than uncompilable: the
     // pending-ARP maps are keyed by bare IP, so one shared set of them would let
@@ -1807,13 +1810,13 @@ TEST(EachInterfaceResolvesAgainstItsOwnArpTable)
     socket->send_to(PEER_IP, 7001, Bytes::from_hex("aabb"));
 
     ArpView request = find_arp(first->outbound_frames());
-    test_assert(request.is_arp && request.op == ArpOperation::REQUEST,
-                "the first interface must ARP for its own neighbour");
-    test_assert(request.target_ip == PEER_IP.to_string(), "for the right address");
-    test_assert(!find_arp(second->outbound_frames()).is_arp, "and the second interface must not be asked about it");
+    ASSERT_TRUE(request.is_arp && request.op == ArpOperation::REQUEST)
+        << "the first interface must ARP for its own neighbour";
+    ASSERT_TRUE(request.target_ip == PEER_IP.to_string()) << "for the right address";
+    ASSERT_TRUE(!find_arp(second->outbound_frames()).is_arp) << "and the second interface must not be asked about it";
 }
 
-TEST(AnArpRequestCarriesTheIdentityOfTheLinkItLeavesBy)
+TEST(NetworkStack, AnArpRequestCarriesTheIdentityOfTheLinkItLeavesBy)
 {
     // A request carrying the wrong sender address gets its reply sent to a
     // network the asker is not on. Every field here is per-interface.
@@ -1827,11 +1830,11 @@ TEST(AnArpRequestCarriesTheIdentityOfTheLinkItLeavesBy)
     socket->send_to(SECOND_PEER_IP, 7001, Bytes::from_hex("aabb"));
 
     ArpView request = find_arp(second->outbound_frames());
-    test_assert(request.is_arp && request.op == ArpOperation::REQUEST,
-                "the second interface should ARP for its neighbour");
-    test_assert(request.sender_ip == SECOND_IP.to_string(),
-                "the request must carry that interface's address as the sender");
-    test_assert(request.sender_mac == SECOND_MAC.to_string(), "and that interface's MAC");
+    ASSERT_TRUE(request.is_arp && request.op == ArpOperation::REQUEST)
+        << "the second interface should ARP for its neighbour";
+    ASSERT_TRUE(request.sender_ip == SECOND_IP.to_string())
+        << "the request must carry that interface's address as the sender";
+    ASSERT_TRUE(request.sender_mac == SECOND_MAC.to_string()) << "and that interface's MAC";
 }
 
 namespace
@@ -1848,7 +1851,7 @@ namespace
     }
 }
 
-TEST(ABroadcastPingIsRefusedOnEveryInterfaceNotJustTheFirst)
+TEST(NetworkStack, ABroadcastPingIsRefusedOnEveryInterfaceNotJustTheFirst)
 {
     // Adding a second interface briefly reopened the smurf hole. The L3 accept
     // filter is correctly per-link, so a ping to 192.168.5.255 arriving on that
@@ -1873,14 +1876,14 @@ TEST(ABroadcastPingIsRefusedOnEveryInterfaceNotJustTheFirst)
                                                       SECOND_PEER_IP, SECOND_PEER_MAC));
     stack->poll();
 
-    test_assert(!find_icmp(second->outbound_frames()).is_icmp,
-                "a ping to the second interface's directed broadcast must not be answered - "
-                "answering makes this host an amplifier for that segment");
-    test_assert(!find_icmp(first->outbound_frames()).is_icmp,
-                "and nothing should go out of the other interface either");
+    ASSERT_TRUE(!find_icmp(second->outbound_frames()).is_icmp)
+        << "a ping to the second interface's directed broadcast must not be answered - "
+           "answering makes this host an amplifier for that segment";
+    ASSERT_TRUE(!find_icmp(first->outbound_frames()).is_icmp)
+        << "and nothing should go out of the other interface either";
 }
 
-TEST(ABroadcastPingToThePrimarysNetworkIsStillRefused)
+TEST(NetworkStack, ABroadcastPingToThePrimarysNetworkIsStillRefused)
 {
     // The case that always worked, kept so the fix cannot be "check the other
     // interface instead of the first one".
@@ -1896,11 +1899,11 @@ TEST(ABroadcastPingToThePrimarysNetworkIsStillRefused)
         build_broadcast_echo_request(IPv4Address("10.0.0.255"), MacAddress::BROADCAST, PEER_IP, PEER_MAC));
     stack->poll();
 
-    test_assert(!find_icmp(first->outbound_frames()).is_icmp,
-                "a ping to the primary's directed broadcast must still be refused");
+    ASSERT_TRUE(!find_icmp(first->outbound_frames()).is_icmp)
+        << "a ping to the primary's directed broadcast must still be refused";
 }
 
-TEST(AUnicastPingIsStillAnswered)
+TEST(NetworkStack, AUnicastPingIsStillAnswered)
 {
     // And the guard must not have become "refuse every ping".
     FakePacketChannel* channel = nullptr;
@@ -1911,11 +1914,11 @@ TEST(AUnicastPingIsStillAnswered)
     stack->poll();
 
     IcmpView reply = find_icmp(channel->outbound_frames());
-    test_assert(reply.is_icmp && reply.type == IcmpType::ICMP_ECHO_REPLY,
-                "an ordinary unicast ping must still get a reply");
+    ASSERT_TRUE(reply.is_icmp && reply.type == IcmpType::ICMP_ECHO_REPLY)
+        << "an ordinary unicast ping must still get a reply";
 }
 
-TEST(ThePollBudgetIsSharedAcrossInterfacesNotMultipliedByThem)
+TEST(NetworkStack, ThePollBudgetIsSharedAcrossInterfacesNotMultipliedByThem)
 {
     // The budget exists so a fast sender cannot starve the caller's timer work.
     // A per-interface budget scales that bound with the number of links, which
@@ -1937,12 +1940,12 @@ TEST(ThePollBudgetIsSharedAcrossInterfacesNotMultipliedByThem)
     size_t after = first->inbound_remaining() + second->inbound_remaining();
     size_t consumed = before - after;
 
-    test_assert(!drained, "poll() must report that frames are still queued");
-    test_assert(consumed <= 64,
-                "one poll() must not exceed the shared frame budget - consumed " + std::to_string(consumed));
+    ASSERT_TRUE(!drained) << "poll() must report that frames are still queued";
+    ASSERT_TRUE(consumed <= 64) << "one poll() must not exceed the shared frame budget - consumed "
+                                       + std::to_string(consumed);
 }
 
-TEST(APollBudgetSpentRoundRobinDoesNotStarveAQuietInterface)
+TEST(NetworkStack, APollBudgetSpentRoundRobinDoesNotStarveAQuietInterface)
 {
     // The other half, and the reason the budget is spent round-robin rather
     // than interface-by-interface: a saturated link must not consume the whole
@@ -1959,8 +1962,8 @@ TEST(APollBudgetSpentRoundRobinDoesNotStarveAQuietInterface)
 
     stack->poll();
 
-    test_assert(second->inbound_remaining() == 0,
-                "the quiet interface's frame must have been read despite the flood on the other");
+    ASSERT_TRUE(second->inbound_remaining() == 0)
+        << "the quiet interface's frame must have been read despite the flood on the other";
 }
 
 // --- forwarding: the thing that makes this a router rather than a host ------
@@ -2072,7 +2075,7 @@ namespace
     }
 }
 
-TEST(APacketForSomebodyElseIsNotForwardedByDefault)
+TEST(NetworkStack, APacketForSomebodyElseIsNotForwardedByDefault)
 {
     // Two interfaces do not make a router. A machine that starts relaying other
     // hosts' traffic because it happens to straddle two networks is a surprise
@@ -2087,16 +2090,16 @@ TEST(APacketForSomebodyElseIsNotForwardedByDefault)
     first->clear_outbound();
     second->clear_outbound();
 
-    test_assert(!stack->forwarding(), "forwarding must be off unless asked for");
+    ASSERT_TRUE(!stack->forwarding()) << "forwarding must be off unless asked for";
 
     first->push_inbound(build_transit_packet(BEHIND_US, 64));
     stack->poll();
 
-    test_assert(!find_ip_to(second->outbound_frames(), BEHIND_US).found,
-                "a host must drop a packet addressed to somebody else");
+    ASSERT_TRUE(!find_ip_to(second->outbound_frames(), BEHIND_US).found)
+        << "a host must drop a packet addressed to somebody else";
 }
 
-TEST(ARouterForwardsTransitTrafficOutTheRightInterface)
+TEST(NetworkStack, ARouterForwardsTransitTrafficOutTheRightInterface)
 {
     FakePacketChannel* first = nullptr;
     FakePacketChannel* second = nullptr;
@@ -2105,12 +2108,12 @@ TEST(ARouterForwardsTransitTrafficOutTheRightInterface)
     first->push_inbound(build_transit_packet(BEHIND_US, 64));
     stack->poll();
 
-    test_assert(find_ip_to(second->outbound_frames(), BEHIND_US).found,
-                "the packet must go out of the interface its route names");
-    test_assert(!find_ip_to(first->outbound_frames(), BEHIND_US).found, "and not back out of the one it arrived on");
+    ASSERT_TRUE(find_ip_to(second->outbound_frames(), BEHIND_US).found)
+        << "the packet must go out of the interface its route names";
+    ASSERT_TRUE(!find_ip_to(first->outbound_frames(), BEHIND_US).found) << "and not back out of the one it arrived on";
 }
 
-TEST(ForwardingDecrementsTheTtl)
+TEST(NetworkStack, ForwardingDecrementsTheTtl)
 {
     // A hop budget that is not spent is not a budget. This is what makes a
     // routing loop terminate instead of circulating a packet forever.
@@ -2122,13 +2125,13 @@ TEST(ForwardingDecrementsTheTtl)
     stack->poll();
 
     IpView forwarded = find_ip_to(second->outbound_frames(), BEHIND_US);
-    test_assert(forwarded.found, "the packet should have been forwarded");
-    test_assert(forwarded.ttl == 63,
-                "TTL must be decremented on the way through, got " + std::to_string(forwarded.ttl));
-    test_assert(forwarded.checksum_ok, "and the header checksum recomputed - the TTL it covers just changed");
+    ASSERT_TRUE(forwarded.found) << "the packet should have been forwarded";
+    ASSERT_TRUE(forwarded.ttl == 63) << "TTL must be decremented on the way through, got "
+                                            + std::to_string(forwarded.ttl);
+    ASSERT_TRUE(forwarded.checksum_ok) << "and the header checksum recomputed - the TTL it covers just changed";
 }
 
-TEST(ForwardingPreservesTheSourceAddressAndThePayload)
+TEST(NetworkStack, ForwardingPreservesTheSourceAddressAndThePayload)
 {
     // A router forwards; it does not translate. The packet keeps naming its
     // original sender all the way to the destination, which is what lets the
@@ -2147,18 +2150,18 @@ TEST(ForwardingPreservesTheSourceAddressAndThePayload)
     stack->poll();
 
     IpView forwarded = find_ip_to(second->outbound_frames(), BEHIND_US);
-    test_assert(forwarded.found, "the packet should have been forwarded");
-    test_assert(forwarded.source == PEER_IP.to_string(),
-                "the source must still be the original sender, not this router");
-    test_assert(forwarded.identification == 0x1234,
-                "identification must survive, or a forwarded fragment cannot reassemble");
-    test_assert(forwarded.src_port == 4444 && forwarded.dest_port == 5555,
-                "the transport header must be untouched - a router does not translate");
-    test_assert(forwarded.body.to_hex() == payload.to_hex(),
-                "and the body must survive byte for byte, not re-serialized from a parse");
+    ASSERT_TRUE(forwarded.found) << "the packet should have been forwarded";
+    ASSERT_TRUE(forwarded.source == PEER_IP.to_string())
+        << "the source must still be the original sender, not this router";
+    ASSERT_TRUE(forwarded.identification == 0x1234)
+        << "identification must survive, or a forwarded fragment cannot reassemble";
+    ASSERT_TRUE(forwarded.src_port == 4444 && forwarded.dest_port == 5555)
+        << "the transport header must be untouched - a router does not translate";
+    ASSERT_TRUE(forwarded.body.to_hex() == payload.to_hex())
+        << "and the body must survive byte for byte, not re-serialized from a parse";
 }
 
-TEST(ATtlThatRunsOutDrawsTimeExceededRatherThanSilence)
+TEST(NetworkStack, ATtlThatRunsOutDrawsTimeExceededRatherThanSilence)
 {
     // This is traceroute's whole mechanism: each probe carries a TTL one larger
     // than the last, and the hop that discards it names itself by replying.
@@ -2169,17 +2172,17 @@ TEST(ATtlThatRunsOutDrawsTimeExceededRatherThanSilence)
     first->push_inbound(build_transit_packet(BEHIND_US, 1));
     stack->poll();
 
-    test_assert(!find_ip_to(second->outbound_frames(), BEHIND_US).found, "an expired packet must not be forwarded");
+    ASSERT_TRUE(!find_ip_to(second->outbound_frames(), BEHIND_US).found) << "an expired packet must not be forwarded";
 
     IcmpView reply = find_icmp(first->outbound_frames());
-    test_assert(reply.is_icmp, "the sender must be told, on the interface it can be reached by");
-    test_assert(reply.type == IcmpType::ICMP_TIME_EXCEEDED, "with Time Exceeded");
-    test_assert(reply.code == ICMP_CODE_TTL_EXCEEDED,
-                "code 0 - the TTL ran out in transit, which only a router reports; "
-                "code 1 is a host's reassembly timeout");
+    ASSERT_TRUE(reply.is_icmp) << "the sender must be told, on the interface it can be reached by";
+    ASSERT_TRUE(reply.type == IcmpType::ICMP_TIME_EXCEEDED) << "with Time Exceeded";
+    ASSERT_TRUE(reply.code == ICMP_CODE_TTL_EXCEEDED)
+        << "code 0 - the TTL ran out in transit, which only a router reports; "
+           "code 1 is a host's reassembly timeout";
 }
 
-TEST(APacketWithNoRouteDrawsNetUnreachable)
+TEST(NetworkStack, APacketWithNoRouteDrawsNetUnreachable)
 {
     // Distinct from the port unreachable a host sends: that means "this
     // machine, wrong port", this means "I have no idea how to reach that
@@ -2192,12 +2195,12 @@ TEST(APacketWithNoRouteDrawsNetUnreachable)
     stack->poll();
 
     IcmpView reply = find_icmp(first->outbound_frames());
-    test_assert(reply.is_icmp, "the sender must be told");
-    test_assert(reply.type == IcmpType::ICMP_DESTINATION_UNREACHABLE, "with Destination Unreachable");
-    test_assert(reply.code == ICMP_CODE_NET_UNREACHABLE, "code 0 - no route to that network");
+    ASSERT_TRUE(reply.is_icmp) << "the sender must be told";
+    ASSERT_TRUE(reply.type == IcmpType::ICMP_DESTINATION_UNREACHABLE) << "with Destination Unreachable";
+    ASSERT_TRUE(reply.code == ICMP_CODE_NET_UNREACHABLE) << "code 0 - no route to that network";
 }
 
-TEST(APacketIsNotForwardedBackOutTheInterfaceItArrivedOn)
+TEST(NetworkStack, APacketIsNotForwardedBackOutTheInterfaceItArrivedOn)
 {
     // The sender is already on that segment and can reach the next hop itself,
     // so bouncing it back is pure waste - and with two routers on one segment it
@@ -2213,11 +2216,11 @@ TEST(APacketIsNotForwardedBackOutTheInterfaceItArrivedOn)
     first->push_inbound(build_transit_packet(PEER_IP, 64, Bytes::from_hex("d0d0"), IPv4Address("10.0.0.77")));
     stack->poll();
 
-    test_assert(!find_ip_to(first->outbound_frames(), PEER_IP).found,
-                "a packet must not be forwarded back out of the link it came in on");
+    ASSERT_TRUE(!find_ip_to(first->outbound_frames(), PEER_IP).found)
+        << "a packet must not be forwarded back out of the link it came in on";
 }
 
-TEST(ABroadcastIsNeverForwarded)
+TEST(NetworkStack, ABroadcastIsNeverForwarded)
 {
     // A broadcast is scoped to its segment by definition. Relaying one onto
     // another network is the amplification vector directed broadcasts were
@@ -2230,11 +2233,11 @@ TEST(ABroadcastIsNeverForwarded)
     first->push_inbound(build_transit_packet(second_broadcast, 64));
     stack->poll();
 
-    test_assert(!find_ip_to(second->outbound_frames(), second_broadcast).found,
-                "a broadcast must not cross onto another segment");
+    ASSERT_TRUE(!find_ip_to(second->outbound_frames(), second_broadcast).found)
+        << "a broadcast must not cross onto another segment";
 }
 
-TEST(UdpQueuedOnASecondInterfaceIsFlushedWhenThatInterfaceResolves)
+TEST(NetworkStack, UdpQueuedOnASecondInterfaceIsFlushedWhenThatInterfaceResolves)
 {
     // The datagram waits on the egress interface's queue, and the ARP reply
     // that releases it arrives on that same interface. Flushing only the
@@ -2247,17 +2250,17 @@ TEST(UdpQueuedOnASecondInterfaceIsFlushedWhenThatInterfaceResolves)
 
     UdpSocket* socket = stack->bind_udp(7000);
     socket->send_to(SECOND_PEER_IP, 7001, Bytes::from_hex("aabb")); // peer MAC not known yet
-    test_assert(!contains_udp(second->outbound_frames()), "nothing can go out before resolution");
+    ASSERT_TRUE(!contains_udp(second->outbound_frames())) << "nothing can go out before resolution";
 
     second->clear_outbound();
     second->push_inbound(build_arp_request_from_second_peer());
     stack->poll();
 
-    test_assert(contains_udp(second->outbound_frames()),
-                "the queued datagram must leave once the second interface learns the peer's MAC");
+    ASSERT_TRUE(contains_udp(second->outbound_frames()))
+        << "the queued datagram must leave once the second interface learns the peer's MAC";
 }
 
-TEST(ForwardingAPacketWithIpOptionsRecomputesTheChecksumOverTheWholeHeader)
+TEST(NetworkStack, ForwardingAPacketWithIpOptionsRecomputesTheChecksumOverTheWholeHeader)
 {
     // The checksum covers IHL*4 bytes. Recomputing it over a fixed 20 after the
     // TTL decrement sends an optioned packet out with a checksum that leaves
@@ -2285,12 +2288,12 @@ TEST(ForwardingAPacketWithIpOptionsRecomputesTheChecksumOverTheWholeHeader)
     stack->poll();
 
     IpView forwarded = find_ip_to(second->outbound_frames(), BEHIND_US);
-    test_assert(forwarded.found, "an optioned packet should be accepted and forwarded");
-    test_assert(forwarded.ttl == 63, "with its TTL decremented");
-    test_assert(forwarded.checksum_ok, "and a checksum that covers the options too");
+    ASSERT_TRUE(forwarded.found) << "an optioned packet should be accepted and forwarded";
+    ASSERT_TRUE(forwarded.ttl == 63) << "with its TTL decremented";
+    ASSERT_TRUE(forwarded.checksum_ok) << "and a checksum that covers the options too";
 }
 
-TEST(ASynAckOnTheWireEchoesEveryOptionThePeerOffered)
+TEST(NetworkStack, ASynAckOnTheWireEchoesEveryOptionThePeerOffered)
 {
     // The connection builds timestamp and SACK-permitted options, but the copy
     // the stack makes on the way to the wire used to carry only MSS and window
@@ -2312,14 +2315,14 @@ TEST(ASynAckOnTheWireEchoesEveryOptionThePeerOffered)
     stack->poll();
 
     TcpView syn_ack = find_tcp(channel->outbound_frames());
-    test_assert(syn_ack.syn && syn_ack.ack_flag, "the SYN should draw a SYN-ACK");
-    test_assert(syn_ack.has_window_scale, "window scale, offered by the peer, is echoed");
-    test_assert(syn_ack.has_sack_permitted, "SACK-permitted, offered by the peer, is echoed");
-    test_assert(syn_ack.has_timestamp, "a timestamp, offered by the peer, is echoed");
-    test_assert(syn_ack.ts_echo == 0x11223344, "and its TSecr echoes the peer's TSval");
+    ASSERT_TRUE(syn_ack.syn && syn_ack.ack_flag) << "the SYN should draw a SYN-ACK";
+    ASSERT_TRUE(syn_ack.has_window_scale) << "window scale, offered by the peer, is echoed";
+    ASSERT_TRUE(syn_ack.has_sack_permitted) << "SACK-permitted, offered by the peer, is echoed";
+    ASSERT_TRUE(syn_ack.has_timestamp) << "a timestamp, offered by the peer, is echoed";
+    ASSERT_TRUE(syn_ack.ts_echo == 0x11223344) << "and its TSecr echoes the peer's TSval";
 }
 
-TEST(ASynAckCarriesNoOptionThePeerDidNotOffer)
+TEST(NetworkStack, ASynAckCarriesNoOptionThePeerDidNotOffer)
 {
     // RFC 7323 1.3 and RFC 2018 2: window scale, timestamps and SACK-permitted
     // may appear on a SYN-ACK only if the SYN carried them. A peer that never
@@ -2334,13 +2337,13 @@ TEST(ASynAckCarriesNoOptionThePeerDidNotOffer)
     stack->poll();
 
     TcpView syn_ack = find_tcp(channel->outbound_frames());
-    test_assert(syn_ack.syn && syn_ack.ack_flag, "the SYN should draw a SYN-ACK");
-    test_assert(!syn_ack.has_window_scale, "no window scale on a SYN-ACK to a peer that offered none");
-    test_assert(!syn_ack.has_sack_permitted, "no SACK-permitted on a SYN-ACK to a peer that offered none");
-    test_assert(!syn_ack.has_timestamp, "no timestamp on a SYN-ACK to a peer that offered none");
+    ASSERT_TRUE(syn_ack.syn && syn_ack.ack_flag) << "the SYN should draw a SYN-ACK";
+    ASSERT_TRUE(!syn_ack.has_window_scale) << "no window scale on a SYN-ACK to a peer that offered none";
+    ASSERT_TRUE(!syn_ack.has_sack_permitted) << "no SACK-permitted on a SYN-ACK to a peer that offered none";
+    ASSERT_TRUE(!syn_ack.has_timestamp) << "no timestamp on a SYN-ACK to a peer that offered none";
 }
 
-TEST(ADnsQueryNeverTakesOverAPortTheApplicationBound)
+TEST(NetworkStack, ADnsQueryNeverTakesOverAPortTheApplicationBound)
 {
     // The resolver picks a random ephemeral source port per query and binds a
     // socket there - but bind_udp() hands back whatever socket already owns a
@@ -2383,11 +2386,11 @@ TEST(ADnsQueryNeverTakesOverAPortTheApplicationBound)
         if (!udp || udp->get_dest_port() != 53)
             continue;
         queries++;
-        test_assert(udp->get_src_port() % 2 == 1, "a DNS query went out from port "
-                                                      + std::to_string(udp->get_src_port())
-                                                      + ", which the application had bound");
+        ASSERT_TRUE(udp->get_src_port() % 2 == 1) << "a DNS query went out from port "
+                                                         + std::to_string(udp->get_src_port())
+                                                         + ", which the application had bound";
     }
-    test_assert(queries == 20, "every resolve() should have sent a query, got " + std::to_string(queries));
+    ASSERT_TRUE(queries == 20) << "every resolve() should have sent a query, got " + std::to_string(queries);
 
     // Let every query give up, so each releases (unbinds) its port. The
     // application's sockets must all survive that.
@@ -2398,8 +2401,8 @@ TEST(ADnsQueryNeverTakesOverAPortTheApplicationBound)
     for (size_t i = 0; i < app_sockets.size(); i++)
     {
         uint16_t port = static_cast<uint16_t>(49152 + 2 * i);
-        test_assert(stack->bind_udp(port) == app_sockets[i],
-                    "the application's socket on port " + std::to_string(port) + " was torn down by the resolver");
+        ASSERT_TRUE(stack->bind_udp(port) == app_sockets[i])
+            << "the application's socket on port " + std::to_string(port) + " was torn down by the resolver";
     }
 }
 
@@ -2440,7 +2443,7 @@ namespace
     }
 }
 
-TEST(ABroadcastToAnUnboundPortDrawsNoPortUnreachable)
+TEST(NetworkStack, ABroadcastToAnUnboundPortDrawsNoPortUnreachable)
 {
     // RFC 1122 3.2.2. Every host on the segment hears the broadcast, and a host
     // with nothing on that port answering it is how one datagram becomes a
@@ -2454,10 +2457,10 @@ TEST(ABroadcastToAnUnboundPortDrawsNoPortUnreachable)
     channel->push_inbound(build_ip_frame(PEER_IP, IPv4Address("255.255.255.255"), 64, IpProtocol::UDP,
                                          udp_bytes(40000, 9999), 0, 0, MacAddress::BROADCAST));
     stack->poll();
-    test_assert(!any_icmp(channel->outbound_frames()), "no ICMP error may answer a broadcast");
+    ASSERT_TRUE(!any_icmp(channel->outbound_frames())) << "no ICMP error may answer a broadcast";
 }
 
-TEST(AMulticastPacketIsNeitherForwardedNorAnsweredWithAnError)
+TEST(NetworkStack, AMulticastPacketIsNeitherForwardedNorAnsweredWithAnError)
 {
     // Link-local multicast (LLMNR to 224.0.0.252, mDNS) routinely has TTL 1.
     // The MAC filter accepts multicast frames, so without a check this reached
@@ -2477,12 +2480,12 @@ TEST(AMulticastPacketIsNeitherForwardedNorAnsweredWithAnError)
                                        0, 0, MacAddress("01:00:5e:01:02:03")));
     stack->poll();
 
-    test_assert(!any_icmp(first->outbound_frames()), "multicast must not draw an ICMP error");
-    test_assert(!find_ip_to(second->outbound_frames(), IPv4Address("239.1.2.3")).found,
-                "and must not be forwarded - this stack does not route multicast");
+    ASSERT_TRUE(!any_icmp(first->outbound_frames())) << "multicast must not draw an ICMP error";
+    ASSERT_TRUE(!find_ip_to(second->outbound_frames(), IPv4Address("239.1.2.3")).found)
+        << "and must not be forwarded - this stack does not route multicast";
 }
 
-TEST(AnExpiredPacketFromANonUnicastSourceDrawsNoTimeExceeded)
+TEST(NetworkStack, AnExpiredPacketFromANonUnicastSourceDrawsNoTimeExceeded)
 {
     // The error would go to 0.0.0.0 or to everyone - neither is one sender.
     FakePacketChannel* first = nullptr;
@@ -2498,11 +2501,11 @@ TEST(AnExpiredPacketFromANonUnicastSourceDrawsNoTimeExceeded)
     first->push_inbound(build_ip_frame(IPv4Address("224.0.0.9"), BEHIND_US, 1, IpProtocol::UDP, udp_bytes(1, 2)));
     stack->poll();
 
-    test_assert(!any_icmp(first->outbound_frames()) && !any_icmp(second->outbound_frames()),
-                "no error may be sent to an unspecified, broadcast or multicast source");
+    ASSERT_TRUE(!any_icmp(first->outbound_frames()) && !any_icmp(second->outbound_frames()))
+        << "no error may be sent to an unspecified, broadcast or multicast source";
 }
 
-TEST(AnExpiredIcmpErrorDrawsNoTimeExceeded)
+TEST(NetworkStack, AnExpiredIcmpErrorDrawsNoTimeExceeded)
 {
     // An error about an error is how two routers that each consider the other
     // wrong end up exchanging them indefinitely.
@@ -2516,10 +2519,10 @@ TEST(AnExpiredIcmpErrorDrawsNoTimeExceeded)
     first->push_inbound(build_ip_frame(PEER_IP, BEHIND_US, 1, IpProtocol::ICMP, unreachable.to_bytes()));
     stack->poll();
 
-    test_assert(!any_icmp(first->outbound_frames()), "an ICMP error must never draw another ICMP error");
+    ASSERT_TRUE(!any_icmp(first->outbound_frames())) << "an ICMP error must never draw another ICMP error";
 }
 
-TEST(AnExpiredEchoRequestStillDrawsTimeExceeded)
+TEST(NetworkStack, AnExpiredEchoRequestStillDrawsTimeExceeded)
 {
     // The control for the test above: only ICMP *errors* are exempt. A ping
     // that runs out of TTL is exactly what traceroute -I sends.
@@ -2534,11 +2537,11 @@ TEST(AnExpiredEchoRequestStillDrawsTimeExceeded)
     stack->poll();
 
     IcmpView reply = find_icmp(first->outbound_frames());
-    test_assert(reply.is_icmp && reply.type == IcmpType::ICMP_TIME_EXCEEDED,
-                "an expiring echo request must still be reported");
+    ASSERT_TRUE(reply.is_icmp && reply.type == IcmpType::ICMP_TIME_EXCEEDED)
+        << "an expiring echo request must still be reported";
 }
 
-TEST(AnExpiredNonFirstFragmentDrawsNoTimeExceeded)
+TEST(NetworkStack, AnExpiredNonFirstFragmentDrawsNoTimeExceeded)
 {
     // Only the first fragment carries the transport header the quote is for,
     // and one error per datagram is enough - not one per fragment.
@@ -2549,10 +2552,10 @@ TEST(AnExpiredNonFirstFragmentDrawsNoTimeExceeded)
     first->push_inbound(build_ip_frame(PEER_IP, BEHIND_US, 1, IpProtocol::UDP, Bytes(16), 0, 185));
     stack->poll();
 
-    test_assert(!any_icmp(first->outbound_frames()), "a non-first fragment must not draw an ICMP error");
+    ASSERT_TRUE(!any_icmp(first->outbound_frames())) << "a non-first fragment must not draw an ICMP error";
 }
 
-TEST(AnErrorQuotesTheWholeHeaderPlusEightBytesEvenWithOptions)
+TEST(NetworkStack, AnErrorQuotesTheWholeHeaderPlusEightBytesEvenWithOptions)
 {
     // RFC 792: the quote is the offending IP header plus the first 8 bytes of
     // its payload - which for UDP or TCP are the ports the sender needs to
@@ -2583,11 +2586,11 @@ TEST(AnErrorQuotesTheWholeHeaderPlusEightBytesEvenWithOptions)
     stack->poll();
 
     IcmpView reply = find_icmp(channel->outbound_frames());
-    test_assert(reply.is_icmp && reply.code == ICMP_CODE_PORT_UNREACHABLE, "an unbound port draws Port Unreachable");
-    test_assert(reply.payload.size() == 24 + 8,
-                "the quote must be the 24-byte header plus 8 bytes, got " + std::to_string(reply.payload.size()));
-    test_assert(reply.payload.size() >= 28 && reply.payload.slice_int<uint16_t>(26) == 9999,
-                "including the destination port, which is what the sender matches on");
+    ASSERT_TRUE(reply.is_icmp && reply.code == ICMP_CODE_PORT_UNREACHABLE) << "an unbound port draws Port Unreachable";
+    ASSERT_TRUE(reply.payload.size() == 24 + 8)
+        << "the quote must be the 24-byte header plus 8 bytes, got " + std::to_string(reply.payload.size());
+    ASSERT_TRUE(reply.payload.size() >= 28 && reply.payload.slice_int<uint16_t>(26) == 9999)
+        << "including the destination port, which is what the sender matches on";
 }
 
 namespace
@@ -2613,7 +2616,7 @@ namespace
     }
 }
 
-TEST(HalfOpenConnectionsPerListeningPortAreCapped)
+TEST(NetworkStack, HalfOpenConnectionsPerListeningPortAreCapped)
 {
     // The listen backlog bounds connections that finished the handshake and
     // wait for accept(). Before they finish they sit in SYN_RECEIVED, and that
@@ -2653,11 +2656,11 @@ TEST(HalfOpenConnectionsPerListeningPortAreCapped)
             cookies++;
         }
     }
-    test_assert(syn_acks.size() == NetworkStack::MAX_HALF_OPEN_PER_PORT,
-                "only MAX_HALF_OPEN_PER_PORT SYNs may get a half-open slot while none completes, got "
-                    + std::to_string(syn_acks.size()));
-    test_assert(cookies == static_cast<size_t>(flood) - NetworkStack::MAX_HALF_OPEN_PER_PORT,
-                "and every SYN past the cap is answered with a SYN cookie instead");
+    ASSERT_TRUE(syn_acks.size() == NetworkStack::MAX_HALF_OPEN_PER_PORT)
+        << "only MAX_HALF_OPEN_PER_PORT SYNs may get a half-open slot while none completes, got "
+               + std::to_string(syn_acks.size());
+    ASSERT_TRUE(cookies == static_cast<size_t>(flood) - NetworkStack::MAX_HALF_OPEN_PER_PORT)
+        << "and every SYN past the cap is answered with a SYN cookie instead";
 
     // The cap counts connections still half-open, not ever accepted: one
     // completing its handshake frees a slot for the next SYN.
@@ -2668,11 +2671,11 @@ TEST(HalfOpenConnectionsPerListeningPortAreCapped)
     channel->push_inbound(syn_with_options(5000, 20000));
     stack->poll();
     TcpView answer = find_tcp(channel->outbound_frames());
-    test_assert(is_stateful_syn_ack(answer) && answer.dest_port == 20000,
-                "a completed handshake must free its half-open slot - the next SYN gets a slot, not a cookie");
+    ASSERT_TRUE(is_stateful_syn_ack(answer) && answer.dest_port == 20000)
+        << "a completed handshake must free its half-open slot - the next SYN gets a slot, not a cookie";
 }
 
-TEST(AnExpiredIcmpErrorThatIsAFirstFragmentDrawsNoTimeExceeded)
+TEST(NetworkStack, AnExpiredIcmpErrorThatIsAFirstFragmentDrawsNoTimeExceeded)
 {
     // Fragments are left unparsed (Raw, not Icmp) by the IP codec - only the
     // reassembled datagram is parsed. A first fragment has offset 0, so the
@@ -2691,8 +2694,8 @@ TEST(AnExpiredIcmpErrorThatIsAFirstFragmentDrawsNoTimeExceeded)
         build_ip_frame(PEER_IP, BEHIND_US, 1, IpProtocol::ICMP, fragment_payload, IP_FLAG_MORE_FRAGMENTS, 0));
     stack->poll();
 
-    test_assert(!any_icmp(first->outbound_frames()),
-                "an ICMP error must not draw another even when it arrives as a first fragment");
+    ASSERT_TRUE(!any_icmp(first->outbound_frames()))
+        << "an ICMP error must not draw another even when it arrives as a first fragment";
 }
 
 // --- which ICMP errors may end a TCP connection ------------------------------
@@ -2705,7 +2708,7 @@ TEST(AnExpiredIcmpErrorThatIsAFirstFragmentDrawsNoTimeExceeded)
 // is forged. An off-path attacker who guesses the ports should not be able to
 // kill a connection with one spoofed packet.
 
-TEST(ASoftIcmpErrorDoesNotAbortAConnectionEvenDuringTheHandshake)
+TEST(NetworkStack, ASoftIcmpErrorDoesNotAbortAConnectionEvenDuringTheHandshake)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -2717,11 +2720,11 @@ TEST(ASoftIcmpErrorDoesNotAbortAConnectionEvenDuringTheHandshake)
     channel->push_inbound(build_icmp_port_unreachable_for_our_tcp(syn.src_port, 80, syn.seq, 1 /* host unreachable */));
     stack->poll();
 
-    test_assert(stack->find_connection(id) != nullptr,
-                "host unreachable is a soft error - often transient, so the connection keeps retrying");
+    ASSERT_TRUE(stack->find_connection(id) != nullptr)
+        << "host unreachable is a soft error - often transient, so the connection keeps retrying";
 }
 
-TEST(AnIcmpErrorQuotingASequenceNumberNeverSentIsIgnored)
+TEST(NetworkStack, AnIcmpErrorQuotingASequenceNumberNeverSentIsIgnored)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -2736,33 +2739,33 @@ TEST(AnIcmpErrorQuotingASequenceNumberNeverSentIsIgnored)
     channel->push_inbound(build_icmp_port_unreachable_for_our_tcp(syn.src_port, 80, syn.seq + 100000));
     stack->poll();
 
-    test_assert(stack->find_connection(id) != nullptr,
-                "an error about a segment never sent must not end the connection (RFC 5927)");
+    ASSERT_TRUE(stack->find_connection(id) != nullptr)
+        << "an error about a segment never sent must not end the connection (RFC 5927)";
 }
 
-TEST(AHardIcmpErrorDoesNotAbortAnEstablishedConnection)
+TEST(NetworkStack, AHardIcmpErrorDoesNotAbortAnEstablishedConnection)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
 
     TcpConnection* connection = accept_connection_with_peer_mss(*stack, *channel, 80, 40000);
-    test_assert(connection != nullptr && connection->get_state() == TcpState::ESTABLISHED, "precondition");
+    ASSERT_TRUE(connection != nullptr && connection->get_state() == TcpState::ESTABLISHED) << "precondition";
     uint64_t id = connection->get_id();
 
     channel->clear_outbound();
     connection->send(Bytes::from_hex("6869")); // something in flight for the error to plausibly be about
     TcpView data = find_tcp(channel->outbound_frames());
-    test_assert(data.is_tcp, "precondition: the data segment went out");
+    ASSERT_TRUE(data.is_tcp) << "precondition: the data segment went out";
 
     channel->push_inbound(build_icmp_port_unreachable_for_our_tcp(80, 40000, data.seq));
     stack->poll();
 
-    test_assert(stack->find_connection(id) != nullptr,
-                "once established, even a hard error is reported, not fatal (RFC 5461) - "
-                "the peer's own RST is what ends a connection it no longer has");
+    ASSERT_TRUE(stack->find_connection(id) != nullptr)
+        << "once established, even a hard error is reported, not fatal (RFC 5461) - "
+           "the peer's own RST is what ends a connection it no longer has";
 }
 
-TEST(HalfOpenConnectionsThatTimeOutFreeTheirSlots)
+TEST(NetworkStack, HalfOpenConnectionsThatTimeOutFreeTheirSlots)
 {
     // A flood's SYNs never complete; their connections leave SYN_RECEIVED by
     // giving up instead. That exit has to free the slot as surely as a
@@ -2788,8 +2791,8 @@ TEST(HalfOpenConnectionsThatTimeOutFreeTheirSlots)
     channel->clear_outbound();
     channel->push_inbound(syn_with_options(4000, 20001));
     stack->poll();
-    test_assert(is_cookie_syn_ack(find_tcp(channel->outbound_frames())),
-                "precondition: the port is at its half-open cap - a new SYN gets a cookie, not a slot");
+    ASSERT_TRUE(is_cookie_syn_ack(find_tcp(channel->outbound_frames())))
+        << "precondition: the port is at its half-open cap - a new SYN gets a cookie, not a slot";
 
     // Let every SYN-ACK retransmission run out.
     for (int i = 0; i < 600; i++)
@@ -2806,11 +2809,11 @@ TEST(HalfOpenConnectionsThatTimeOutFreeTheirSlots)
     channel->push_inbound(syn_with_options(5000, 20000));
     stack->poll();
     TcpView answer = find_tcp(channel->outbound_frames());
-    test_assert(is_stateful_syn_ack(answer) && answer.dest_port == 20000,
-                "once the half-open connections have given up, a new SYN must get a slot again");
+    ASSERT_TRUE(is_stateful_syn_ack(answer) && answer.dest_port == 20000)
+        << "once the half-open connections have given up, a new SYN must get a slot again";
 }
 
-TEST(AConnectionLeavesTheHalfOpenCountOnceNotOnEveryTransition)
+TEST(NetworkStack, AConnectionLeavesTheHalfOpenCountOnceNotOnEveryTransition)
 {
     // A connection stops counting as half-open when it leaves SYN_RECEIVED -
     // once. If its later transitions (here CLOSE_WAIT, on the peer's FIN) also
@@ -2863,12 +2866,12 @@ TEST(AConnectionLeavesTheHalfOpenCountOnceNotOnEveryTransition)
             answered++;
         }
     }
-    test_assert(answered == 1,
-                "exactly one slot was freed, so exactly one new SYN may get a slot (the other gets a cookie), got "
-                    + std::to_string(answered));
+    ASSERT_TRUE(answered == 1)
+        << "exactly one slot was freed, so exactly one new SYN may get a slot (the other gets a cookie), got "
+               + std::to_string(answered);
 }
 
-TEST(ADirectedBroadcastLeavesByTheInterfaceWhoseNetworkItBelongsTo)
+TEST(NetworkStack, ADirectedBroadcastLeavesByTheInterfaceWhoseNetworkItBelongsTo)
 {
     // _route_for used to send every broadcast out of interface 0. For
     // 192.168.5.255 - the second link's directed broadcast - interface 0 does
@@ -2889,7 +2892,7 @@ TEST(ADirectedBroadcastLeavesByTheInterfaceWhoseNetworkItBelongsTo)
     {
         threw = true;
     }
-    test_assert(!threw, "sending to a directed broadcast must not throw");
+    ASSERT_TRUE(!threw) << "sending to a directed broadcast must not throw";
 
     bool found = false;
     for (const Bytes& frame : second->outbound_frames())
@@ -2901,14 +2904,14 @@ TEST(ADirectedBroadcastLeavesByTheInterfaceWhoseNetworkItBelongsTo)
         if (!ip || !(IPv4Address(ip->get_dest_address()) == IPv4Address("192.168.5.255")))
             continue;
         found = true;
-        test_assert(eth.get_dest() == MacAddress::BROADCAST, "a broadcast goes to the broadcast MAC");
-        test_assert(IPv4Address(ip->get_src_address()) == SECOND_IP, "from the second link's own address");
+        ASSERT_TRUE(eth.get_dest() == MacAddress::BROADCAST) << "a broadcast goes to the broadcast MAC";
+        ASSERT_TRUE(IPv4Address(ip->get_src_address()) == SECOND_IP) << "from the second link's own address";
     }
-    test_assert(found, "the datagram must leave by the second interface");
-    test_assert(!contains_udp(first->outbound_frames()), "and not by the first");
+    ASSERT_TRUE(found) << "the datagram must leave by the second interface";
+    ASSERT_TRUE(!contains_udp(first->outbound_frames())) << "and not by the first";
 }
 
-TEST(ConnectNeverReplacesALiveConnectionWhenThePortCounterWraps)
+TEST(NetworkStack, ConnectNeverReplacesALiveConnectionWhenThePortCounterWraps)
 {
     // The ephemeral port allocator is a counter that wraps after 16384 ports
     // without checking which are in use, and connect() stored its new
@@ -2931,14 +2934,14 @@ TEST(ConnectNeverReplacesALiveConnectionWhenThePortCounterWraps)
     channel->clear_outbound();
 
     TcpConnection* second = stack->connect(PEER_IP, 80); // the counter is back at first's port
-    test_assert(second != nullptr && second->get_id() != first_id, "precondition: a distinct new connection");
+    ASSERT_TRUE(second != nullptr && second->get_id() != first_id) << "precondition: a distinct new connection";
 
     TcpConnection* found = stack->find_connection(first_id);
-    test_assert(found != nullptr && found->get_id() == first_id,
-                "the first connection must still exist under its own id - it was destroyed and its id re-pointed");
+    ASSERT_TRUE(found != nullptr && found->get_id() == first_id)
+        << "the first connection must still exist under its own id - it was destroyed and its id re-pointed";
     TcpView syn = find_tcp(channel->outbound_frames());
-    test_assert(syn.is_tcp && syn.syn && syn.dest_port == 80, "precondition: the second connect sent its SYN");
-    test_assert(found->get_state() == TcpState::SYN_SENT, "and the first is still connecting, untouched");
+    ASSERT_TRUE(syn.is_tcp && syn.syn && syn.dest_port == 80) << "precondition: the second connect sent its SYN";
+    ASSERT_TRUE(found->get_state() == TcpState::SYN_SENT) << "and the first is still connecting, untouched";
 }
 
 // --- the reassembly timeout's Time Exceeded obeys the same rules -------------
@@ -2964,39 +2967,39 @@ namespace
     }
 }
 
-TEST(AReassemblyTimeoutWithoutFragmentZeroDrawsNoTimeExceeded)
+TEST(NetworkStack, AReassemblyTimeoutWithoutFragmentZeroDrawsNoTimeExceeded)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
     channel->push_inbound(build_arp_request());
     channel->push_inbound(build_ip_frame(PEER_IP, LOCAL_IP, 64, IpProtocol::UDP, Bytes(16), 0, 10)); // last piece only
-    test_assert(!time_exceeded_after_reassembly_timeout(*stack, *channel),
-                "without fragment zero there is nothing to quote and no Time Exceeded may be sent");
+    ASSERT_TRUE(!time_exceeded_after_reassembly_timeout(*stack, *channel))
+        << "without fragment zero there is nothing to quote and no Time Exceeded may be sent";
 }
 
-TEST(AReassemblyTimeoutForABroadcastDrawsNoTimeExceeded)
+TEST(NetworkStack, AReassemblyTimeoutForABroadcastDrawsNoTimeExceeded)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
     channel->push_inbound(build_arp_request());
     channel->push_inbound(build_ip_frame(PEER_IP, IPv4Address("255.255.255.255"), 64, IpProtocol::UDP, Bytes(16),
                                          IP_FLAG_MORE_FRAGMENTS, 0, MacAddress::BROADCAST));
-    test_assert(!time_exceeded_after_reassembly_timeout(*stack, *channel),
-                "a fragment sent to a broadcast must not draw an error from every host that heard it");
+    ASSERT_TRUE(!time_exceeded_after_reassembly_timeout(*stack, *channel))
+        << "a fragment sent to a broadcast must not draw an error from every host that heard it";
 }
 
-TEST(AReassemblyTimeoutFromANonUnicastSourceDrawsNoTimeExceeded)
+TEST(NetworkStack, AReassemblyTimeoutFromANonUnicastSourceDrawsNoTimeExceeded)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
     channel->push_inbound(build_arp_request());
     channel->push_inbound(build_ip_frame(IPv4Address("255.255.255.255"), LOCAL_IP, 64, IpProtocol::UDP, Bytes(16),
                                          IP_FLAG_MORE_FRAGMENTS, 0));
-    test_assert(!time_exceeded_after_reassembly_timeout(*stack, *channel),
-                "an error to a broadcast source would go to the whole segment");
+    ASSERT_TRUE(!time_exceeded_after_reassembly_timeout(*stack, *channel))
+        << "an error to a broadcast source would go to the whole segment";
 }
 
-TEST(AReassemblyTimeoutOfAnIcmpErrorDrawsNoTimeExceeded)
+TEST(NetworkStack, AReassemblyTimeoutOfAnIcmpErrorDrawsNoTimeExceeded)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -3006,15 +3009,15 @@ TEST(AReassemblyTimeoutOfAnIcmpErrorDrawsNoTimeExceeded)
     unreachable.compute_checksum();
     channel->push_inbound(build_ip_frame(PEER_IP, LOCAL_IP, 64, IpProtocol::ICMP, unreachable.to_bytes().slice(0, 16),
                                          IP_FLAG_MORE_FRAGMENTS, 0));
-    test_assert(!time_exceeded_after_reassembly_timeout(*stack, *channel),
-                "an ICMP error must not draw another, even one that never finished reassembling");
+    ASSERT_TRUE(!time_exceeded_after_reassembly_timeout(*stack, *channel))
+        << "an ICMP error must not draw another, even one that never finished reassembling";
 }
 
 // RFC 1122 3.3.6: a datagram that arrives as a link-layer broadcast but names
 // a unicast IP destination is silently discarded - by a host, which must not
 // answer it with an error from every machine that heard it, and by a router,
 // which must not forward it (RFC 1812 5.3.4).
-TEST(AUnicastDatagramInALinkLayerBroadcastIsDiscarded)
+TEST(NetworkStack, AUnicastDatagramInALinkLayerBroadcastIsDiscarded)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
@@ -3025,11 +3028,11 @@ TEST(AUnicastDatagramInALinkLayerBroadcastIsDiscarded)
     channel->push_inbound(
         build_ip_frame(PEER_IP, LOCAL_IP, 64, IpProtocol::UDP, udp_bytes(40000, 9999), 0, 0, MacAddress::BROADCAST));
     stack->poll();
-    test_assert(!any_icmp(channel->outbound_frames()),
-                "a unicast datagram that arrived as a link-layer broadcast draws no Port Unreachable");
+    ASSERT_TRUE(!any_icmp(channel->outbound_frames()))
+        << "a unicast datagram that arrived as a link-layer broadcast draws no Port Unreachable";
 }
 
-TEST(ARouterNeverForwardsAUnicastDatagramThatArrivedAsALinkLayerBroadcast)
+TEST(NetworkStack, ARouterNeverForwardsAUnicastDatagramThatArrivedAsALinkLayerBroadcast)
 {
     FakePacketChannel* first = nullptr;
     FakePacketChannel* second = nullptr;
@@ -3041,11 +3044,11 @@ TEST(ARouterNeverForwardsAUnicastDatagramThatArrivedAsALinkLayerBroadcast)
         build_ip_frame(PEER_IP, BEHIND_US, 1, IpProtocol::UDP, udp_bytes(3, 4), 0, 0, MacAddress::BROADCAST));
     stack->poll();
 
-    test_assert(!find_ip_to(second->outbound_frames(), BEHIND_US).found, "it must not be forwarded");
-    test_assert(!any_icmp(first->outbound_frames()), "nor draw Time Exceeded from every router on the segment");
+    ASSERT_TRUE(!find_ip_to(second->outbound_frames(), BEHIND_US).found) << "it must not be forwarded";
+    ASSERT_TRUE(!any_icmp(first->outbound_frames())) << "nor draw Time Exceeded from every router on the segment";
 }
 
-TEST(AGroupMacIsRefusedAsAnInterfacesOwnAddress)
+TEST(NetworkStack, AGroupMacIsRefusedAsAnInterfacesOwnAddress)
 {
     // Frames to a group MAC carrying unicast IP are discarded, so a stack whose
     // own MAC were one would drop everything sent to it without a word. Fail
@@ -3059,10 +3062,10 @@ TEST(AGroupMacIsRefusedAsAnInterfacesOwnAddress)
     {
         threw = true;
     }
-    test_assert(threw, "bb:bb:... has the group bit set and must be refused as an interface's own MAC");
+    ASSERT_TRUE(threw) << "bb:bb:... has the group bit set and must be refused as an interface's own MAC";
 }
 
-TEST(ADirectedBroadcastForAnotherLinkIsNeitherForwardedNorResolved)
+TEST(NetworkStack, ADirectedBroadcastForAnotherLinkIsNeitherForwardedNorResolved)
 {
     // ABroadcastIsNeverForwarded above only held because the forwarding path
     // missed in the ARP table: it still sent "who-has 192.168.5.255" onto the
@@ -3079,8 +3082,8 @@ TEST(ADirectedBroadcastForAnotherLinkIsNeitherForwardedNorResolved)
     for (const Bytes& frame : second->outbound_frames())
     {
         ArpView arp = view_arp(frame);
-        test_assert(!(arp.is_arp && arp.target_ip == second_broadcast.to_string()),
-                    "the router must not try to resolve a broadcast address");
+        ASSERT_TRUE(!(arp.is_arp && arp.target_ip == second_broadcast.to_string()))
+            << "the router must not try to resolve a broadcast address";
     }
 
     // Plant a mapping for the broadcast address, as a host on link 2 could.
@@ -3092,11 +3095,11 @@ TEST(ADirectedBroadcastForAnotherLinkIsNeitherForwardedNorResolved)
 
     first->push_inbound(build_transit_packet(second_broadcast, 64));
     stack->poll();
-    test_assert(!find_ip_to(second->outbound_frames(), second_broadcast).found,
-                "a directed broadcast must not be relayed even once something claims that address");
+    ASSERT_TRUE(!find_ip_to(second->outbound_frames(), second_broadcast).found)
+        << "a directed broadcast must not be relayed even once something claims that address";
 }
 
-TEST(TheApplicationCannotBindAPortADnsQueryIsUsing)
+TEST(NetworkStack, TheApplicationCannotBindAPortADnsQueryIsUsing)
 {
     // The reverse of ADnsQueryNeverTakesOverAPortTheApplicationBound. bind_udp()
     // returns whatever socket already owns a port, so an application binding a
@@ -3126,7 +3129,7 @@ TEST(TheApplicationCannotBindAPortADnsQueryIsUsing)
         if (udp && udp->get_dest_port() == 53)
             query_port = udp->get_src_port();
     }
-    test_assert(query_port != 0, "precondition: the query went out");
+    ASSERT_TRUE(query_port != 0) << "precondition: the query went out";
 
     bool refused = false;
     try
@@ -3137,7 +3140,7 @@ TEST(TheApplicationCannotBindAPortADnsQueryIsUsing)
     {
         refused = true;
     }
-    test_assert(refused, "binding a port an outstanding DNS query owns must be refused, not handed its socket");
+    ASSERT_TRUE(refused) << "binding a port an outstanding DNS query owns must be refused, not handed its socket";
 
     // Once the query is over (here: it gives up), the port is free again.
     for (int i = 0; i < 120; i++)
@@ -3151,10 +3154,10 @@ TEST(TheApplicationCannotBindAPortADnsQueryIsUsing)
     }
     catch (const std::exception&)
     {}
-    test_assert(bound, "a port the resolver has released must be bindable again");
+    ASSERT_TRUE(bound) << "a port the resolver has released must be bindable again";
 }
 
-TEST(AFragmentationNeededQuotingNoSegmentInFlightIsIgnored)
+TEST(NetworkStack, AFragmentationNeededQuotingNoSegmentInFlightIsIgnored)
 {
     // RFC 5927 5.2: Fragmentation Needed is as forgeable as any ICMP error, and
     // what it controls is the MSS. Anyone who guesses a connection's ports can
@@ -3164,23 +3167,23 @@ TEST(AFragmentationNeededQuotingNoSegmentInFlightIsIgnored)
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
     TcpConnection* connection = accept_connection_with_peer_mss(*stack, *channel, 80, 40000);
-    test_assert(connection->get_effective_mss() == 1460, "precondition: a full-sized MSS");
+    ASSERT_TRUE(connection->get_effective_mss() == 1460) << "precondition: a full-sized MSS";
 
     // nothing in flight at all: no segment can have been too big
     channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 600, 12345));
     stack->poll();
-    test_assert(connection->get_effective_mss() == 1460, "a report with nothing in flight must be ignored");
+    ASSERT_TRUE(connection->get_effective_mss() == 1460) << "a report with nothing in flight must be ignored";
 
     // something in flight, but the quote names a sequence number it does not cover
     uint32_t seq = send_one_segment(*connection, *channel);
     channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 600, seq + 100000));
     stack->poll();
-    test_assert(connection->get_effective_mss() == 1460,
-                "a report quoting a sequence number never sent must be ignored, got MSS "
-                    + std::to_string(connection->get_effective_mss()));
+    ASSERT_TRUE(connection->get_effective_mss() == 1460)
+        << "a report quoting a sequence number never sent must be ignored, got MSS "
+               + std::to_string(connection->get_effective_mss());
 }
 
-TEST(AStaleHalfOpenConnectionIsEvictedToMakeRoomForANewSyn)
+TEST(NetworkStack, AStaleHalfOpenConnectionIsEvictedToMakeRoomForANewSyn)
 {
     // With the cap full, a new SYN used to be dropped whatever was holding the
     // slots. A half-open connection that has waited far longer than any real
@@ -3219,14 +3222,14 @@ TEST(AStaleHalfOpenConnectionIsEvictedToMakeRoomForANewSyn)
     channel->push_inbound(syn_with_options(5000, 20000));
     stack->poll();
     TcpView answer = find_tcp(channel->outbound_frames());
-    test_assert(is_stateful_syn_ack(answer) && answer.dest_port == 20000,
-                "with the oldest half-open connection stale, a new SYN must get its slot - options and all - "
-                "rather than a cookie");
+    ASSERT_TRUE(is_stateful_syn_ack(answer) && answer.dest_port == 20000)
+        << "with the oldest half-open connection stale, a new SYN must get its slot - options and all - "
+           "rather than a cookie";
 
     // a younger handshake was not the one evicted: it still completes
     channel->push_inbound(build_tcp(FLAG_ACK, 1001, younger_isn + 1, 30001, 80));
     stack->poll();
-    test_assert(stack->accept(80) != nullptr, "a younger half-open connection must survive the eviction");
+    ASSERT_TRUE(stack->accept(80) != nullptr) << "a younger half-open connection must survive the eviction";
 }
 
 // --- SYN cookies under a flood ------------------------------------------------
@@ -3298,19 +3301,19 @@ namespace
     }
 }
 
-TEST(AFloodBeyondTheCapIsStillAnsweredWithCookieSynAcks)
+TEST(NetworkStack, AFloodBeyondTheCapIsStillAnsweredWithCookieSynAcks)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_flooded_stack(channel);
 
     TcpView answer = syn_for_a_cookie(*stack, *channel, 20000, 5000);
-    test_assert(answer.is_tcp && answer.syn && answer.ack_flag && answer.ack == 5001,
-                "a SYN past a full cap of young half-open connections must still be answered");
-    test_assert(!answer.has_window_scale && !answer.has_sack_permitted && !answer.has_timestamp,
-                "a cookie SYN-ACK can carry no options a cookie cannot remember");
+    ASSERT_TRUE(answer.is_tcp && answer.syn && answer.ack_flag && answer.ack == 5001)
+        << "a SYN past a full cap of young half-open connections must still be answered";
+    ASSERT_TRUE(!answer.has_window_scale && !answer.has_sack_permitted && !answer.has_timestamp)
+        << "a cookie SYN-ACK can carry no options a cookie cannot remember";
 }
 
-TEST(AValidCookieAckCompletesTheConnection)
+TEST(NetworkStack, AValidCookieAckCompletesTheConnection)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_flooded_stack(channel);
@@ -3320,12 +3323,12 @@ TEST(AValidCookieAckCompletesTheConnection)
     stack->poll();
 
     TcpConnection* connection = stack->accept(80);
-    test_assert(connection != nullptr, "the ACK carrying a valid cookie must produce an acceptable connection");
-    test_assert(connection->get_state() == TcpState::ESTABLISHED, "already established");
-    test_assert(connection->read().to_hex() == "6869", "with the data that rode on that ACK");
+    ASSERT_TRUE(connection != nullptr) << "the ACK carrying a valid cookie must produce an acceptable connection";
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED) << "already established";
+    ASSERT_TRUE(connection->read().to_hex() == "6869") << "with the data that rode on that ACK";
 }
 
-TEST(AnAckWithAForgedCookieIsResetAndCreatesNothing)
+TEST(NetworkStack, AnAckWithAForgedCookieIsResetAndCreatesNothing)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_flooded_stack(channel);
@@ -3334,12 +3337,12 @@ TEST(AnAckWithAForgedCookieIsResetAndCreatesNothing)
     channel->clear_outbound();
     channel->push_inbound(build_tcp_data(FLAG_ACK, 5001, answer.seq + 2, 20000, 80, Bytes()));
     stack->poll();
-    test_assert(stack->accept(80) == nullptr, "a wrong cookie must not create a connection");
+    ASSERT_TRUE(stack->accept(80) == nullptr) << "a wrong cookie must not create a connection";
     TcpView reply = find_tcp(channel->outbound_frames());
-    test_assert(reply.is_tcp && reply.rst, "and gets the ordinary RST for a segment matching nothing");
+    ASSERT_TRUE(reply.is_tcp && reply.rst) << "and gets the ordinary RST for a segment matching nothing";
 }
 
-TEST(AnExpiredCookieIsRefused)
+TEST(NetworkStack, AnExpiredCookieIsRefused)
 {
     FakePacketChannel* channel = nullptr;
     auto stack = make_flooded_stack(channel);
@@ -3354,10 +3357,10 @@ TEST(AnExpiredCookieIsRefused)
 
     channel->push_inbound(build_tcp_data(FLAG_ACK, 5001, answer.seq + 1, 20000, 80, Bytes()));
     stack->poll();
-    test_assert(stack->accept(80) == nullptr, "a cookie past its two slots must not open a connection");
+    ASSERT_TRUE(stack->accept(80) == nullptr) << "a cookie past its two slots must not open a connection";
 }
 
-TEST(FailedCookieChecksAreCountedSoGuessingIsVisible)
+TEST(NetworkStack, FailedCookieChecksAreCountedSoGuessingIsVisible)
 {
     // In cookie mode a blind spoofer opens a connection by guessing a 24-bit
     // hash (about 1 in 2^23 per try, with two valid slots). That cannot be made
@@ -3366,18 +3369,18 @@ TEST(FailedCookieChecksAreCountedSoGuessingIsVisible)
     FakePacketChannel* channel = nullptr;
     auto stack = make_flooded_stack(channel);
     TcpView answer = syn_for_a_cookie(*stack, *channel, 20000, 5000);
-    test_assert(stack->syn_cookie_check_failures() == 0, "nothing has failed yet");
+    ASSERT_TRUE(stack->syn_cookie_check_failures() == 0) << "nothing has failed yet";
 
     for (uint32_t guess = 0; guess < 5; guess++)
     {
         channel->push_inbound(build_tcp_data(FLAG_ACK, 7001, 0x10000000 + guess, 21000, 80, Bytes()));
     }
     stack->poll();
-    test_assert(stack->syn_cookie_check_failures() == 5, "each forged cookie ACK is a counted failure, got "
-                                                             + std::to_string(stack->syn_cookie_check_failures()));
+    ASSERT_TRUE(stack->syn_cookie_check_failures() == 5)
+        << "each forged cookie ACK is a counted failure, got " + std::to_string(stack->syn_cookie_check_failures());
 
     channel->push_inbound(build_tcp_data(FLAG_ACK, 5001, answer.seq + 1, 20000, 80, Bytes()));
     stack->poll();
-    test_assert(stack->syn_cookie_check_failures() == 5 && stack->accept(80) != nullptr,
-                "a genuine cookie is not a failure");
+    ASSERT_TRUE(stack->syn_cookie_check_failures() == 5 && stack->accept(80) != nullptr)
+        << "a genuine cookie is not a failure";
 }

@@ -1,4 +1,4 @@
-#include "test.h"
+#include "test_support.h"
 #include "isn_generator.h"
 
 #include <set>
@@ -21,7 +21,7 @@ namespace
 // to the reference output rather than to a reading of the code. These are the
 // first vectors from Aumasson and Bernstein's paper, which uses the key
 // 000102...0f and messages that are the first N bytes of 000102...
-TEST(SipHashMatchesTheReferenceVectors)
+TEST(IsnGenerator, SipHashMatchesTheReferenceVectors)
 {
     struct Vector
     {
@@ -43,12 +43,12 @@ TEST(SipHashMatchesTheReferenceVectors)
     for (const Vector& vector : vectors)
     {
         uint64_t actual = siphash_2_4(message, vector.length, TEST_KEY_LOW, TEST_KEY_HIGH);
-        test_assert(actual == vector.expected,
-                    "siphash of " + std::to_string(vector.length) + " bytes should match the paper");
+        ASSERT_TRUE(actual == vector.expected)
+            << "siphash of " + std::to_string(vector.length) + " bytes should match the paper";
     }
 }
 
-TEST(TheSameFourTupleAlwaysGetsTheSameOffset)
+TEST(IsnGenerator, TheSameFourTupleAlwaysGetsTheSameOffset)
 {
     // This is the half of RFC 6528 that preserves what RFC 793 was doing. The
     // offset must be a pure function of the 4-tuple, so two successive
@@ -60,21 +60,21 @@ TEST(TheSameFourTupleAlwaysGetsTheSameOffset)
     uint32_t first = generator.offset_for(LOCAL, 8080, PEER, 12345);
     uint32_t second = generator.offset_for(LOCAL, 8080, PEER, 12345);
 
-    test_assert(first == second, "the offset for one 4-tuple must be stable");
+    ASSERT_TRUE(first == second) << "the offset for one 4-tuple must be stable";
 }
 
-TEST(EveryPartOfTheFourTupleChangesTheOffset)
+TEST(IsnGenerator, EveryPartOfTheFourTupleChangesTheOffset)
 {
     IsnGenerator generator(TEST_KEY_LOW, TEST_KEY_HIGH);
     uint32_t base = generator.offset_for(LOCAL, 8080, PEER, 12345);
 
-    test_assert(generator.offset_for(PEER, 8080, PEER, 12345) != base, "local ip must matter");
-    test_assert(generator.offset_for(LOCAL, 8081, PEER, 12345) != base, "local port must matter");
-    test_assert(generator.offset_for(LOCAL, 8080, OTHER_PEER, 12345) != base, "remote ip must matter");
-    test_assert(generator.offset_for(LOCAL, 8080, PEER, 12346) != base, "remote port must matter");
+    ASSERT_TRUE(generator.offset_for(PEER, 8080, PEER, 12345) != base) << "local ip must matter";
+    ASSERT_TRUE(generator.offset_for(LOCAL, 8081, PEER, 12345) != base) << "local port must matter";
+    ASSERT_TRUE(generator.offset_for(LOCAL, 8080, OTHER_PEER, 12345) != base) << "remote ip must matter";
+    ASSERT_TRUE(generator.offset_for(LOCAL, 8080, PEER, 12346) != base) << "remote port must matter";
 }
 
-TEST(TheOffsetIsNotSymmetricInTheAddressPair)
+TEST(IsnGenerator, TheOffsetIsNotSymmetricInTheAddressPair)
 {
     // A hash that folded the two addresses together commutatively would give a
     // connection and its mirror image the same offset, which hands an attacker
@@ -82,11 +82,11 @@ TEST(TheOffsetIsNotSymmetricInTheAddressPair)
     // *from* it.
     IsnGenerator generator(TEST_KEY_LOW, TEST_KEY_HIGH);
 
-    test_assert(generator.offset_for(LOCAL, 8080, PEER, 12345) != generator.offset_for(PEER, 12345, LOCAL, 8080),
-                "swapping the endpoints must not reproduce the offset");
+    ASSERT_TRUE(generator.offset_for(LOCAL, 8080, PEER, 12345) != generator.offset_for(PEER, 12345, LOCAL, 8080))
+        << "swapping the endpoints must not reproduce the offset";
 }
 
-TEST(ADifferentSecretGivesAnUnrelatedOffsetForTheSameConnection)
+TEST(IsnGenerator, ADifferentSecretGivesAnUnrelatedOffsetForTheSameConnection)
 {
     // The whole security argument: an attacker who watches ISNs learns the
     // clock, which was never secret, plus the offset for 4-tuples they can
@@ -96,11 +96,11 @@ TEST(ADifferentSecretGivesAnUnrelatedOffsetForTheSameConnection)
     IsnGenerator one(TEST_KEY_LOW, TEST_KEY_HIGH);
     IsnGenerator another(TEST_KEY_LOW ^ 1, TEST_KEY_HIGH);
 
-    test_assert(one.offset_for(LOCAL, 8080, PEER, 12345) != another.offset_for(LOCAL, 8080, PEER, 12345),
-                "a one-bit change in the key must change the offset");
+    ASSERT_TRUE(one.offset_for(LOCAL, 8080, PEER, 12345) != another.offset_for(LOCAL, 8080, PEER, 12345))
+        << "a one-bit change in the key must change the offset";
 }
 
-TEST(OffsetsAreSpreadAcrossTheSequenceSpaceRatherThanClustered)
+TEST(IsnGenerator, OffsetsAreSpreadAcrossTheSequenceSpaceRatherThanClustered)
 {
     // The old clock-driven scheme advanced by a fixed 64000 per connection, so
     // knowing one ISN gave you the next. This is the property that replaces
@@ -123,12 +123,12 @@ TEST(OffsetsAreSpreadAcrossTheSequenceSpaceRatherThanClustered)
         previous = offset;
     }
 
-    test_assert(offsets.size() == 199, "200 consecutive ports must not collide");
-    test_assert(smallest_gap > 65536,
-                "consecutive ports must not land near each other, smallest gap was " + std::to_string(smallest_gap));
+    ASSERT_TRUE(offsets.size() == 199) << "200 consecutive ports must not collide";
+    ASSERT_TRUE(smallest_gap > 65536) << "consecutive ports must not land near each other, smallest gap was "
+                                             + std::to_string(smallest_gap);
 }
 
-TEST(TheClockTermAdvancesTheIsnBeyondItsOwnOffset)
+TEST(IsnGenerator, TheClockTermAdvancesTheIsnBeyondItsOwnOffset)
 {
     // The two halves of RFC 6528's sum, observed together: generate() is the
     // offset plus a real clock, so it is not simply the offset.
@@ -137,10 +137,10 @@ TEST(TheClockTermAdvancesTheIsnBeyondItsOwnOffset)
     uint32_t offset = generator.offset_for(LOCAL, 8080, PEER, 12345);
     uint32_t isn = generator.generate(LOCAL, 8080, PEER, 12345);
 
-    test_assert(isn != offset, "the ISN must carry a clock term as well as the offset");
+    ASSERT_TRUE(isn != offset) << "the ISN must carry a clock term as well as the offset";
 }
 
-TEST(TwoGeneratorsDrawDifferentSecrets)
+TEST(IsnGenerator, TwoGeneratorsDrawDifferentSecrets)
 {
     // Each stack instance must get its own key from the system entropy source.
     // If this ever fails, the default constructor has stopped reading real
@@ -149,6 +149,6 @@ TEST(TwoGeneratorsDrawDifferentSecrets)
     IsnGenerator one;
     IsnGenerator another;
 
-    test_assert(one.offset_for(LOCAL, 8080, PEER, 12345) != another.offset_for(LOCAL, 8080, PEER, 12345),
-                "two stacks must not share a secret");
+    ASSERT_TRUE(one.offset_for(LOCAL, 8080, PEER, 12345) != another.offset_for(LOCAL, 8080, PEER, 12345))
+        << "two stacks must not share a secret";
 }

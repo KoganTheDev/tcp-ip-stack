@@ -1,4 +1,4 @@
-#include "test.h"
+#include "test_support.h"
 #include "ip_reassembler.h"
 
 namespace
@@ -33,94 +33,94 @@ namespace
     }
 }
 
-TEST(FragmentsReassembleInOrder)
+TEST(IpReassembler, FragmentsReassembleInOrder)
 {
     IpReassembler reassembler(TIMEOUT_MS);
     Bytes out;
 
-    test_assert(offer(reassembler, 0, true, filled(8, 0xAA), out) == IpReassembler::Result::Incomplete,
-                "a first fragment with more to come cannot complete anything");
-    test_assert(reassembler.pending_datagrams() == 1, "it should be held");
+    ASSERT_TRUE(offer(reassembler, 0, true, filled(8, 0xAA), out) == IpReassembler::Result::Incomplete)
+        << "a first fragment with more to come cannot complete anything";
+    ASSERT_TRUE(reassembler.pending_datagrams() == 1) << "it should be held";
 
-    test_assert(offer(reassembler, 1, false, filled(4, 0xBB), out) == IpReassembler::Result::Complete,
-                "the last fragment should complete the datagram");
-    test_assert(out.size() == 12, "the reassembled datagram should be the sum of its fragments");
-    test_assert(out[0] == 0xAA && out[7] == 0xAA && out[8] == 0xBB && out[11] == 0xBB,
-                "the pieces must be laid out at their offsets, in order");
-    test_assert(reassembler.pending_datagrams() == 0 && reassembler.buffered_bytes() == 0,
-                "a completed datagram must release everything it was holding");
+    ASSERT_TRUE(offer(reassembler, 1, false, filled(4, 0xBB), out) == IpReassembler::Result::Complete)
+        << "the last fragment should complete the datagram";
+    ASSERT_TRUE(out.size() == 12) << "the reassembled datagram should be the sum of its fragments";
+    ASSERT_TRUE(out[0] == 0xAA && out[7] == 0xAA && out[8] == 0xBB && out[11] == 0xBB)
+        << "the pieces must be laid out at their offsets, in order";
+    ASSERT_TRUE(reassembler.pending_datagrams() == 0 && reassembler.buffered_bytes() == 0)
+        << "a completed datagram must release everything it was holding";
 }
 
 // Fragments arrive in whatever order the network delivers them, which is not
 // necessarily the order they were sent.
-TEST(FragmentsReassembleOutOfOrder)
+TEST(IpReassembler, FragmentsReassembleOutOfOrder)
 {
     IpReassembler reassembler(TIMEOUT_MS);
     Bytes out;
 
-    test_assert(offer(reassembler, 2, false, filled(4, 0xCC), out) == IpReassembler::Result::Incomplete,
-                "the last fragment arriving first tells us the length but leaves holes");
-    test_assert(offer(reassembler, 0, true, filled(8, 0xAA), out) == IpReassembler::Result::Incomplete,
-                "still a hole in the middle");
-    test_assert(offer(reassembler, 1, true, filled(8, 0xBB), out) == IpReassembler::Result::Complete,
-                "filling the last hole completes it");
-    test_assert(out.size() == 20 && out[0] == 0xAA && out[8] == 0xBB && out[16] == 0xCC,
-                "the datagram must be assembled by offset, not by arrival order");
+    ASSERT_TRUE(offer(reassembler, 2, false, filled(4, 0xCC), out) == IpReassembler::Result::Incomplete)
+        << "the last fragment arriving first tells us the length but leaves holes";
+    ASSERT_TRUE(offer(reassembler, 0, true, filled(8, 0xAA), out) == IpReassembler::Result::Incomplete)
+        << "still a hole in the middle";
+    ASSERT_TRUE(offer(reassembler, 1, true, filled(8, 0xBB), out) == IpReassembler::Result::Complete)
+        << "filling the last hole completes it";
+    ASSERT_TRUE(out.size() == 20 && out[0] == 0xAA && out[8] == 0xBB && out[16] == 0xCC)
+        << "the datagram must be assembled by offset, not by arrival order";
 }
 
 // The heart of the security story. Two fragments claiming the same bytes cannot
 // both be right, and picking a winner is what made fragment-overlap evasion
 // work: a monitor resolving the conflict differently from its target saw
 // different bytes than the target assembled. So no winner is picked.
-TEST(OverlappingFragmentsDestroyTheWholeDatagram)
+TEST(IpReassembler, OverlappingFragmentsDestroyTheWholeDatagram)
 {
     IpReassembler reassembler(TIMEOUT_MS);
     Bytes out;
 
     offer(reassembler, 0, true, filled(16, 0xAA), out);
-    test_assert(offer(reassembler, 1, true, filled(16, 0xBB), out) == IpReassembler::Result::Rejected,
-                "a fragment overlapping one already held must be refused, not resolved in favour of either");
-    test_assert(reassembler.pending_datagrams() == 0,
-                "the whole datagram must be discarded - keeping the non-overlapping parts would still let an attacker "
-                "steer the result");
-    test_assert(reassembler.buffered_bytes() == 0, "and its buffer released");
+    ASSERT_TRUE(offer(reassembler, 1, true, filled(16, 0xBB), out) == IpReassembler::Result::Rejected)
+        << "a fragment overlapping one already held must be refused, not resolved in favour of either";
+    ASSERT_TRUE(reassembler.pending_datagrams() == 0)
+        << "the whole datagram must be discarded - keeping the non-overlapping parts would still let an attacker "
+           "steer the result";
+    ASSERT_TRUE(reassembler.buffered_bytes() == 0) << "and its buffer released";
 }
 
-TEST(ConflictingFinalFragmentsAreRejected)
+TEST(IpReassembler, ConflictingFinalFragmentsAreRejected)
 {
     IpReassembler reassembler(TIMEOUT_MS);
     Bytes out;
 
     offer(reassembler, 2, false, filled(4, 0xAA), out);          // says the datagram ends at 20
-    test_assert(offer(reassembler, 5, false, filled(4, 0xBB), out) == IpReassembler::Result::Rejected,
-                "a second final fragment claiming a different total length is the same contradiction as an overlap");
-    test_assert(reassembler.pending_datagrams() == 0, "the datagram should be gone");
+    ASSERT_TRUE(offer(reassembler, 5, false, filled(4, 0xBB), out) == IpReassembler::Result::Rejected)
+        << "a second final fragment claiming a different total length is the same contradiction as an overlap";
+    ASSERT_TRUE(reassembler.pending_datagrams() == 0) << "the datagram should be gone";
 }
 
-TEST(FragmentReachingPastTheDeclaredEndIsRejected)
+TEST(IpReassembler, FragmentReachingPastTheDeclaredEndIsRejected)
 {
     IpReassembler reassembler(TIMEOUT_MS);
     Bytes out;
 
     offer(reassembler, 1, false, filled(8, 0xAA), out);          // datagram ends at 16
-    test_assert(offer(reassembler, 0, true, filled(24, 0xBB), out) == IpReassembler::Result::Rejected,
-                "a fragment extending past a length the last fragment already fixed must be refused");
+    ASSERT_TRUE(offer(reassembler, 0, true, filled(24, 0xBB), out) == IpReassembler::Result::Rejected)
+        << "a fragment extending past a length the last fragment already fixed must be refused";
 }
 
-TEST(OversizedFragmentIsRejected)
+TEST(IpReassembler, OversizedFragmentIsRejected)
 {
     IpReassembler reassembler(TIMEOUT_MS);
     Bytes out;
 
     // 8190 * 8 = 65520, so any real payload pushes past the 65535-byte maximum
-    test_assert(offer(reassembler, 8190, false, filled(64, 0xAA), out) == IpReassembler::Result::Rejected,
-                "a fragment claiming to reach past the largest possible datagram is lying and must be refused");
-    test_assert(reassembler.pending_datagrams() == 0, "nothing should be retained for it");
+    ASSERT_TRUE(offer(reassembler, 8190, false, filled(64, 0xAA), out) == IpReassembler::Result::Rejected)
+        << "a fragment claiming to reach past the largest possible datagram is lying and must be refused";
+    ASSERT_TRUE(reassembler.pending_datagrams() == 0) << "nothing should be retained for it";
 }
 
 // A reassembler holds partial data for something that may never complete, so an
 // attacker sending only first fragments is asking it to buy memory for them.
-TEST(PendingDatagramsAreCapped)
+TEST(IpReassembler, PendingDatagramsAreCapped)
 {
     IpReassembler reassembler(TIMEOUT_MS);
     Bytes out;
@@ -129,17 +129,16 @@ TEST(PendingDatagramsAreCapped)
     {
         reassembler.offer(SRC, DST, static_cast<uint16_t>(i), PROTO, 0, true, filled(8, 0xAA), out);
     }
-    test_assert(reassembler.pending_datagrams() == IpReassembler::MAX_PENDING_DATAGRAMS, "the table should be full");
+    ASSERT_TRUE(reassembler.pending_datagrams() == IpReassembler::MAX_PENDING_DATAGRAMS) << "the table should be full";
 
     IpReassembler::Result result = reassembler.offer(SRC, DST, 9999, PROTO, 0, true, filled(8, 0xAA), out);
-    test_assert(
-        result == IpReassembler::Result::Rejected,
-        "a further partial datagram must be refused once the limit is reached, or an attacker sets the memory budget");
-    test_assert(reassembler.pending_datagrams() == IpReassembler::MAX_PENDING_DATAGRAMS,
-                "and must not be admitted anyway");
+    ASSERT_TRUE(result == IpReassembler::Result::Rejected) << "a further partial datagram must be refused once the "
+                                                              "limit is reached, or an attacker sets the memory budget";
+    ASSERT_TRUE(reassembler.pending_datagrams() == IpReassembler::MAX_PENDING_DATAGRAMS)
+        << "and must not be admitted anyway";
 }
 
-TEST(IncompleteDatagramsExpireAndNameTheirSender)
+TEST(IpReassembler, IncompleteDatagramsExpireAndNameTheirSender)
 {
     IpReassembler reassembler(SHORT_TIMEOUT_MS);
     Bytes out;
@@ -148,23 +147,22 @@ TEST(IncompleteDatagramsExpireAndNameTheirSender)
     std::vector<IpReassembler::Expired> expired;
     reassembler.age(TEST_TICK_MS, expired);
     reassembler.age(TEST_TICK_MS, expired);
-    test_assert(expired.empty() && reassembler.pending_datagrams() == 1,
-                "it should still be waiting before the timeout elapses");
+    ASSERT_TRUE(expired.empty() && reassembler.pending_datagrams() == 1)
+        << "it should still be waiting before the timeout elapses";
 
     reassembler.age(TEST_TICK_MS, expired);
-    test_assert(reassembler.pending_datagrams() == 0,
-                "a datagram whose fragments never arrived must not be held forever");
-    test_assert(
-        expired.size() == 1 && expired[0].source == SRC,
-        "the sender must be reported so it can be told - it is otherwise waiting on a datagram nobody will deliver");
-    test_assert(expired[0].first_bytes == filled(8, 0xAA),
-                "with fragment zero's first bytes, which is what tells the caller it may report at all");
-    test_assert(reassembler.buffered_bytes() == 0, "the buffer must be released");
+    ASSERT_TRUE(reassembler.pending_datagrams() == 0)
+        << "a datagram whose fragments never arrived must not be held forever";
+    ASSERT_TRUE(expired.size() == 1 && expired[0].source == SRC)
+        << "the sender must be reported so it can be told - it is otherwise waiting on a datagram nobody will deliver";
+    ASSERT_TRUE(expired[0].first_bytes == filled(8, 0xAA))
+        << "with fragment zero's first bytes, which is what tells the caller it may report at all";
+    ASSERT_TRUE(reassembler.buffered_bytes() == 0) << "the buffer must be released";
 }
 
 // Two peers can pick the same identification at the same moment. Keying on it
 // alone would splice unrelated datagrams together.
-TEST(DatagramsAreKeyedByTheFullFourTuple)
+TEST(IpReassembler, DatagramsAreKeyedByTheFullFourTuple)
 {
     IpReassembler reassembler(TIMEOUT_MS);
     Bytes out;
@@ -172,6 +170,6 @@ TEST(DatagramsAreKeyedByTheFullFourTuple)
     reassembler.offer(SRC, DST, 4242, PROTO, 0, true, filled(8, 0xAA), out);
     reassembler.offer(IPv4Address("10.0.0.9"), DST, 4242, PROTO, 0, true, filled(8, 0xBB), out);
 
-    test_assert(reassembler.pending_datagrams() == 2,
-                "the same identification from a different source is a different datagram, not more of the same one");
+    ASSERT_TRUE(reassembler.pending_datagrams() == 2)
+        << "the same identification from a different source is a different datagram, not more of the same one";
 }

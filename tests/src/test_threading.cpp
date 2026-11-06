@@ -1,4 +1,4 @@
-#include "test.h"
+#include "test_support.h"
 #include "thread_pool.h"
 #include "completion_queue.h"
 
@@ -28,7 +28,7 @@ namespace
     }
 }
 
-TEST(EveryTaskSubmittedToThePoolRunsExactlyOnce)
+TEST(Threading, EveryTaskSubmittedToThePoolRunsExactlyOnce)
 {
     constexpr int TASK_COUNT = 200;
     std::atomic<int> total{0};
@@ -54,16 +54,16 @@ TEST(EveryTaskSubmittedToThePoolRunsExactlyOnce)
         // enough", which would be a race dressed as a test.
     }
 
-    test_assert(total.load() == TASK_COUNT, "every submitted task must run - got " + std::to_string(total.load())
-                                                + " of " + std::to_string(TASK_COUNT));
+    ASSERT_TRUE(total.load() == TASK_COUNT)
+        << "every submitted task must run - got " + std::to_string(total.load()) + " of " + std::to_string(TASK_COUNT);
     for (int i = 0; i < TASK_COUNT; i++)
     {
-        test_assert(per_task[i].load() == 1,
-                    "task " + std::to_string(i) + " ran " + std::to_string(per_task[i].load()) + " times, not once");
+        ASSERT_TRUE(per_task[i].load() == 1)
+            << "task " + std::to_string(i) + " ran " + std::to_string(per_task[i].load()) + " times, not once";
     }
 }
 
-TEST(TasksSubmittedFromManyThreadsAreAllRun)
+TEST(Threading, TasksSubmittedFromManyThreadsAreAllRun)
 {
     // submit() takes the same lock the workers pop under, so concurrent
     // producers are the case most likely to lose one.
@@ -91,11 +91,11 @@ TEST(TasksSubmittedFromManyThreadsAreAllRun)
         }
     }
 
-    test_assert(total.load() == PRODUCERS * PER_PRODUCER,
-                "no task may be lost across concurrent producers - got " + std::to_string(total.load()));
+    ASSERT_TRUE(total.load() == PRODUCERS * PER_PRODUCER)
+        << "no task may be lost across concurrent producers - got " + std::to_string(total.load());
 }
 
-TEST(ShutdownDrainsQueuedWorkRatherThanDiscardingIt)
+TEST(Threading, ShutdownDrainsQueuedWorkRatherThanDiscardingIt)
 {
     // The distinction that matters on a clean exit: a pool that stops its
     // workers and throws away what is still queued silently loses whatever the
@@ -115,12 +115,12 @@ TEST(ShutdownDrainsQueuedWorkRatherThanDiscardingIt)
     }
     pool.shutdown();
 
-    test_assert(completed.load() == TASK_COUNT, "shutdown must drain the queue, not discard it - "
-                                                    + std::to_string(completed.load()) + " of "
-                                                    + std::to_string(TASK_COUNT) + " ran");
+    ASSERT_TRUE(completed.load() == TASK_COUNT) << "shutdown must drain the queue, not discard it - "
+                                                       + std::to_string(completed.load()) + " of "
+                                                       + std::to_string(TASK_COUNT) + " ran";
 }
 
-TEST(ShutdownIsIdempotent)
+TEST(Threading, ShutdownIsIdempotent)
 {
     // Server calls shutdown() explicitly and then the destructor runs. A second
     // call joining already-joined threads would be undefined behaviour.
@@ -131,10 +131,10 @@ TEST(ShutdownIsIdempotent)
     pool.shutdown();
     pool.shutdown();
 
-    test_assert(ran.load() == 1, "the task still ran exactly once");
+    ASSERT_TRUE(ran.load() == 1) << "the task still ran exactly once";
 }
 
-TEST(AThrowingTaskDoesNotKillItsWorker)
+TEST(Threading, AThrowingTaskDoesNotKillItsWorker)
 {
     // A worker lost to an escaping exception is invisible: the pool keeps
     // accepting work and quietly runs it on fewer threads, until the last
@@ -162,12 +162,12 @@ TEST(AThrowingTaskDoesNotKillItsWorker)
         }
     }
 
-    test_assert(survived.load() == TASK_COUNT / 3, "work submitted after a throwing task must still run - got "
-                                                       + std::to_string(survived.load()) + " of "
-                                                       + std::to_string(TASK_COUNT / 3));
+    ASSERT_TRUE(survived.load() == TASK_COUNT / 3) << "work submitted after a throwing task must still run - got "
+                                                          + std::to_string(survived.load()) + " of "
+                                                          + std::to_string(TASK_COUNT / 3);
 }
 
-TEST(SubmittingAfterShutdownIsRefusedRatherThanSilentlyQueued)
+TEST(Threading, SubmittingAfterShutdownIsRefusedRatherThanSilentlyQueued)
 {
     // The workers are gone by then, so anything accepted here would sit in the
     // queue forever. Neither outcome runs the task; the difference is whether
@@ -183,14 +183,14 @@ TEST(SubmittingAfterShutdownIsRefusedRatherThanSilentlyQueued)
     // the refusal the task is queued behind workers that have already exited,
     // so it never runs either - ran == 0 is true whether the pool refuses or
     // silently swallows it. Only the return value tells them apart.
-    test_assert(!accepted, "the pool must report that it refused the task");
-    test_assert(ran.load() == 0, "and the task must not run - there are no workers left");
+    ASSERT_TRUE(!accepted) << "the pool must report that it refused the task";
+    ASSERT_TRUE(ran.load() == 0) << "and the task must not run - there are no workers left";
     // And the pool must still destruct cleanly with that submission behind it,
     // which it would not if the task were sitting in the queue holding a
     // reference to a local that is about to go out of scope.
 }
 
-TEST(CompletionQueueRunsEverythingPushedToIt)
+TEST(Threading, CompletionQueueRunsEverythingPushedToIt)
 {
     CompletionQueue queue;
     std::atomic<int> total{0};
@@ -201,10 +201,10 @@ TEST(CompletionQueueRunsEverythingPushedToIt)
     }
     queue.drain_and_run();
 
-    test_assert(total.load() == 50, "every pushed completion must run once");
+    ASSERT_TRUE(total.load() == 50) << "every pushed completion must run once";
 }
 
-TEST(CompletionQueueDeliversWorkPushedFromOtherThreads)
+TEST(Threading, CompletionQueueDeliversWorkPushedFromOtherThreads)
 {
     // Its actual job: workers finish off the reactor thread and hand results
     // back for the reactor to apply. Nothing may be lost in that handover.
@@ -232,11 +232,11 @@ TEST(CompletionQueueDeliversWorkPushedFromOtherThreads)
 
     queue.drain_and_run();
 
-    test_assert(total.load() == PRODUCERS * PER_PRODUCER,
-                "no completion may be lost in the handover - got " + std::to_string(total.load()));
+    ASSERT_TRUE(total.load() == PRODUCERS * PER_PRODUCER)
+        << "no completion may be lost in the handover - got " + std::to_string(total.load());
 }
 
-TEST(AThrowingCompletionDoesNotEscapeToTheReactor)
+TEST(Threading, AThrowingCompletionDoesNotEscapeToTheReactor)
 {
     // These run on the reactor thread, so an escaping exception does not lose
     // one completion - it unwinds out of the event loop and takes the server
@@ -251,10 +251,10 @@ TEST(AThrowingCompletionDoesNotEscapeToTheReactor)
 
     queue.drain_and_run(); // must return normally
 
-    test_assert(ran_after.load() == 1, "completions queued behind a throwing one must still run");
+    ASSERT_TRUE(ran_after.load() == 1) << "completions queued behind a throwing one must still run";
 }
 
-TEST(DrainingAnEmptyCompletionQueueIsHarmless)
+TEST(Threading, DrainingAnEmptyCompletionQueueIsHarmless)
 {
     // The reactor calls this whenever the eventfd reports readable, and a
     // spurious wakeup is possible by design: push() inserts under the mutex
@@ -267,5 +267,5 @@ TEST(DrainingAnEmptyCompletionQueueIsHarmless)
     queue.push([&ran]() { ran.fetch_add(1); });
     queue.drain_and_run();
 
-    test_assert(ran.load() == 1, "the queue must still work after empty drains");
+    ASSERT_TRUE(ran.load() == 1) << "the queue must still work after empty drains";
 }

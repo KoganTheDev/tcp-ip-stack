@@ -1,4 +1,4 @@
-#include "test.h"
+#include "test_support.h"
 #include "route_table.h"
 #include "interface_config.h"
 
@@ -21,33 +21,33 @@ namespace
 // A connected route carries a zero next hop, meaning "the destination is a
 // neighbour" - so the address to resolve is the destination itself. This is the
 // distinction the whole table exists to express.
-TEST(ConnectedRouteResolvesTheDestinationItself)
+TEST(RouteTable, ConnectedRouteResolvesTheDestinationItself)
 {
     RouteTable table;
     table.add(IPv4Address("10.0.0.0"), 24, IPv4Address());
 
-    test_assert(has_route_for(table, "10.0.0.7"), "an address inside the connected network should match");
-    test_assert(
-        next_hop_for(table, "10.0.0.7") == IPv4Address("10.0.0.7"),
-        "a directly reachable destination is its own next hop - there is no router in between to address the frame to");
+    ASSERT_TRUE(has_route_for(table, "10.0.0.7")) << "an address inside the connected network should match";
+    ASSERT_TRUE(next_hop_for(table, "10.0.0.7") == IPv4Address("10.0.0.7"))
+        << "a directly reachable destination is its own next hop - there is no router in between to address the frame "
+           "to";
 }
 
-TEST(DefaultRouteSendsEverythingElseToTheGateway)
+TEST(RouteTable, DefaultRouteSendsEverythingElseToTheGateway)
 {
     RouteTable table;
     table.add(IPv4Address("10.0.0.0"), 24, IPv4Address());
     table.add(IPv4Address(), 0, IPv4Address("10.0.0.1"));
 
-    test_assert(next_hop_for(table, "10.0.0.7") == IPv4Address("10.0.0.7"),
-                "an on-link destination must still resolve to itself even with a default route present");
-    test_assert(next_hop_for(table, "8.8.8.8") == IPv4Address("10.0.0.1"),
-                "an off-link destination must resolve to the gateway - the IP header still names 8.8.8.8, but the "
-                "frame goes to the router");
+    ASSERT_TRUE(next_hop_for(table, "10.0.0.7") == IPv4Address("10.0.0.7"))
+        << "an on-link destination must still resolve to itself even with a default route present";
+    ASSERT_TRUE(next_hop_for(table, "8.8.8.8") == IPv4Address("10.0.0.1"))
+        << "an off-link destination must resolve to the gateway - the IP header still names 8.8.8.8, but the "
+           "frame goes to the router";
 }
 
 // The reason routes are matched by prefix length rather than insertion order:
 // a general rule can be stated once and then narrowed by exception.
-TEST(LongestPrefixWinsRegardlessOfInsertionOrder)
+TEST(RouteTable, LongestPrefixWinsRegardlessOfInsertionOrder)
 {
     RouteTable table;
     table.add(IPv4Address(), 0, IPv4Address("10.0.0.1"));            // default
@@ -55,81 +55,82 @@ TEST(LongestPrefixWinsRegardlessOfInsertionOrder)
     table.add(IPv4Address("192.168.5.0"), 24, IPv4Address("10.0.0.3")); // more specific
     table.add(IPv4Address("192.168.5.9"), 32, IPv4Address("10.0.0.4")); // host route
 
-    test_assert(next_hop_for(table, "192.168.5.9") == IPv4Address("10.0.0.4"),
-                "a /32 host route must beat every shorter prefix");
-    test_assert(next_hop_for(table, "192.168.5.20") == IPv4Address("10.0.0.3"), "the /24 must beat the /16");
-    test_assert(next_hop_for(table, "192.168.9.1") == IPv4Address("10.0.0.2"), "the /16 must beat the default route");
-    test_assert(next_hop_for(table, "1.2.3.4") == IPv4Address("10.0.0.1"),
-                "the default route catches whatever nothing else matched");
+    ASSERT_TRUE(next_hop_for(table, "192.168.5.9") == IPv4Address("10.0.0.4"))
+        << "a /32 host route must beat every shorter prefix";
+    ASSERT_TRUE(next_hop_for(table, "192.168.5.20") == IPv4Address("10.0.0.3")) << "the /24 must beat the /16";
+    ASSERT_TRUE(next_hop_for(table, "192.168.9.1") == IPv4Address("10.0.0.2")) << "the /16 must beat the default route";
+    ASSERT_TRUE(next_hop_for(table, "1.2.3.4") == IPv4Address("10.0.0.1"))
+        << "the default route catches whatever nothing else matched";
 }
 
-TEST(NoMatchingRouteIsReportedRatherThanGuessed)
+TEST(RouteTable, NoMatchingRouteIsReportedRatherThanGuessed)
 {
     RouteTable table;
     table.add(IPv4Address("10.0.0.0"), 24, IPv4Address());
 
-    test_assert(!has_route_for(table, "8.8.8.8"), "with no default route an off-link destination is unreachable, and "
-                                                  "lookup must say so rather than inventing a next hop");
+    ASSERT_TRUE(!has_route_for(table, "8.8.8.8"))
+        << "with no default route an off-link destination is unreachable, and "
+           "lookup must say so rather than inventing a next hop";
 }
 
 // A caller passing 10.0.0.7/24 means the 10.0.0.0 network. Storing it verbatim
 // would make every later comparison against the entry miss.
-TEST(RoutesAreNormalisedToTheirNetworkAddress)
+TEST(RouteTable, RoutesAreNormalisedToTheirNetworkAddress)
 {
     RouteTable table;
     table.add(IPv4Address("10.0.0.7"), 24, IPv4Address("192.168.1.1"));
 
-    test_assert(table.size() == 1, "precondition");
-    test_assert(table.routes()[0].destination == IPv4Address("10.0.0.0"),
-                "the host bits must be masked off on insertion, or lookups against this route never match");
-    test_assert(next_hop_for(table, "10.0.0.99") == IPv4Address("192.168.1.1"),
-                "the normalised route should still match its network");
+    ASSERT_TRUE(table.size() == 1) << "precondition";
+    ASSERT_TRUE(table.routes()[0].destination == IPv4Address("10.0.0.0"))
+        << "the host bits must be masked off on insertion, or lookups against this route never match";
+    ASSERT_TRUE(next_hop_for(table, "10.0.0.99") == IPv4Address("192.168.1.1"))
+        << "the normalised route should still match its network";
 }
 
-TEST(AddingTheSameNetworkReplacesRatherThanDuplicates)
+TEST(RouteTable, AddingTheSameNetworkReplacesRatherThanDuplicates)
 {
     RouteTable table;
     table.add(IPv4Address("10.0.0.0"), 24, IPv4Address("10.0.0.1"));
     table.add(IPv4Address("10.0.0.0"), 24, IPv4Address("10.0.0.2"));
 
-    test_assert(table.size() == 1, "re-adding the same destination and prefix must replace, not accumulate");
-    test_assert(next_hop_for(table, "10.0.0.5") == IPv4Address("10.0.0.2"), "the replacement's next hop should win");
+    ASSERT_TRUE(table.size() == 1) << "re-adding the same destination and prefix must replace, not accumulate";
+    ASSERT_TRUE(next_hop_for(table, "10.0.0.5") == IPv4Address("10.0.0.2")) << "the replacement's next hop should win";
 }
 
 // The mask helpers underpin every comparison above; /0 and /32 are the two
 // boundaries where a naive shift would be undefined behaviour.
-TEST(PrefixMaskHandlesBothBoundaries)
+TEST(RouteTable, PrefixMaskHandlesBothBoundaries)
 {
-    test_assert(ipv4_prefix_mask(0) == 0u, "a /0 mask must be zero - shifting a 32-bit value by 32 would be undefined");
-    test_assert(ipv4_prefix_mask(32) == 0xFFFFFFFFu, "a /32 mask must be all ones");
-    test_assert(ipv4_prefix_mask(24) == 0xFFFFFF00u, "a /24 mask must clear exactly the low octet");
-    test_assert(is_same_network(IPv4Address("10.0.0.1"), IPv4Address("10.0.0.254"), 24), "same /24");
-    test_assert(!is_same_network(IPv4Address("10.0.0.1"), IPv4Address("10.0.1.1"), 24), "different /24");
+    ASSERT_TRUE(ipv4_prefix_mask(0) == 0u)
+        << "a /0 mask must be zero - shifting a 32-bit value by 32 would be undefined";
+    ASSERT_TRUE(ipv4_prefix_mask(32) == 0xFFFFFFFFu) << "a /32 mask must be all ones";
+    ASSERT_TRUE(ipv4_prefix_mask(24) == 0xFFFFFF00u) << "a /24 mask must clear exactly the low octet";
+    ASSERT_TRUE(is_same_network(IPv4Address("10.0.0.1"), IPv4Address("10.0.0.254"), 24)) << "same /24";
+    ASSERT_TRUE(!is_same_network(IPv4Address("10.0.0.1"), IPv4Address("10.0.1.1"), 24)) << "different /24";
 }
 
-TEST(BroadcastRecognisesLimitedAndDirectedForms)
+TEST(RouteTable, BroadcastRecognisesLimitedAndDirectedForms)
 {
     InterfaceConfig config;
     config.ip = IPv4Address("10.0.0.2");
     config.prefix_length = 24;
 
-    test_assert(is_broadcast_address(IPv4Address("255.255.255.255"), config),
-                "the limited broadcast is always broadcast");
-    test_assert(is_broadcast_address(IPv4Address("10.0.0.255"), config),
-                "the all-ones host part of our own network is a directed broadcast");
-    test_assert(!is_broadcast_address(IPv4Address("10.0.0.2"), config), "our own address is not a broadcast");
-    test_assert(!is_broadcast_address(IPv4Address("10.0.1.255"), config),
-                "another network's directed broadcast is not ours");
+    ASSERT_TRUE(is_broadcast_address(IPv4Address("255.255.255.255"), config))
+        << "the limited broadcast is always broadcast";
+    ASSERT_TRUE(is_broadcast_address(IPv4Address("10.0.0.255"), config))
+        << "the all-ones host part of our own network is a directed broadcast";
+    ASSERT_TRUE(!is_broadcast_address(IPv4Address("10.0.0.2"), config)) << "our own address is not a broadcast";
+    ASSERT_TRUE(!is_broadcast_address(IPv4Address("10.0.1.255"), config))
+        << "another network's directed broadcast is not ours";
 
     InterfaceConfig unconfigured;
-    test_assert(
-        is_broadcast_address(IPv4Address("255.255.255.255"), unconfigured),
-        "the limited broadcast must be recognised even with no address configured - that is the whole point of it");
-    test_assert(!is_broadcast_address(IPv4Address("10.0.0.255"), unconfigured),
-                "without an address there is no network whose host part could be all ones");
+    ASSERT_TRUE(is_broadcast_address(IPv4Address("255.255.255.255"), unconfigured))
+        << "the limited broadcast must be recognised even with no address configured - that is the whole point of it";
+    ASSERT_TRUE(!is_broadcast_address(IPv4Address("10.0.0.255"), unconfigured))
+        << "without an address there is no network whose host part could be all ones";
 }
 
-TEST(PointToPointPrefixesHaveNoDirectedBroadcast)
+TEST(RouteTable, PointToPointPrefixesHaveNoDirectedBroadcast)
 {
     // RFC 3021: a /31 is a point-to-point link of exactly two hosts and has no
     // broadcast address - both addresses are hosts. Treating the all-ones one
@@ -139,15 +140,16 @@ TEST(PointToPointPrefixesHaveNoDirectedBroadcast)
     InterfaceConfig p2p;
     p2p.ip = IPv4Address("10.0.0.0");
     p2p.prefix_length = 31;
-    test_assert(!is_broadcast_address(IPv4Address("10.0.0.1"), p2p), "a /31 peer's address is a host, not a broadcast");
-    test_assert(!is_broadcast_address(IPv4Address("10.0.0.0"), p2p), "and so is ours");
+    ASSERT_TRUE(!is_broadcast_address(IPv4Address("10.0.0.1"), p2p))
+        << "a /31 peer's address is a host, not a broadcast";
+    ASSERT_TRUE(!is_broadcast_address(IPv4Address("10.0.0.0"), p2p)) << "and so is ours";
 
     InterfaceConfig host;
     host.ip = IPv4Address("10.0.0.7");
     host.prefix_length = 32;
-    test_assert(!is_broadcast_address(IPv4Address("10.0.0.7"), host), "a /32's only address is the host itself");
+    ASSERT_TRUE(!is_broadcast_address(IPv4Address("10.0.0.7"), host)) << "a /32's only address is the host itself";
 
-    test_assert(is_broadcast_address(IPv4Address("255.255.255.255"), p2p)
-                    && is_broadcast_address(IPv4Address("255.255.255.255"), host),
-                "the limited broadcast still is one, whatever the prefix");
+    ASSERT_TRUE(is_broadcast_address(IPv4Address("255.255.255.255"), p2p)
+                && is_broadcast_address(IPv4Address("255.255.255.255"), host))
+        << "the limited broadcast still is one, whatever the prefix";
 }

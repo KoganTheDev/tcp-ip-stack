@@ -117,9 +117,22 @@ endif()
 # Globbed so that adding tests/src/test_foo.cpp needs no wiring here.
 enable_testing()
 file(GLOB TEST_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/tests/src/*.cpp)
+list(FILTER TEST_SOURCES EXCLUDE REGEX "/tests/src/(main|test)\\.cpp$")
 add_executable(run_tests ${TEST_SOURCES})
 target_include_directories(run_tests PRIVATE ${PROJECT_SOURCE_DIR}/tests/include)
-target_link_libraries(run_tests PRIVATE tcpip epoll_threaded GTest::gmock)
+# gmock_main provides main() and initialises both GoogleTest and GMock.
+target_link_libraries(run_tests PRIVATE tcpip epoll_threaded GTest::gmock_main)
 
-add_test(NAME run_tests COMMAND run_tests)
-set_tests_properties(run_tests PROPERTIES LABELS unit)
+# One ctest test per GoogleTest test, so `ctest -R` and `ctest -j` work and a
+# failure names the test. PRE_TEST lists the tests when ctest runs rather than
+# as a post-build step: listing means running the binary, and a build should not
+# fail because a sanitizer binary aborted while being asked for its test names.
+#
+# Each test writes JUnit-style XML into build/<preset>/test-results/, which CI
+# uploads when a job fails. Everything is labelled `unit` so that integration
+# tests registered later can be selected or excluded with -L / -LE.
+include(GoogleTest)
+gtest_discover_tests(run_tests
+    DISCOVERY_MODE PRE_TEST
+    XML_OUTPUT_DIR ${CMAKE_BINARY_DIR}/test-results
+    PROPERTIES LABELS unit)

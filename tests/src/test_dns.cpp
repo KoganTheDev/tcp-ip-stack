@@ -1,4 +1,5 @@
-#include "test.h"
+#include "test_support.h"
+#include "exceptions.h"
 #include "dns.h"
 #include "dns_resolver.h"
 
@@ -141,7 +142,7 @@ namespace
 
 // --- the parser, and the one feature that makes it dangerous ----------------
 
-TEST(AQuestionAndAnswerSurviveARoundTrip)
+TEST(Dns, AQuestionAndAnswerSurviveARoundTrip)
 {
     Dns query;
     query.set_id(0x1234);
@@ -150,14 +151,14 @@ TEST(AQuestionAndAnswerSurviveARoundTrip)
 
     Dns parsed(query.to_bytes());
 
-    test_assert(parsed.get_id() == 0x1234, "id should survive");
-    test_assert(parsed.recursion_desired(), "RD should survive - it is what makes this a stub query");
-    test_assert(!parsed.is_response(), "a query is not a response");
-    test_assert(parsed.questions().size() == 1, "one question");
-    test_assert(parsed.questions()[0].name == "example.com", "name should survive");
+    ASSERT_TRUE(parsed.get_id() == 0x1234) << "id should survive";
+    ASSERT_TRUE(parsed.recursion_desired()) << "RD should survive - it is what makes this a stub query";
+    ASSERT_TRUE(!parsed.is_response()) << "a query is not a response";
+    ASSERT_TRUE(parsed.questions().size() == 1) << "one question";
+    ASSERT_TRUE(parsed.questions()[0].name == "example.com") << "name should survive";
 }
 
-TEST(ACompressionPointerIsFollowedAndLeavesTheOffsetPastThePointerItself)
+TEST(Dns, ACompressionPointerIsFollowedAndLeavesTheOffsetPastThePointerItself)
 {
     // The subtle half of compression: a compressed name occupies TWO bytes
     // where it appears, however long it expands to. Advancing by the expanded
@@ -174,15 +175,15 @@ TEST(ACompressionPointerIsFollowedAndLeavesTheOffsetPastThePointerItself)
 
     Dns parsed(b.wire);
 
-    test_assert(parsed.answers().size() == 2, "both records should parse");
-    test_assert(parsed.answers()[0].name == "example.com", "the pointer should expand");
-    test_assert(parsed.answers()[1].name == "example.com", "and so should the second");
-    test_assert(parsed.answers()[0].address() == IPv4Address("10.0.0.1"), "first address");
-    test_assert(parsed.answers()[1].address() == IPv4Address("10.0.0.2"),
-                "the second record must start where the two-byte pointer ended");
+    ASSERT_TRUE(parsed.answers().size() == 2) << "both records should parse";
+    ASSERT_TRUE(parsed.answers()[0].name == "example.com") << "the pointer should expand";
+    ASSERT_TRUE(parsed.answers()[1].name == "example.com") << "and so should the second";
+    ASSERT_TRUE(parsed.answers()[0].address() == IPv4Address("10.0.0.1")) << "first address";
+    ASSERT_TRUE(parsed.answers()[1].address() == IPv4Address("10.0.0.2"))
+        << "the second record must start where the two-byte pointer ended";
 }
 
-TEST(APointerToItselfIsRefusedRatherThanLoopingForever)
+TEST(Dns, APointerToItselfIsRefusedRatherThanLoopingForever)
 {
     // The classic DNS parser CVE. A naive expander hangs here, and since this
     // runs on an unsolicited UDP datagram, hanging is remote denial of service
@@ -190,10 +191,10 @@ TEST(APointerToItselfIsRefusedRatherThanLoopingForever)
     MessageBuilder b(1, 0x8180, 1, 0);
     b.pointer(static_cast<uint16_t>(Dns::HEADER_SIZE)); // points at itself
 
-    test_assert(throws_on_parse(b.wire), "a self-referential pointer must be refused");
+    ASSERT_TRUE(throws_on_parse(b.wire)) << "a self-referential pointer must be refused";
 }
 
-TEST(TwoPointersAimedAtEachOtherAreRefused)
+TEST(Dns, TwoPointersAimedAtEachOtherAreRefused)
 {
     // The same attack with one level of indirection, which defeats a
     // "does it point at itself" check but not a "must point backwards" one.
@@ -202,10 +203,10 @@ TEST(TwoPointersAimedAtEachOtherAreRefused)
     b.pointer(static_cast<uint16_t>(first + 2)); // forwards, to the second
     b.pointer(first);                            // back to the first
 
-    test_assert(throws_on_parse(b.wire), "a two-pointer cycle must be refused");
+    ASSERT_TRUE(throws_on_parse(b.wire)) << "a two-pointer cycle must be refused";
 }
 
-TEST(AForwardPointerIsRefusedEvenWhenItWouldTerminate)
+TEST(Dns, AForwardPointerIsRefusedEvenWhenItWouldTerminate)
 {
     // Perfectly terminating, and still refused. Requiring backwards-only is
     // what makes a cycle impossible by construction rather than merely bounded
@@ -216,10 +217,10 @@ TEST(AForwardPointerIsRefusedEvenWhenItWouldTerminate)
     b.pointer(static_cast<uint16_t>(start + 2));
     b.name("example.com");
 
-    test_assert(throws_on_parse(b.wire), "a forward pointer must be refused on principle");
+    ASSERT_TRUE(throws_on_parse(b.wire)) << "a forward pointer must be refused on principle";
 }
 
-TEST(ALabelLongerThanSixtyThreeBytesIsRefused)
+TEST(Dns, ALabelLongerThanSixtyThreeBytesIsRefused)
 {
     MessageBuilder b(1, 0x8180, 1, 0);
     b.wire.append_int<uint8_t>(64); // one over the maximum, and not a pointer
@@ -227,10 +228,10 @@ TEST(ALabelLongerThanSixtyThreeBytesIsRefused)
         b.wire.append_int<uint8_t>('a');
     b.wire.append_int<uint8_t>(0);
 
-    test_assert(throws_on_parse(b.wire), "a 64-byte label must be refused");
+    ASSERT_TRUE(throws_on_parse(b.wire)) << "a 64-byte label must be refused";
 }
 
-TEST(AReservedLabelPrefixIsRefused)
+TEST(Dns, AReservedLabelPrefixIsRefused)
 {
     // 0b01 and 0b10 have never been assigned. Treating them as a length is how
     // two parsers end up disagreeing about the same bytes.
@@ -238,10 +239,10 @@ TEST(AReservedLabelPrefixIsRefused)
     b.wire.append_int<uint8_t>(0x80);
     b.wire.append_int<uint8_t>(0x00);
 
-    test_assert(throws_on_parse(b.wire), "a reserved length prefix must be refused");
+    ASSERT_TRUE(throws_on_parse(b.wire)) << "a reserved length prefix must be refused";
 }
 
-TEST(ATruncatedRecordIsRefusedRatherThanReadPastTheEnd)
+TEST(Dns, ATruncatedRecordIsRefusedRatherThanReadPastTheEnd)
 {
     MessageBuilder b(1, 0x8180, 1, 1);
     b.name("example.com");
@@ -252,20 +253,20 @@ TEST(ATruncatedRecordIsRefusedRatherThanReadPastTheEnd)
     b.wire.append_int<uint32_t>(300);
     b.wire.append_int<uint16_t>(4); // claims four bytes of address, supplies none
 
-    test_assert(throws_on_parse(b.wire), "rdata running past the end must be refused");
+    ASSERT_TRUE(throws_on_parse(b.wire)) << "rdata running past the end must be refused";
 }
 
-TEST(AnAbsurdRecordCountDoesNotPreallocateAnything)
+TEST(Dns, AnAbsurdRecordCountDoesNotPreallocateAnything)
 {
     // The counts are attacker-chosen 16-bit numbers in a datagram of a few
     // hundred bytes. A parser that reserves what they claim allocates 65535
     // records from a 12-byte message.
     MessageBuilder b(1, 0x8180, 0, 65535);
 
-    test_assert(throws_on_parse(b.wire), "a count with no records behind it must fail on the missing bytes");
+    ASSERT_TRUE(throws_on_parse(b.wire)) << "a count with no records behind it must fail on the missing bytes";
 }
 
-TEST(AnUnknownRecordTypeSurvivesTheParse)
+TEST(Dns, AnUnknownRecordTypeSurvivesTheParse)
 {
     // An unrecognised type in a response is completely normal. Failing on it
     // would make this resolver hostage to whatever a server chooses to include.
@@ -281,26 +282,26 @@ TEST(AnUnknownRecordTypeSurvivesTheParse)
         b.wire.append_int<uint8_t>(0xab);
 
     Dns parsed(b.wire);
-    test_assert(parsed.answers().size() == 1, "the record should parse");
-    test_assert(parsed.answers()[0].rdata.size() == 3, "with its data kept verbatim");
-    test_assert(parsed.answers()[0].address() == IPv4Address(), "and no address, since it is not an A record");
+    ASSERT_TRUE(parsed.answers().size() == 1) << "the record should parse";
+    ASSERT_TRUE(parsed.answers()[0].rdata.size() == 3) << "with its data kept verbatim";
+    ASSERT_TRUE(parsed.answers()[0].address() == IPv4Address()) << "and no address, since it is not an A record";
 }
 
 // --- the resolver, and what stops a forged answer ---------------------------
 
-TEST(AQuerySetsRecursionDesiredAndAsksTheFirstServer)
+TEST(Dns, AQuerySetsRecursionDesiredAndAsksTheFirstServer)
 {
     ResolverHarness h;
     h.resolver.resolve("example.com", h.recorder());
 
-    test_assert(h.sent.size() == 1, "one query should go out");
-    test_assert(h.last().server == SERVER, "to the first configured server");
-    test_assert(h.last().message->recursion_desired(), "RD is what makes this a stub - the server does the walk");
-    test_assert(h.last().message->questions().size() == 1, "asking one question");
-    test_assert(h.last().message->questions()[0].name == "example.com", "for the right name");
+    ASSERT_TRUE(h.sent.size() == 1) << "one query should go out";
+    ASSERT_TRUE(h.last().server == SERVER) << "to the first configured server";
+    ASSERT_TRUE(h.last().message->recursion_desired()) << "RD is what makes this a stub - the server does the walk";
+    ASSERT_TRUE(h.last().message->questions().size() == 1) << "asking one question";
+    ASSERT_TRUE(h.last().message->questions()[0].name == "example.com") << "for the right name";
 }
 
-TEST(EveryQueryGetsAFreshRandomSourcePort)
+TEST(Dns, EveryQueryGetsAFreshRandomSourcePort)
 {
     // The single highest-value thing a stub resolver does. A fixed source port
     // leaves an attacker only the 16-bit id to guess; a random one doubles the
@@ -322,29 +323,29 @@ TEST(EveryQueryGetsAFreshRandomSourcePort)
 
     for (size_t i = 0; i < ports.size(); i++)
     {
-        test_assert(ports[i] >= 49152, "ports must be in the ephemeral range");
+        ASSERT_TRUE(ports[i] >= 49152) << "ports must be in the ephemeral range";
         for (size_t j = i + 1; j < ports.size(); j++)
         {
-            test_assert(ports[i] != ports[j], "outstanding queries must not share a source port");
-            test_assert(ids[i] != ids[j], "nor a transaction id");
-            test_assert(ports[i] + 1 != ports[j], "and ports must not be a counter");
-            test_assert(ids[i] + 1 != ids[j], "nor ids");
+            ASSERT_TRUE(ports[i] != ports[j]) << "outstanding queries must not share a source port";
+            ASSERT_TRUE(ids[i] != ids[j]) << "nor a transaction id";
+            ASSERT_TRUE(ports[i] + 1 != ports[j]) << "and ports must not be a counter";
+            ASSERT_TRUE(ids[i] + 1 != ids[j]) << "nor ids";
         }
     }
 }
 
-TEST(AnAnswerOnTheRightPortWithTheRightIdIsAccepted)
+TEST(Dns, AnAnswerOnTheRightPortWithTheRightIdIsAccepted)
 {
     ResolverHarness h;
     h.resolver.resolve("example.com", h.recorder());
     h.reply(good_response(h.last().message->get_id(), "example.com"));
 
-    test_assert(h.callbacks == 1, "the callback should fire exactly once");
-    test_assert(h.results["example.com"].size() == 1, "with one address");
-    test_assert(h.results["example.com"][0] == ANSWER, "the one the server gave");
+    ASSERT_TRUE(h.callbacks == 1) << "the callback should fire exactly once";
+    ASSERT_TRUE(h.results["example.com"].size() == 1) << "with one address";
+    ASSERT_TRUE(h.results["example.com"][0] == ANSWER) << "the one the server gave";
 }
 
-TEST(AnAnswerWithTheWrongTransactionIdIsIgnored)
+TEST(Dns, AnAnswerWithTheWrongTransactionIdIsIgnored)
 {
     ResolverHarness h;
     h.resolver.resolve("example.com", h.recorder());
@@ -352,16 +353,16 @@ TEST(AnAnswerWithTheWrongTransactionIdIsIgnored)
 
     h.reply(good_response(static_cast<uint16_t>(real_id ^ 0xffff), "example.com"));
 
-    test_assert(h.callbacks == 0, "a forged id must not answer the query");
+    ASSERT_TRUE(h.callbacks == 0) << "a forged id must not answer the query";
 
     // And crucially the real answer still works: a forged reply must not be
     // able to cancel the outstanding query, or guessing wrong would be a
     // denial of service even when guessing right fails.
     h.reply(good_response(real_id, "example.com"));
-    test_assert(h.callbacks == 1, "the genuine answer must still be accepted afterwards");
+    ASSERT_TRUE(h.callbacks == 1) << "the genuine answer must still be accepted afterwards";
 }
 
-TEST(AnAnswerArrivingOnTheWrongPortIsIgnored)
+TEST(Dns, AnAnswerArrivingOnTheWrongPortIsIgnored)
 {
     ResolverHarness h;
     h.resolver.resolve("example.com", h.recorder());
@@ -370,10 +371,10 @@ TEST(AnAnswerArrivingOnTheWrongPortIsIgnored)
     h.resolver.on_datagram(SERVER, DnsResolver::SERVER_PORT, wrong_port,
                            good_response(h.last().message->get_id(), "example.com"));
 
-    test_assert(h.callbacks == 0, "the port is half the entropy - it must be checked");
+    ASSERT_TRUE(h.callbacks == 0) << "the port is half the entropy - it must be checked";
 }
 
-TEST(AnAnswerFromAnAddressThatWasNotAskedIsIgnored)
+TEST(Dns, AnAnswerFromAnAddressThatWasNotAskedIsIgnored)
 {
     ResolverHarness h;
     h.resolver.resolve("example.com", h.recorder());
@@ -381,10 +382,10 @@ TEST(AnAnswerFromAnAddressThatWasNotAskedIsIgnored)
     h.resolver.on_datagram(IPv4Address("6.6.6.6"), DnsResolver::SERVER_PORT, h.last().source_port,
                            good_response(h.last().message->get_id(), "example.com"));
 
-    test_assert(h.callbacks == 0, "a reply must come from the server that was asked");
+    ASSERT_TRUE(h.callbacks == 0) << "a reply must come from the server that was asked";
 }
 
-TEST(AnAnswerForADifferentNameIsIgnored)
+TEST(Dns, AnAnswerForADifferentNameIsIgnored)
 {
     // The shape a poisoning attempt takes when the attacker got the port and
     // the id right but is aiming at another name.
@@ -393,10 +394,10 @@ TEST(AnAnswerForADifferentNameIsIgnored)
 
     h.reply(good_response(h.last().message->get_id(), "evil.example.net"));
 
-    test_assert(h.callbacks == 0, "the question section must echo what was asked");
+    ASSERT_TRUE(h.callbacks == 0) << "the question section must echo what was asked";
 }
 
-TEST(AMalformedReplyDoesNotFailTheOutstandingQuery)
+TEST(Dns, AMalformedReplyDoesNotFailTheOutstandingQuery)
 {
     // Failing here would let one garbage datagram deny resolution of any name.
     ResolverHarness h;
@@ -405,13 +406,13 @@ TEST(AMalformedReplyDoesNotFailTheOutstandingQuery)
 
     h.reply(Bytes(4));
     h.reply(Bytes());
-    test_assert(h.callbacks == 0, "garbage must be dropped, not answered");
+    ASSERT_TRUE(h.callbacks == 0) << "garbage must be dropped, not answered";
 
     h.reply(good_response(id, "example.com"));
-    test_assert(h.callbacks == 1, "and the real answer must still land");
+    ASSERT_TRUE(h.callbacks == 1) << "and the real answer must still land";
 }
 
-TEST(AnAnswerIsCachedAndServedWithoutASecondQuery)
+TEST(Dns, AnAnswerIsCachedAndServedWithoutASecondQuery)
 {
     ResolverHarness h;
     h.resolver.resolve("example.com", h.recorder());
@@ -420,11 +421,11 @@ TEST(AnAnswerIsCachedAndServedWithoutASecondQuery)
 
     h.resolver.resolve("example.com", h.recorder());
 
-    test_assert(h.sent.size() == after_first, "a cached name must not be queried again");
-    test_assert(h.callbacks == 2, "but the callback must still fire");
+    ASSERT_TRUE(h.sent.size() == after_first) << "a cached name must not be queried again";
+    ASSERT_TRUE(h.callbacks == 2) << "but the callback must still fire";
 }
 
-TEST(TheCacheIsCaseInsensitiveAndIgnoresATrailingDot)
+TEST(Dns, TheCacheIsCaseInsensitiveAndIgnoresATrailingDot)
 {
     ResolverHarness h;
     h.resolver.resolve("example.com", h.recorder());
@@ -433,10 +434,10 @@ TEST(TheCacheIsCaseInsensitiveAndIgnoresATrailingDot)
 
     h.resolver.resolve("EXAMPLE.com.", h.recorder());
 
-    test_assert(h.sent.size() == after_first, "DNS names are case-insensitive and may be rooted");
+    ASSERT_TRUE(h.sent.size() == after_first) << "DNS names are case-insensitive and may be rooted";
 }
 
-TEST(ACachedAnswerExpiresWhenItsTtlRunsOut)
+TEST(Dns, ACachedAnswerExpiresWhenItsTtlRunsOut)
 {
     ResolverHarness h;
     h.resolver.resolve("example.com", h.recorder());
@@ -446,10 +447,10 @@ TEST(ACachedAnswerExpiresWhenItsTtlRunsOut)
     h.resolver.on_time_passed(6000);
     h.resolver.resolve("example.com", h.recorder());
 
-    test_assert(h.sent.size() == after_first + 1, "an expired name must be asked again");
+    ASSERT_TRUE(h.sent.size() == after_first + 1) << "an expired name must be asked again";
 }
 
-TEST(ASecondRequestForAnInFlightNameJoinsItRatherThanRacingIt)
+TEST(Dns, ASecondRequestForAnInFlightNameJoinsItRatherThanRacingIt)
 {
     // Two queries for one name would be two chances for an attacker to win the
     // race, on top of being wasteful.
@@ -457,28 +458,28 @@ TEST(ASecondRequestForAnInFlightNameJoinsItRatherThanRacingIt)
     h.resolver.resolve("example.com", h.recorder());
     h.resolver.resolve("example.com", h.recorder());
 
-    test_assert(h.sent.size() == 1, "only one query should be in flight");
+    ASSERT_TRUE(h.sent.size() == 1) << "only one query should be in flight";
 
     h.reply(good_response(h.last().message->get_id(), "example.com"));
-    test_assert(h.callbacks == 2, "but both callers must be answered");
+    ASSERT_TRUE(h.callbacks == 2) << "but both callers must be answered";
 }
 
-TEST(AnUnansweredQueryRetriesThenMovesToTheNextServer)
+TEST(Dns, AnUnansweredQueryRetriesThenMovesToTheNextServer)
 {
     ResolverHarness h;
     h.resolver.resolve("example.com", h.recorder());
-    test_assert(h.last().server == SERVER, "first server first");
+    ASSERT_TRUE(h.last().server == SERVER) << "first server first";
 
     h.resolver.on_time_passed(2100);
-    test_assert(h.sent.size() == 2, "a retry");
-    test_assert(h.last().server == SERVER, "still the first server");
+    ASSERT_TRUE(h.sent.size() == 2) << "a retry";
+    ASSERT_TRUE(h.last().server == SERVER) << "still the first server";
 
     h.resolver.on_time_passed(2100);
-    test_assert(h.sent.size() == 3, "then the second server");
-    test_assert(h.last().server == OTHER_SERVER, "a dead server must not stall resolution");
+    ASSERT_TRUE(h.sent.size() == 3) << "then the second server";
+    ASSERT_TRUE(h.last().server == OTHER_SERVER) << "a dead server must not stall resolution";
 }
 
-TEST(AQueryNoServerAnswersFailsRatherThanHangingForever)
+TEST(Dns, AQueryNoServerAnswersFailsRatherThanHangingForever)
 {
     ResolverHarness h;
     h.resolver.resolve("example.com", h.recorder());
@@ -488,12 +489,12 @@ TEST(AQueryNoServerAnswersFailsRatherThanHangingForever)
         h.resolver.on_time_passed(2100);
     }
 
-    test_assert(h.callbacks == 1, "the callback must fire exactly once, even on failure");
-    test_assert(h.results["example.com"].empty(), "with no addresses");
-    test_assert(!h.resolver.busy(), "and nothing left outstanding");
+    ASSERT_TRUE(h.callbacks == 1) << "the callback must fire exactly once, even on failure";
+    ASSERT_TRUE(h.results["example.com"].empty()) << "with no addresses";
+    ASSERT_TRUE(!h.resolver.busy()) << "and nothing left outstanding";
 }
 
-TEST(NxdomainIsAnAnswerNotAFailureToGetOne)
+TEST(Dns, NxdomainIsAnAnswerNotAFailureToGetOne)
 {
     // Asking the next server would be asking the same question of somebody
     // less likely to know.
@@ -505,12 +506,12 @@ TEST(NxdomainIsAnAnswerNotAFailureToGetOne)
     b.question_tail();
     h.reply(b.wire);
 
-    test_assert(h.callbacks == 1, "NXDOMAIN answers the query");
-    test_assert(h.results["nope.example.com"].empty(), "with nothing");
-    test_assert(h.sent.size() == 1, "and must not be retried against another server");
+    ASSERT_TRUE(h.callbacks == 1) << "NXDOMAIN answers the query";
+    ASSERT_TRUE(h.results["nope.example.com"].empty()) << "with nothing";
+    ASSERT_TRUE(h.sent.size() == 1) << "and must not be retried against another server";
 }
 
-TEST(ATruncatedAnswerFailsRatherThanReturningAPartialAddressSet)
+TEST(Dns, ATruncatedAnswerFailsRatherThanReturningAPartialAddressSet)
 {
     // DNS over TCP is out of scope, and a partial answer set is worse than
     // none - the address it omits may be the only one that works.
@@ -521,11 +522,11 @@ TEST(ATruncatedAnswerFailsRatherThanReturningAPartialAddressSet)
     wire[2] = static_cast<byte_t>(wire[2] | 0x02); // set TC
     h.reply(wire);
 
-    test_assert(h.callbacks == 1, "a truncated answer must resolve the call");
-    test_assert(h.results["example.com"].empty(), "as a failure, not a partial success");
+    ASSERT_TRUE(h.callbacks == 1) << "a truncated answer must resolve the call";
+    ASSERT_TRUE(h.results["example.com"].empty()) << "as a failure, not a partial success";
 }
 
-TEST(FollowingAnAliasUsesAFreshIdAndPort)
+TEST(Dns, FollowingAnAliasUsesAFreshIdAndPort)
 {
     // A CNAME chase is a new query on the network, so reusing the id and port
     // would hand an attacker who saw the first one the second for free.
@@ -552,18 +553,18 @@ TEST(FollowingAnAliasUsesAFreshIdAndPort)
     b.wire.insert(b.wire.end(), target.begin(), target.end());
     h.reply(b.wire);
 
-    test_assert(h.sent.size() == 2, "the alias should be chased");
-    test_assert(h.last().message->questions()[0].name == "example.com", "asking for the target");
-    test_assert(h.last().message->get_id() != first_id, "with a fresh transaction id");
-    test_assert(h.last().source_port != first_port, "and a fresh source port");
-    test_assert(h.callbacks == 0, "the original caller is still waiting");
+    ASSERT_TRUE(h.sent.size() == 2) << "the alias should be chased";
+    ASSERT_TRUE(h.last().message->questions()[0].name == "example.com") << "asking for the target";
+    ASSERT_TRUE(h.last().message->get_id() != first_id) << "with a fresh transaction id";
+    ASSERT_TRUE(h.last().source_port != first_port) << "and a fresh source port";
+    ASSERT_TRUE(h.callbacks == 0) << "the original caller is still waiting";
 
     h.reply(good_response(h.last().message->get_id(), "example.com"));
-    test_assert(h.callbacks == 1, "and is answered once the target resolves");
-    test_assert(h.results["example.com"][0] == ANSWER, "with the target's address");
+    ASSERT_TRUE(h.callbacks == 1) << "and is answered once the target resolves";
+    ASSERT_TRUE(h.results["example.com"][0] == ANSWER) << "with the target's address";
 }
 
-TEST(ResolvingWithNoServersConfiguredFailsImmediately)
+TEST(Dns, ResolvingWithNoServersConfiguredFailsImmediately)
 {
     std::vector<SentQuery> sent;
     DnsResolver resolver([&sent](const IPv4Address& s, uint16_t sp, const Bytes& p)
@@ -573,14 +574,14 @@ TEST(ResolvingWithNoServersConfiguredFailsImmediately)
                      [&calls](const std::string&, const std::vector<IPv4Address>& a)
                      {
                          calls++;
-                         test_assert(a.empty(), "no addresses");
+                         REQUIRE_TRUE(a.empty(), "no addresses");
                      });
 
-    test_assert(calls == 1, "the callback must fire even with nowhere to ask");
-    test_assert(sent.empty(), "and nothing should go on the wire");
+    ASSERT_TRUE(calls == 1) << "the callback must fire even with nowhere to ask";
+    ASSERT_TRUE(sent.empty()) << "and nothing should go on the wire";
 }
 
-TEST(AQueryThatGivesUpStillReleasesItsPort)
+TEST(Dns, AQueryThatGivesUpStillReleasesItsPort)
 {
     // The failure path matters as much as the success path: a name that never
     // resolves must not leave its socket behind, or a host with a dead DNS
@@ -603,22 +604,22 @@ TEST(AQueryThatGivesUpStillReleasesItsPort)
     resolver.set_servers({SERVER, OTHER_SERVER});
 
     resolver.resolve("nowhere.example.com", [](const std::string&, const std::vector<IPv4Address>&) {});
-    test_assert(bound.size() == 1, "one port taken");
-    test_assert(released.empty(), "and not released while the query is still trying");
+    ASSERT_TRUE(bound.size() == 1) << "one port taken";
+    ASSERT_TRUE(released.empty()) << "and not released while the query is still trying";
 
     for (int i = 0; i < 6; i++)
     {
         resolver.on_time_passed(2100); // exhaust both servers
     }
 
-    test_assert(!resolver.busy(), "the query should have given up");
-    test_assert(released.size() == bound.size(), "every port taken must be released exactly once - "
-                                                     + std::to_string(bound.size()) + " taken, "
-                                                     + std::to_string(released.size()) + " released");
-    test_assert(released[0] == bound[0], "and it must be the port that was taken");
+    ASSERT_TRUE(!resolver.busy()) << "the query should have given up";
+    ASSERT_TRUE(released.size() == bound.size()) << "every port taken must be released exactly once - "
+                                                        + std::to_string(bound.size()) + " taken, "
+                                                        + std::to_string(released.size()) + " released";
+    ASSERT_TRUE(released[0] == bound[0]) << "and it must be the port that was taken";
 }
 
-TEST(AResolvedQueryReleasesItsPortToo)
+TEST(Dns, AResolvedQueryReleasesItsPortToo)
 {
     ResolverHarness h;
     std::vector<uint16_t> released;
@@ -628,12 +629,12 @@ TEST(AResolvedQueryReleasesItsPortToo)
     uint16_t port = h.last().source_port;
     h.reply(good_response(h.last().message->get_id(), "example.com"));
 
-    test_assert(h.callbacks == 1, "the query should have been answered");
-    test_assert(released.size() == 1, "and its port released exactly once");
-    test_assert(released[0] == port, "the port it used");
+    ASSERT_TRUE(h.callbacks == 1) << "the query should have been answered";
+    ASSERT_TRUE(released.size() == 1) << "and its port released exactly once";
+    ASSERT_TRUE(released[0] == port) << "the port it used";
 }
 
-TEST(AnAliasChaseReleasesTheFirstPortBeforeTakingASecond)
+TEST(Dns, AnAliasChaseReleasesTheFirstPortBeforeTakingASecond)
 {
     // The CNAME path abandons its port for a fresh one mid-query. That is the
     // other place a port stops being used, and it is easy to miss because the
@@ -663,12 +664,12 @@ TEST(AnAliasChaseReleasesTheFirstPortBeforeTakingASecond)
     b.wire.insert(b.wire.end(), target.begin(), target.end());
     h.reply(b.wire);
 
-    test_assert(released.size() == 1, "the abandoned port must be released as the alias is chased");
-    test_assert(released[0] == first_port, "specifically the first one");
-    test_assert(h.last().source_port != first_port, "and a fresh one taken");
+    ASSERT_TRUE(released.size() == 1) << "the abandoned port must be released as the alias is chased";
+    ASSERT_TRUE(released[0] == first_port) << "specifically the first one";
+    ASSERT_TRUE(h.last().source_port != first_port) << "and a fresh one taken";
 }
 
-TEST(APortTheHostReportsInUseIsNeverChosen)
+TEST(Dns, APortTheHostReportsInUseIsNeverChosen)
 {
     // The resolver half of the socket-hijack fix: given the same seed, a run
     // told that the ports it would have picked are taken must pick others.
@@ -689,10 +690,10 @@ TEST(APortTheHostReportsInUseIsNeverChosen)
     {
         h.resolver.resolve("host" + std::to_string(i) + ".example.com", h.recorder());
     }
-    test_assert(h.sent.size() == 8, "every query should still go out");
+    ASSERT_TRUE(h.sent.size() == 8) << "every query should still go out";
     for (const SentQuery& q : h.sent)
     {
-        test_assert(taken.count(q.source_port) == 0,
-                    "port " + std::to_string(q.source_port) + " was reported in use and must not be chosen");
+        ASSERT_TRUE(taken.count(q.source_port) == 0)
+            << "port " + std::to_string(q.source_port) + " was reported in use and must not be chosen";
     }
 }

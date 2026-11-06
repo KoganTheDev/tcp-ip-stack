@@ -1,4 +1,4 @@
-#include "test.h"
+#include "test_support.h"
 #include "exceptions.h"
 #include "ethernet.h"
 #include "arp.h"
@@ -56,32 +56,32 @@ namespace
     }
 }
 
-TEST(EthernetFromBytesNeverCrashesOnGarbage)
+TEST(ProtocolFuzz, EthernetFromBytesNeverCrashesOnGarbage)
 {
     fuzz_from_bytes<Ethernet>(128);
 }
 
-TEST(ArpFromBytesNeverCrashesOnGarbage)
+TEST(ProtocolFuzz, ArpFromBytesNeverCrashesOnGarbage)
 {
     fuzz_from_bytes<Arp>(64);
 }
 
-TEST(IpFromBytesNeverCrashesOnGarbage)
+TEST(ProtocolFuzz, IpFromBytesNeverCrashesOnGarbage)
 {
     fuzz_from_bytes<Ip>(128);
 }
 
-TEST(TcpFromBytesNeverCrashesOnGarbage)
+TEST(ProtocolFuzz, TcpFromBytesNeverCrashesOnGarbage)
 {
     fuzz_from_bytes<Tcp>(128);
 }
 
-TEST(UdpFromBytesNeverCrashesOnGarbage)
+TEST(ProtocolFuzz, UdpFromBytesNeverCrashesOnGarbage)
 {
     fuzz_from_bytes<Udp>(128);
 }
 
-TEST(IcmpFromBytesNeverCrashesOnGarbage)
+TEST(ProtocolFuzz, IcmpFromBytesNeverCrashesOnGarbage)
 {
     fuzz_from_bytes<Icmp>(128);
 }
@@ -89,7 +89,7 @@ TEST(IcmpFromBytesNeverCrashesOnGarbage)
 // Truncated-but-plausible-looking input is worth testing separately from
 // pure noise: a header that claims a length longer than the data actually
 // present is the classic way an off-by-one in bounds checking gets missed.
-TEST(TruncatedButPlausibleHeadersDoNotCrash)
+TEST(ProtocolFuzz, TruncatedButPlausibleHeadersDoNotCrash)
 {
     // A real Ethernet+IP+TCP header's opening bytes, cut off at every
     // possible length - including lengths that pass Ethernet's own size
@@ -111,7 +111,7 @@ TEST(TruncatedButPlausibleHeadersDoNotCrash)
     }
 }
 
-TEST(DhcpFromBytesNeverCrashesOnGarbage)
+TEST(ProtocolFuzz, DhcpFromBytesNeverCrashesOnGarbage)
 {
     // The one parser here that runs before this host has an address at all,
     // on datagrams from any source, with nothing in the protocol
@@ -122,7 +122,7 @@ TEST(DhcpFromBytesNeverCrashesOnGarbage)
     fuzz_from_bytes<Dhcp>(512);
 }
 
-TEST(DnsFromBytesNeverCrashesOnGarbage)
+TEST(ProtocolFuzz, DnsFromBytesNeverCrashesOnGarbage)
 {
     // Name compression makes this the most dangerous parser in the stack: a
     // label byte can be a 14-bit offset back into the same buffer, chosen by
