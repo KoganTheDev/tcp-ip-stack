@@ -9,6 +9,7 @@
 #include <string>
 #include <cstdint>
 #include <functional>
+#include <random>
 
 #include "tun_wrapper.h"
 #include "packet_channel.h"
@@ -206,6 +207,18 @@ public:
     // climbing count is a blind spoofer guessing cookies (see syn_cookie.h).
     uint64_t syn_cookie_check_failures() const { return _syn_cookie_failures; }
 
+    // RFC 5961 challenge ACKs, across every connection. Each is a reply to a
+    // segment anyone can forge (an in-window RST, a SYN on an open
+    // connection, an ACK far behind SND.UNA), so section 7 asks for them to
+    // be throttled. The budget is per stack and per second of the stack's
+    // elapsed-ms clock: about CHALLENGE_ACK_LIMIT_PER_SECOND, which is Linux's
+    // net.ipv4.tcp_challenge_ack_limit default, with each second's actual
+    // limit drawn at random (see _draw_challenge_ack_limit). Suppressed ones
+    // are counted too: a climbing count means somebody is probing.
+    static constexpr uint64_t CHALLENGE_ACK_LIMIT_PER_SECOND = 1000;
+    uint64_t challenge_acks_sent() const { return _challenge_acks_sent; }
+    uint64_t challenge_acks_suppressed() const { return _challenge_acks_suppressed; }
+
     // Pops one ESTABLISHED connection waiting on this port, or nullptr if
     // none are ready. The returned pointer is owned by NetworkStack for the
     // connection's whole lifetime - it stays valid until the connection
@@ -362,6 +375,13 @@ private:
     // method. The actual erase happens later, safely, in
     // _reap_closed_connections().
     void _watch_for_close(TcpConnection& connection);
+    // Everything a freshly created connection is hooked up to: the close watch
+    // above, and the stack-wide challenge-ACK budget.
+    void _wire_connection(TcpConnection& connection);
+    // The gate installed on every connection (TcpConnection::
+    // set_challenge_ack_gate): true while this second's budget lasts.
+    bool _may_send_challenge_ack();
+    uint64_t _draw_challenge_ack_limit();
     // Records a freshly accepted SYN_RECEIVED connection against its port, and
     // removes it on its first transition anywhere else - completion, RST,
     // give-up, eviction - which is every way out of the state, so the record
@@ -593,6 +613,17 @@ private:
     // For the warning: failures counted within the current cookie slot.
     uint64_t _cookie_failure_slot = 0;
     uint64_t _cookie_failures_in_slot = 0;
+
+    // Challenge-ACK throttling (see challenge_acks_sent()). Not a security
+    // secret, so an ordinary engine is enough - it only has to be
+    // unpredictable to someone counting replies, not cryptographically.
+    std::minstd_rand _challenge_ack_rng{std::random_device{}()};
+    bool _challenge_ack_window_open = false; // false until the first challenge ACK draws a limit
+    uint64_t _challenge_ack_window_start_ms = 0;
+    uint64_t _challenge_ack_window_limit = 0;
+    uint64_t _challenge_acks_in_window = 0;
+    uint64_t _challenge_acks_sent = 0;
+    uint64_t _challenge_acks_suppressed = 0;
 
     // Null until start_dhcp(). Owned here rather than by the application
     // because it reconfigures the interface, which is this class's state.

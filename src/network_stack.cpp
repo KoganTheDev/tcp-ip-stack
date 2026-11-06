@@ -308,7 +308,7 @@ TcpConnection* NetworkStack::connect(const IPv4Address& remote_ip, uint16_t remo
         { this->_send_tcp_segment(remote_ip, header, payload); }, this->_primary().config.local_mss());
 
     TcpConnection* connection_ptr = connection.get();
-    this->_watch_for_close(*connection_ptr);
+    this->_wire_connection(*connection_ptr);
     this->_connections_by_id[connection_ptr->get_id()] = key;
     this->_connections[key] = std::move(connection);
 
@@ -502,6 +502,48 @@ UdpSocket* NetworkStack::_bind_udp_socket(uint16_t port)
 bool NetworkStack::unbind_udp(uint16_t port)
 {
     return this->_udp_sockets.erase(port) > 0;
+}
+
+void NetworkStack::_wire_connection(TcpConnection& connection)
+{
+    this->_watch_for_close(connection);
+    connection.set_challenge_ack_gate([this]() { return this->_may_send_challenge_ack(); });
+}
+
+bool NetworkStack::_may_send_challenge_ack()
+{
+    // A fresh one-second window on the stack's own clock, so the limit is a
+    // rate in real time whatever the caller's polling cadence.
+    if (!this->_challenge_ack_window_open
+        || this->_now_ms - this->_challenge_ack_window_start_ms >= static_cast<uint64_t>(MS_PER_SECOND))
+    {
+        this->_challenge_ack_window_open = true;
+        this->_challenge_ack_window_start_ms = this->_now_ms;
+        this->_challenge_acks_in_window = 0;
+        this->_challenge_ack_window_limit = this->_draw_challenge_ack_limit();
+    }
+    if (this->_challenge_acks_in_window >= this->_challenge_ack_window_limit)
+    {
+        this->_challenge_acks_suppressed++;
+        LOG_DEBUG("NetworkStack: challenge ACK suppressed - " << this->_challenge_acks_in_window
+                                                              << " already sent this second");
+        return false;
+    }
+    this->_challenge_acks_in_window++;
+    this->_challenge_acks_sent++;
+    return true;
+}
+
+uint64_t NetworkStack::_draw_challenge_ack_limit()
+{
+    // Linux's fix for CVE-2016-5696: a fixed host-wide limit is a side channel.
+    // An off-path attacker with its own connection to this host can count how
+    // many challenge ACKs it gets back in a second and so learn whether its
+    // spoofed probes at someone else's connection drew some - which reveals
+    // the four-tuple and then the sequence window. Drawing each second's limit
+    // from [LIMIT/2, LIMIT * 3/2) takes the count away from it.
+    std::uniform_int_distribution<uint64_t> spread(0, CHALLENGE_ACK_LIMIT_PER_SECOND - 1);
+    return CHALLENGE_ACK_LIMIT_PER_SECOND / 2 + spread(this->_challenge_ack_rng);
 }
 
 void NetworkStack::_watch_for_close(TcpConnection& connection)
@@ -1161,7 +1203,7 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
         return;
     }
 
-    this->_watch_for_close(*connection);
+    this->_wire_connection(*connection);
     this->_track_half_open(*connection, key.local_port);
     this->_connections_by_id[connection->get_id()] = key;
     this->_connections[key] = std::move(connection);
@@ -1254,7 +1296,7 @@ bool NetworkStack::_try_complete_cookie_handshake(const Ip& ip, const Tcp& tcp)
     connection->accept_cookie_handshake(peer_isn, mss);
 
     TcpConnection* connection_ptr = connection.get();
-    this->_watch_for_close(*connection_ptr);
+    this->_wire_connection(*connection_ptr);
     this->_connections_by_id[connection_ptr->get_id()] = key;
     this->_connections[key] = std::move(connection);
     this->_pending_accepts[local_port].push_back(key);

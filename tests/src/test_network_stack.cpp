@@ -3417,3 +3417,65 @@ TEST(NetworkStack, SimultaneousOpenCompletesAndIsNotOfferedToAccept)
     ASSERT_TRUE(client->get_state() == TcpState::ESTABLISHED) << "the peer's SYN-ACK completes the handshake";
     ASSERT_TRUE(stack->accept(syn.src_port) == nullptr) << "an active open is never handed out by accept()";
 }
+
+namespace
+{
+    // Drives a passive open on port 80 from the peer's port 40000 (peer ISN
+    // 1000) to ESTABLISHED and returns our ISN. Leaves the outbound log empty.
+    uint32_t establish_passive(NetworkStack& stack, FakePacketChannel& channel)
+    {
+        stack.listen(80);
+        channel.push_inbound(build_arp_request());
+        channel.push_inbound(build_tcp(FLAG_SYN, 1000, 0, 40000, 80));
+        stack.poll();
+        uint32_t our_isn = find_tcp(channel.outbound_frames()).seq;
+        channel.push_inbound(build_tcp(FLAG_ACK, 1001, our_isn + 1, 40000, 80));
+        stack.poll();
+        channel.clear_outbound();
+        return our_isn;
+    }
+
+    size_t count_tcp_frames(const std::vector<Bytes>& frames)
+    {
+        size_t count = 0;
+        for (const Bytes& frame : frames)
+        {
+            count += view_tcp(frame).is_tcp ? 1 : 0;
+        }
+        return count;
+    }
+}
+
+// RFC 5961 section 7: challenge ACKs are throttled stack-wide, per second of
+// real time. A flood of in-window RSTs inside one second draws no more than
+// the budget, which is about CHALLENGE_ACK_LIMIT_PER_SECOND but drawn at
+// random each second (so it cannot be counted from outside); the next second
+// gets a fresh one. Both what was sent and what was held back are counted.
+TEST(NetworkStack, ChallengeAcksAreRateLimitedPerSecondAndCounted)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    uint32_t our_isn = establish_passive(*stack, *channel);
+    TcpConnection* connection = stack->accept(80);
+    ASSERT_TRUE(connection != nullptr) << "precondition: established";
+
+    const uint64_t limit = NetworkStack::CHALLENGE_ACK_LIMIT_PER_SECOND;
+    const uint64_t flood = 2 * limit;
+    for (uint64_t i = 0; i < flood; i++)
+    {
+        channel->push_inbound(build_tcp(FLAG_RST | FLAG_ACK, 1500, our_isn + 1, 40000, 80));
+        stack->poll();
+    }
+    size_t answered = count_tcp_frames(channel->outbound_frames());
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED) << "in-window RSTs off RCV.NXT never reset";
+    ASSERT_TRUE(answered >= limit / 2 && answered < limit + limit / 2)
+        << "one second's challenge ACKs stay within the drawn budget, got " << answered;
+    ASSERT_TRUE(stack->challenge_acks_sent() == answered) << "every challenge ACK sent is counted";
+    ASSERT_TRUE(stack->challenge_acks_suppressed() == flood - answered) << "and every one held back";
+
+    stack->on_time_passed(1000);
+    channel->clear_outbound();
+    channel->push_inbound(build_tcp(FLAG_RST | FLAG_ACK, 1500, our_isn + 1, 40000, 80));
+    stack->poll();
+    ASSERT_TRUE(count_tcp_frames(channel->outbound_frames()) == 1) << "a new second brings a new budget";
+}
