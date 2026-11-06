@@ -2443,3 +2443,40 @@ TEST(TcpConnection, DataPlusOptionsNeverExceedsTheMss)
             << "payload " << segment.payload << " + options " << segment.option_bytes << " exceeds the 1460 MSS";
     }
 }
+
+// RFC 6093: implementations disagree on where the urgent pointer points, and
+// middleboxes clear it, so it cannot be relied on. This stack follows the
+// RFC's advice for implementations that do not use it: the URG bit and the
+// pointer are ignored for delivery, and "urgent" bytes arrive inline, in
+// sequence order, like any others (the SO_OOBINLINE behaviour). It never sets
+// URG on what it sends.
+TEST(TcpConnection, UrgentDataIsDeliveredInlineAndUrgIsNeverSent)
+{
+    struct Sent
+    {
+        bool urg;
+        uint16_t urgent_ptr;
+    };
+    std::vector<Sent> sent;
+    TcpConnection connection(8080, IPv4Address("10.0.0.1"), 12345, 1000, [&sent](const Tcp& header, const Bytes&)
+                             { sent.push_back({header.get_urg(), header.get_urgent_ptr()}); });
+    connection.accept_incoming_syn(500);
+    connection.on_segment(*make_incoming_segment(501, 1001, FLAG_ACK));
+
+    Bytes received;
+    connection.set_data_ready_callback([&received, &connection]() { received |= connection.read(); });
+
+    constexpr uint8_t FLAG_URG = 0x20;
+    Tcp urgent(12345, 8080, 501, 1001, 5, FLAG_URG | FLAG_ACK, 65535, 0, 2);
+    urgent /= std::make_unique<Raw>(Bytes::from_hex("61626364"));
+    connection.on_segment(urgent);
+    connection.on_segment(*make_incoming_segment(505, 1001, FLAG_ACK, Bytes::from_hex("6566")));
+    ASSERT_TRUE(received.to_hex() == "616263646566") << "urgent bytes are ordinary in-sequence data";
+
+    connection.send(Bytes(3000));
+    connection.close();
+    for (const Sent& segment : sent)
+    {
+        ASSERT_TRUE(!segment.urg && segment.urgent_ptr == 0) << "no segment we send carries URG";
+    }
+}

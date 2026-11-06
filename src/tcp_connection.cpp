@@ -1391,6 +1391,11 @@ void TcpConnection::on_segment(const Tcp& segment)
     // places the FIN one past the end of that data in sequence space, and
     // _handle_fin() has to know where the FIN actually sits. Held as a pointer
     // rather than a copied Bytes so states that ignore data pay nothing.
+    //
+    // URG and the urgent pointer are deliberately never looked at (RFC 6093):
+    // implementations disagree on what the pointer points to and middleboxes
+    // clear it, so "urgent" bytes are delivered inline, in sequence order,
+    // like any others. Nothing this stack sends ever sets URG.
     const Raw* payload_layer = segment.has_next_layer() ? dynamic_cast<const Raw*>(&segment.get_next_layer()) : nullptr;
     uint32_t payload_size = payload_layer ? static_cast<uint32_t>(payload_layer->get_data().size()) : 0;
 
