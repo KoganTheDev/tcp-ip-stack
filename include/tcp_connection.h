@@ -322,7 +322,16 @@ public:
 
 private:
     void _transition(TcpState new_state);
-    Tcp _build_header(uint8_t flags, uint32_t seq) const;
+    // Builds and sends one segment - the only path any non-RST segment takes,
+    // first transmission, retransmission, ack or probe alike, so what options
+    // a segment carries never depends on which code sent it (RFC 7323 3.2: once
+    // negotiated, every non-RST segment carries TSopt; a retransmitted SYN
+    // offers what the first one did). Tracks nothing: the callers that put
+    // data in flight do that themselves.
+    void _transmit(uint8_t flags, uint32_t seq, const Bytes& payload);
+    // The options for a segment with these flags and this much payload: the
+    // SYN's negotiation options, or a timestamp and whatever SACK blocks fit.
+    void _add_options(Tcp& header, uint8_t flags, size_t payload_size) const;
     // include_ack is false only for the very first segment of an active
     // open: every other segment this stack ever sends acks something.
     void _send_flags(uint8_t flags, const Bytes& payload = Bytes(), bool include_ack = true);

@@ -199,7 +199,7 @@ bool TcpConnection::_seq_in_receive_window(uint32_t seq) const
     return (seq - _recv_next) < window;
 }
 
-Tcp TcpConnection::_build_header(uint8_t flags, uint32_t seq) const
+void TcpConnection::_transmit(uint8_t flags, uint32_t seq, const Bytes& payload)
 {
     uint32_t available = _advertised_window();
     // RFC 7323: if window scaling wasn't negotiated, this side must
@@ -212,24 +212,25 @@ Tcp TcpConnection::_build_header(uint8_t flags, uint32_t seq) const
     uint8_t our_shift = (_window_scaling_negotiated && !(flags & FLAG_SYN)) ? WINDOW_SCALE_SHIFT : 0;
     uint32_t window_value = std::min<uint32_t>(available >> our_shift, 0xFFFFu);
 
-    return Tcp(_local_port, _remote_port, seq, _recv_next, 5, flags, static_cast<uint16_t>(window_value), 0, 0);
+    Tcp header(_local_port, _remote_port, seq, _recv_next, 5, flags, static_cast<uint16_t>(window_value), 0, 0);
+    _add_options(header, flags, payload.size());
+    _send_segment(header, payload);
 }
 
-void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool include_ack)
+void TcpConnection::_add_options(Tcp& header, uint8_t flags, size_t payload_size) const
 {
-    uint32_t seq = _send_next;
-    uint8_t full_flags = include_ack ? (flags | FLAG_ACK) : flags;
-    Tcp header = _build_header(full_flags, seq);
     if (flags & FLAG_SYN)
     {
         // MSS and window scale are one-time parameters, so they only ever go on
-        // a SYN. An active open offers everything; whether each ends up used
-        // depends on whether the peer offered it too (RFC 7323's rule). A
-        // SYN-ACK is the other half of that rule: it may only carry window
-        // scale, timestamps or SACK-permitted if the peer's SYN did (RFC 7323
-        // 1.3, RFC 2018 2), and accept_incoming_syn has already recorded which
-        // ones that was. MSS is the exception - it may always be sent.
-        bool is_syn_ack = (full_flags & FLAG_ACK) != 0;
+        // a SYN - including a retransmitted one, which must offer exactly what
+        // the first did. An active open offers everything; whether each ends
+        // up used depends on whether the peer offered it too (RFC 7323's
+        // rule). A SYN-ACK is the other half of that rule: it may only carry
+        // window scale, timestamps or SACK-permitted if the peer's SYN did
+        // (RFC 7323 1.3, RFC 2018 2), and accept_incoming_syn has already
+        // recorded which ones that was. MSS is the exception - it may always
+        // be sent.
+        bool is_syn_ack = (flags & FLAG_ACK) != 0;
         header.set_mss_option(_local_mss);
         if (!is_syn_ack || _window_scaling_negotiated)
         {
@@ -237,28 +238,31 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
         }
         if (!is_syn_ack || _timestamps_negotiated)
         {
-            header.set_timestamp_option(_now_ms, _have_ts_recent ? _ts_recent : 0);
+            header.set_timestamp_option(static_cast<uint32_t>(_now_ms), _have_ts_recent ? _ts_recent : 0);
         }
         if (!is_syn_ack || _sack_permitted)
         {
             header.set_sack_permitted_option();
         }
-    }
-    else if (_timestamps_negotiated)
-    {
-        // Unlike the other two this goes on EVERY segment - each one is a fresh
-        // clock reading, not a parameter agreed once.
-        header.set_timestamp_option(_now_ms, _ts_recent);
+        return;
     }
 
-    if (_sack_permitted && !(flags & FLAG_SYN))
+    if (_timestamps_negotiated)
+    {
+        // RFC 7323 3.2: once negotiated, TSopt goes on every non-RST segment -
+        // retransmissions and probes included - and each carries the clock
+        // as it is now, not as it was when the data was first sent.
+        header.set_timestamp_option(static_cast<uint32_t>(_now_ms), _ts_recent);
+    }
+
+    if (_sack_permitted)
     {
         std::vector<Tcp::SackBlock> blocks = _sack_blocks_to_report();
         // RFC 6691: data plus options must fit the MSS. The payload was
         // already sized to leave room for the timestamp; SACK blocks take
         // whatever is left, and the oldest are the ones dropped (they are
         // repeats the peer has most likely seen).
-        size_t used = payload.size() + (_timestamps_negotiated ? TIMESTAMP_OPTION_BYTES : 0);
+        size_t used = payload_size + (_timestamps_negotiated ? TIMESTAMP_OPTION_BYTES : 0);
         size_t room = used < _effective_mss ? _effective_mss - used : 0;
         size_t fit = room >= SACK_OPTION_OVERHEAD_BYTES ? (room - SACK_OPTION_OVERHEAD_BYTES) / SACK_BLOCK_BYTES : 0;
         if (blocks.size() > fit)
@@ -270,7 +274,13 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
             header.set_sack_blocks(blocks);
         }
     }
-    _send_segment(header, payload);
+}
+
+void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool include_ack)
+{
+    uint32_t seq = _send_next;
+    uint8_t full_flags = include_ack ? (flags | FLAG_ACK) : flags;
+    _transmit(full_flags, seq, payload);
 
     // this segment carries our current RCV.NXT in its ack field, so it
     // discharges any pending delayed ack - exactly the piggyback delayed ack
@@ -354,24 +364,10 @@ bool TcpConnection::_matches_recorded_syn_options(const Tcp& segment) const
 void TcpConnection::_send_pure_ack()
 {
     // an ACK with nothing new to say is never itself acknowledged - it isn't
-    // tracked in the window, unlike everything sent through _send_flags
-    Tcp header = _build_header(FLAG_ACK, _send_next);
-    if (_timestamps_negotiated)
-    {
-        header.set_timestamp_option(_now_ms, _ts_recent);
-    }
-    if (_sack_permitted)
-    {
-        // The duplicate acks a loss produces are exactly the segments that
-        // carry this information, so a pure ack is the most important place
-        // for it to appear.
-        std::vector<Tcp::SackBlock> blocks = _sack_blocks_to_report();
-        if (!blocks.empty())
-        {
-            header.set_sack_blocks(blocks);
-        }
-    }
-    _send_segment(header, Bytes());
+    // tracked in the window, unlike everything sent through _send_flags. The
+    // duplicate acks a loss produces are exactly the segments whose SACK
+    // blocks matter, and with no payload every block that fits goes on.
+    _transmit(FLAG_ACK, _send_next, Bytes());
     _ack_pending = false;
     _ack_delay_ms_remaining = 0;
 }
@@ -717,7 +713,7 @@ void TcpConnection::_send_zero_window_probe()
     // discards the one-byte overlap.
     Bytes probe = _send_queue.front().slice(0, 1);
     LOG_DEBUG("TcpConnection[" << _id << "] zero-window probe at seq=" << _send_next);
-    _send_segment(_build_header(FLAG_ACK, _send_next), probe);
+    _transmit(FLAG_ACK, _send_next, probe);
     // The byte did go on the wire, so an ack covering it is legitimate - see
     // _send_max - even though SND.NXT stays put.
     if (!seq_at_or_before(_send_next + 1, _send_max))
@@ -753,7 +749,7 @@ void TcpConnection::_send_keepalive_probe()
     // with a different timeout and a different log line each time.
     LOG_DEBUG("TcpConnection[" << _id << "] keepalive probe " << (_keepalive_probes_sent + 1) << "/"
                                << KEEPALIVE_MAX_PROBES << " at seq=" << (_send_next - 1));
-    _send_segment(_build_header(FLAG_ACK, _send_next - 1), Bytes());
+    _transmit(FLAG_ACK, _send_next - 1, Bytes());
     _keepalive_probes_sent += 1;
     _keepalive_probe_ms_remaining = KEEPALIVE_PROBE_INTERVAL_MS;
 }
@@ -944,7 +940,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
             }
             InFlightSegment& oldest = *target;
             uint32_t cwnd_before = _congestion->window();
-            _send_segment(_build_header(oldest.flags, oldest.seq), oldest.payload);
+            _transmit(oldest.flags, oldest.seq, oldest.payload);
             // Karn again: this segment has now been sent twice, so the ack
             // that eventually retires it can't be attributed to either
             // transmission. Note there is deliberately no RTO backoff here -
@@ -1658,7 +1654,7 @@ void TcpConnection::on_time_passed(uint32_t elapsed_ms)
                                << cwnd_before << " -> " << _congestion->window() << ", rto " << rto_before << " -> "
                                << _rto_ms);
 
-    _send_segment(_build_header(oldest.flags, oldest.seq), oldest.payload);
+    _transmit(oldest.flags, oldest.seq, oldest.payload);
     oldest.retransmitted = true; // no RTT sample may ever come from it now
     oldest.retransmit_ms_remaining = _rto_ms;
 }
