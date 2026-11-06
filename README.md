@@ -326,6 +326,39 @@ injects a fake frame transport into `NetworkStack`, and `LoopbackChannel` wires 
 complete stacks back to back through a real ARP exchange, handshake, data transfer, and
 half-close.
 
+### Simulator
+
+`tests/include/sim/` is a deterministic network simulator. `SimNetwork` runs any number of
+stacks on virtual time (`SimClock`; nothing reads the real clock) over `NetemChannel` links
+that, per direction, lose, duplicate, corrupt, reorder, delay and jitter frames, serialize
+them at a given rate behind a bounded queue, and drop frames over an MTU. Every decision comes
+from one seeded `std::mt19937_64`, so a seed reproduces a run frame for frame. (The stack's
+ISNs come from `std::random_device` with no seam to inject them, so sequence numbers differ
+between runs; timing and sizes do not.)
+
+- **Property tests** (`test_sim_transfer.cpp`, ctest label `sim`): per seed, a random link and
+  a random payload of up to 1 MiB, sent one way or echoed; the bytes must arrive intact and in
+  order and both connections must close. `make sim` runs `SIM_SEEDS` seeds (default 200, a
+  few seconds) sharded over all CPUs; the nightly workflow runs 100000. Seeds that fail today
+  are kept, disabled, in `SimTransferRegression` with the diagnosis.
+- **Conformance scripts** (`tests/scripts/*.pkt`): packetdrill-style scripts that play the peer
+  of one stack - inject segments, state exactly what must come back and when. The syntax is
+  documented in `tests/include/sim/pkt_runner.h`. `tests/scripts/pending/` holds scripts for
+  behaviour not implemented yet; run them with
+  `PKT_SCRIPTS=tests/scripts/pending ./build/debug/run_tests --gtest_filter='*PktScript*'`.
+
+When a simulator test fails it writes `build/<preset>/sim-pcaps/<Suite>.<Test>.pcap` (frames as
+delivered), `...tx.pcap` (as transmitted, so the difference is what the link dropped) and a
+text rendering of each, and prints the paths.
+
+```sh
+make sim                                   # 200 seeds
+SIM_SEEDS=100000 make sim                  # the nightly run
+SIM_SEED_START=1055 SIM_SEEDS=1 make sim   # one seed again
+```
+
+### Integration tests
+
 The components that cannot be unit tested are the ones that are nothing but syscalls -
 the `AF_PACKET` and TAP transports, and the channel factory that opens them. It has an integration test instead, driving the whole stack over a
 veth pair against a peer in its own network namespace. **This runs in CI on every push** -
