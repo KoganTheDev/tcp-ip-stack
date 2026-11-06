@@ -298,6 +298,14 @@ public:
     // keep active opens out of the accept queue.
     bool is_active_open() const { return _active_open; }
 
+    // RFC 5961 challenge ACKs are replies to segments anyone can forge, so
+    // section 7 asks for them to be throttled. The budget is the stack's, not
+    // one connection's, so the decision is delegated: the gate is asked before
+    // each one goes out and returns false to suppress it. Unset means always
+    // send, which is what a connection used on its own (in a test) wants.
+    using ChallengeAckGateFn = std::function<bool()>;
+    void set_challenge_ack_gate(ChallengeAckGateFn gate) { _challenge_ack_gate = std::move(gate); }
+
 private:
     void _transition(TcpState new_state);
     Tcp _build_header(uint8_t flags, uint32_t seq) const;
@@ -305,6 +313,9 @@ private:
     // open: every other segment this stack ever sends acks something.
     void _send_flags(uint8_t flags, const Bytes& payload = Bytes(), bool include_ack = true);
     void _send_pure_ack();
+    // RFC 5961's challenge ACK - a pure ACK of where this side really is -
+    // unless the challenge-ACK gate says the stack-wide budget is spent.
+    void _send_challenge_ack();
     // A bare <SEQ=seq><CTL=RST>, outside the retransmission machinery.
     void _send_reset(uint32_t seq);
     // Records what the peer's SYN (or SYN-ACK) negotiated: MSS, window scale,
@@ -585,6 +596,15 @@ private:
 
     // --- flow control ---
     uint32_t _peer_window; // SND.WND, already left-shifted by the peer's window scale if negotiated
+    // MAX.SND.WND (RFC 5961 section 5): the largest window the peer has ever
+    // advertised, scaled. Bounds how far behind SND.UNA an acceptable ACK may
+    // be. Starts at the same placeholder as _peer_window.
+    uint32_t _max_peer_window;
+    void _set_peer_window(uint32_t window)
+    {
+        _peer_window = window;
+        _max_peer_window = std::max(_max_peer_window, window);
+    }
     // out-of-order segments, keyed by sequence number - drained into
     // _recv_next/_deliver() as gaps fill in; bounded by
     // RECEIVE_BUFFER_CAPACITY via _receive_buffer_occupied()
@@ -628,6 +648,7 @@ private:
     // rather than a walk over every buffered chunk on every header build.
     size_t _receive_queued_bytes;
     bool _active_open = false; // see is_active_open()
+    ChallengeAckGateFn _challenge_ack_gate;
 
     static constexpr uint16_t DEFAULT_LOCAL_MSS = 1460; // 1500 (typical Ethernet MTU) - 20 (IP) - 20 (TCP)
     static constexpr uint16_t DEFAULT_PEER_MSS = 536; // RFC 793's fallback when a peer's SYN carries no MSS option

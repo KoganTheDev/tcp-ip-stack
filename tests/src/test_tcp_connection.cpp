@@ -2244,3 +2244,64 @@ TEST(TcpConnection, AnUnacceptableAckInSynSentIsAnsweredWithARst)
         << "a SYN-ACK acking ISS itself is unacceptable too";
     ASSERT_TRUE(connection->get_state() == TcpState::SYN_SENT) << "and does not complete the handshake";
 }
+
+// RFC 5961 section 3: a reset inside the window but not exactly at RCV.NXT is
+// not believed. A blind attacker only has to land anywhere in the window to
+// pass the old in-window test; landing on RCV.NXT exactly is 2^32 / window
+// times harder. The peer gets a challenge ACK instead - a genuine peer that
+// really did reset answers it with a RST at exactly RCV.NXT.
+TEST(TcpConnection, AnInWindowRstOffRcvNxtDrawsAChallengeAck)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent); // RCV.NXT 501, SND.NXT 1001
+
+    connection->on_segment(*make_incoming_segment(600, 1001, FLAG_RST | FLAG_ACK));
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED) << "an in-window RST off RCV.NXT must not reset";
+    ASSERT_TRUE(sent.size() == 1) << "it draws exactly one segment";
+    ASSERT_TRUE(sent[0].flags == FLAG_ACK && sent[0].seq == 1001 && sent[0].ack == 501)
+        << "a challenge ACK: <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>";
+
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_RST));
+    ASSERT_TRUE(connection->get_state() == TcpState::CLOSED) << "a RST at exactly RCV.NXT resets";
+}
+
+// RFC 5961 section 4: a SYN on a synchronized connection is answered with a
+// challenge ACK whatever its sequence number, and otherwise dropped. A real
+// peer that rebooted and is reopening gets told where this connection
+// stands, and replies with the RST that clears it.
+TEST(TcpConnection, ASynOnAnEstablishedConnectionDrawsAChallengeAck)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+
+    connection->on_segment(*make_incoming_segment(501, 0, FLAG_SYN));
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED) << "a SYN must not disturb the connection";
+    ASSERT_TRUE(sent.size() == 1 && sent[0].flags == FLAG_ACK && sent[0].seq == 1001 && sent[0].ack == 501)
+        << "it draws a challenge ACK";
+
+    sent.clear();
+    Bytes received;
+    connection->set_data_ready_callback([&received, &connection]() { received |= connection->read(); });
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_SYN | FLAG_ACK, Bytes::from_hex("6869")));
+    ASSERT_TRUE(received.empty()) << "data riding on a SYN is dropped with it";
+    ASSERT_TRUE(sent.size() == 1 && sent[0].ack == 501) << "and RCV.NXT does not move";
+}
+
+// RFC 5961 section 5: an ACK must lie in [SND.UNA - MAX.SND.WND, SND.NXT].
+// The upper half has been checked for a while; the lower one is what makes a
+// blind data injection need a plausible ACK as well as an in-window sequence
+// number. MAX.SND.WND here is the 65535 the test peer advertises.
+TEST(TcpConnection, ASegmentAckingTooFarBehindIsDroppedAndAcked)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent); // SND.UNA 1001
+
+    Bytes received;
+    connection->set_data_ready_callback([&received, &connection]() { received |= connection->read(); });
+    connection->on_segment(*make_incoming_segment(501, 1001 - 100000, FLAG_ACK, Bytes::from_hex("6869")));
+    ASSERT_TRUE(received.empty()) << "data on a segment acking far behind SND.UNA is not delivered";
+    ASSERT_TRUE(sent.size() == 1 && sent[0].flags == FLAG_ACK && sent[0].ack == 501) << "an ACK is sent back";
+
+    connection->on_segment(*make_incoming_segment(501, 1001 - 1000, FLAG_ACK, Bytes::from_hex("6869")));
+    ASSERT_TRUE(received.to_hex() == "6869") << "an old ACK within MAX.SND.WND of SND.UNA is still acceptable";
+}

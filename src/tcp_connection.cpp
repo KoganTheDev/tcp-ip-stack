@@ -81,8 +81,8 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
       _ts_recent(0), _have_ts_recent(false), _local_mss(local_mss), _peer_mss(DEFAULT_PEER_MSS),
       _effective_mss(std::min(local_mss, DEFAULT_PEER_MSS)), _window_scaling_negotiated(false), _peer_window_scale(0),
       _peer_window(local_mss), // conservative placeholder until the handshake's real window arrives
-      _congestion(make_congestion_control(algorithm)), _dup_ack_count(0), _in_fast_recovery(false),
-      _send_segment(std::move(send_segment)), _receive_queued_bytes(0)
+      _max_peer_window(local_mss), _congestion(make_congestion_control(algorithm)), _dup_ack_count(0),
+      _in_fast_recovery(false), _send_segment(std::move(send_segment)), _receive_queued_bytes(0)
 {
     // Seeded with the MSS this side advertises, which is all that is known
     // before the handshake. on_established() re-seeds it with the negotiated
@@ -287,6 +287,17 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
     entry.sacked = false;
     _unsacked_in_flight_bytes += entry.end_seq - entry.seq;
     _in_flight.push_back(std::move(entry));
+}
+
+void TcpConnection::_send_challenge_ack()
+{
+    // RFC 5961 section 7: the stack throttles these, because each is a reply
+    // to a segment an attacker can send at will
+    if (_challenge_ack_gate && !_challenge_ack_gate())
+    {
+        return;
+    }
+    _send_pure_ack(); // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
 }
 
 void TcpConnection::_send_reset(uint32_t seq)
@@ -811,7 +822,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     // buffer
     uint8_t peer_shift = _window_scaling_negotiated ? _peer_window_scale : 0;
     uint32_t previous_peer_window = _peer_window;
-    _peer_window = static_cast<uint32_t>(segment.get_window()) << peer_shift;
+    _set_peer_window(static_cast<uint32_t>(segment.get_window()) << peer_shift);
 
     uint32_t snd_una = _in_flight.empty() ? _send_next : _in_flight.front().seq;
 
@@ -1128,17 +1139,27 @@ void TcpConnection::on_segment(const Tcp& segment)
             // number against, so the ACK is the only thing tying a reset to this
             // connection. One without an ACK, or whose ACK does not cover our
             // SYN, could come from anyone and is dropped.
-            if (!segment.get_ack() || !_ack_acceptable_in_syn_sent(segment.get_acknowledgement_number()))
+            if (segment.get_ack() && _ack_acceptable_in_syn_sent(segment.get_acknowledgement_number()))
             {
-                return;
+                _transition(TcpState::CLOSED);
             }
+            return;
         }
-        else if (!_seq_in_receive_window(segment.get_sequence_number()))
+        if (!_seq_in_receive_window(segment.get_sequence_number()))
         {
             // RFC 9293 3.10.7.4: in SYN_RECEIVED and every later state a
             // reset outside the receive window is ignored - a segment with
             // this sequence number couldn't legitimately be this far from what
             // is actually expected next
+            return;
+        }
+        if (segment.get_sequence_number() != _recv_next)
+        {
+            // RFC 5961 section 3: in the window but not exactly at RCV.NXT.
+            // A blind attacker only has to land somewhere in the window to get
+            // this far, so it is not believed; a challenge ACK tells a genuine
+            // peer where we are, and its answering RST lands on RCV.NXT.
+            _send_challenge_ack();
             return;
         }
         _transition(TcpState::CLOSED);
@@ -1182,7 +1203,7 @@ void TcpConnection::on_segment(const Tcp& segment)
             _in_flight.clear();
             _unsacked_in_flight_bytes = 0;
             _send_next = _iss;
-            _peer_window = segment.get_window();
+            _set_peer_window(segment.get_window());
             _transition(TcpState::SYN_RECEIVED);
             _send_flags(FLAG_SYN);
             return;
@@ -1190,7 +1211,7 @@ void TcpConnection::on_segment(const Tcp& segment)
 
         _in_flight.clear(); // our SYN is now acked
         _unsacked_in_flight_bytes = 0;
-        _peer_window = segment.get_window(); // a SYN-ACK's window is never scaled (RFC 7323 2.2)
+        _set_peer_window(segment.get_window()); // a SYN-ACK's window is never scaled (RFC 7323 2.2)
         // The MSS is only now negotiated, and the window is denominated in
         // it, so this is where congestion control actually starts.
         _congestion->on_established(_effective_mss);
@@ -1209,7 +1230,7 @@ void TcpConnection::on_segment(const Tcp& segment)
             // After a simultaneous open the completing segment is the peer's
             // SYN-ACK, whose window is unscaled like that of any SYN.
             uint8_t peer_shift = (_window_scaling_negotiated && !segment.get_syn()) ? _peer_window_scale : 0;
-            _peer_window = static_cast<uint32_t>(segment.get_window()) << peer_shift;
+            _set_peer_window(static_cast<uint32_t>(segment.get_window()) << peer_shift);
             // The MSS is only now negotiated, and the window is denominated in
             // it, so this is where congestion control actually starts.
             _congestion->on_established(_effective_mss);
@@ -1220,6 +1241,31 @@ void TcpConnection::on_segment(const Tcp& segment)
 
     if (_state == TcpState::CLOSED)
     {
+        return;
+    }
+
+    // RFC 5961 section 4 (RFC 9293 3.10.7.4, fourth check): a SYN on a
+    // synchronized connection is answered with a challenge ACK whatever its
+    // sequence number, and dropped with everything it carried. Resetting on an
+    // in-window SYN, as RFC 793 did, let a blind attacker tear the connection
+    // down; a genuine peer that rebooted answers the challenge ACK with the
+    // RST that clears this connection.
+    if (segment.get_syn())
+    {
+        _send_challenge_ack();
+        return;
+    }
+
+    // RFC 5961 section 5: an acceptable ACK lies in
+    // [SND.UNA - MAX.SND.WND, SND.MAX]. Below the window the segment is
+    // dropped and acked, so an injected segment needs a plausible ACK as well
+    // as an in-window sequence number.
+    uint32_t snd_una = _in_flight.empty() ? _send_next : _in_flight.front().seq;
+    if (segment.get_ack() && !seq_at_or_before(snd_una - _max_peer_window, segment.get_acknowledgement_number()))
+    {
+        LOG_DEBUG("TcpConnection[" << _id << "] dropping a segment acking " << segment.get_acknowledgement_number()
+                                   << ", more than MAX.SND.WND " << _max_peer_window << " behind SND.UNA " << snd_una);
+        _send_challenge_ack();
         return;
     }
 
