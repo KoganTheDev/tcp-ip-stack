@@ -2480,3 +2480,46 @@ TEST(TcpConnection, UrgentDataIsDeliveredInlineAndUrgIsNeverSent)
         ASSERT_TRUE(!segment.urg && segment.urgent_ptr == 0) << "no segment we send carries URG";
     }
 }
+
+// RFC 9293 3.10.5 ABORT on a synchronized connection: send <SEQ=SND.NXT>
+// <CTL=RST>, flush everything queued in both directions and every segment
+// awaiting retransmission, and go straight to CLOSED. What SO_LINGER{0} +
+// close() will map to.
+TEST(TcpConnection, AbortSendsARstAtSndNxtAndDiscardsEverything)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes::from_hex("6869"))); // left unread
+    connection->send(Bytes(200000)); // some in flight, the rest queued
+    ASSERT_TRUE(connection->bytes_available() > 0 && connection->bytes_unacked() > 0) << "precondition";
+    uint32_t snd_nxt = sent.back().seq + static_cast<uint32_t>(sent.back().payload.size());
+    sent.clear();
+
+    connection->abort();
+    ASSERT_TRUE(connection->get_state() == TcpState::CLOSED) << "abort closes immediately";
+    ASSERT_TRUE(sent.size() == 1 && sent[0].flags == FLAG_RST) << "with exactly one bare RST";
+    ASSERT_TRUE(sent[0].seq == snd_nxt) << "sequenced at SND.NXT";
+    ASSERT_TRUE(connection->bytes_available() == 0) << "unread data is discarded";
+    ASSERT_TRUE(connection->bytes_unacked() == 0) << "queued and in-flight data is discarded";
+
+    sent.clear();
+    connection->on_time_passed(10000);
+    ASSERT_TRUE(sent.empty()) << "nothing is retransmitted after an abort";
+}
+
+// In CLOSING, LAST_ACK and TIME_WAIT the connection is already done sending;
+// ABORT just deletes it, without a RST.
+TEST(TcpConnection, AbortInTimeWaitClosesWithoutARst)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->close();
+    uint32_t fin_seq = sent[0].seq;
+    connection->on_segment(*make_incoming_segment(501, fin_seq + 1, FLAG_ACK));
+    connection->on_segment(*make_incoming_segment(501, fin_seq + 1, FLAG_ACK | FLAG_FIN));
+    ASSERT_TRUE(connection->get_state() == TcpState::TIME_WAIT) << "precondition";
+    sent.clear();
+
+    connection->abort();
+    ASSERT_TRUE(connection->get_state() == TcpState::CLOSED && sent.empty()) << "closed, nothing sent";
+}

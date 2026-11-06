@@ -141,8 +141,25 @@ public:
     // a segment; an off-path forgery has to guess one. Always false with
     // nothing in flight, since then no error can be about anything.
     bool has_sent_unacknowledged(uint32_t seq) const;
-    // Half-closes our side: sends a FIN and starts the shutdown sequence.
+    // Half-closes our side: a FIN goes out once everything already queued has
+    // been sent, and from then on send() accepts nothing. Receiving is not
+    // affected - read() keeps working, and data the peer sends in FIN_WAIT_1/2
+    // is still delivered - so this is RFC 9293's CLOSE, which is exactly what
+    // shutdown(SHUT_WR) means. There is deliberately no separate
+    // shutdown_write(): it would be this function under a second name.
+    //
+    // It is not POSIX close(), which also gives up the receive side (Linux
+    // answers data arriving after it with a RST). A socket layer gets that
+    // from close() plus discarding further reads, and SO_LINGER{0} from
+    // abort() below.
     void close();
+
+    // RFC 9293 3.10.5 ABORT: drops the connection at once. In SYN_RECEIVED,
+    // ESTABLISHED, FIN_WAIT_1/2 and CLOSE_WAIT a <SEQ=SND.NXT><CTL=RST> tells
+    // the peer; in the other states there is nothing to tell. Queued and
+    // in-flight send data, unread and out-of-order receive data are all
+    // discarded, and the connection is CLOSED on return.
+    void abort();
 
     // Turns keepalive on or off. Off is the default, and RFC 1122 4.2.3.6 is
     // unusually blunt about why: a keepalive can drop a connection that is

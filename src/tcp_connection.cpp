@@ -1690,3 +1690,35 @@ void TcpConnection::close()
     _transition(_state == TcpState::ESTABLISHED ? TcpState::FIN_WAIT_1 : TcpState::LAST_ACK);
     _send_flags(FLAG_FIN);
 }
+
+void TcpConnection::abort()
+{
+    if (_state == TcpState::CLOSED)
+    {
+        return;
+    }
+
+    // RFC 9293 3.10.5: only states where the peer may still think the
+    // connection is live are told; in LISTEN/SYN_SENT it never was, and in
+    // CLOSING/LAST_ACK/TIME_WAIT both sides are already done sending.
+    bool peer_needs_reset = _state == TcpState::SYN_RECEIVED || _state == TcpState::ESTABLISHED
+                            || _state == TcpState::FIN_WAIT_1 || _state == TcpState::FIN_WAIT_2
+                            || _state == TcpState::CLOSE_WAIT;
+    if (peer_needs_reset)
+    {
+        _send_reset(_send_next);
+    }
+
+    _in_flight.clear();
+    _unsacked_in_flight_bytes = 0;
+    _send_queue.clear();
+    _send_queued_bytes = 0;
+    _fin_requested = false;
+    _receive_queue.clear();
+    _receive_queued_bytes = 0;
+    _reorder_buffer.clear();
+    _reorder_buffered_bytes = 0;
+    _ack_pending = false;
+    _persist_ms_remaining = 0;
+    _transition(TcpState::CLOSED);
+}
