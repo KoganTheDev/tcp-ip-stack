@@ -77,9 +77,6 @@ simultaneous close rather than folding it into `FIN_WAIT_2`. On top of that:
   one 4-tuple ordered, exactly as RFC 793 intended; the keyed term means an attacker who
   can watch ISNs for their own 4-tuple learns nothing about anybody else's - which is the
   hole Morris described in 1985 and Mitnick used in 1994
-- **Keepalive** (RFC 1122 4.2.3.6), off by default as the RFC requires, probing one byte
-  *behind* SND.NXT because that is the only segment that compels a reply without moving
-  the stream
 - Checksum verification on receive, over the bytes *as received* rather than a
   re-serialization, and RFC 793 section 3.4 RST generation for segments matching no
   connection
@@ -289,7 +286,7 @@ and applies itself. See its own README for the full reasoning.
 
 ## Testing
 
-280 unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
+Over 340 unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
 estimation, congestion control, flow control, keepalive, ISN generation, DHCP lease
 acquisition and renewal, DNS parsing and anti-spoofing, routing, fragment reassembly,
 ARP ageing, UDP, ICMP, the thread pool and completion queue, and the logger, plus a fuzz

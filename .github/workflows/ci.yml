@@ -130,14 +130,11 @@ jobs:
   # underlying type) were invisible to a fully passing test suite and caught
   # here.
   #
-  # Note what each job is actually worth. The asan job carries the weight: it
-  # runs ASan, UBSan, and leak detection over the whole suite, which parses
-  # deliberately malformed input in the fuzz tests. The tsan job is currently a
-  # build-and-link check rather than a real race hunt, because the unit tests
-  # are single-threaded - the only threaded code in this project is
-  # epoll-server's reactor and thread pool, and exercising that needs a TAP
-  # device and NET_ADMIN, which this workflow does not have. It is here so the
-  # suite stays TSan-clean and ready the moment threaded tests exist.
+  # Note what each job is actually worth. The asan job runs ASan, UBSan, and
+  # leak detection over the whole suite, which parses deliberately malformed
+  # input in the fuzz tests. The tsan job hunts real races: test_threading.cpp
+  # drives epoll-server's thread pool and completion queue under contention,
+  # which needs only eventfd - no TAP device or NET_ADMIN.
   sanitizers:
     name: ${{ matrix.sanitizer }}
     runs-on: ubuntu-latest
@@ -145,12 +142,9 @@ jobs:
       fail-fast: false
       matrix:
         sanitizer: [asan, tsan]
-    # asan blocks the build; tsan reports without blocking. TSan aborts at
-    # startup (exit 66) on hosts where it cannot get the memory layout it
-    # needs, which is an environment property rather than anything about this
-    # code - not worth failing a build over while the suite it runs is still
-    # single-threaded. Revisit once there are threaded tests for it to bite on.
-    continue-on-error: ${{ matrix.sanitizer == 'tsan' }}
+    # Both block the build. TSan aborts at startup (exit 66) on a host where it
+    # cannot disable ASLR, but `make tsan` probes for that and runs under
+    # setarch -R when it can, which hosted runners allow - see the Makefile.
     steps:
       - uses: actions/checkout@v5
       - name: Run the suite under ${{ matrix.sanitizer }}
