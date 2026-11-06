@@ -1050,7 +1050,11 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
         TcpState state_before = connection_it->second->get_state();
         connection_it->second->on_segment(tcp);
 
-        if (state_before == TcpState::SYN_RECEIVED && connection_it->second->get_state() == TcpState::ESTABLISHED)
+        // Only a passive open belongs in the accept queue. An active open can
+        // pass through SYN_RECEIVED too, by way of a simultaneous open, and it
+        // already belongs to whoever called connect().
+        if (state_before == TcpState::SYN_RECEIVED && connection_it->second->get_state() == TcpState::ESTABLISHED
+            && !connection_it->second->is_active_open())
         {
             this->_pending_accepts[key.local_port].push_back(key);
         }

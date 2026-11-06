@@ -292,6 +292,12 @@ public:
     // MAC is resolved (or immediately, if it already was).
     void initiate_connect();
 
+    // True for a connection opened with initiate_connect(), including one
+    // that went through SYN_RECEIVED by way of a simultaneous open - which is
+    // why the state history alone cannot answer it. NetworkStack uses it to
+    // keep active opens out of the accept queue.
+    bool is_active_open() const { return _active_open; }
+
 private:
     void _transition(TcpState new_state);
     Tcp _build_header(uint8_t flags, uint32_t seq) const;
@@ -299,6 +305,11 @@ private:
     // open: every other segment this stack ever sends acks something.
     void _send_flags(uint8_t flags, const Bytes& payload = Bytes(), bool include_ack = true);
     void _send_pure_ack();
+    // A bare <SEQ=seq><CTL=RST>, outside the retransmission machinery.
+    void _send_reset(uint32_t seq);
+    // Records what the peer's SYN (or SYN-ACK) negotiated: MSS, window scale,
+    // SACK-permitted and timestamps.
+    void _take_peer_syn_options(const Tcp& segment);
     // Delayed ACK (RFC 1122 4.2.3.2): rather than acking every in-order data
     // segment immediately, coalesce - send the ack when a second segment
     // arrives, when the delay timer fires, or piggybacked on any segment we
@@ -616,6 +627,7 @@ private:
     // Kept alongside the queue so the advertised window is an O(1) subtraction
     // rather than a walk over every buffered chunk on every header build.
     size_t _receive_queued_bytes;
+    bool _active_open = false; // see is_active_open()
 
     static constexpr uint16_t DEFAULT_LOCAL_MSS = 1460; // 1500 (typical Ethernet MTU) - 20 (IP) - 20 (TCP)
     static constexpr uint16_t DEFAULT_PEER_MSS = 536; // RFC 793's fallback when a peer's SYN carries no MSS option

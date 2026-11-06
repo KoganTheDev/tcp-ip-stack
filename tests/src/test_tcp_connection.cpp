@@ -2193,3 +2193,54 @@ TEST(TcpConnection, ARstOutsideTheWindowInSynReceivedIsIgnored)
     connection.on_segment(*make_incoming_segment(501, 0, FLAG_RST));
     ASSERT_TRUE(connection.get_state() == TcpState::CLOSED) << "a RST at RCV.NXT resets the half-open connection";
 }
+
+// Simultaneous open, RFC 9293 3.10.7.3 and figure 8: a SYN without an ACK
+// in SYN_SENT means the peer opened towards us at the same moment. Answer
+// with SYN-ACK (same ISN - our SYN is still the one being acknowledged), wait
+// in SYN_RECEIVED, and complete when the peer's SYN-ACK acks our SYN.
+TEST(TcpConnection, SimultaneousOpenGoesThroughSynReceived)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_syn_sent_connection(sent);
+
+    connection->on_segment(*make_incoming_segment(9000, 0, FLAG_SYN));
+    ASSERT_TRUE(connection->get_state() == TcpState::SYN_RECEIVED) << "a crossing SYN moves SYN_SENT to SYN_RECEIVED";
+    ASSERT_TRUE(sent.size() == 1 && sent[0].flags == (FLAG_SYN | FLAG_ACK)) << "and is answered with a SYN-ACK";
+    ASSERT_TRUE(sent[0].seq == 2000) << "the SYN-ACK repeats our ISS";
+    ASSERT_TRUE(sent[0].ack == 9001) << "and acknowledges the peer's SYN";
+
+    connection->on_segment(*make_incoming_segment(9000, 2001, FLAG_SYN | FLAG_ACK));
+    ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED) << "the peer's SYN-ACK completes the handshake";
+
+    sent.clear();
+    connection->send(Bytes::from_hex("6869"));
+    ASSERT_TRUE(!sent.empty() && sent[0].seq == 2001 && sent[0].ack == 9001)
+        << "data then flows from ISS + 1, acking the peer's ISN + 1";
+
+    Bytes received;
+    connection->set_data_ready_callback([&received, &connection]() { received |= connection->read(); });
+    connection->on_segment(*make_incoming_segment(9001, 2003, FLAG_ACK, Bytes::from_hex("6f6b")));
+    ASSERT_TRUE(received.to_hex() == "6f6b") << "and the peer's data is delivered";
+}
+
+// RFC 9293 3.10.7.3: in SYN_SENT a segment whose ACK does not cover our SYN
+// (and that is not itself a RST) is answered with <SEQ=SEG.ACK><CTL=RST> and
+// dropped. That is what clears a half-open connection the peer still thinks
+// exists from before a crash.
+TEST(TcpConnection, AnUnacceptableAckInSynSentIsAnsweredWithARst)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_syn_sent_connection(sent);
+
+    connection->on_segment(*make_incoming_segment(9000, 5000, FLAG_ACK));
+    ASSERT_TRUE(sent.size() == 1) << "an unacceptable ACK draws exactly one segment";
+    ASSERT_TRUE(sent[0].flags == FLAG_RST) << "a bare RST, no ACK";
+    ASSERT_TRUE(sent[0].seq == 5000) << "sequenced at SEG.ACK, so the peer accepts it";
+    ASSERT_TRUE(connection->get_state() == TcpState::SYN_SENT) << "and our own open carries on";
+
+    sent.clear();
+    connection->on_segment(*make_incoming_segment(9000, 2000, FLAG_SYN | FLAG_ACK));
+    ASSERT_TRUE(sent.size() == 1 && sent[0].flags == FLAG_RST && sent[0].seq == 2000)
+        << "a SYN-ACK acking ISS itself is unacceptable too";
+    ASSERT_TRUE(connection->get_state() == TcpState::SYN_SENT) << "and does not complete the handshake";
+}

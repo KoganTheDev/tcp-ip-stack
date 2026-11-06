@@ -3384,3 +3384,36 @@ TEST(NetworkStack, FailedCookieChecksAreCountedSoGuessingIsVisible)
     ASSERT_TRUE(stack->syn_cookie_check_failures() == 5 && stack->accept(80) != nullptr)
         << "a genuine cookie is not a failure";
 }
+
+// Simultaneous open (RFC 9293 figure 8): both ends send a SYN for the same
+// four-tuple. The peer's bare SYN reaches our SYN_SENT connection through the
+// ordinary 4-tuple lookup, is answered with a SYN-ACK carrying our ISN, and the
+// peer's own SYN-ACK completes the handshake. The connection is our active
+// open, so it must never surface through accept().
+TEST(NetworkStack, SimultaneousOpenCompletesAndIsNotOfferedToAccept)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+    channel->clear_outbound();
+
+    TcpConnection* client = stack->connect(PEER_IP, 80);
+    TcpView syn = find_tcp(channel->outbound_frames());
+    ASSERT_TRUE(syn.is_tcp && syn.syn && !syn.ack_flag) << "precondition: our SYN went out";
+    stack->listen(syn.src_port); // a listener on the same port must not adopt the connection either
+
+    channel->clear_outbound();
+    channel->push_inbound(build_tcp(FLAG_SYN, 7000, 0, 80, syn.src_port));
+    stack->poll();
+    TcpView syn_ack = find_tcp(channel->outbound_frames());
+    ASSERT_TRUE(syn_ack.is_tcp && syn_ack.syn && syn_ack.ack_flag) << "the crossing SYN is answered with a SYN-ACK";
+    ASSERT_TRUE(syn_ack.seq == syn.seq) << "carrying our original ISN, not a new one";
+    ASSERT_TRUE(syn_ack.ack == 7001) << "and acknowledging the peer's SYN";
+    ASSERT_TRUE(client->get_state() == TcpState::SYN_RECEIVED) << "the connection waits for its SYN to be acked";
+
+    channel->push_inbound(build_tcp(FLAG_SYN | FLAG_ACK, 7000, syn.seq + 1, 80, syn.src_port));
+    stack->poll();
+    ASSERT_TRUE(client->get_state() == TcpState::ESTABLISHED) << "the peer's SYN-ACK completes the handshake";
+    ASSERT_TRUE(stack->accept(syn.src_port) == nullptr) << "an active open is never handed out by accept()";
+}
