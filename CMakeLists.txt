@@ -81,13 +81,45 @@ add_executable(http-get ${HTTP_GET_SOURCES})
 target_compile_options(http-get PRIVATE -Wextra)
 target_link_libraries(http-get PRIVATE tcpip)
 
+# --- GoogleTest ------------------------------------------------------------
+# The installed package first (Arch: gtest, Debian/Ubuntu: libgtest-dev and
+# libgmock-dev), so a normal build needs no network. CONFIG mode because only
+# GoogleTest's own package config provides the GMock targets; CMake's FindGTest
+# module does not.
+#
+# Otherwise fetch a pinned release. Built from source it also picks up the
+# preset's CMAKE_CXX_FLAGS, so under a sanitizer preset it is instrumented too.
+# -DTCPIP_FETCH_GTEST=ON forces this path even when a package is installed.
+option(TCPIP_FETCH_GTEST "Build GoogleTest from source instead of using an installed package" OFF)
+if(NOT TCPIP_FETCH_GTEST)
+    find_package(GTest 1.11 CONFIG QUIET)
+endif()
+if(GTest_FOUND)
+    message(STATUS "GoogleTest: using installed package ${GTest_VERSION} (${GTest_DIR})")
+else()
+    message(STATUS "GoogleTest: building v1.15.2 from source")
+    include(FetchContent)
+    set(GTEST_FETCH_ARGS
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG v1.15.2
+        GIT_SHALLOW TRUE)
+    # SYSTEM keeps the strict preset's -Werror off GoogleTest's headers, as it
+    # already is for an installed package. The option needs CMake 3.25.
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.25)
+        list(APPEND GTEST_FETCH_ARGS SYSTEM)
+    endif()
+    FetchContent_Declare(googletest ${GTEST_FETCH_ARGS})
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+endif()
+
 # --- Tests -----------------------------------------------------------------
 # Globbed so that adding tests/src/test_foo.cpp needs no wiring here.
 enable_testing()
 file(GLOB TEST_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/tests/src/*.cpp)
 add_executable(run_tests ${TEST_SOURCES})
 target_include_directories(run_tests PRIVATE ${PROJECT_SOURCE_DIR}/tests/include)
-target_link_libraries(run_tests PRIVATE tcpip epoll_threaded)
+target_link_libraries(run_tests PRIVATE tcpip epoll_threaded GTest::gmock)
 
 add_test(NAME run_tests COMMAND run_tests)
 set_tests_properties(run_tests PROPERTIES LABELS unit)
