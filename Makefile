@@ -20,6 +20,8 @@
 #   make asan       - full rebuild, then run the suite under ASan + UBSan
 #   make tsan       - full rebuild, then run the suite under ThreadSanitizer
 #   make strict     - build everything with -Wextra -Werror, then run the suite
+#   make coverage   - run the suite with clang coverage; per-file report, plus
+#                     HTML in build/coverage/html
 #   make clean      - remove every build directory
 #
 # Without the wrapper: cmake --preset debug && cmake --build --preset debug &&
@@ -109,10 +111,40 @@ strict: build/strict/build.ninja
 	$(CMAKE) --build --preset strict
 	./build/strict/run_tests
 
+# Line/region/function coverage of the stack from one run of the unit suite,
+# using clang's source-based coverage (the coverage preset builds with clang++
+# whatever the other presets use). The report is per file and has no threshold:
+# it is there to show what the suite never reaches, not to gate merges.
+#
+# llvm-profdata's on-disk format is tied to the compiler version that wrote the
+# raw profiles, so the tools are looked up next to the clang++ that built the
+# binary (-print-prog-name) rather than whichever llvm-profdata is first in
+# PATH. On Ubuntu that is /usr/lib/llvm-<N>/bin; override with
+# LLVM_PROFDATA=... LLVM_COV=... if needed.
+#
+# The profile directory is emptied first: profiles from an earlier run of an
+# older binary would otherwise be merged in and the counts would be fiction.
+# The tests themselves and anything outside the repo are left out of the report.
+COVERAGE_DIR = build/coverage
+LLVM_PROFDATA ?= $(shell clang++ -print-prog-name=llvm-profdata 2>/dev/null || echo llvm-profdata)
+LLVM_COV ?= $(shell clang++ -print-prog-name=llvm-cov 2>/dev/null || echo llvm-cov)
+COVERAGE_IGNORE = -ignore-filename-regex='/tests/|/_deps/|^/usr/'
+
+coverage: $(COVERAGE_DIR)/build.ninja
+	$(CMAKE) --build --preset coverage
+	rm -rf $(COVERAGE_DIR)/profraw $(COVERAGE_DIR)/html
+	LLVM_PROFILE_FILE=$(COVERAGE_DIR)/profraw/%p.profraw ./$(COVERAGE_DIR)/run_tests
+	$(LLVM_PROFDATA) merge -sparse $(COVERAGE_DIR)/profraw/*.profraw -o $(COVERAGE_DIR)/run_tests.profdata
+	$(LLVM_COV) show ./$(COVERAGE_DIR)/run_tests -instr-profile=$(COVERAGE_DIR)/run_tests.profdata \
+	    $(COVERAGE_IGNORE) -format=html -output-dir=$(COVERAGE_DIR)/html
+	$(LLVM_COV) report ./$(COVERAGE_DIR)/run_tests -instr-profile=$(COVERAGE_DIR)/run_tests.profdata \
+	    $(COVERAGE_IGNORE)
+	@echo "coverage: HTML report in $(COVERAGE_DIR)/html/index.html"
+
 # bin/, tests/bin/ and ./run_tests are where the hand-written Makefile this
 # replaced put its output; removed too so an old checkout cleans up fully.
 clean:
 	rm -rf build bin tests/bin
 	rm -f run_tests tcpipstack
 
-.PHONY: all run_tests test asan tsan strict clean
+.PHONY: all run_tests test asan tsan strict coverage clean
