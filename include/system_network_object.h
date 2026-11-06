@@ -1,6 +1,15 @@
 #pragma once
 
+#include <net/if.h>
 #include <string>
+
+// The ifreq naming one interface, for the SIOCGIFFLAGS/SIOCSIFFLAGS ioctls.
+// The name is copied byte for byte - nothing interprets it - and a name that
+// does not fit IFNAMSIZ with its terminator, is empty, or holds a NUL is
+// refused with an exception rather than truncated, since a truncated name can
+// be a different, existing interface. Pure, so it is testable without
+// privileges or a real interface.
+struct ifreq interface_request(const std::string& name);
 
 class SystemNetworkObject
 {
@@ -17,5 +26,7 @@ public:
     virtual void stop() = 0;
 
 protected:
+    // Sets or clears IFF_UP on the named interface - what `ip link set <name>
+    // up/down` does. Needs CAP_NET_ADMIN.
     static void _set_interface_state(const std::string& name, bool state);
 };

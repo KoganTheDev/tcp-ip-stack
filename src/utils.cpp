@@ -1,16 +1,5 @@
 #include "utils.h"
 
-void system_wrapper(const std::string& command)
-{
-    // NOLINTNEXTLINE(bugprone-command-processor,cert-env33-c,concurrency-mt-unsafe): see review, fix pending
-    int return_value = system(command.c_str());
-    if (return_value != 0)
-    {
-        throw EXCEPTION(SystemException,
-                        "Error in command \"" + command + "\", return value " + std::to_string(return_value));
-    }
-}
-
 std::string string_replace_all(const std::string& str, const std::string& to_replace, const std::string& replace_with)
 {
     if (to_replace.empty())

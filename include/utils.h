@@ -5,10 +5,6 @@
 #include "bytes.h"
 #include "network_addresses.h"
 
-// Throws a system exception
-// Prints the following: a message, the error number, file, func and the specific line
-void system_wrapper(const std::string& command);
-
 // In a string, replace each substring with another substring
 std::string string_replace_all(const std::string& str, const std::string& to_replace, const std::string& replace_with);
 
