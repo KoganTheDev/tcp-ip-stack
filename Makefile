@@ -138,7 +138,9 @@ coverage: $(COVERAGE_DIR)/build.ninja
 	$(LLVM_COV) show ./$(COVERAGE_DIR)/run_tests -instr-profile=$(COVERAGE_DIR)/run_tests.profdata \
 	    $(COVERAGE_IGNORE) -format=html -output-dir=$(COVERAGE_DIR)/html
 	$(LLVM_COV) report ./$(COVERAGE_DIR)/run_tests -instr-profile=$(COVERAGE_DIR)/run_tests.profdata \
-	    $(COVERAGE_IGNORE)
+	    $(COVERAGE_IGNORE) > $(COVERAGE_DIR)/report.txt
+	@cat $(COVERAGE_DIR)/report.txt
+	@echo "coverage: text report in $(COVERAGE_DIR)/report.txt"
 	@echo "coverage: HTML report in $(COVERAGE_DIR)/html/index.html"
 
 # bin/, tests/bin/ and ./run_tests are where the hand-written Makefile this

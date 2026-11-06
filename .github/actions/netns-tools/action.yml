@@ -1,0 +1,31 @@
+# The tooling every end-to-end job needs to build network namespaces and veth
+# pairs and to talk across them, installed one way in one place. It used to be
+# three hand-written apt-get lines that had already drifted apart (the router
+# job had traceroute, the demonstrator had neither ping nor netcat).
+#
+# Jobs that need more (traceroute for the router test, dnsmasq for the
+# demonstrator) pass it in extra-packages.
+name: netns tools
+description: Install the network tooling the scripts/*.sh end-to-end tests use.
+inputs:
+  extra-packages:
+    description: Space-separated apt packages to install on top of the common set.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Install network tooling
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y iproute2 ethtool iputils-ping netcat-openbsd ${{ inputs.extra-packages }}
+
+    # Ubuntu's dnsmasq package starts a system-wide instance on install, which
+    # would hold port 53. The demonstrator runs its own in a namespace.
+    - name: Stop the system dnsmasq
+      if: contains(inputs.extra-packages, 'dnsmasq')
+      shell: bash
+      run: |
+        sudo systemctl stop dnsmasq 2>/dev/null || true
+        sudo systemctl disable dnsmasq 2>/dev/null || true
