@@ -1,88 +1,70 @@
-# This Makefile builds the stack's objects and the test runner. There is no
-# standalone binary target here any more: the sandbox that used to provide
-# main() demonstrated the retired physical-NIC path, and the actual program
-# built on this stack is epoll-server/ (see its own Makefile).
+# The real build is CMake (CMakeLists.txt, with one preset per build flavour in
+# CMakePresets.json). This Makefile is a thin wrapper, kept so the entry points
+# everyone already types - `make test`, `make asan`, `make tsan` - keep working,
+# and for the parts a preset cannot express: the TSan ASLR probe below, and the
+# sanitizer runtime options.
+#
+# Every preset builds into its own build/<preset> directory, so a debug object
+# can never end up linked into a sanitizer binary or the other way round.
+#
+# The applications on top of the stack (epoll-server/, http-get/) are built by
+# the CMake presets too, but keep their own Makefiles: scripts/*.sh build
+# through `make -C epoll-server` / `make -C http-get` and run the binaries that
+# land next to those Makefiles.
 #
 # Targets:
-#   make            - build the test runner (same as `make run_tests`)
-#   make all        - same
-#   make run_tests  - build the test runner (tests/src/*.cpp are picked up
-#                     automatically by the wildcard below - no per-file wiring)
-#   make test       - build and run the whole test suite
-#   make asan       - run the test suite under AddressSanitizer + UBSan
-#   make tsan       - run the test suite under ThreadSanitizer
-#   make clean      - remove build artifacts
-
-# Include all directories recursively under "include"
-INCLUDES = -I./include
-TEST_INCLUDES = -I./include -I./tests/include -I./epoll-server/include
-
-HEADERS = $(wildcard ./include/*.h)
-TEST_HEADERS = $(wildcard ./tests/include/*.h)
-
-# Automatically find all .cpp files in the src directory (and subdirectories)
-SRC = $(wildcard ./src/*.cpp)
-TEST_SRC = $(wildcard ./tests/src/*.cpp)
-
-# The two pieces of epoll-server that are testable without a network device.
-# They are named explicitly rather than wildcarded because the rest of that
-# program (server.cpp, main.cpp) needs a channel and an event loop, and pulling
-# main() into the test runner would not link.
+#   make            - build everything in the debug preset (same as `make all`)
+#   make run_tests  - same; the test runner is build/debug/run_tests
+#   make test       - build and run the whole test suite (exit status is
+#                     nonzero if any test fails)
+#   make asan       - full rebuild, then run the suite under ASan + UBSan
+#   make tsan       - full rebuild, then run the suite under ThreadSanitizer
+#   make strict     - build everything with -Wextra -Werror, then run the suite
+#   make clean      - remove every build directory
 #
-# They are here at all because the tsan job was decorative for as long as the
-# whole suite was single-threaded: it built and linked, and proved nothing. This
-# is the threaded code, and it needs no TAP device or privilege - only eventfd,
-# which works anywhere Linux does.
-THREADED_SRC = ./epoll-server/src/thread_pool.cpp ./epoll-server/src/completion_queue.cpp
+# Without the wrapper: cmake --preset debug && cmake --build --preset debug &&
+# ctest --preset debug. tests/src/*.cpp are globbed by CMake, so a new test file
+# needs no wiring anywhere.
 
-# Object files corresponding to the source files
-OBJ = $(SRC:./src/%.cpp=./bin/%.o)
-THREADED_OBJ = $(THREADED_SRC:./epoll-server/src/%.cpp=./bin/%.o)
-TEST_OBJ = $(OBJ) $(THREADED_OBJ) $(TEST_SRC:./tests/src/%.cpp=./tests/bin/%.o)
+CMAKE ?= cmake
 
-# Compiler and flags
-CXX = g++
-CXXFLAGS = -std=c++17 -Wall -g -pthread
+all: build/debug/build.ninja
+	$(CMAKE) --build --preset debug
 
-# Output executable
-TEST_TARGET = run_tests
+run_tests: all
 
-# first rule, so a bare `make` builds the test runner
-all: $(TEST_TARGET)
+# The runner is invoked directly rather than through ctest: it is one process
+# for the whole suite, prints its own summary, and its exit status is the
+# answer.
+test: all
+	./build/debug/run_tests
 
-$(TEST_TARGET) : $(TEST_OBJ)
-	$(CXX) $(CXXFLAGS) $(TEST_INCLUDES) -o $(TEST_TARGET) $^
+# Configure a preset the first time it is used, and again whenever the presets
+# file changes (re-running `cmake --preset` re-applies its cache variables).
+# Edits to CMakeLists.txt need nothing here - `cmake --build` notices those and
+# re-runs the configure step itself.
+build/%/build.ninja: CMakePresets.json
+	$(CMAKE) --preset $*
 
-test: $(TEST_TARGET)
-	./$(TEST_TARGET)
-
-bin/%.o: src/%.cpp $(HEADERS)
-	@mkdir -p bin
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
-
-bin/%.o: epoll-server/src/%.cpp
-	@mkdir -p bin
-	$(CXX) $(CXXFLAGS) $(TEST_INCLUDES) -c $< -o $@
-
-tests/bin/%.o: tests/src/%.cpp $(HEADERS) $(TEST_HEADERS)
-	@mkdir -p tests/bin
-	$(CXX) $(CXXFLAGS) $(TEST_INCLUDES) -c $< -o $@
-
-# Sanitizer runs are always full rebuilds: the instrumentation is a compile
-# flag, so reusing objects from a normal build would silently leave most of the
-# code uninstrumented and the run would prove nothing.
+# Sanitizer runs are always full rebuilds, from an empty build directory. The
+# instrumentation is a compile flag; separate build directories already keep a
+# normal build's objects out, and starting from nothing also rules out a stale
+# CMake cache (an old compiler or flag set) silently surviving into the run.
+# ccache keeps the cost of this down where it is installed.
 #
 # ASan and UBSan combine in one pass (they instrument different things and do
-# not conflict). TSan must be its own target - it is incompatible with ASan and
+# not conflict). TSan must be its own build - it is incompatible with ASan and
 # has to be linked into everything.
 #
 # halt_on_error=1 matters for UBSan especially: without it, undefined behavior
 # is reported and then execution continues, so a passing exit code would mean
-# nothing.
+# nothing. The asan preset also compiles with -fno-sanitize-recover=all, which
+# makes the same thing true at compile time.
 asan:
-	$(MAKE) clean
-	$(MAKE) $(TEST_TARGET) CXXFLAGS="-std=c++17 -Wall -g -pthread -O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all"
-	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ./$(TEST_TARGET)
+	rm -rf build/asan
+	$(CMAKE) --preset asan
+	$(CMAKE) --build --preset asan
+	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ./build/asan/run_tests
 
 # TSan needs a specific virtual-memory layout and disables ASLR itself to get
 # it. Where it cannot (a container whose seccomp profile blocks the
@@ -96,22 +78,41 @@ asan:
 # can. The probe matters - falling back after a failed *test* run instead would
 # quietly turn a genuine TSan race report into a passing retry.
 #
+# This probe is why `make tsan` is the way to run TSan; `ctest --preset tsan`
+# runs the same binary without it.
+#
 # In Docker, grant the syscall with:
 #   docker run --security-opt seccomp=unconfined ...
 tsan:
-	$(MAKE) clean
-	$(MAKE) $(TEST_TARGET) CXXFLAGS="-std=c++17 -Wall -g -pthread -O1 -fno-omit-frame-pointer -fsanitize=thread"
+	rm -rf build/tsan
+	$(CMAKE) --preset tsan
+	$(CMAKE) --build --preset tsan
 	@if setarch $$(uname -m) -R true >/dev/null 2>&1; then \
 	    echo "tsan: ASLR can be disabled, running under setarch -R"; \
-	    TSAN_OPTIONS=halt_on_error=1 setarch $$(uname -m) -R ./$(TEST_TARGET); \
+	    TSAN_OPTIONS=halt_on_error=1 setarch $$(uname -m) -R ./build/tsan/run_tests; \
 	else \
 	    echo "tsan: cannot disable ASLR here (blocked personality() syscall?);"; \
 	    echo "tsan: running anyway - a startup abort with exit 66 is environmental, not a race"; \
-	    TSAN_OPTIONS=halt_on_error=1 ./$(TEST_TARGET); \
+	    TSAN_OPTIONS=halt_on_error=1 ./build/tsan/run_tests; \
 	fi
 
-clean:
-	rm -rf bin tests/bin
-	rm -f $(TEST_TARGET) tcpipstack
+# Warnings as errors, but only on the code this project owns: imported
+# libraries' headers are included as system headers, which the compiler exempts.
+# A blanket -Werror over system headers would fail on -Wextra noise
+# (sockaddr_ll and ifreq have members no caller is meant to initialize), which
+# is why -Wno-missing-field-initializers is in the preset.
+#
+# Not a forced rebuild like the sanitizers: build/strict only ever compiles with
+# -Werror, so every object already in it passed, and ninja recompiles whatever
+# changed since.
+strict: build/strict/build.ninja
+	$(CMAKE) --build --preset strict
+	./build/strict/run_tests
 
-.PHONY: all test asan tsan clean
+# bin/, tests/bin/ and ./run_tests are where the hand-written Makefile this
+# replaced put its output; removed too so an old checkout cleans up fully.
+clean:
+	rm -rf build bin tests/bin
+	rm -f run_tests tcpipstack
+
+.PHONY: all run_tests test asan tsan strict clean
