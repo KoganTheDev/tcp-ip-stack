@@ -7,13 +7,12 @@ name: Static analysis
 # do not control as tightly as the compiler, so a toolchain bump on the runner
 # image can turn this workflow red without touching the build.
 #
-# TOOL VERSIONS: the jobs install the distro's default `clang-format`,
-# `clang-tidy` and `cppcheck` packages. ubuntu-latest (24.04) ships LLVM 18.
-# .clang-format uses the nested `KeepEmptyLines:` option, which clang-format
-# only understands from 19 on, and the local checks were triaged with a newer
-# clang-tidy than that. If the format job rejects .clang-format on the runner,
-# the fix is to install a newer LLVM from apt.llvm.org (pin the major version
-# there), not to loosen the config.
+# TOOL VERSIONS: clang-format is pinned from PyPI to the exact version used
+# locally (23.1.4). Formatting output changes between LLVM releases, and
+# .clang-format uses options (nested KeepEmptyLines) that the distro's LLVM 18
+# does not understand, so "whatever apt has" would either reject the config or
+# disagree with the developer's machine. clang-tidy and cppcheck come from apt;
+# a runner image bump can surface new findings there, which is acceptable.
 
 on:
   push:
@@ -37,8 +36,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - name: Install clang-format
-        run: sudo apt-get update && sudo apt-get install -y clang-format
+      - name: Install clang-format (pinned, same version as local)
+        run: pipx install clang-format==23.1.4
       - name: Check every tracked C++ file
         run: git ls-files '*.cpp' '*.h' | xargs clang-format --dry-run --Werror
 
