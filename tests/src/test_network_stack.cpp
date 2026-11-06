@@ -3479,3 +3479,69 @@ TEST(NetworkStack, ChallengeAcksAreRateLimitedPerSecondAndCounted)
     stack->poll();
     ASSERT_TRUE(count_tcp_frames(channel->outbound_frames()) == 1) << "a new second brings a new budget";
 }
+
+// A transmit failure that will pass by itself (a full transmit queue: ENOBUFS
+// on the packet socket, EAGAIN on the TAP fd) is a lost frame, not an error.
+// It must not throw out of the stack - the application would see an exception
+// from send() or a timer tick for what the network does all the time - and
+// TCP's retransmission must then deliver the data intact.
+TEST(NetworkStack, TransientWriteFailuresAreDroppedFramesThatTcpRecovers)
+{
+    auto channel_a = std::make_unique<LoopbackChannel>();
+    auto channel_b = std::make_unique<LoopbackChannel>();
+    LoopbackChannel* lossy = channel_a.get();
+    channel_a->set_peer(channel_b.get());
+    channel_b->set_peer(channel_a.get());
+    NetworkStack stack_a(std::move(channel_a), MacAddress("aa:aa:aa:aa:aa:aa"), IPv4Address("10.0.0.1"));
+    NetworkStack stack_b(std::move(channel_b), MacAddress("02:bb:bb:bb:bb:bb"), IPv4Address("10.0.0.2"));
+
+    auto step = [&]()
+    {
+        stack_a.poll();
+        stack_b.poll();
+        stack_a.on_time_passed(TEST_TICK_MS);
+        stack_b.on_time_passed(TEST_TICK_MS);
+    };
+
+    stack_b.listen(80);
+    TcpConnection* client = stack_a.connect(IPv4Address("10.0.0.2"), 80);
+    for (int i = 0; i < 12; i++)
+    {
+        step();
+    }
+    TcpConnection* server = stack_b.accept(80);
+    ASSERT_TRUE(server != nullptr && client->get_state() == TcpState::ESTABLISHED) << "precondition: connected";
+
+    Bytes received;
+    server->set_data_ready_callback([&received, server]() { received |= server->read(); });
+
+    Bytes message(8000);
+    for (size_t i = 0; i < message.size(); i++)
+    {
+        message[i] = static_cast<byte_t>(i * 7);
+    }
+    lossy->fail_next_writes(3);
+    ASSERT_NO_THROW(client->send(message)) << "a dropped frame must not surface as an exception from send()";
+    for (int i = 0; i < 200 && received.size() < message.size(); i++)
+    {
+        ASSERT_NO_THROW(step()) << "nor from poll() or on_time_passed() while retransmitting";
+    }
+    ASSERT_TRUE(received.to_hex() == message.to_hex()) << "retransmission delivers every byte, in order";
+    ASSERT_TRUE(stack_a.transmit_drops() == 3) << "each dropped frame is counted";
+}
+
+// A channel that is gone for good (EBADF, the device removed) is not a lost
+// frame: retrying into it forever would turn a dead interface into a stack
+// that silently stops talking. That stays an exception, out of every entry
+// point - including the timer, which used to log it and carry on.
+TEST(NetworkStack, AFatalWriteFailureStillPropagates)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    establish_passive(*stack, *channel);
+    TcpConnection* connection = stack->accept(80);
+    connection->send(Bytes::from_hex("6869"));
+
+    channel->fail_writes_fatally();
+    ASSERT_THROW(stack->on_time_passed(2000), BaseException) << "the retransmission's fatal failure must surface";
+}

@@ -216,6 +216,14 @@ public:
     // limit drawn at random (see _draw_challenge_ack_limit). Suppressed ones
     // are counted too: a climbing count means somebody is probing.
     static constexpr uint64_t CHALLENGE_ACK_LIMIT_PER_SECOND = 1000;
+
+    // Frames a channel dropped for a transient reason (TransientWriteError:
+    // a full transmit queue, an interrupted write, a link that is down), since
+    // the stack started. Each is treated as loss on the wire - TCP retransmits,
+    // ARP and DNS retry - so it never surfaces as an exception; this count is
+    // where it shows instead. Fatal channel errors are not counted here: they
+    // propagate out of poll()/on_time_passed()/send().
+    uint64_t transmit_drops() const { return _transmit_drops; }
     uint64_t challenge_acks_sent() const { return _challenge_acks_sent; }
     uint64_t challenge_acks_suppressed() const { return _challenge_acks_suppressed; }
 
@@ -577,6 +585,10 @@ private:
     Interface& _primary() { return *this->_interfaces.front(); }
     const Interface& _primary() const { return *this->_interfaces.front(); }
 
+    // The one place a frame is handed to a channel. A TransientWriteError is
+    // a dropped frame (counted in transmit_drops()); anything else propagates.
+    void _transmit(const Interface& interface, const Bytes& frame);
+
     // Held by pointer so an Interface's address is stable: the channel, the ARP
     // table and the pending maps are all referred to across a poll(), and a
     // vector reallocating on add_interface() would invalidate every one.
@@ -624,6 +636,7 @@ private:
     uint64_t _challenge_acks_in_window = 0;
     uint64_t _challenge_acks_sent = 0;
     uint64_t _challenge_acks_suppressed = 0;
+    uint64_t _transmit_drops = 0;
 
     // Null until start_dhcp(). Owned here rather than by the application
     // because it reconfigures the interface, which is this class's state.

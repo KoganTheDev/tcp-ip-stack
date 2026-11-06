@@ -304,35 +304,31 @@ void Server::_continue_response(uint64_t connection_id)
         return; // reaped while waiting for room
     }
 
-    try
+    // No try/catch here any more. It existed because a channel write failing
+    // mid-send() threw out of the stack, and the response was then dropped
+    // with a log line - for a full transmit queue, which is ordinary loss.
+    // The stack now absorbs that as a dropped frame that TCP retransmits
+    // (NetworkStack::transmit_drops()), so send() only throws when the device
+    // itself is gone. That is not a per-connection problem to log and skip:
+    // it propagates out of run() to main(), which reports it and exits.
+    Bytes& remaining = unsent_it->second;
+    size_t accepted = connection->send(remaining);
+    TcpState state = connection->get_state();
+    bool can_still_send = state == TcpState::ESTABLISHED || state == TcpState::CLOSE_WAIT;
+    if (accepted < remaining.size() && can_still_send)
     {
-        Bytes& remaining = unsent_it->second;
-        size_t accepted = connection->send(remaining);
-        TcpState state = connection->get_state();
-        bool can_still_send = state == TcpState::ESTABLISHED || state == TcpState::CLOSE_WAIT;
-        if (accepted < remaining.size() && can_still_send)
-        {
-            // No room for the rest yet. It goes out once an ack frees send
-            // buffer space, which can only happen in poll() or a timer tick -
-            // run() calls _flush_unsent() after both.
-            remaining = remaining.slice(accepted, remaining.size() - accepted);
-            return;
-        }
-        // Either everything was accepted, or the connection can no longer send
-        // at all and send() would return 0 forever - holding the tail then
-        // would keep this connection in flight, and unread, for good.
-        this->_unsent.erase(unsent_it);
+        // No room for the rest yet. It goes out once an ack frees send
+        // buffer space, which can only happen in poll() or a timer tick -
+        // run() calls _flush_unsent() after both.
+        remaining = remaining.slice(accepted, remaining.size() - accepted);
+        return;
     }
-    catch (const std::exception& e)
-    {
-        this->_unsent.erase(connection_id);
-        LOG_ERROR("Server: sending the response for connection " << connection_id << " failed: " << e.what());
-    }
+    // Either everything was accepted, or the connection can no longer send
+    // at all and send() would return 0 forever - holding the tail then
+    // would keep this connection in flight, and unread, for good.
+    this->_unsent.erase(unsent_it);
 
-    // Clear the in-flight mark whatever happened above. It is what lets the
-    // next chunk be picked up, so a throw must not be able to skip it - that
-    // is how a connection ends up acking forever while silently answering
-    // nothing.
+    // Clearing the in-flight mark is what lets the next chunk be picked up.
     this->_in_flight.erase(connection_id);
 
     // Whatever arrived while that chunk was in the pool is still sitting unread
@@ -359,14 +355,9 @@ void Server::_close_if_finished(uint64_t connection_id)
     {
         return;
     }
-    try
-    {
-        connection->close(); // TcpConnection defers the FIN until queued data is sent
-    }
-    catch (const std::exception& e)
-    {
-        LOG_ERROR("Server: closing connection " << connection_id << " failed: " << e.what());
-    }
+    // Not caught, for the same reason as in _continue_response(): only a
+    // fatal channel error can still throw out of the stack.
+    connection->close(); // TcpConnection defers the FIN until queued data is sent
 }
 
 void Server::_close_finished_peers()

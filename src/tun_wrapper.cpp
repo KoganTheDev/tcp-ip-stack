@@ -128,6 +128,13 @@ void TunWrapper::write(const Bytes& buffer)
 
     if (bytes_written < 0)
     {
+        // Transient (a full queue, an interrupted call) means this frame is
+        // lost and the protocols above resend it; anything else means the
+        // device itself is unusable. See packet_channel.h.
+        if (is_transient_write_errno(errno))
+        {
+            throw EXCEPTION(TransientWriteError, "TAP write dropped a frame (transient)");
+        }
         throw EXCEPTION(SystemException, "Writing using the tun device has failed");
     }
     else if ((size_t)bytes_written != buffer.size())

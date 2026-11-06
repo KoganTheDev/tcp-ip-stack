@@ -504,6 +504,27 @@ bool NetworkStack::unbind_udp(uint16_t port)
     return this->_udp_sockets.erase(port) > 0;
 }
 
+void NetworkStack::_transmit(const Interface& interface, const Bytes& frame)
+{
+    try
+    {
+        interface.channel->write(frame);
+    }
+    catch (const TransientWriteError& e)
+    {
+        // Loss, as if the frame had died on the wire: TCP retransmits, ARP and
+        // DNS retry. Counted, and logged at powers of two so a sustained
+        // condition (a saturated NIC queue) stays visible without one line
+        // per frame. Any other exception is fatal and is not caught here.
+        this->_transmit_drops++;
+        if ((this->_transmit_drops & (this->_transmit_drops - 1)) == 0)
+        {
+            LOG_WARNING("NetworkStack: " << this->_transmit_drops
+                                         << " frame(s) dropped on transmit so far: " << e.what());
+        }
+    }
+}
+
 void NetworkStack::_wire_connection(TcpConnection& connection)
 {
     this->_watch_for_close(connection);
@@ -622,16 +643,14 @@ void NetworkStack::on_time_passed(uint32_t elapsed_ms)
 {
     this->_now_ms += elapsed_ms;
 
+    // No catch around each connection any more. What used to land here was a
+    // channel write failing during a retransmission, and _transmit() now
+    // absorbs the transient kind as a dropped frame. What is left is fatal - a
+    // device that is gone - and logging it per connection on every tick hid
+    // exactly the failure that needs to be seen.
     for (auto& entry : this->_connections)
     {
-        try
-        {
-            entry.second->on_time_passed(elapsed_ms);
-        }
-        catch (const std::exception& e)
-        {
-            LOG_ERROR("NetworkStack: on_time_passed failed for a connection: " << e.what());
-        }
+        entry.second->on_time_passed(elapsed_ms);
     }
 
     this->_reap_closed_connections();
@@ -893,7 +912,7 @@ void NetworkStack::_handle_arp(size_t ingress, const Arp& arp)
     reply /= std::make_unique<Arp>(ArpOperation::REPLY, interface.config.mac, interface.config.ip,
                                    arp.get_sender_hardware_address(), arp.get_sender_protocol_address());
 
-    interface.channel->write(reply.to_bytes());
+    this->_transmit(interface, reply.to_bytes());
 }
 
 void NetworkStack::_handle_ip(size_t ingress, const Ip& ip, const Bytes& ip_bytes, bool link_layer_group)
@@ -1753,7 +1772,7 @@ void NetworkStack::_send_arp_request(size_t interface_index, const IPv4Address& 
     Interface& interface = *this->_interfaces.at(interface_index);
     Ethernet request(interface.config.mac, MacAddress::BROADCAST, EtherType::ARP);
     request /= std::make_unique<Arp>(interface.config.mac, interface.config.ip, target_ip);
-    interface.channel->write(request.to_bytes());
+    this->_transmit(interface, request.to_bytes());
 }
 
 void NetworkStack::_ensure_arp_resolution(size_t interface_index, const IPv4Address& ip)
@@ -1913,7 +1932,7 @@ void NetworkStack::_forward_ip(size_t ingress, const Ip& ip, const Bytes& ip_byt
     // traceroute show every hop rather than just the last one.
     Ethernet out_frame(out.config.mac, dest_mac, EtherType::IPv4);
     out_frame /= std::make_unique<Raw>(forwarded);
-    out.channel->write(out_frame.to_bytes());
+    this->_transmit(out, out_frame.to_bytes());
 
     LOG_DEBUG("NetworkStack: forwarded a packet from "
               << source.to_string() << " to " << destination.to_string() << " via interface " << egress << " (ttl "
@@ -1983,7 +2002,7 @@ void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol,
 
         Ethernet ethernet(interface.config.mac, dest_mac, EtherType::IPv4);
         ethernet /= std::move(ip);
-        interface.channel->write(ethernet.to_bytes());
+        this->_transmit(interface, ethernet.to_bytes());
         return;
     }
 
@@ -2021,7 +2040,7 @@ void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol,
 
         Ethernet ethernet(interface.config.mac, dest_mac, EtherType::IPv4);
         ethernet /= std::move(ip);
-        interface.channel->write(ethernet.to_bytes());
+        this->_transmit(interface, ethernet.to_bytes());
 
         offset += chunk;
     }
