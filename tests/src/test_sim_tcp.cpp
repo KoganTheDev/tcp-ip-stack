@@ -27,6 +27,26 @@ namespace
             out[i] = static_cast<byte_t>((i * 131) ^ (i >> 8));
         return out;
     }
+
+    // The TCP segments a capture holds, decoded.
+    std::vector<tcp_frame::Segment> tcp_segments(const PcapWriter& capture)
+    {
+        std::vector<tcp_frame::Segment> out;
+        for (const PcapWriter::Record& record : capture.records())
+        {
+            tcp_frame::Segment segment;
+            std::string error;
+            if (tcp_frame::parse(record.frame, segment, error))
+                out.push_back(segment);
+        }
+        return out;
+    }
+
+    bool has_option(const tcp_frame::Segment& segment, uint8_t kind)
+    {
+        return std::any_of(segment.options.begin(), segment.options.end(),
+                           [kind](const tcp_frame::Option& o) { return o.kind == kind; });
+    }
 }
 
 class SimTcp : public SimFixture
@@ -34,6 +54,7 @@ class SimTcp : public SimFixture
 protected:
     NetworkStack* client_stack = nullptr;
     NetworkStack* server_stack = nullptr;
+    NetemChannel* link = nullptr;
     uint64_t client_id = 0;
     uint64_t server_id = 0;
     Bytes server_received;
@@ -43,9 +64,9 @@ protected:
     void build(uint64_t seed, const LinkParams& client_to_server, const LinkParams& server_to_client)
     {
         net = std::make_unique<SimNetwork>(seed);
-        NetemChannel& link = net->add_link(client_to_server, server_to_client);
-        client_stack = &net->add_stack(link.take_endpoint(NetemChannel::A), CLIENT_MAC, CLIENT_IP);
-        server_stack = &net->add_stack(link.take_endpoint(NetemChannel::B), SERVER_MAC, SERVER_IP);
+        link = &net->add_link(client_to_server, server_to_client);
+        client_stack = &net->add_stack(link->take_endpoint(NetemChannel::A), CLIENT_MAC, CLIENT_IP);
+        server_stack = &net->add_stack(link->take_endpoint(NetemChannel::B), SERVER_MAC, SERVER_IP);
         client_stack->add_static_arp_entry(SERVER_IP, SERVER_MAC);
         server_stack->add_static_arp_entry(CLIENT_IP, CLIENT_MAC);
         server_stack->listen(SERVER_PORT);
@@ -131,4 +152,52 @@ TEST_F(SimTcp, TheRtoStaysNearTheRoundTripUnderLoss)
     ASSERT_TRUE(server_received == payload) << "and arrive intact";
     ASSERT_TRUE(worst_rto <= 3000) << "the RTO peaked at " << worst_rto
                                    << " ms on a ~50 ms path - RTT samples are not the round trip";
+}
+
+// SimTransfer seed 7079, reduced: the server's first SYN-ACK is lost. Its
+// retransmission used to go out with no options at all, so the client
+// concluded the server offered none - MSS 536, no timestamps, no SACK - while
+// the server, having seen the client's SYN offer everything, believed
+// timestamps were in use. Every segment then disagreed with its receiver
+// about what it should carry.
+TEST_F(SimTcp, ALostSynAckStillNegotiatesTheSameOptionsOnBothSides)
+{
+    LinkParams wire;
+    wire.delay_ms = 5;
+    wire.mtu = 1500;
+    build(7079, wire, wire);
+    // Lose whatever the server sends until it has sent one frame: its SYN-ACK.
+    link->params(NetemChannel::B).loss = 1.0;
+    net->add_tick_hook(
+        [this]()
+        {
+            if (link->stats(NetemChannel::B).transmitted >= 1)
+                link->params(NetemChannel::B).loss = 0.0;
+        });
+
+    const Bytes payload = pattern(20000);
+    ASSERT_TRUE(send_one_way(payload, 30000)) << "the transfer should finish once the SYN-ACK is retransmitted";
+    ASSERT_TRUE(link->stats(NetemChannel::B).lost == 1) << "precondition: exactly the first SYN-ACK was lost";
+
+    TcpConnection* client = client_stack->find_connection(client_id);
+    TcpConnection* server = server_stack->find_connection(server_id);
+    ASSERT_TRUE(client != nullptr && server != nullptr) << "both connections should still be open";
+    ASSERT_TRUE(client->get_effective_mss() == 1460 && server->get_effective_mss() == 1460)
+        << "both sides should agree on MSS 1460; client " << client->get_effective_mss() << ", server "
+        << server->get_effective_mss();
+
+    std::vector<tcp_frame::Segment> delivered = tcp_segments(net->delivered_capture());
+    for (const tcp_frame::Segment& segment : delivered)
+    {
+        ASSERT_TRUE((segment.flags & tcp_frame::RST) != 0 || has_option(segment, tcp_frame::TIMESTAMP))
+            << "every segment should carry a timestamp, as both SYNs offered one; this one did not: seq " << segment.seq
+            << " flags " << tcp_frame::flags_to_string(segment.flags) << " from port " << segment.src_port;
+        if ((segment.flags & tcp_frame::SYN) != 0)
+        {
+            ASSERT_TRUE(has_option(segment, tcp_frame::MSS) && has_option(segment, tcp_frame::SACK_OK)
+                        && has_option(segment, tcp_frame::WSCALE))
+                << "every SYN and SYN-ACK should offer MSS, SACK and window scale, the first and the retransmitted "
+                   "alike";
+        }
+    }
 }
