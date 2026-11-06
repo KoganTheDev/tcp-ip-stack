@@ -1146,6 +1146,14 @@ void TcpConnection::on_segment(const Tcp& segment)
 
     if (segment.get_rst())
     {
+        if (_state == TcpState::TIME_WAIT)
+        {
+            // RFC 1337: ignore it. RFC 9293 3.10.7.4 would close, citing RFC
+            // 1337 only as an option; closing early is what TIME_WAIT exists
+            // to prevent, since it frees the four-tuple while the old
+            // connection's segments may still be in the network.
+            return;
+        }
         if (_state == TcpState::SYN_SENT)
         {
             // RFC 9293 3.10.7.3: there is no RCV.NXT yet to check the sequence

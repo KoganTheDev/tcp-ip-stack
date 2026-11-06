@@ -2371,3 +2371,28 @@ TEST(TcpConnection, ASimultaneousOpenRefusesASynAckWhoseOptionsDifferFromTheSyn)
     ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED) << "a SYN-ACK agreeing with the SYN completes";
     ASSERT_TRUE(connection->get_effective_mss() == 600) << "with the options both carried";
 }
+
+// RFC 1337 ("TIME-WAIT Assassination Hazards"): a RST arriving in TIME_WAIT
+// is ignored. RFC 9293 3.10.7.4 still says to close on it and mentions RFC
+// 1337 only as optional; this stack takes RFC 1337's side, like FreeBSD,
+// because closing early is exactly what TIME_WAIT exists to prevent - an old
+// duplicate (or a forged RST) would otherwise free the four-tuple for reuse
+// while segments of the old connection are still in the network.
+TEST(TcpConnection, ARstInTimeWaitIsIgnored)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->close();
+    uint32_t fin_seq = sent[0].seq;
+    connection->on_segment(*make_incoming_segment(501, fin_seq + 1, FLAG_ACK));
+    connection->on_segment(*make_incoming_segment(501, fin_seq + 1, FLAG_ACK | FLAG_FIN));
+    ASSERT_TRUE(connection->get_state() == TcpState::TIME_WAIT) << "precondition";
+    sent.clear();
+
+    connection->on_segment(*make_incoming_segment(502, fin_seq + 1, FLAG_RST)); // exactly RCV.NXT
+    ASSERT_TRUE(connection->get_state() == TcpState::TIME_WAIT) << "a RST must not cut TIME_WAIT short";
+    ASSERT_TRUE(sent.empty()) << "and is not answered";
+
+    advance_ms(*connection, TIME_WAIT_MS);
+    ASSERT_TRUE(connection->get_state() == TcpState::CLOSED) << "TIME_WAIT still ends after its full 2*MSL";
+}
