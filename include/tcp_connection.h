@@ -49,9 +49,6 @@ enum class TcpState
 //  - SACK reports and honours blocks, but recovery is not full RFC 6675:
 //    there is no pipe estimate driving transmission during recovery, and no
 //    rescue retransmission. The scoreboard both would need does exist
-//  - the reorder buffer stores exact-sequence-keyed segments, not merged
-//    ranges - an incoming segment that partially overlaps one already
-//    buffered doesn't get stitched together, just kept or dropped whole
 class TcpConnection
 {
 public:
@@ -268,8 +265,8 @@ public:
     // because it is the number an application needs to reason about how much
     // it can afford not to read.
     static constexpr uint32_t RECEIVE_BUFFER_CAPACITY = 131072; // 128 KiB
-    // How many out-of-order segments the reorder buffer may hold, whatever
-    // their size. The window bounds the bytes but not the count, and each entry
+    // How many entries (disjoint byte ranges) the reorder buffer may hold,
+    // whatever their size. The window bounds the bytes but not the count, and each entry
     // costs a map node and a step of every SACK report - so a peer sending
     // one-byte segments could otherwise pin memory and CPU far beyond what the
     // window suggests. A 128 KiB window holds ~90 full-sized segments, so
@@ -584,7 +581,7 @@ private:
 
     // The out-of-order ranges this side currently holds, as they would be
     // reported to the peer. Derived from _reorder_buffer by merging adjacent
-    // entries - the buffer keys segments by exact sequence number, so what is
+    // entries - the buffer's ranges are disjoint but may touch, so what is
     // logically one contiguous run can be several entries in it.
     std::vector<Tcp::SackBlock> _sack_blocks_to_report() const;
 
@@ -634,10 +631,38 @@ private:
         _peer_window = window;
         _max_peer_window = std::max(_max_peer_window, window);
     }
-    // out-of-order segments, keyed by sequence number - drained into
-    // _recv_next/_deliver() as gaps fill in; bounded by
-    // RECEIVE_BUFFER_CAPACITY via _receive_buffer_occupied()
-    std::map<uint32_t, Bytes> _reorder_buffer;
+    // Out-of-order data as disjoint byte ranges, keyed by the unwrapped
+    // (64-bit) sequence number of their first byte - drained into
+    // _recv_next/_deliver() as gaps fill in; bounded by RECEIVE_BUFFER_CAPACITY
+    // via _receive_buffer_occupied() and by MAX_REORDER_SEGMENTS entries.
+    //
+    // A new segment is cut against what is already held, so every byte is
+    // stored once however the segments overlap; a piece that starts exactly
+    // where an entry ends is appended to it. Two entries can still end up
+    // adjacent (a gap filled from its front edge) and are left as two rather
+    // than concatenated: joining them would copy the second, and a peer could
+    // make that copy happen once per segment - the SACK report and the drain
+    // treat adjacent entries as one range anyway.
+    //
+    // Unwrapped keys sort in true sequence order, so the earliest range is
+    // always begin() even across the 2^32 wrap.
+    std::map<uint64_t, Bytes> _reorder_buffer;
+    // RCV.NXT, unwrapped: advanced in lockstep with _recv_next, so the two are
+    // equal modulo 2^32. Every buffered range lies after it and within the
+    // window, so (seq - RCV.NXT) + this is a range's unwrapped position.
+    uint64_t _recv_next_unwrapped = 0;
+    void _set_recv_next(uint32_t value)
+    {
+        _recv_next = value;
+        _recv_next_unwrapped = value;
+    }
+    void _advance_recv_next(uint32_t count)
+    {
+        _recv_next += count;
+        _recv_next_unwrapped += count;
+    }
+    // Stores whatever part of an out-of-order segment is not already held.
+    void _buffer_out_of_order(uint32_t seq, const Bytes& payload);
     // Total payload bytes in _reorder_buffer, kept alongside it like
     // _receive_queued_bytes is for the receive queue. Summing the map instead
     // was O(entries) on every segment received and every ack sent - quadratic

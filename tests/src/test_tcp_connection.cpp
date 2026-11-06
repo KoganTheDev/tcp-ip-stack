@@ -1978,23 +1978,28 @@ TEST(TcpConnection, LossRightAfterAnAcceptedProbeIsRecoveredByFastRetransmit)
 // larger than its byte), and every ack sent walks them all to build its SACK
 // blocks. Past the cap a segment is dropped, as when it falls outside the
 // window, and the peer retransmits it.
+//
+// Since the buffer holds ranges, adjacent one-byte segments extend one entry
+// and cost nothing extra; it takes segments separated by gaps to make
+// entries, so that is what this sends. The bytes held are read back from the
+// advertised window (shift 1, so 2-byte resolution).
 TEST(TcpConnection, TheReorderBufferHoldsABoundedNumberOfSegments)
 {
-    std::vector<RecordedSegment> sent;
-    auto connection = make_established_connection(sent); // RCV.NXT = 501
-
-    Bytes received;
-    connection->set_data_ready_callback([&received, &connection]() { received |= connection->read(); });
+    uint32_t window = 0;
+    TcpConnection connection(8080, IPv4Address("10.0.0.1"), 12345, 1000, [&window](const Tcp& header, const Bytes&)
+                             { window = static_cast<uint32_t>(header.get_window()) << 1; });
+    connection.accept_incoming_syn(500, 1460, true, 0); // RCV.NXT = 501
+    connection.on_segment(*make_incoming_segment(501, 1001, FLAG_ACK));
 
     const uint32_t offered = 2 * TcpConnection::MAX_REORDER_SEGMENTS;
     for (uint32_t i = 1; i <= offered; i++)
     {
-        connection->on_segment(*make_incoming_segment(501 + i, 1001, FLAG_ACK, Bytes(1)));
+        // one byte, then a one-byte hole: every segment needs an entry
+        connection.on_segment(*make_incoming_segment(501 + 2 * i, 1001, FLAG_ACK, Bytes(1)));
     }
-    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes(1)));
-
-    ASSERT_TRUE(received.size() == 1 + TcpConnection::MAX_REORDER_SEGMENTS)
-        << "only MAX_REORDER_SEGMENTS segments may have been held, got " + std::to_string(received.size() - 1);
+    uint32_t held = TcpConnection::RECEIVE_BUFFER_CAPACITY - window;
+    ASSERT_TRUE(held == TcpConnection::MAX_REORDER_SEGMENTS)
+        << "only MAX_REORDER_SEGMENTS entries may have been held, got " << held << " bytes";
 }
 
 // The cost scenario for the cap above: SACK negotiated, and tens of thousands
@@ -2522,4 +2527,103 @@ TEST(TcpConnection, AbortInTimeWaitClosesWithoutARst)
 
     connection->abort();
     ASSERT_TRUE(connection->get_state() == TcpState::CLOSED && sent.empty()) << "closed, nothing sent";
+}
+
+namespace
+{
+    // The stream byte at sequence number seq. Content that is a function of
+    // the sequence number makes any overlap consistent, and any misplaced or
+    // duplicated byte visible.
+    byte_t stream_byte(uint32_t seq)
+    {
+        return static_cast<byte_t>((seq * 131u) >> 3);
+    }
+
+    Bytes stream(uint32_t from, uint32_t to)
+    {
+        Bytes bytes;
+        for (uint32_t seq = from; seq != to; seq++)
+        {
+            bytes.push_back(stream_byte(seq));
+        }
+        return bytes;
+    }
+
+    // An established connection with SACK and window scaling (shift 1, so the
+    // advertised window has 2-byte resolution) that records the last SACK
+    // report and window it sent, and collects everything it delivers.
+    struct ReorderHarness
+    {
+        std::vector<Tcp::SackBlock> sack;
+        uint32_t window = 0;
+        Bytes delivered;
+        std::unique_ptr<TcpConnection> connection;
+
+        explicit ReorderHarness(uint32_t peer_isn)
+        {
+            connection = std::make_unique<TcpConnection>(8080, IPv4Address("10.0.0.1"), 12345, 1000,
+                                                         [this](const Tcp& header, const Bytes&)
+                                                         {
+                                                             sack = header.get_sack_blocks();
+                                                             window = static_cast<uint32_t>(header.get_window()) << 1;
+                                                         });
+            connection->accept_incoming_syn(peer_isn, 1460, true, 0, false, 0, true);
+            connection->on_segment(*make_incoming_segment(peer_isn + 1, 1001, FLAG_ACK));
+            connection->set_data_ready_callback([this]() { delivered |= connection->read(); });
+        }
+
+        void arrive(uint32_t from, uint32_t to)
+        {
+            connection->on_segment(*make_incoming_segment(from, 1001, FLAG_ACK, stream(from, to)));
+        }
+    };
+}
+
+// The reorder buffer holds byte ranges, not segments keyed by their exact
+// starting sequence number. A retransmission that starts where a buffered
+// segment starts but carries more (a sender that coalesced) used to be
+// dropped whole as a duplicate, losing its new bytes.
+TEST(TcpConnection, ALongerSegmentAtABufferedStartKeepsItsNewBytes)
+{
+    ReorderHarness h(500); // RCV.NXT 501
+    h.arrive(510, 520);
+    h.arrive(510, 540);
+    h.arrive(501, 510);
+    ASSERT_TRUE(h.delivered.to_hex() == stream(501, 540).to_hex()) << "every byte through 540 is delivered, in order";
+}
+
+// Overlapping ranges are held once: one SACK block for the union, and the
+// window shrinks by the bytes actually held rather than by the sum of the
+// segments that brought them.
+TEST(TcpConnection, OverlappingOutOfOrderSegmentsAreHeldOnce)
+{
+    ReorderHarness h(500);
+    uint32_t full_window = 131072;
+
+    h.arrive(510, 520);
+    h.arrive(506, 530); // contains the first
+    ASSERT_TRUE(h.sack.size() == 1 && h.sack[0].start == 506 && h.sack[0].end == 530) << "one block for the union";
+    ASSERT_TRUE(h.window == full_window - 24) << "24 bytes held, counted once; window " << h.window;
+
+    h.arrive(526, 540); // overlaps the tail
+    h.arrive(502, 508); // overlaps the head, leaving 501 as the only gap
+    ASSERT_TRUE(h.sack.size() == 1 && h.sack[0].start == 502 && h.sack[0].end == 540) << "still one block";
+    ASSERT_TRUE(h.window == full_window - 38) << "38 bytes held; window " << h.window;
+
+    h.arrive(501, 502);
+    ASSERT_TRUE(h.delivered.to_hex() == stream(501, 540).to_hex()) << "the whole range is delivered, in order";
+}
+
+// The same across the 2^32 wrap, where raw sequence numbers stop sorting in
+// sequence order.
+TEST(TcpConnection, OverlappingSegmentsAcrossTheSequenceWrapAreMerged)
+{
+    ReorderHarness h(0xFFFFFFE0u); // RCV.NXT 0xFFFFFFE1
+    h.arrive(0xFFFFFFF0u, 0x00000008u);
+    h.arrive(0xFFFFFFF8u, 0x00000020u);
+    h.arrive(0xFFFFFFE8u, 0xFFFFFFF4u);
+    ASSERT_TRUE(h.sack.size() == 1 && h.sack[0].start == 0xFFFFFFE8u && h.sack[0].end == 0x00000020u)
+        << "one block spanning the wrap";
+    h.arrive(0xFFFFFFE1u, 0xFFFFFFE8u);
+    ASSERT_TRUE(h.delivered.to_hex() == stream(0xFFFFFFE1u, 0x00000020u).to_hex()) << "delivered whole, in order";
 }

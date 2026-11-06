@@ -119,23 +119,26 @@ std::vector<Tcp::SackBlock> TcpConnection::_sack_blocks_to_report() const
         return blocks;
     }
 
-    // The reorder buffer keys segments by their exact sequence number, so a run
-    // of bytes that is logically contiguous can sit in it as several entries.
-    // Reporting each entry separately would waste the very small option space
-    // on describing something the peer can be told in one block, so adjacent
-    // entries are merged as they are walked - the map being ordered is what
-    // makes that a single pass.
+    // Entries are disjoint but may be adjacent (see _reorder_buffer), so a run
+    // that is logically contiguous can be several of them. Reporting each
+    // separately would waste the very small option space on describing
+    // something the peer can be told in one block, so adjacent entries are
+    // merged as they are walked - the map being ordered by unwrapped sequence
+    // number is what makes that a single pass, across the wrap too. The
+    // unwrapped values equal the real ones modulo 2^32.
+    uint64_t previous_end = 0;
     for (const auto& entry : _reorder_buffer)
     {
-        uint32_t start = entry.first;
-        uint32_t end = start + static_cast<uint32_t>(entry.second.size());
-
-        if (!blocks.empty() && blocks.back().end == start)
+        uint64_t end = entry.first + entry.second.size();
+        if (!blocks.empty() && previous_end == entry.first)
         {
-            blocks.back().end = end;
-            continue;
+            blocks.back().end = static_cast<uint32_t>(end);
         }
-        blocks.push_back({start, end});
+        else
+        {
+            blocks.push_back({static_cast<uint32_t>(entry.first), static_cast<uint32_t>(end)});
+        }
+        previous_end = end;
     }
 
     // RFC 2018: the first block must name the range that most recently arrived,
@@ -395,7 +398,7 @@ void TcpConnection::accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss, bo
                                         uint32_t peer_timestamp, bool peer_permits_sack)
 {
     _sack_permitted = peer_permits_sack;
-    _recv_next = peer_isn + 1; // the SYN itself consumes one sequence number
+    _set_recv_next(peer_isn + 1); // the SYN itself consumes one sequence number
     _peer_mss = peer_mss != 0 ? peer_mss : DEFAULT_PEER_MSS;
     _effective_mss = std::min(_local_mss, _peer_mss);
     _window_scaling_negotiated =
@@ -419,7 +422,7 @@ void TcpConnection::accept_cookie_handshake(uint32_t peer_isn, uint16_t peer_mss
     // consumed and acknowledged, and nothing is in flight.
     _send_next += 1;
     _send_max = _send_next;
-    _recv_next = peer_isn + 1;
+    _set_recv_next(peer_isn + 1);
     _peer_mss = peer_mss != 0 ? peer_mss : DEFAULT_PEER_MSS;
     _effective_mss = std::min(_local_mss, _peer_mss);
     _window_scaling_negotiated = false;
@@ -510,6 +513,76 @@ void TcpConnection::initiate_connect()
     _send_flags(FLAG_SYN, Bytes(), false); // active open: bare SYN, nothing to ack yet
 }
 
+void TcpConnection::_buffer_out_of_order(uint32_t seq, const Bytes& payload)
+{
+    // seq is after RCV.NXT and inside the window, so this is its position.
+    uint64_t start = _recv_next_unwrapped + static_cast<uint32_t>(seq - _recv_next);
+    uint64_t end = start + payload.size();
+
+    // The parts of [start, end) not already held. Entries are disjoint, so
+    // one walk from the entry before start finds them; the walk is bounded by
+    // the entries this segment overlaps.
+    std::vector<std::pair<uint64_t, uint64_t>> gaps;
+    uint64_t cursor = start;
+    auto it = _reorder_buffer.upper_bound(start);
+    if (it != _reorder_buffer.begin())
+    {
+        auto previous = std::prev(it);
+        cursor = std::max(cursor, previous->first + previous->second.size());
+    }
+    for (; it != _reorder_buffer.end() && it->first < end; ++it)
+    {
+        if (it->first > cursor)
+        {
+            gaps.emplace_back(cursor, it->first);
+        }
+        cursor = std::max(cursor, it->first + it->second.size());
+    }
+    if (cursor < end)
+    {
+        gaps.emplace_back(cursor, end);
+    }
+    if (gaps.empty())
+    {
+        return; // every byte of it is already held
+    }
+
+    // Every gap after the first starts where an entry ends, so it extends
+    // that entry; only the first can need an entry of its own. That is the
+    // only way the entry count grows, and it is what the cap is checked for.
+    auto ends_at = [this](uint64_t position)
+    {
+        auto candidate = _reorder_buffer.upper_bound(position);
+        if (candidate == _reorder_buffer.begin())
+        {
+            return _reorder_buffer.end();
+        }
+        --candidate;
+        return candidate->first + candidate->second.size() == position ? candidate : _reorder_buffer.end();
+    };
+    if (ends_at(gaps.front().first) == _reorder_buffer.end() && _reorder_buffer.size() >= MAX_REORDER_SEGMENTS)
+    {
+        return; // dropped like a segment outside the window; the peer resends it
+    }
+
+    for (const auto& gap : gaps)
+    {
+        auto from = payload.begin() + static_cast<std::ptrdiff_t>(gap.first - start);
+        auto to = payload.begin() + static_cast<std::ptrdiff_t>(gap.second - start);
+        auto host = ends_at(gap.first);
+        if (host != _reorder_buffer.end())
+        {
+            host->second.insert(host->second.end(), from, to); // appended in place: no copy of what is held
+        }
+        else
+        {
+            _reorder_buffer.emplace(gap.first, Bytes(std::vector<byte_t>(from, to)));
+        }
+        _reorder_buffered_bytes += gap.second - gap.first;
+    }
+    _last_out_of_order_seq = seq;
+}
+
 void TcpConnection::_drain_reorder_buffer()
 {
     // Every buffered segment that now starts at or before RCV.NXT is resolved:
@@ -520,34 +593,25 @@ void TcpConnection::_drain_reorder_buffer()
     // retransmissions, say), that segment starts behind RCV.NXT, is never
     // matched, and sits counted against the receive window forever.
     //
-    // The entries are processed earliest-first in SEQUENCE order, which is
-    // not the map's order: it is keyed by raw uint32_t, so across the 2^32
-    // wrap the post-wrap entries sort first while coming last. Every entry
-    // lies within 2^31 of RCV.NXT, though, so sequence order is raw order
-    // rotated to start at RCV.NXT - 2^31 + 1: lower_bound() finds that start,
-    // and if nothing sorts at or after it the earliest is begin(). That keeps
-    // each step O(log n). A rescan from begin() was correct but quadratic -
-    // with the wrap placed by the peer's ISN, a peer could make one gap-filler
-    // cost tens of seconds of CPU.
+    // The entries are processed earliest-first in SEQUENCE order. The map is
+    // keyed by unwrapped sequence number, so that is simply begin(), across
+    // the 2^32 wrap too, and each step is O(log n). (It used to be keyed by
+    // raw uint32_t, where the post-wrap entries sort first, and a rescan was
+    // correct but quadratic - a peer could make one gap-filler cost tens of
+    // seconds of CPU.)
     while (!_reorder_buffer.empty())
     {
-        uint32_t rotation_start = _recv_next - 0x7FFFFFFFu;
-        auto it = _reorder_buffer.lower_bound(rotation_start);
-        if (it == _reorder_buffer.end())
-        {
-            it = _reorder_buffer.begin();
-        }
-
-        uint32_t start = it->first;
-        if (!seq_at_or_before(start, _recv_next))
+        auto it = _reorder_buffer.begin();
+        uint64_t start = it->first;
+        if (start > _recv_next_unwrapped)
         {
             break; // the earliest entry is still beyond a gap, so all are
         }
-        uint32_t end = start + static_cast<uint32_t>(it->second.size());
+        uint64_t end = start + it->second.size();
         Bytes new_tail;
-        if (!seq_at_or_before(end, _recv_next))
+        if (end > _recv_next_unwrapped)
         {
-            uint32_t already_seen = _recv_next - start;
+            size_t already_seen = static_cast<size_t>(_recv_next_unwrapped - start);
             new_tail = it->second.slice(already_seen, it->second.size() - already_seen);
         }
         // erase before delivering: _deliver() runs the application's
@@ -571,7 +635,7 @@ void TcpConnection::_deliver(const Bytes& payload)
     // straight out, as this used to, reopened the window for bytes the
     // application had not seen, which is flow control that describes a buffer
     // nothing is actually held in.
-    _recv_next += static_cast<uint32_t>(payload.size());
+    _advance_recv_next(static_cast<uint32_t>(payload.size()));
     _receive_queue.push_back(payload);
     _receive_queued_bytes += payload.size();
 
@@ -1116,7 +1180,7 @@ void TcpConnection::_handle_fin(uint32_t fin_seq)
         return;
     }
 
-    _recv_next += 1; // the FIN itself consumes one sequence number
+    _advance_recv_next(1); // the FIN itself consumes one sequence number
 
     if (_state == TcpState::ESTABLISHED)
     {
@@ -1222,7 +1286,7 @@ void TcpConnection::on_segment(const Tcp& segment)
             return; // neither SYN nor RST: nothing here for SYN_SENT
         }
 
-        _recv_next = segment.get_sequence_number() + 1; // the peer's SYN consumes one sequence number
+        _set_recv_next(segment.get_sequence_number() + 1); // the peer's SYN consumes one sequence number
         _take_peer_syn_options(segment);
 
         if (!ack_acceptable)
@@ -1419,20 +1483,15 @@ void TcpConnection::on_segment(const Tcp& segment)
             }
             else if (!seq_at_or_before(seq, _recv_next)) // seq after RCV.NXT, modulo 2^32
             {
-                // out of order - buffer it if there's room and it isn't
-                // already there (a retransmit of an already-buffered
-                // segment), and either way tell the peer our current
-                // RCV.NXT again: that duplicate ack is the signal a sender's
-                // fast retransmit depends on, so it must be sent *immediately*,
-                // never delayed
-                // ...and within MAX_REORDER_SEGMENTS: past it the segment is
-                // dropped like one outside the window, and the peer resends it
-                if (_reorder_buffer.find(seq) == _reorder_buffer.end() && _seq_in_receive_window(seq)
-                    && _reorder_buffer.size() < MAX_REORDER_SEGMENTS)
+                // out of order - buffer whatever of it is not already held
+                // (within the window and MAX_REORDER_SEGMENTS - past those it
+                // is dropped and the peer resends it), and either way tell the
+                // peer our current RCV.NXT again: that duplicate ack is the
+                // signal a sender's fast retransmit depends on, so it must be
+                // sent *immediately*, never delayed
+                if (_seq_in_receive_window(seq))
                 {
-                    _reorder_buffer[seq] = payload;
-                    _reorder_buffered_bytes += payload.size();
-                    _last_out_of_order_seq = seq;
+                    _buffer_out_of_order(seq, payload);
                 }
                 _send_pure_ack();
             }

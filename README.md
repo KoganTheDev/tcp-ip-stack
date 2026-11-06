@@ -52,8 +52,9 @@ simultaneous close rather than folding it into `FIN_WAIT_2`. On top of that:
   ack clock and smoothed with Jacobson and Karels' estimator, tracking both the mean
   and its variation, with Karn's algorithm rejecting the ambiguous samples that come
   from retransmitted segments and exponential backoff covering the resulting blind spot
-- Out-of-order reassembly, bounded by a fixed receive-buffer capacity that also
-  determines the advertised window
+- Out-of-order reassembly as disjoint byte ranges, so overlapping and partially
+  overlapping segments are held once and keep every new byte, bounded by a fixed
+  receive-buffer capacity that also determines the advertised window
 - MSS and window scale negotiation (RFC 7323), including the rule that scaling applies
   only if *both* SYNs carried the option
 - **Timestamps and PAWS** (RFC 7323): a round-trip sample from every segment rather than
@@ -215,8 +216,6 @@ These are documented decisions, not gaps that were missed:
 - **No ICMP Redirect.** When a packet would go back out the interface it arrived on, this
   stack declines to forward it rather than telling the sender about the better first hop.
   That is the safe half of the behaviour.
-- **The reorder buffer keys exact sequence numbers** rather than merging overlapping
-  ranges, so a partially overlapping segment is kept or dropped whole.
 - **`TIME_WAIT` assumes a 30-second MSL**, so it runs for 60 seconds rather than RFC
   793's 4 minutes. Linux makes the same call, for the same reason: the RFC's figure was
   calibrated for a network whose delays no longer exist, and holding per-connection
