@@ -152,3 +152,40 @@ TEST(TcpSegmentOptions, AKeepaliveProbeCarriesATimestamp)
     ASSERT_TRUE(!sent.empty() && sent.back().seq == 1000) << "a keepalive probe at SND.NXT - 1 should have gone out";
     ASSERT_TRUE(sent.back().has_timestamp) << "the probe is a non-RST segment, so it carries TSopt";
 }
+
+// RFC 7323 4.3: TS.Recent takes a segment's TSval only if SEG.SEQ <=
+// Last.ACK.sent - the left edge this side last acknowledged. With a delayed
+// ack outstanding, that makes the echo the TSval of the EARLIEST
+// unacknowledged segment, so the peer's RTT sample includes the delay it
+// actually waited rather than understating it.
+TEST(TcpSegmentOptions, ADelayedAckEchoesTheEarliestUnacknowledgedSegment)
+{
+    std::vector<Sent> sent;
+    auto c = established_with_all_options(sent);
+    c->on_segment(*peer_segment(501, 1001, FLAG_ACK, 6000, 1, 65535, Bytes(100)));
+    ASSERT_TRUE(sent.empty()) << "precondition: the first in-order segment's ack is delayed";
+    c->on_segment(*peer_segment(601, 1001, FLAG_ACK, 6100, 1, 65535, Bytes(100)));
+    ASSERT_TRUE(sent.size() == 1) << "the second segment forces the ack out";
+    ASSERT_TRUE(sent[0].ts_echo == 6000) << "the ack must echo the earlier segment's TSval, not " << sent[0].ts_echo;
+}
+
+// The ACK that completes a passive open is a segment like any other: it
+// arrives at RCV.NXT, so its TSval becomes TS.Recent. Keeping the SYN's
+// instead makes the first data ack echo a timestamp from before the
+// handshake - after a lost SYN-ACK, seconds old - and the peer's very first
+// RTT sample, the one RFC 6298 seeds the estimator with, includes all of it.
+TEST(TcpSegmentOptions, TheAckCompletingAPassiveOpenUpdatesTsRecent)
+{
+    std::vector<Sent> sent;
+    auto c = std::make_unique<TcpConnection>(8080, IPv4Address("10.0.0.1"), 12345, 1000, recorder(sent));
+    c->accept_incoming_syn(500, 1460, true, 7, true, 5000, true);
+    c->on_time_passed(3000); // the SYN-ACK is retransmitted meanwhile
+    c->on_segment(*peer_segment(501, 1001, FLAG_ACK, 8000, 1));
+    ASSERT_TRUE(c->get_state() == TcpState::ESTABLISHED) << "precondition: the handshake completed";
+    sent.clear();
+
+    c->send(Bytes(10));
+    ASSERT_TRUE(sent.size() == 1 && sent[0].has_timestamp) << "precondition: data went out";
+    ASSERT_TRUE(sent[0].ts_echo == 8000) << "should echo the completing ACK's TSval, not the SYN's: "
+                                         << sent[0].ts_echo;
+}

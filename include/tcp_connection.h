@@ -618,6 +618,13 @@ private:
     bool _timestamps_negotiated;
     uint32_t _ts_recent;      // newest timestamp received in sequence - echoed back
     bool _have_ts_recent;
+    // Last.ACK.sent (RFC 7323 4.3): the ACK field of the last segment sent.
+    // TS.Recent only takes the TSval of a segment at or before it, which is
+    // what makes the echo the earliest unacknowledged segment's (delayed
+    // acks) and the hole-filling retransmission's (loss).
+    uint32_t _last_ack_sent = 0;
+    // RFC 7323 4.3's update: called for an acceptable segment.
+    void _update_ts_recent(const Tcp& segment);
 
     // --- MSS / window-scale negotiation (RFC 7323) ---
     uint16_t _local_mss;

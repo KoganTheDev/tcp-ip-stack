@@ -215,6 +215,31 @@ void TcpConnection::_transmit(uint8_t flags, uint32_t seq, const Bytes& payload)
     Tcp header(_local_port, _remote_port, seq, _recv_next, 5, flags, static_cast<uint16_t>(window_value), 0, 0);
     _add_options(header, flags, payload.size());
     _send_segment(header, payload);
+    if (flags & FLAG_ACK)
+    {
+        _last_ack_sent = _recv_next;
+    }
+}
+
+void TcpConnection::_update_ts_recent(const Tcp& segment)
+{
+    // RFC 7323 4.3 rule 2: copy SEG.TSval to TS.Recent if it is not older and
+    // SEG.SEQ <= Last.ACK.sent. With an ack delayed, a later in-order segment
+    // is past Last.ACK.sent, so the echo stays the earliest unacked one's
+    // (case A); a segment beyond a hole is too (case B); the retransmission
+    // that fills a hole sits at RCV.NXT, which every duplicate ack named, so
+    // its fresh TSval is taken (case C).
+    if (!_timestamps_negotiated || !segment.has_timestamp_option())
+    {
+        return;
+    }
+    uint32_t value = segment.get_timestamp_value();
+    if (!_have_ts_recent
+        || (seq_at_or_before(_ts_recent, value) && seq_at_or_before(segment.get_sequence_number(), _last_ack_sent)))
+    {
+        _ts_recent = value;
+        _have_ts_recent = true;
+    }
 }
 
 void TcpConnection::_add_options(Tcp& header, uint8_t flags, size_t payload_size) const
@@ -1350,6 +1375,11 @@ void TcpConnection::on_segment(const Tcp& segment)
             _send_reset(segment.get_acknowledgement_number());
             return;
         }
+        // The completing segment sits at RCV.NXT, so its TSval is the one to
+        // echo from now on (RFC 7323 4.3); keeping the SYN's would make the
+        // peer's first RTT sample span the whole handshake, retransmissions
+        // and all.
+        _update_ts_recent(segment);
         _in_flight.clear(); // only the SYN-ACK could have been in flight here
         _unsacked_in_flight_bytes = 0;
         // After a simultaneous open the completing segment is the peer's
@@ -1431,14 +1461,9 @@ void TcpConnection::on_segment(const Tcp& segment)
             return;
         }
 
-        // Only advance the echo for a segment that arrived in sequence -
-        // echoing a timestamp from a future, out-of-order segment would make
-        // the peer measure a round trip against the wrong moment.
-        if (!_have_ts_recent || segment.get_sequence_number() == _recv_next)
-        {
-            _ts_recent = their_timestamp;
-            _have_ts_recent = true;
-        }
+        // Never from a future, out-of-order segment: that would make the peer
+        // measure a round trip against the wrong moment.
+        _update_ts_recent(segment);
     }
 
     if (segment.get_ack())
