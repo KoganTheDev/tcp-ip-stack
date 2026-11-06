@@ -224,16 +224,28 @@ These are documented decisions, not gaps that were missed:
 
 ## Building
 
-Requires a Linux toolchain with C++17. Everything below assumes GNU Make and `g++`.
+Requires a Linux toolchain with C++17, CMake 3.20+ and Ninja. GoogleTest and GMock are
+taken from the system package (`libgtest-dev libgmock-dev` on Debian/Ubuntu, `gtest` on
+Arch) and fetched at a pinned release if none is installed. ccache is used when present.
+
+The build is CMake, with one preset per flavour in `CMakePresets.json` - `debug`,
+`release`, `asan`, `tsan`, `coverage` (clang) and `strict` (`-Wextra -Werror`) - each in
+its own `build/<preset>` directory. The root Makefile is a thin wrapper over them:
 
 ```sh
-make            # build the test runner
+make            # build everything (debug preset)
 make test       # build and run the full test suite
+make strict     # build everything with -Wall -Wextra -Werror, then run the tests
+make coverage   # per-file coverage report; HTML in build/coverage/html
 make clean
+
+# or directly
+cmake --preset debug && cmake --build --preset debug && ctest --preset debug -L unit
 ```
 
-The root Makefile builds the stack's objects and its tests. The program built on top of
-the stack is [`epoll-server/`](epoll-server/), which has its own Makefile.
+The presets build the stack, the test runner and both applications. The applications,
+[`epoll-server/`](epoll-server/) and [`http-get/`](http-get/), also keep their own
+Makefiles (`make -C epoll-server`), which is how the end-to-end scripts build them.
 
 There is no native Linux requirement for the *tests* - they run anywhere, because every
 component takes an injectable seam instead of touching the OS directly. Running the
@@ -286,7 +298,7 @@ and applies itself. See its own README for the full reasoning.
 
 ## Testing
 
-Over 340 unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
+Over 340 GoogleTest unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
 estimation, congestion control, flow control, keepalive, ISN generation, DHCP lease
 acquisition and renewal, DNS parsing and anti-spoofing, routing, fragment reassembly,
 ARP ageing, UDP, ICMP, the thread pool and completion queue, and the logger, plus a fuzz
@@ -318,13 +330,14 @@ while relaying between them.
 
 ```sh
 make test
-make asan    # AddressSanitizer + UBSan + leak detection
-make tsan    # ThreadSanitizer
+make asan    # AddressSanitizer + UBSan + leak detection (rebuilds from scratch)
+make tsan    # ThreadSanitizer (rebuilds from scratch)
+./build/debug/run_tests --gtest_filter='TcpConnection.*'   # one suite
 ```
 
 ASan, UBSan, and leak detection are clean, and CI runs them on every push, alongside
-both compilers, a `-Werror` build of the stack *and* of `epoll-server`, and the veth
-integration test above. They are
+both compilers, a `-Werror` build of the stack and both applications, a coverage report,
+and the end-to-end tests above. They are
 worth more here than the pass/fail of the tests: two real bugs, a missing virtual
 destructor on a class deleted through a base pointer and enums assigned from wire data
 without a fixed underlying type, were both found this way while the entire suite was
