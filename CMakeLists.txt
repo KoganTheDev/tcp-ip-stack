@@ -117,7 +117,6 @@ endif()
 # Globbed so that adding tests/src/test_foo.cpp needs no wiring here.
 enable_testing()
 file(GLOB TEST_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/tests/src/*.cpp)
-list(FILTER TEST_SOURCES EXCLUDE REGEX "/tests/src/(main|test)\\.cpp$")
 add_executable(run_tests ${TEST_SOURCES})
 target_include_directories(run_tests PRIVATE ${PROJECT_SOURCE_DIR}/tests/include)
 # gmock_main provides main() and initialises both GoogleTest and GMock.
