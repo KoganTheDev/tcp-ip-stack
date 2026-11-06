@@ -53,8 +53,8 @@ private:
     struct Entry
     {
         MacAddress mac;
-        int ms_remaining; // ignored when is_static
-        bool is_static;
+        int ms_remaining{}; // ignored when is_static
+        bool is_static{};
     };
 
     std::unordered_map<IPv4Address, Entry> _entries;

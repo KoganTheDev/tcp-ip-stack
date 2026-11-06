@@ -113,19 +113,19 @@ private:
     struct Pending
     {
         std::string name;
-        uint16_t transaction_id;
-        uint16_t source_port;
-        size_t server_index;      // which of _servers is being asked
-        int attempts;
-        int timeout_ms_remaining;
-        int cname_depth;          // how many aliases have been followed
+        uint16_t transaction_id{};
+        uint16_t source_port{};
+        size_t server_index{};      // which of _servers is being asked
+        int attempts{};
+        int timeout_ms_remaining{};
+        int cname_depth{};          // how many aliases have been followed
         std::vector<ResolvedFn> callbacks;
     };
 
     struct CacheEntry
     {
         std::vector<IPv4Address> addresses;
-        int ms_remaining;
+        int ms_remaining{};
     };
 
     void _send_query(Pending& query);

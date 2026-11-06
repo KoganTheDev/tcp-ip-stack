@@ -44,7 +44,7 @@ public:
 private:
     MacAddress _src;
     MacAddress _dest;
-    EtherType _ethernet_protocol;
+    EtherType _ethernet_protocol{IPv4};
 
     static const std::map<EtherType, const std::string> ETHERTYPE_TO_NAME;
 };

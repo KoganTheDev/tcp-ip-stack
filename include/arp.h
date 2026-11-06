@@ -53,11 +53,11 @@ public:
 
 
 private:
-    ArpHardwareType _hardware_type; // htype, default value is 1 for Ethernet
-    ArpProtocolType _protocol_type; // ptype, IPv4 = 0x0800
-    uint8_t _hardware_address_length; // hlen
-    uint8_t _protocol_address_length; // plen
-    ArpOperation _operation; // oper, 1 - ARP request | 2 - ARP reply
+    ArpHardwareType _hardware_type{ETHERNET}; // htype, default value is 1 for Ethernet
+    ArpProtocolType _protocol_type{IPV4}; // ptype, IPv4 = 0x0800
+    uint8_t _hardware_address_length{}; // hlen
+    uint8_t _protocol_address_length{}; // plen
+    ArpOperation _operation{REQUEST}; // oper, 1 - ARP request | 2 - ARP reply
     MacAddress
         _sender_hardware_address; // sha, on ARP request holds the sender`s MAC address, on ARP reply holds the requested MAC address from the receiver
     IPv4Address _sender_protocol_address; // spa, Sender IP address

@@ -373,19 +373,19 @@ private:
     // one each for SYN/FIN) - a cumulative ack covering end_seq clears it.
     struct InFlightSegment
     {
-        uint32_t seq;
-        uint32_t end_seq;
-        uint8_t flags;
+        uint32_t seq{};
+        uint32_t end_seq{};
+        uint8_t flags{};
         Bytes payload;
-        int retransmit_ms_remaining;
-        int retransmit_attempts;
+        int retransmit_ms_remaining{};
+        int retransmit_attempts{};
         // The connection's clock when this segment first went out. Storing the
         // absolute moment rather than an age counter keeps timekeeping O(1):
         // on_time_passed() would otherwise have to walk the whole window on
         // every call just to age each entry, and this window is walked often
         // enough already. Age is _now_ms - sent_at_ms, computed only when a
         // segment is actually acked.
-        uint64_t sent_at_ms;
+        uint64_t sent_at_ms{};
         // Named by a SACK block, so the peer holds it even though the
         // cumulative ack has not reached it. It stays in this deque because the
         // window cannot slide past it until everything before it is acked too -
@@ -396,7 +396,7 @@ private:
         // it is ambiguous - it could be acking the original or the
         // retransmission, and those imply very different round-trip times.
         // Such a segment never yields an RTT sample.
-        bool retransmitted;
+        bool retransmitted{};
     };
 
     // The oldest in-flight segment the peer has NOT reported holding - the one

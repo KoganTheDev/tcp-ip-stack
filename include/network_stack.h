@@ -311,8 +311,8 @@ private:
     struct ConnectionKey
     {
         IPv4Address remote_ip;
-        uint16_t remote_port;
-        uint16_t local_port;
+        uint16_t remote_port{};
+        uint16_t local_port{};
         bool operator==(const ConnectionKey& other) const;
     };
     struct ConnectionKeyHash
@@ -510,8 +510,8 @@ private:
         // releases it - but the packet still has to be addressed to where it
         // was actually going.
         IPv4Address destination;
-        uint16_t src_port;
-        uint16_t dest_port;
+        uint16_t src_port{};
+        uint16_t dest_port{};
         Bytes payload;
     };
 

@@ -80,7 +80,7 @@ public:
     // caps on what an attacker can make this hold by sending fragments that
     // never complete.
     static constexpr size_t MAX_PENDING_DATAGRAMS = 64;
-    static constexpr size_t MAX_BUFFERED_BYTES = 1024 * 1024;
+    static constexpr size_t MAX_BUFFERED_BYTES = size_t{1024} * 1024;
     // Fragments in one datagram. A legitimate sender needs few; a large number
     // of tiny fragments is a way to make reassembly expensive.
     static constexpr size_t MAX_FRAGMENTS_PER_DATAGRAM = 128;
@@ -93,8 +93,8 @@ private:
     {
         IPv4Address source;
         IPv4Address destination;
-        uint16_t identification;
-        uint8_t protocol;
+        uint16_t identification{};
+        uint8_t protocol{};
         bool operator==(const Key& other) const;
     };
     struct KeyHash
