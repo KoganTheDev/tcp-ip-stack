@@ -10,3 +10,4 @@ compile_commands.json
 .ruff_cache/
 # CMake preset build trees.
 build/
+http-get/http-get
