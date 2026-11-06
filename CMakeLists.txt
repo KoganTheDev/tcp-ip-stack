@@ -121,6 +121,14 @@ add_executable(run_tests ${TEST_SOURCES})
 target_include_directories(run_tests PRIVATE ${PROJECT_SOURCE_DIR}/tests/include)
 # gmock_main provides main() and initialises both GoogleTest and GMock.
 target_link_libraries(run_tests PRIVATE tcpip epoll_threaded GTest::gmock_main)
+# The network simulator (tests/include/sim) writes a failing test's capture
+# under the build directory, next to test-results/, so CI can upload both from
+# one place. The packetdrill-style runner finds its scripts by absolute path,
+# so the binary works from any working directory (ctest runs it from the build
+# directory, `make test` from the repo root).
+target_compile_definitions(run_tests PRIVATE
+    SIM_PCAP_DEFAULT_DIR="${CMAKE_BINARY_DIR}/sim-pcaps"
+    PKT_SCRIPT_DIR="${PROJECT_SOURCE_DIR}/tests/scripts")
 
 # One ctest test per GoogleTest test, so `ctest -R` and `ctest -j` work and a
 # failure names the test. PRE_TEST lists the tests when ctest runs rather than
@@ -128,10 +136,30 @@ target_link_libraries(run_tests PRIVATE tcpip epoll_threaded GTest::gmock_main)
 # fail because a sanitizer binary aborted while being asked for its test names.
 #
 # Each test writes JUnit-style XML into build/<preset>/test-results/, which CI
-# uploads when a job fails. Everything is labelled `unit` so that integration
-# tests registered later can be selected or excluded with -L / -LE.
+# uploads when a job fails.
+#
+# Two labels. `unit` is everything fast and fixed. `sim` is the simulator's
+# seeded property tests (suites named *SimTransfer*), whose count is set by
+# SIM_SEEDS when the binary lists its tests - so it is a separate label that the
+# per-push unit runs (ctest -L unit, the test presets) leave out, and that
+# `make sim` runs on its own. Splitting by TEST_FILTER needs CMake 3.22; older
+# CMake registers everything as `unit`, which is only slower.
 include(GoogleTest)
-gtest_discover_tests(run_tests
-    DISCOVERY_MODE PRE_TEST
-    XML_OUTPUT_DIR ${CMAKE_BINARY_DIR}/test-results
-    PROPERTIES LABELS unit)
+set(SIM_TEST_PATTERN "*SimTransfer*")
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.22)
+    gtest_discover_tests(run_tests
+        DISCOVERY_MODE PRE_TEST
+        TEST_FILTER "-${SIM_TEST_PATTERN}"
+        XML_OUTPUT_DIR ${CMAKE_BINARY_DIR}/test-results
+        PROPERTIES LABELS unit)
+    gtest_discover_tests(run_tests
+        DISCOVERY_MODE PRE_TEST
+        TEST_FILTER "${SIM_TEST_PATTERN}"
+        XML_OUTPUT_DIR ${CMAKE_BINARY_DIR}/test-results
+        PROPERTIES LABELS sim)
+else()
+    gtest_discover_tests(run_tests
+        DISCOVERY_MODE PRE_TEST
+        XML_OUTPUT_DIR ${CMAKE_BINARY_DIR}/test-results
+        PROPERTIES LABELS unit)
+endif()
