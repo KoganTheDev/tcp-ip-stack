@@ -59,6 +59,8 @@ private:
 // exceptions.h. (std::ostringstream() << x).str() is the same idiom used to
 // build a message inline for a thrown exception - operator<< on a temporary
 // stream is legal; the temporary lives until the end of the full expression.
+// x is a stream insertion chain (a << b << c), so it cannot be parenthesised.
+// NOLINTBEGIN(bugprone-macro-parentheses)
 #define LOG_DEBUG(x) \
     Logger::instance().log(LogLevel::DEBUG, (std::ostringstream() << x).str(), __FILE__, __func__, __LINE__)
 #define LOG_INFO(x) \
@@ -67,3 +69,4 @@ private:
     Logger::instance().log(LogLevel::WARNING, (std::ostringstream() << x).str(), __FILE__, __func__, __LINE__)
 #define LOG_ERROR(x) \
     Logger::instance().log(LogLevel::ERROR, (std::ostringstream() << x).str(), __FILE__, __func__, __LINE__)
+// NOLINTEND(bugprone-macro-parentheses)

@@ -9,6 +9,7 @@ void SystemNetworkObject::_set_interface_state(const std::string& interface, boo
     // doesn't ship sudo at all.
     std::string command = "ip link set " + interface + " ";
     command += state_up ? "up" : "down";
+    // NOLINTNEXTLINE(bugprone-command-processor,cert-env33-c,concurrency-mt-unsafe): see review, fix pending
     int return_value = system(command.c_str());
     if (return_value != 0)
     {

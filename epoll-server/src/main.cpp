@@ -206,6 +206,9 @@ int main(int argc, char** argv)
 {
     Config config;
     int exit_code = 0;
+    // parse_arguments catches BaseException and std::exception around every call
+    // that can throw; cppcheck does not follow that through the lambda.
+    // cppcheck-suppress throwInEntryPoint
     if (!parse_arguments(argc, argv, config, exit_code))
     {
         return exit_code;
@@ -225,9 +228,9 @@ int main(int argc, char** argv)
 
     try
     {
-        std::signal(SIGINT, handle_shutdown_signal);
-        std::signal(SIGTERM, handle_shutdown_signal);
-        std::signal(SIGPIPE, SIG_IGN); // defensive - nothing here writes to a raw kernel socket
+        static_cast<void>(std::signal(SIGINT, handle_shutdown_signal));
+        static_cast<void>(std::signal(SIGTERM, handle_shutdown_signal));
+        static_cast<void>(std::signal(SIGPIPE, SIG_IGN)); // defensive - nothing here writes to a raw kernel socket
 
         Server server(config.port, config.worker_count, config.channel);
 

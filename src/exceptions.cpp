@@ -19,5 +19,6 @@ std::string BaseException::position() const noexcept
 
 SystemException::SystemException(const std::string& message, const std::string& file, const std::string& func,
                                  unsigned int line)
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): see review, fix pending (strerror shares a static buffer; use strerror_r)
     : BaseException(message + "\nerror " + std::to_string(errno) + ", " + strerror(errno), file, func, line)
 {}

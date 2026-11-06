@@ -14,6 +14,7 @@ Icmp::Icmp(uint8_t type, uint8_t code, uint16_t checksum, uint32_t rest_of_heade
 
 Icmp::Icmp(const Bytes& bytes)
 {
+    // NOLINTNEXTLINE(clang-analyzer-optin.cplusplus.VirtualCall): intended: parses with this class's own from_bytes, which no subclass overrides
     this->from_bytes(bytes);
 }
 

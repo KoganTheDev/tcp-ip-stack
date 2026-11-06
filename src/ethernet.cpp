@@ -6,10 +6,12 @@
 #include "arp.h"
 #include "ip.h"
 
+// NOLINTNEXTLINE(bugprone-throwing-static-initialization,cert-err58-cpp): a small map built once at startup; bad_alloc here is fatal either way
 const std::map<EtherType, const std::string> Ethernet::ETHERTYPE_TO_NAME = {{ARP, "ARP"}, {IPv4, "IPv4"}};
 
 Ethernet::Ethernet(const Bytes& data)
 {
+    // NOLINTNEXTLINE(clang-analyzer-optin.cplusplus.VirtualCall): intended: parses with this class's own from_bytes, which no subclass overrides
     this->from_bytes(data);
 }
 
