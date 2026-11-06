@@ -189,3 +189,36 @@ TEST(TcpSegmentOptions, TheAckCompletingAPassiveOpenUpdatesTsRecent)
     ASSERT_TRUE(sent[0].ts_echo == 8000) << "should echo the completing ACK's TSval, not the SYN's: "
                                          << sent[0].ts_echo;
 }
+
+// RFC 7323 5.3: TS.Recent is updated (R3) only for a segment that passed PAWS
+// (R1) and the RFC 9293 acceptability test (R2). A blind attacker can send a
+// segment with an old sequence number - nothing to guess - and a TSval far
+// in the future; if that moved TS.Recent, PAWS would then drop every genuine
+// segment as "older", a denial of service for the price of one packet.
+TEST(TcpSegmentOptions, AnOutOfWindowSegmentCannotPoisonTsRecent)
+{
+    std::vector<Sent> sent;
+    auto c = established_with_all_options(sent);
+    // seq far behind RCV.NXT (501), a valid ACK, a TSval half the space ahead
+    c->on_segment(*peer_segment(501 - 200000, 1001, FLAG_ACK, 0x7fff0000, 1, 65535, Bytes(10)));
+
+    c->on_segment(*peer_segment(501, 1001, FLAG_ACK, 6000, 1, 65535, Bytes(10)));
+    ASSERT_TRUE(c->bytes_available() == 10)
+        << "a genuine in-window segment must still be accepted, not dropped by PAWS";
+    c->on_time_passed(500); // flush the delayed ack
+    ASSERT_TRUE(!sent.empty() && sent.back().ts_echo == 6000)
+        << "and TS.Recent must be the genuine segment's TSval, not the spoofed one: " << sent.back().ts_echo;
+}
+
+// RFC 9293 3.10.7.4, fifth check: in a synchronized state a segment without
+// ACK is dropped - before its timestamp is looked at.
+TEST(TcpSegmentOptions, ASegmentWithoutAckCannotMoveTsRecent)
+{
+    std::vector<Sent> sent;
+    auto c = established_with_all_options(sent);
+    c->on_segment(*peer_segment(501, 0, 0, 0x7fff0000, 1, 65535, Bytes(10)));
+    ASSERT_TRUE(c->bytes_available() == 0) << "a segment without ACK carries nothing a synchronized connection takes";
+
+    c->on_segment(*peer_segment(501, 1001, FLAG_ACK, 6000, 1, 65535, Bytes(10)));
+    ASSERT_TRUE(c->bytes_available() == 10) << "the genuine segment must still be accepted";
+}

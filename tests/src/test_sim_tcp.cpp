@@ -115,14 +115,19 @@ protected:
     }
 };
 
-// RFC 7323 4.3 and Appendix G: under loss, the timestamp a receiver echoes
-// must come from a segment that really advanced its window - the
-// retransmission that filled the hole - so the sender's RTT samples stay the
-// path's round trip. Echoing a timestamp from before the loss makes every
-// sample include the whole stall, and the RTO climbs to its 60 s cap (what
-// seeds 1055, 5578, 6580, ... of SimTransfer did while retransmissions
-// carried no timestamp). With an RTT around 50 ms, a few back-offs in a row
-// stay well under a few seconds.
+// RFC 7323 4.3: under loss, the timestamp a receiver echoes comes from the
+// retransmission that filled the hole, so the sender's RTT samples stay the
+// path's round trip. While retransmissions carried no timestamp, every ack
+// echoed one from before the loss, every sample included the whole stall,
+// and the RTO ran up to its 60 s cap and stayed there (SimTransfer seeds
+// 1055, 5578, 6580, ...).
+//
+// Not "the RTO never exceeds a few RTTs": RFC 7323 5.3 takes TS.Recent only
+// from an acceptable segment, so when an ack is lost and the sender's second
+// retransmission arrives as an old duplicate, the next ack legitimately
+// echoes the first retransmission and one sample spans the lost ack. That
+// one sample may lift the RTO for a while (this seed does, to ~12 s); what
+// must not happen is a runaway, or an RTO that does not come back down.
 TEST_F(SimTcp, TheRtoStaysNearTheRoundTripUnderLoss)
 {
     LinkParams lossy;
@@ -150,8 +155,10 @@ TEST_F(SimTcp, TheRtoStaysNearTheRoundTripUnderLoss)
         << "a 512 KiB transfer at 3% loss should finish within 2 minutes; got " << server_received.size() << "\n"
         << net->describe_links();
     ASSERT_TRUE(server_received == payload) << "and arrive intact";
-    ASSERT_TRUE(worst_rto <= 3000) << "the RTO peaked at " << worst_rto
+    ASSERT_TRUE(worst_rto < 30000) << "the RTO peaked at " << worst_rto
                                    << " ms on a ~50 ms path - RTT samples are not the round trip";
+    ASSERT_TRUE(previous_rto <= 1000) << "by the end of the transfer the RTO should be back near the round trip, not "
+                                      << previous_rto << " ms";
 }
 
 // SimTransfer seed 7079, reduced: the server's first SYN-ACK is lost. Its

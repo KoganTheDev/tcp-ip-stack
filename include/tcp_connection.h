@@ -424,6 +424,10 @@ private:
     // sequence-number wraparound the same way real TCP's modular arithmetic
     // is, without needing any special-case wraparound handling.
     bool _seq_in_receive_window(uint32_t seq) const;
+    // RFC 9293 3.10.7.4's acceptability test for a segment occupying `length`
+    // sequence numbers (payload plus FIN) from seq: does it overlap the
+    // receive window at all?
+    bool _segment_acceptable(uint32_t seq, uint32_t length) const;
     // RFC 9293 3.10.7.3's test in SYN_SENT: does this ACK cover our SYN, and
     // nothing beyond what was sent (ISS < SEG.ACK =< SND.NXT)?
     bool _ack_acceptable_in_syn_sent(uint32_t ack) const;

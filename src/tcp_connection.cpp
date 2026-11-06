@@ -178,6 +178,28 @@ uint32_t TcpConnection::_advertised_window() const
     return occupied < RECEIVE_BUFFER_CAPACITY ? RECEIVE_BUFFER_CAPACITY - occupied : 0;
 }
 
+bool TcpConnection::_segment_acceptable(uint32_t seq, uint32_t length) const
+{
+    // RFC 9293 3.10.7.4's table, in modular arithmetic: a segment is
+    // acceptable if its first or its last sequence number falls in
+    // [RCV.NXT, RCV.NXT + RCV.WND). With the window shut only RCV.NXT
+    // itself is, which keeps a zero-window probe answerable.
+    uint32_t window = _advertised_window();
+    auto in_window = [this, window](uint32_t s)
+    {
+        return (s - _recv_next) < window;
+    };
+    if (window == 0)
+    {
+        return seq == _recv_next;
+    }
+    if (length == 0)
+    {
+        return in_window(seq);
+    }
+    return in_window(seq) || in_window(seq + length - 1);
+}
+
 bool TcpConnection::_ack_acceptable_in_syn_sent(uint32_t ack) const
 {
     // ISS < SEG.ACK =< SND.NXT, modular: an ack of ISS itself acknowledges
@@ -1410,6 +1432,13 @@ void TcpConnection::on_segment(const Tcp& segment)
         return;
     }
 
+    // RFC 9293 3.10.7.4, fifth check: on a synchronized connection a segment
+    // without ACK is dropped - nothing in it, timestamp included, is used.
+    if (!segment.get_ack())
+    {
+        return;
+    }
+
     // RFC 5961 section 5: an acceptable ACK lies in
     // [SND.UNA - MAX.SND.WND, SND.MAX]. Below the window the segment is
     // dropped and acked, so an injected segment needs a plausible ACK as well
@@ -1460,16 +1489,32 @@ void TcpConnection::on_segment(const Tcp& segment)
             _send_pure_ack();
             return;
         }
-
-        // Never from a future, out-of-order segment: that would make the peer
-        // measure a round trip against the wrong moment.
-        _update_ts_recent(segment);
     }
 
-    if (segment.get_ack())
+    // RFC 9293 3.10.7.4, first check (RFC 7323 5.3 R2): a segment that does
+    // not overlap the receive window is answered with an ACK and dropped.
+    // Before this, a segment's ACK and timestamp were used wherever its
+    // sequence number pointed; old data was only filtered at delivery.
+    const Raw* payload_layer = segment.has_next_layer() ? dynamic_cast<const Raw*>(&segment.get_next_layer()) : nullptr;
+    uint32_t payload_size = payload_layer ? static_cast<uint32_t>(payload_layer->get_data().size()) : 0;
+    if (!_segment_acceptable(segment.get_sequence_number(), payload_size + (segment.get_fin() ? 1 : 0)))
     {
-        _handle_ack(segment);
+        if (_state == TcpState::TIME_WAIT && segment.get_fin())
+        {
+            _handle_fin(segment.get_sequence_number() + payload_size); // re-ack it and restart 2*MSL
+            return;
+        }
+        _send_pure_ack();
+        return;
     }
+
+    // RFC 7323 5.3 R3: only now, past PAWS and the window check, may the
+    // segment's TSval become TS.Recent. Taken any earlier, one spoofed
+    // segment with an old sequence number and a far-future TSval would make
+    // PAWS drop every genuine segment after it.
+    _update_ts_recent(segment);
+
+    _handle_ack(segment);
 
     // Resolved before the state check because the FIN handling at the bottom
     // needs the payload's length too: a segment carrying both data and FIN
@@ -1481,9 +1526,6 @@ void TcpConnection::on_segment(const Tcp& segment)
     // implementations disagree on what the pointer points to and middleboxes
     // clear it, so "urgent" bytes are delivered inline, in sequence order,
     // like any others. Nothing this stack sends ever sets URG.
-    const Raw* payload_layer = segment.has_next_layer() ? dynamic_cast<const Raw*>(&segment.get_next_layer()) : nullptr;
-    uint32_t payload_size = payload_layer ? static_cast<uint32_t>(payload_layer->get_data().size()) : 0;
-
     if (_state == TcpState::ESTABLISHED || _state == TcpState::FIN_WAIT_1 || _state == TcpState::FIN_WAIT_2)
     {
         if (payload_size > 0)
