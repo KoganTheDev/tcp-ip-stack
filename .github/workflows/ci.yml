@@ -63,6 +63,34 @@ jobs:
           path: build/debug/test-results/
           if-no-files-found: ignore
 
+  # The network simulator's seeded property tests (ctest label `sim`), which the
+  # unit runs above leave out. The default 200 seeds take a few seconds; the
+  # nightly workflow runs 100000. A failing seed leaves a pcap of the run, which
+  # is uploaded with the logs.
+  sim:
+    name: simulator (200 seeds)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: debug-g++
+
+      - name: Run the simulator property tests
+        run: make sim
+
+      - name: Upload captures and logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-pcaps
+          path: |
+            build/debug/sim-pcaps/
+            build/debug/sim-shard-*.log
+          if-no-files-found: ignore
+
   # Treat warnings as errors, but only on the code this project actually owns.
   # A blanket -Werror would fail on -Wextra noise coming out of system headers
   # (sockaddr_ll and ifreq have members no caller is meant to initialize), which

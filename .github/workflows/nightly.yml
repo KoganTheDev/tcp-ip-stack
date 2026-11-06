@@ -1,0 +1,54 @@
+name: Nightly
+
+# The simulator's property tests at depth. Per push they run 200 seeds (a few
+# seconds, see the sim job in ci.yml); here they run 100000, which takes long
+# enough that it belongs off the push path but finds the rare interleavings
+# (a loss at exactly the wrong moment) that 200 seeds will not. Seeds are
+# fixed, so a nightly failure reproduces locally with
+#     SIM_SEED_START=<seed> SIM_SEEDS=1 make sim
+on:
+  schedule:
+    - cron: "17 3 * * *" # 03:17 UTC, off the top of the hour when runners are busiest
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: Number of seeds to run
+        required: false
+        default: "100000"
+
+# One nightly at a time; a manual run while the scheduled one is going waits.
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sim:
+    name: simulator (${{ github.event.inputs.seeds || '100000' }} seeds)
+    runs-on: ubuntu-latest
+    # The debug build does roughly 50-100 seeds per second per core; 100000
+    # seeds sharded over a 4-core runner is well under an hour.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: debug-g++
+
+      - name: Run the simulator property tests
+        env:
+          SIM_SEEDS: ${{ github.event.inputs.seeds || '100000' }}
+        run: make sim
+
+      # Every failing seed leaves a pcap of what was delivered and of what was
+      # transmitted (drops included), plus text renderings of both.
+      - name: Upload captures and logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-pcaps-nightly
+          path: |
+            build/debug/sim-pcaps/
+            build/debug/sim-shard-*.log
+          if-no-files-found: ignore
+          retention-days: 14
