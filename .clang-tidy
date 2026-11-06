@@ -1,0 +1,47 @@
+# Static analysis for tcp-ip-stack. Run with:
+#   run-clang-tidy -p <dir containing compile_commands.json> \
+#       '^(?!.*/tests/).*/(src|epoll-server/src)/[^/]*\.cpp$'
+#
+# The compile database must have exactly one entry per file. Appending
+# epoll-server's build to the root one with `bear --append` also records its
+# compiles of ../src/*.cpp and the root build's compiles of
+# epoll-server/src/{thread_pool,completion_queue}.cpp; clang-tidy then analyses
+# those twice, and the second pass fails to find headers because the entries'
+# relative -I paths assume different working directories. Drop the duplicates:
+#   python3 -c "import json;d=json.load(open('compile_commands.json'));\
+#     json.dump([e for e in d if not e['file'].startswith(('../','epoll-server/src/'))],\
+#     open('compile_commands.json','w'),indent=1)"
+# (CMake's absolute-path database, used in CI, has no such problem.)
+#
+# tests/ is excluded by that file filter rather than here, so the tests can
+# be analysed on demand by changing the filter.
+#
+# Disabled checks, each for a reason specific to this codebase:
+#   bugprone-easily-swappable-parameters
+#       Protocol constructors legitimately take many adjacent same-typed
+#       fields (Tcp has nine, Ip ten) because the parameters mirror the wire
+#       header field for field.
+#   bugprone-signed-bitwise
+#       Fires on every uint8_t/uint16_t shift or mask, since integer promotion
+#       makes the operand int. Header parsing is bit manipulation on promoted
+#       narrow types; there is no signed value involved.
+#   performance-enum-size
+#       Suggests uint8_t underlying types for enums. Wire-format enums
+#       already pick their width deliberately and the in-memory ones are not
+#       worth an ABI-visible change.
+#   clang-analyzer-optin.performance.Padding
+#       Opt-in layout advice (reorder TcpConnection's fields); the member
+#       order is grouped by meaning and fixes constructor init order.
+Checks: >
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  cert-*,
+  concurrency-*,
+  performance-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-signed-bitwise,
+  -performance-enum-size,
+  -clang-analyzer-optin.performance.Padding
+WarningsAsErrors: ''
+HeaderFilterRegex: '(include|epoll-server/include)/.*\.h$'
