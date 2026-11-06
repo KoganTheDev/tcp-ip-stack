@@ -1,0 +1,29 @@
+#!/bin/bash
+# Pre-commit: format-check what is being committed, then run the test suite.
+#
+# The format check reads the STAGED content (git show :path), not the working
+# tree. Otherwise a file with an unstaged fix, or with unstaged mess, would
+# pass or fail for a version that is not the one being committed.
+#
+# Enable with:  git config core.hooksPath githooks
+# Bypass once:  git commit --no-verify
+set -euo pipefail
+
+staged=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(cpp|h)$' || true)
+
+if [ -n "$staged" ]; then
+    status=0
+    while IFS= read -r file; do
+        if ! git show ":$file" | clang-format --assume-filename="$file" --dry-run --Werror >/dev/null 2>&1; then
+            echo "pre-commit: $file (staged version) is not clang-formatted" >&2
+            status=1
+        fi
+    done <<<"$staged"
+    if [ "$status" -ne 0 ]; then
+        echo "pre-commit: fix with 'clang-format -i <file>' and re-stage, or skip with 'git commit --no-verify'" >&2
+        exit 1
+    fi
+fi
+
+echo "pre-commit: running make test (skip with 'git commit --no-verify')"
+make test

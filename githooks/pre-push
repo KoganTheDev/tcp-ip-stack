@@ -1,0 +1,11 @@
+#!/bin/bash
+# Pre-push: run the suite under ASan + UBSan. It does a full clean rebuild
+# (see the Makefile for why), so it is too slow for every commit but cheap
+# compared to finding out in CI.
+#
+# Enable with:  git config core.hooksPath githooks
+# Bypass once:  git push --no-verify
+set -euo pipefail
+
+echo "pre-push: running make asan (skip with 'git push --no-verify')"
+make asan

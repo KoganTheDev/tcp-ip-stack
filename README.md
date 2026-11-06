@@ -256,6 +256,23 @@ docker run --rm -it --cap-add=NET_ADMIN --device=/dev/net/tun \
     -v "$PWD:/work" -w /work gcc:latest bash
 ```
 
+### Git hooks
+
+Optional hooks in [`githooks/`](githooks/) catch what CI would catch, before you push:
+
+- `pre-commit` checks the *staged* C/C++ files with `clang-format`, then runs `make test`.
+- `pre-push` runs `make asan` (a full clean rebuild, so it is the slow one).
+
+```sh
+git config core.hooksPath githooks     # enable (per clone)
+git commit --no-verify                 # skip pre-commit once
+git push --no-verify                   # skip pre-push once
+```
+
+Needs `clang-format` on `PATH`. The static-analysis checks CI runs are in
+[`.github/workflows/static-analysis.yml`](.github/workflows/static-analysis.yml); the
+`clang-tidy` configuration is in [`.clang-tidy`](.clang-tidy).
+
 ## The applications on top
 
 [`http-get/`](http-get/) is the demonstrator: a one-shot HTTP client that starts with **no
