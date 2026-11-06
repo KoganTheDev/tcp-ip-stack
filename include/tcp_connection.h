@@ -367,6 +367,9 @@ private:
     // sequence-number wraparound the same way real TCP's modular arithmetic
     // is, without needing any special-case wraparound handling.
     bool _seq_in_receive_window(uint32_t seq) const;
+    // RFC 9293 3.10.7.3's test in SYN_SENT: does this ACK cover our SYN, and
+    // nothing beyond what was sent (ISS < SEG.ACK =< SND.NXT)?
+    bool _ack_acceptable_in_syn_sent(uint32_t ack) const;
 
     // One segment this side sent and hasn't seen acked yet. end_seq is
     // seq + however many sequence numbers it consumed (payload bytes, plus
@@ -412,6 +415,7 @@ private:
     uint16_t _remote_port;
 
     TcpState _state;
+    uint32_t _iss;       // ISS - our initial sequence number, what our SYN carried
     uint32_t _send_next; // SND.NXT - next sequence number this side will send
     // SND.MAX (RFC 9293): one past the highest sequence number ever actually
     // put on the wire. Usually equal to SND.NXT, but a zero-window probe sends

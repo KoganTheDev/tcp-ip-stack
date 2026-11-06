@@ -68,7 +68,7 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
                              uint32_t initial_seq, SendSegmentFn send_segment, uint16_t local_mss,
                              CongestionControlAlgorithm algorithm)
     : _id(g_next_connection_id.fetch_add(1)), _local_port(local_port), _remote_ip(remote_ip), _remote_port(remote_port),
-      _state(TcpState::LISTEN), _send_next(initial_seq), _send_max(initial_seq), _recv_next(0),
+      _state(TcpState::LISTEN), _iss(initial_seq), _send_next(initial_seq), _send_max(initial_seq), _recv_next(0),
       // Kept in declaration order. Members are initialised in the order they
       // are declared regardless of the order written here, so any divergence
       // is a lie about what actually happens - and a real hazard the moment
@@ -173,6 +173,13 @@ uint32_t TcpConnection::_advertised_window() const
 {
     uint32_t occupied = _receive_buffer_occupied();
     return occupied < RECEIVE_BUFFER_CAPACITY ? RECEIVE_BUFFER_CAPACITY - occupied : 0;
+}
+
+bool TcpConnection::_ack_acceptable_in_syn_sent(uint32_t ack) const
+{
+    // ISS < SEG.ACK =< SND.NXT, modular: an ack of ISS itself acknowledges
+    // nothing, and one past SND.NXT acknowledges something never sent
+    return !seq_at_or_before(ack, _iss) && seq_at_or_before(ack, _send_next);
 }
 
 bool TcpConnection::_seq_in_receive_window(uint32_t seq) const
@@ -1090,14 +1097,23 @@ void TcpConnection::on_segment(const Tcp& segment)
 
     if (segment.get_rst())
     {
-        bool past_handshake = _state == TcpState::ESTABLISHED || _state == TcpState::FIN_WAIT_1
-                              || _state == TcpState::FIN_WAIT_2 || _state == TcpState::CLOSE_WAIT
-                              || _state == TcpState::CLOSING || _state == TcpState::LAST_ACK;
-        if (past_handshake && !_seq_in_receive_window(segment.get_sequence_number()))
+        if (_state == TcpState::SYN_SENT)
         {
-            // RFC 793 SS3.9: a reset outside the receive window is ignored -
-            // a segment with this sequence number couldn't legitimately be
-            // this far from what's actually expected next
+            // RFC 9293 3.10.7.3: there is no RCV.NXT yet to check the sequence
+            // number against, so the ACK is the only thing tying a reset to this
+            // connection. One without an ACK, or whose ACK does not cover our
+            // SYN, could come from anyone and is dropped.
+            if (!segment.get_ack() || !_ack_acceptable_in_syn_sent(segment.get_acknowledgement_number()))
+            {
+                return;
+            }
+        }
+        else if (!_seq_in_receive_window(segment.get_sequence_number()))
+        {
+            // RFC 9293 3.10.7.4: in SYN_RECEIVED and every later state a
+            // reset outside the receive window is ignored - a segment with
+            // this sequence number couldn't legitimately be this far from what
+            // is actually expected next
             return;
         }
         _transition(TcpState::CLOSED);

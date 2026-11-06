@@ -2125,3 +2125,71 @@ TEST(TcpConnection, AConnectionCompletedByACookieStartsEstablishedWithoutOptions
     ASSERT_TRUE(!data.has_timestamp) << "no timestamps on a cookie connection";
     ASSERT_TRUE(connection.get_effective_mss() == 1400) << "the effective MSS is the cookie's";
 }
+
+namespace
+{
+    TcpConnection::SendSegmentFn recorder(std::vector<RecordedSegment>& sent)
+    {
+        return [&sent](const Tcp& header, const Bytes& payload)
+        {
+            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header),
+                            payload, header.get_window(), header.has_timestamp_option(), header.get_timestamp_value(),
+                            header.get_timestamp_echo()});
+        };
+    }
+
+    // A connection that has sent its SYN (our ISN 2000) and is waiting in
+    // SYN_SENT, recording everything it sends.
+    std::unique_ptr<TcpConnection> make_syn_sent_connection(std::vector<RecordedSegment>& sent)
+    {
+        auto connection = std::make_unique<TcpConnection>(8080, IPv4Address("10.0.0.1"), 12345, 2000, recorder(sent));
+        connection->initiate_connect();
+        sent.clear();
+        return connection;
+    }
+}
+
+// RFC 9293 3.10.7.3: in SYN_SENT a reset is believed only if its ACK
+// acknowledges our SYN. Nothing else ties it to this connection - there is no
+// RCV.NXT yet to check its sequence number against - so without the rule any
+// off-path host could refuse every connection this stack tries to open.
+TEST(TcpConnection, ARstWithoutAckInSynSentIsIgnored)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_syn_sent_connection(sent);
+
+    connection->on_segment(*make_incoming_segment(9000, 0, FLAG_RST));
+    ASSERT_TRUE(connection->get_state() == TcpState::SYN_SENT) << "a RST with no ACK says nothing about our SYN";
+    ASSERT_TRUE(sent.empty()) << "and is never answered - a RST is never replied to";
+}
+
+TEST(TcpConnection, ARstWhoseAckDoesNotCoverOurSynInSynSentIsIgnored)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_syn_sent_connection(sent);
+
+    connection->on_segment(*make_incoming_segment(9000, 2000, FLAG_RST | FLAG_ACK));
+    ASSERT_TRUE(connection->get_state() == TcpState::SYN_SENT) << "an ACK of ISS acknowledges nothing";
+    connection->on_segment(*make_incoming_segment(9000, 2500, FLAG_RST | FLAG_ACK));
+    ASSERT_TRUE(connection->get_state() == TcpState::SYN_SENT) << "an ACK beyond SND.NXT acknowledges nothing we sent";
+    ASSERT_TRUE(sent.empty()) << "a RST is never answered";
+
+    connection->on_segment(*make_incoming_segment(0, 2001, FLAG_RST | FLAG_ACK));
+    ASSERT_TRUE(connection->get_state() == TcpState::CLOSED) << "a RST acknowledging our SYN is the peer refusing";
+}
+
+// RFC 9293 3.10.7.4: SYN_RECEIVED is past the point where the peer's ISN is
+// known, so a reset there is checked against the receive window like in any
+// later state.
+TEST(TcpConnection, ARstOutsideTheWindowInSynReceivedIsIgnored)
+{
+    std::vector<RecordedSegment> sent;
+    TcpConnection connection(8080, IPv4Address("10.0.0.1"), 12345, 1000, recorder(sent));
+    connection.accept_incoming_syn(500);
+
+    connection.on_segment(*make_incoming_segment(999999, 0, FLAG_RST));
+    ASSERT_TRUE(connection.get_state() == TcpState::SYN_RECEIVED) << "a RST far outside the window must be ignored";
+
+    connection.on_segment(*make_incoming_segment(501, 0, FLAG_RST));
+    ASSERT_TRUE(connection.get_state() == TcpState::CLOSED) << "a RST at RCV.NXT resets the half-open connection";
+}
