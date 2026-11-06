@@ -643,14 +643,28 @@ void NetworkStack::on_time_passed(uint32_t elapsed_ms)
 {
     this->_now_ms += elapsed_ms;
 
-    // No catch around each connection any more. What used to land here was a
-    // channel write failing during a retransmission, and _transmit() now
-    // absorbs the transient kind as a dropped frame. What is left is fatal - a
-    // device that is gone - and logging it per connection on every tick hid
-    // exactly the failure that needs to be seen.
+    // Each connection is isolated: an unexpected exception from one (a bug,
+    // a codec error) drops that connection, not the reactor and every other
+    // connection with it. A transient write failure never gets here -
+    // _transmit() absorbs it - and the one thing let through is
+    // FatalChannelError: the device is gone, which is every connection's
+    // problem, and logging it per connection per tick would hide it.
     for (auto& entry : this->_connections)
     {
-        entry.second->on_time_passed(elapsed_ms);
+        try
+        {
+            entry.second->on_time_passed(elapsed_ms);
+        }
+        catch (const FatalChannelError&)
+        {
+            throw;
+        }
+        catch (const std::exception& e)
+        {
+            LOG_ERROR("NetworkStack: dropping connection " << entry.second->get_id()
+                                                           << " after an error in its timers: " << e.what());
+            entry.second->fail(); // -> CLOSED, reaped below
+        }
     }
 
     this->_reap_closed_connections();
@@ -830,6 +844,10 @@ void NetworkStack::_handle_frame(size_t ingress, const Bytes& frame)
                 this->_handle_ip(ingress, *ip, frame.slice(ETHERNET_HEADER_SIZE), link_layer_group);
             }
         }
+    }
+    catch (const FatalChannelError&)
+    {
+        throw; // not about this frame: the device is gone (see packet_channel.h)
     }
     catch (const BaseException& e)
     {
@@ -1042,6 +1060,10 @@ void NetworkStack::_handle_ip_fragment(const Ip& ip)
         Ip complete(reassembled.to_bytes());
         this->_dispatch_transport(complete);
     }
+    catch (const FatalChannelError&)
+    {
+        throw;
+    }
     catch (const BaseException& e)
     {
         LOG_WARNING("NetworkStack: a reassembled datagram from " << source.to_string()
@@ -1215,6 +1237,10 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
             tcp.get_sequence_number(), tcp.has_mss_option() ? tcp.get_mss_option() : 0, tcp.has_window_scale_option(),
             tcp.has_window_scale_option() ? tcp.get_window_scale_option() : 0, tcp.has_timestamp_option(),
             tcp.has_timestamp_option() ? tcp.get_timestamp_value() : 0, tcp.has_sack_permitted_option());
+    }
+    catch (const FatalChannelError&)
+    {
+        throw;
     }
     catch (const std::exception& e)
     {
@@ -2092,6 +2118,25 @@ void NetworkStack::_send_tcp_segment(const IPv4Address& dest_ip, const Tcp& head
     uint16_t checksum =
         transport_checksum(this->_source_address_for(dest_ip), dest_ip, IpProtocol::TCP, segment.to_bytes());
     segment.set_checksum(checksum);
+
+    // A next hop with no ARP entry - an idle peer's entry aged out mid-
+    // connection - is a dropped segment, not an exception: _resolve_mac()
+    // would throw out of send() or the timer. Resolution starts now, and
+    // TCP's own retransmission sends the segment once it completes, so no
+    // queue is needed here (unlike UDP, which has no retransmission).
+    IPv4Address next_hop;
+    size_t egress = 0;
+    if (this->_route_for(dest_ip, next_hop, egress))
+    {
+        const Interface& interface = *this->_interfaces.at(egress);
+        if (!is_broadcast_address(next_hop, interface.config) && !interface.arp_table.contains(next_hop))
+        {
+            LOG_DEBUG("NetworkStack: holding back a TCP segment to " << dest_ip.to_string() << " - no ARP entry for "
+                                                                     << next_hop.to_string() << "; resolving it");
+            this->_ensure_arp_resolution(egress, next_hop);
+            return;
+        }
+    }
 
     this->_send_ip_packet(dest_ip, IpProtocol::TCP, segment.to_bytes(), true);
 }

@@ -240,12 +240,12 @@ void RawPacketChannel::write(const Bytes& buffer)
         {
             throw EXCEPTION(TransientWriteError, "sendto() on the packet socket dropped a frame (transient)");
         }
-        throw EXCEPTION(SystemException, "sendto() on the packet socket failed");
+        throw EXCEPTION(FatalChannelError, "sendto() on the packet socket failed");
     }
     if (static_cast<size_t>(sent) != buffer.size())
     {
         // A packet socket sends a frame whole or not at all, so this should be
         // unreachable; treated as an error rather than silently truncating.
-        throw EXCEPTION(BaseException, "sendto() sent a partial frame");
+        throw EXCEPTION(FatalChannelError, "sendto() sent a partial frame");
     }
 }

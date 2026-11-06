@@ -10,8 +10,8 @@
 // recover from that: TCP retransmits, ARP retries, DNS re-asks. NetworkStack
 // catches exactly this type at its one transmit path and counts the drop.
 //
-// Anything else a channel throws from write() is fatal - the fd is gone, the
-// device was removed - and is deliberately left to propagate, because
+// Anything else is fatal - the fd is gone, the device was removed - and is
+// thrown as FatalChannelError (below), deliberately left to propagate, because
 // retrying into a channel that no longer exists would turn a visible failure
 // into a stack that silently stops talking.
 //
@@ -21,6 +21,18 @@ class TransientWriteError : public BaseException
 {
 public:
     using BaseException::BaseException;
+};
+
+// Thrown by a channel that cannot be used any more: a write failing with
+// anything but a transient errno (EBADF, the device removed, ...), a partial
+// frame, a device that was never started. Every catch inside the stack that
+// isolates one frame or one connection rethrows this type, so it reaches the
+// application. A SystemException, so it carries errno's text and existing
+// handlers for those still see it.
+class FatalChannelError : public SystemException
+{
+public:
+    using SystemException::SystemException;
 };
 
 // Whether a write() errno is one of the transient ones above: EAGAIN /
@@ -48,7 +60,7 @@ public:
     // to know it has drained the edge-triggered fd.
     virtual Bytes read(unsigned int max_length) = 0;
     // Sends one frame whole. Throws TransientWriteError if it was dropped for
-    // a passing reason, anything else if the channel is unusable (see above).
+    // a passing reason, FatalChannelError if the channel is unusable.
     virtual void write(const Bytes& buffer) = 0;
     virtual int get_fd() const = 0;
 };

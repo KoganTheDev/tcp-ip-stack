@@ -1,6 +1,7 @@
 #include "server.h"
 #include "exceptions.h"
 #include "logger.h"
+#include "packet_channel.h"
 
 #include <sys/timerfd.h>
 #include <ctime>
@@ -304,31 +305,45 @@ void Server::_continue_response(uint64_t connection_id)
         return; // reaped while waiting for room
     }
 
-    // No try/catch here any more. It existed because a channel write failing
-    // mid-send() threw out of the stack, and the response was then dropped
-    // with a log line - for a full transmit queue, which is ordinary loss.
-    // The stack now absorbs that as a dropped frame that TCP retransmits
-    // (NetworkStack::transmit_drops()), so send() only throws when the device
-    // itself is gone. That is not a per-connection problem to log and skip:
-    // it propagates out of run() to main(), which reports it and exits.
-    Bytes& remaining = unsent_it->second;
-    size_t accepted = connection->send(remaining);
-    TcpState state = connection->get_state();
-    bool can_still_send = state == TcpState::ESTABLISHED || state == TcpState::CLOSE_WAIT;
-    if (accepted < remaining.size() && can_still_send)
+    // A full transmit queue no longer throws out of send() - the stack counts
+    // it as a dropped frame that TCP retransmits (transmit_drops()) - so the
+    // ordinary-loss case can no longer silently drop a response here. What can
+    // still throw is either fatal to the whole device (FatalChannelError,
+    // rethrown to run() and main(), which report it and exit) or confined to
+    // this connection, which is cleaned up below and does not stop the others.
+    try
     {
-        // No room for the rest yet. It goes out once an ack frees send
-        // buffer space, which can only happen in poll() or a timer tick -
-        // run() calls _flush_unsent() after both.
-        remaining = remaining.slice(accepted, remaining.size() - accepted);
-        return;
+        Bytes& remaining = unsent_it->second;
+        size_t accepted = connection->send(remaining);
+        TcpState state = connection->get_state();
+        bool can_still_send = state == TcpState::ESTABLISHED || state == TcpState::CLOSE_WAIT;
+        if (accepted < remaining.size() && can_still_send)
+        {
+            // No room for the rest yet. It goes out once an ack frees send
+            // buffer space, which can only happen in poll() or a timer tick -
+            // run() calls _flush_unsent() after both.
+            remaining = remaining.slice(accepted, remaining.size() - accepted);
+            return;
+        }
+        // Either everything was accepted, or the connection can no longer send
+        // at all and send() would return 0 forever - holding the tail then
+        // would keep this connection in flight, and unread, for good.
+        this->_unsent.erase(unsent_it);
     }
-    // Either everything was accepted, or the connection can no longer send
-    // at all and send() would return 0 forever - holding the tail then
-    // would keep this connection in flight, and unread, for good.
-    this->_unsent.erase(unsent_it);
+    catch (const FatalChannelError&)
+    {
+        throw;
+    }
+    catch (const std::exception& e)
+    {
+        this->_unsent.erase(connection_id);
+        LOG_ERROR("Server: sending the response for connection " << connection_id << " failed: " << e.what());
+    }
 
-    // Clearing the in-flight mark is what lets the next chunk be picked up.
+    // Clear the in-flight mark whatever happened above. It is what lets the
+    // next chunk be picked up, so a throw must not be able to skip it - that
+    // is how a connection ends up acking forever while silently answering
+    // nothing.
     this->_in_flight.erase(connection_id);
 
     // Whatever arrived while that chunk was in the pool is still sitting unread
@@ -355,9 +370,22 @@ void Server::_close_if_finished(uint64_t connection_id)
     {
         return;
     }
-    // Not caught, for the same reason as in _continue_response(): only a
-    // fatal channel error can still throw out of the stack.
-    connection->close(); // TcpConnection defers the FIN until queued data is sent
+    // Same split as _continue_response(): a dead device ends the server, any
+    // other failure is this connection's alone.
+    try
+    {
+        connection->close(); // TcpConnection defers the FIN until queued data is sent
+    }
+    catch (const FatalChannelError&)
+    {
+        throw;
+    }
+    catch (const std::exception& e)
+    {
+        this->_unsent.erase(connection_id);
+        this->_in_flight.erase(connection_id);
+        LOG_ERROR("Server: closing connection " << connection_id << " failed: " << e.what());
+    }
 }
 
 void Server::_close_finished_peers()

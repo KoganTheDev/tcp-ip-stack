@@ -3543,5 +3543,68 @@ TEST(NetworkStack, AFatalWriteFailureStillPropagates)
     connection->send(Bytes::from_hex("6869"));
 
     channel->fail_writes_fatally();
-    ASSERT_THROW(stack->on_time_passed(2000), BaseException) << "the retransmission's fatal failure must surface";
+    ASSERT_THROW(stack->on_time_passed(2000), FatalChannelError) << "the retransmission's fatal failure must surface";
+}
+
+// An idle peer's ARP entry ages out while the connection stays open. The next
+// segment must not throw (it used to: _resolve_mac() raised "No ARP entry"
+// out of send() or the timer); it is dropped like any lost frame, ARP
+// resolution starts, and retransmission delivers it once the reply is in.
+TEST(NetworkStack, AnArpEntryExpiringMidConnectionIsReResolvedNotThrown)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    uint32_t our_isn = establish_passive(*stack, *channel);
+    TcpConnection* connection = stack->accept(80);
+    ASSERT_TRUE(connection != nullptr) << "precondition";
+
+    for (int i = 0; i < 140; i++) // well past the 60 s ARP TTL, with nothing heard from the peer
+    {
+        stack->on_time_passed(TEST_TICK_MS);
+    }
+    channel->clear_outbound();
+
+    ASSERT_NO_THROW(connection->send(Bytes::from_hex("6869"))) << "a missing MAC is not an exception";
+    ArpView request = find_arp(channel->outbound_frames());
+    ASSERT_TRUE(request.is_arp && request.target_ip == PEER_IP.to_string()) << "it starts ARP resolution";
+    ASSERT_TRUE(!find_tcp(channel->outbound_frames()).is_tcp) << "the segment itself could not go out yet";
+
+    channel->clear_outbound();
+    channel->push_inbound(build_arp_reply());
+    ASSERT_NO_THROW(stack->poll());
+    ASSERT_NO_THROW(stack->on_time_passed(2000));
+    TcpView data = find_tcp(channel->outbound_frames());
+    ASSERT_TRUE(data.is_tcp && data.seq == our_isn + 1) << "once resolved, retransmission sends the data";
+    ASSERT_TRUE(stack->find_connection(connection->get_id()) != nullptr) << "and the connection survived";
+}
+
+// One connection hitting an unexpected error on its timer path must not take
+// the reactor - and every other connection - down with it. That connection
+// is dropped; the others carry on. Only FatalChannelError escapes (above).
+TEST(NetworkStack, AnUnexpectedErrorInOneConnectionDoesNotTakeDownTheOthers)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    uint32_t isn_a = establish_passive(*stack, *channel);
+    channel->push_inbound(build_tcp(FLAG_SYN, 5000, 0, 40001, 80));
+    stack->poll();
+    uint32_t isn_b = find_tcp(channel->outbound_frames()).seq;
+    channel->push_inbound(build_tcp(FLAG_ACK, 5001, isn_b + 1, 40001, 80));
+    stack->poll();
+    TcpConnection* a = stack->accept(80);
+    TcpConnection* b = stack->accept(80);
+    ASSERT_TRUE(a != nullptr && b != nullptr) << "precondition: two connections";
+    uint64_t id_a = a->get_id();
+    uint64_t id_b = b->get_id();
+    a->send(Bytes::from_hex("6869"));
+    b->send(Bytes::from_hex("6869"));
+    channel->clear_outbound();
+    (void)isn_a;
+
+    channel->fail_next_write_unexpectedly();
+    ASSERT_NO_THROW(stack->on_time_passed(2000)) << "one connection's error must not escape the timer";
+    bool a_alive = stack->find_connection(id_a) != nullptr;
+    bool b_alive = stack->find_connection(id_b) != nullptr;
+    ASSERT_TRUE(a_alive != b_alive) << "exactly the connection that failed is dropped";
+    ASSERT_TRUE(count_tcp_frames(channel->outbound_frames()) >= 1) << "the other one still retransmitted";
 }

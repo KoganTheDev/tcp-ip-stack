@@ -120,7 +120,7 @@ void TunWrapper::write(const Bytes& buffer)
 {
     if (!this->_is_active)
     {
-        throw EXCEPTION(BaseException, "tun device is not active at TunWrapper::_write");
+        throw EXCEPTION(FatalChannelError, "tun device is not active at TunWrapper::_write");
     }
 
     size_t buffer_length = buffer.size();
@@ -135,11 +135,11 @@ void TunWrapper::write(const Bytes& buffer)
         {
             throw EXCEPTION(TransientWriteError, "TAP write dropped a frame (transient)");
         }
-        throw EXCEPTION(SystemException, "Writing using the tun device has failed");
+        throw EXCEPTION(FatalChannelError, "Writing using the tun device has failed");
     }
     else if ((size_t)bytes_written != buffer.size())
     {
-        throw EXCEPTION(SystemException, "Not all of the message was sent");
+        throw EXCEPTION(FatalChannelError, "Not all of the message was sent");
     }
 }
 
