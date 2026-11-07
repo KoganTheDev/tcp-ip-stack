@@ -302,6 +302,77 @@ TEST_F(SimNetworkTest, SameSeedReproducesAStackRunsFrameTiming)
     ASSERT_NE(first, run(8));
 }
 
+// Jumping straight to the next event must change nothing but the cost: every
+// frame on the wire, with its timestamp and its bytes, exactly as stepping one
+// millisecond at a time produces it - through loss, retransmission timeouts,
+// the delayed-ack timer, the close and the minute of TIME_WAIT. If a stack
+// failed to report a deadline, the event-driven run would skip past it and the
+// two traces would part ways at that frame.
+TEST_F(SimNetworkTest, EventDrivenSteppingMatchesOneMillisecondSteppingFrameForFrame)
+{
+    auto run = [](bool event_driven)
+    {
+        SimNetwork sim(11);
+        sim.set_event_driven(event_driven);
+        LinkParams params;
+        params.loss = 0.05;
+        params.reorder = 0.05;
+        params.reorder_delay_ms = 7;
+        params.delay_ms = 10;
+        params.jitter_ms = 4;
+        params.bytes_per_ms = 2000;
+        NetemChannel& link = sim.add_link(params, params);
+        NetworkStack& client = sim.add_stack(link.take_endpoint(NetemChannel::A), MAC_A, IP_A);
+        NetworkStack& server = sim.add_stack(link.take_endpoint(NetemChannel::B), MAC_B, IP_B);
+        server.listen(80);
+        TcpConnection* connection = client.connect(IP_B, 80); // ARP first: its retry timer counts too
+        uint64_t client_id = connection->get_id();
+        uint64_t server_id = 0;
+        size_t received = 0;
+        sim.add_tick_hook(
+            [&]()
+            {
+                if (server_id == 0)
+                {
+                    if (TcpConnection* accepted = server.accept(80))
+                        server_id = accepted->get_id();
+                }
+                if (TcpConnection* s = server.find_connection(server_id))
+                {
+                    received += s->read().size();
+                    if (s->get_state() == TcpState::CLOSE_WAIT)
+                        s->close();
+                }
+            });
+        sim.run_until([&] { return connection->get_state() == TcpState::ESTABLISHED; }, 60000);
+        connection->send(Bytes(std::string(60000, 'x')));
+        sim.run_until([&] { return received == 60000; }, 120000);
+        // One lone segment: nothing follows it to force the ack out, so the
+        // receiver's delayed-ack timer has to.
+        connection->send(Bytes(std::string(100, 'y')));
+        sim.step(1000);
+        if (TcpConnection* c = client.find_connection(client_id))
+            c->close();
+        sim.step(90000); // past TIME_WAIT
+
+        std::vector<std::pair<uint64_t, Bytes>> trace;
+        for (const auto& record : sim.transmitted_capture().records())
+            trace.emplace_back(record.timestamp_us, record.frame);
+        return std::make_pair(trace, received);
+    };
+
+    auto stepped = run(false);
+    auto jumped = run(true);
+    ASSERT_EQ(stepped.second, 60100u) << "precondition: the transfer completed";
+    ASSERT_GT(stepped.first.size(), 60u) << "enough frames for the comparison to mean something";
+    ASSERT_EQ(jumped.first.size(), stepped.first.size());
+    for (size_t i = 0; i < stepped.first.size(); i++)
+    {
+        ASSERT_EQ(jumped.first[i].first, stepped.first[i].first) << "frame " << i << " sent at a different time";
+        ASSERT_TRUE(jumped.first[i].second == stepped.first[i].second) << "frame " << i << " differs";
+    }
+}
+
 // A failing seed writes four files; a regression that fails thousands of
 // nightly seeds must not write thousands of sets. The first SIM_PCAP_LIMIT
 // failures in a process get captures, the rest are only counted.

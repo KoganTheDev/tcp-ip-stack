@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <optional>
 #include <map>
 #include <memory>
 #include <random>
@@ -127,6 +128,9 @@ public:
     bool idle() const { return _directions[0].in_flight.empty() && _directions[1].in_flight.empty(); }
     // Some frame is ready to be read right now, at either end.
     bool has_due_frame() const { return _due(_directions[0]) || _due(_directions[1]); }
+    // When the next frame in flight, in either direction, becomes due (us), or
+    // nullopt if nothing is in flight.
+    std::optional<uint64_t> next_due_us() const;
 
     // Where frames are recorded: `delivered` when the far end reads one (with
     // the delivery time, and corrupted as delivered), `transmitted` when an

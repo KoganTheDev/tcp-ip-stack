@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -19,6 +20,15 @@
 // frame that has become due by polling the stacks until nothing is left in
 // flight that is due now - a frame sent with zero delay is delivered within
 // the same step, and its reply too.
+//
+// By default a step goes straight to the next event rather than 1 ms ahead:
+// the earliest of the next frame due on any link and the next timer due in
+// any stack (NetworkStack::ms_until_next_timer()). Nothing can happen in
+// between - a stack does nothing without a frame or a due timer, and the
+// tick hooks react to what those did - so this visits exactly the
+// milliseconds a 1 ms stepper would have found something to do in, and skips
+// the rest: a 60 s TIME_WAIT is one step instead of 60000.
+// set_event_driven(false) restores fixed stepping.
 //
 // Typical use:
 //
@@ -64,20 +74,22 @@ public:
     // "application" lives (accept, send more as the buffer drains, ...).
     void add_tick_hook(std::function<void()> hook) { _hooks.push_back(std::move(hook)); }
 
-    // Granularity of virtual time: each step advances the clock by this much
-    // and reports it to on_time_passed(). 1 ms by default, so every timer
-    // fires on the millisecond it is due.
+    // Granularity of virtual time: each step advances the clock by at least
+    // this much and reports it to on_time_passed(). 1 ms by default, so every
+    // timer fires on the millisecond it is due.
     void set_step_ms(uint32_t ms) { _step_ms = ms == 0 ? 1 : ms; }
-    // Granularity used instead while no link has a frame in flight. Equal to
-    // the step by default (off). Raising it makes long quiet stretches - a
-    // retransmission timeout, TIME_WAIT - cheap to simulate, at the cost of
-    // timers that fire during them running up to this late. Deterministic
-    // either way.
+    // Jump to the next event (the default) or advance one step at a time.
+    void set_event_driven(bool enabled) { _event_driven = enabled; }
+    // Fixed stepping only: the granularity used instead while no link has a
+    // frame in flight. Equal to the step by default (off). Raising it makes
+    // long quiet stretches cheap to simulate, at the cost of timers that fire
+    // during them running up to this late. Event-driven stepping makes the
+    // same stretches cheaper still without the lateness, and ignores this.
     void set_idle_step_ms(uint32_t ms) { _idle_step_ms = ms; }
 
-    // Advances virtual time by at least `ms`, one step at a time.
+    // Advances virtual time by exactly `ms`, one step (or event) at a time.
     void step(uint64_t ms);
-    // One step of the configured granularity (idle-adjusted).
+    // One step: to the next event, or of the configured granularity.
     void tick();
 
     // Steps until predicate() is true or max_virtual_ms have passed; returns
@@ -103,6 +115,11 @@ private:
     // The secret seed for the next stack added: the network seed and the
     // stack's index, mixed so stacks get unrelated secrets.
     uint64_t _stack_secret_seed() const { return _seed * 0x9e3779b97f4a7c15ULL + _stacks.size() + 1; }
+    // One step, advancing the clock by at most max_ms (at least one ms).
+    void _tick(uint64_t max_ms);
+    // Milliseconds until the next frame is due or the next timer fires,
+    // anywhere in the network; nullopt if neither is pending.
+    std::optional<uint64_t> _ms_until_next_event() const;
 
     uint64_t _seed;
     SimClock _clock;
@@ -116,4 +133,5 @@ private:
     std::vector<std::function<void()>> _hooks;
     uint32_t _step_ms = 1;
     uint32_t _idle_step_ms = 0;
+    bool _event_driven = true;
 };

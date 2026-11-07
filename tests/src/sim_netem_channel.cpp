@@ -153,6 +153,20 @@ void NetemChannel::_enqueue_copy(Direction& direction, Bytes frame, uint64_t wir
     direction.in_flight.emplace(std::make_pair(wire_done_us + delay_ms * 1000, _order++), std::move(frame));
 }
 
+std::optional<uint64_t> NetemChannel::next_due_us() const
+{
+    std::optional<uint64_t> next;
+    for (const Direction& direction : _directions)
+    {
+        if (!direction.in_flight.empty())
+        {
+            uint64_t due = direction.in_flight.begin()->first.first;
+            next = next.has_value() ? std::min(*next, due) : due;
+        }
+    }
+    return next;
+}
+
 bool NetemChannel::_due(const Direction& direction) const
 {
     return !direction.in_flight.empty() && direction.in_flight.begin()->first.first <= _clock.now_us();

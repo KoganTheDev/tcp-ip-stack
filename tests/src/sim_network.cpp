@@ -1,5 +1,7 @@
 #include "sim/sim_network.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <sstream>
 #include <stdexcept>
 
@@ -72,17 +74,54 @@ void SimNetwork::deliver_due()
     }
 }
 
-void SimNetwork::tick()
+std::optional<uint64_t> SimNetwork::_ms_until_next_event() const
 {
-    uint32_t elapsed = _step_ms;
-    if (_idle_step_ms > _step_ms && links_idle())
+    std::optional<uint64_t> next;
+    auto fold = [&next](uint64_t ms)
+    {
+        next = next.has_value() ? std::min(*next, ms) : ms;
+    };
+    uint64_t now_us = _clock.now_us();
+    for (const auto& link : _links)
+    {
+        if (std::optional<uint64_t> due_us = link->next_due_us())
+        {
+            // Rounded up: a frame due part-way through a millisecond is read
+            // on the first whole millisecond at or after it, as a 1 ms
+            // stepper would.
+            fold(*due_us <= now_us ? 0 : (*due_us - now_us + 999) / 1000);
+        }
+    }
+    for (const auto& stack : _stacks)
+    {
+        if (std::optional<uint32_t> timer_ms = stack->ms_until_next_timer())
+        {
+            fold(*timer_ms);
+        }
+    }
+    return next;
+}
+
+void SimNetwork::_tick(uint64_t max_ms)
+{
+    uint64_t elapsed = _step_ms;
+    if (_event_driven)
+    {
+        // Straight to the next event, or as far as allowed if there is none.
+        elapsed = _ms_until_next_event().value_or(max_ms);
+        elapsed = std::max<uint64_t>(elapsed, _step_ms);
+    }
+    else if (_idle_step_ms > _step_ms && links_idle())
     {
         elapsed = _idle_step_ms;
     }
+    elapsed = std::max<uint64_t>(std::min<uint64_t>(elapsed, max_ms), 1);
+    elapsed = std::min<uint64_t>(elapsed, UINT32_MAX);
+
     _clock.advance(elapsed);
     for (auto& stack : _stacks)
     {
-        stack->on_time_passed(elapsed);
+        stack->on_time_passed(static_cast<uint32_t>(elapsed));
     }
     deliver_due();
     for (auto& hook : _hooks)
@@ -91,12 +130,19 @@ void SimNetwork::tick()
     }
 }
 
+void SimNetwork::tick()
+{
+    // Uncapped: to the next event; with nothing pending, one (idle) step.
+    std::optional<uint64_t> next = _event_driven ? _ms_until_next_event() : std::nullopt;
+    _tick(next.has_value() ? std::max<uint64_t>(*next, _step_ms) : std::max(_step_ms, _idle_step_ms));
+}
+
 void SimNetwork::step(uint64_t ms)
 {
     uint64_t end = _clock.now_ms() + ms;
     while (_clock.now_ms() < end)
     {
-        tick();
+        _tick(end - _clock.now_ms());
     }
 }
 
@@ -107,7 +153,7 @@ bool SimNetwork::run_until(const std::function<bool()>& predicate, uint64_t max_
     {
         if (_clock.now_ms() >= deadline)
             return false;
-        tick();
+        _tick(deadline - _clock.now_ms());
     }
     return true;
 }
