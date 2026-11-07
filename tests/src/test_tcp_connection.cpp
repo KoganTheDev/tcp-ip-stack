@@ -2947,3 +2947,23 @@ TEST(TcpConnection, ReadingReopensAWindowThatHadFallenBelowOneSegment)
     ASSERT_GT(sent.size(), before) << "the read must send a window update";
     ASSERT_GE(sent.back().window, 536u);
 }
+
+// Nagle holds only the last, partial segment of the stream. Each send() used
+// to be cut into MSS pieces on its own, so the short tail of one write sat at
+// the front of the queue with the next write queued behind it: Nagle held the
+// whole stream on a fragment until every byte in flight was acked - which,
+// with the peer delaying its ack for an odd segment, meant a 200 ms stall in
+// the middle of a bulk transfer (and, at a 200 ms RTO, a spurious timeout).
+TEST(TcpConnection, ALaterWriteTopsUpAPartialSegmentWaitingInTheQueue)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent); // MSS 536
+
+    connection->send(Bytes(600u)); // 536 goes out, the 64-byte tail is held by Nagle
+    ASSERT_EQ(sent.size(), 1u) << "precondition: the tail waits behind the segment in flight";
+    connection->send(Bytes(1000u));
+
+    connection->on_segment(*make_incoming_segment(501, sent[0].seq + 536, FLAG_ACK));
+    ASSERT_EQ(sent.size(), 2u) << "only the final 464-byte tail is held by Nagle";
+    ASSERT_EQ(sent[1].payload.size(), 536u) << "the 64-byte tail and the next write go out as one full segment";
+}

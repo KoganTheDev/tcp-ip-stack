@@ -1907,6 +1907,18 @@ size_t TcpConnection::send(const Bytes& data)
     // split anything larger than the negotiated effective MSS - the
     // application shouldn't have to know what that negotiated value is
     size_t offset = 0;
+    // A partial segment already waiting at the back of the queue is topped up
+    // first, so only the stream's last segment is ever short. Cut per write,
+    // the tail of one send() sat in front of the next one and Nagle held the
+    // whole queue on it.
+    if (!_send_queue.empty() && _send_queue.back().size() < _max_segment_payload())
+    {
+        Bytes& back = _send_queue.back();
+        size_t top_up = std::min(_max_segment_payload() - back.size(), accepted);
+        back.insert(back.end(), data.begin(), data.begin() + static_cast<std::ptrdiff_t>(top_up));
+        _send_queued_bytes += top_up;
+        offset = top_up;
+    }
     while (offset < accepted)
     {
         size_t chunk_size = std::min<size_t>(_max_segment_payload(), accepted - offset);
