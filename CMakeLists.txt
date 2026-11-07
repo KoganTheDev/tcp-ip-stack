@@ -27,6 +27,15 @@ if(NOT DEFINED CMAKE_CXX_COMPILER_LAUNCHER)
     endif()
 endif()
 
+# What gets built, beyond the stack library itself. The fuzz and bench presets
+# switch the tests and applications off: the fuzz build instruments the stack
+# with libFuzzer, which has no use for GoogleTest or the epoll server, and a
+# benchmark build should not wait for either.
+option(TCPIP_BUILD_TESTS "Build the GoogleTest suite" ON)
+option(TCPIP_BUILD_APPS "Build epoll-server and http-get" ON)
+option(TCPIP_BUILD_FUZZERS "Build the libFuzzer harnesses in fuzz/ (needs clang)" OFF)
+option(TCPIP_BUILD_BENCH "Build the Google Benchmark microbenchmarks in bench/" OFF)
+
 # The flags every target shares, the same ones the hand-written Makefile used:
 # -std=c++17 (above) -Wall -g -pthread. -g is unconditional so a release build
 # is still debuggable. Preset-specific flags (sanitizers, coverage, -Werror)
@@ -50,6 +59,7 @@ add_library(tcpip STATIC ${STACK_SOURCES})
 target_include_directories(tcpip PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(tcpip PUBLIC project_options)
 
+if(TCPIP_BUILD_TESTS OR TCPIP_BUILD_APPS)
 # --- The testable part of epoll-server --------------------------------------
 # Named explicitly rather than globbed: the rest of that program (server.cpp,
 # main.cpp, epoll_wrapper.cpp) needs a channel and an event loop, and pulling
@@ -65,6 +75,9 @@ add_library(epoll_threaded STATIC
 target_include_directories(epoll_threaded PUBLIC ${PROJECT_SOURCE_DIR}/epoll-server/include)
 target_link_libraries(epoll_threaded PUBLIC tcpip)
 
+endif()
+
+if(TCPIP_BUILD_APPS)
 # --- The applications --------------------------------------------------------
 # Built here as well as by their own Makefiles so that the strict and sanitizer
 # presets cover them too. The scripts in scripts/ still build through
@@ -80,7 +93,9 @@ file(GLOB HTTP_GET_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/http-get/src/
 add_executable(http-get ${HTTP_GET_SOURCES})
 target_compile_options(http-get PRIVATE -Wextra)
 target_link_libraries(http-get PRIVATE tcpip)
+endif()
 
+if(TCPIP_BUILD_TESTS)
 # --- GoogleTest ------------------------------------------------------------
 # The installed package first (Arch: gtest, Debian/Ubuntu: libgtest-dev and
 # libgmock-dev), so a normal build needs no network. CONFIG mode because only
@@ -162,4 +177,13 @@ else()
         DISCOVERY_MODE PRE_TEST
         XML_OUTPUT_DIR ${CMAKE_BINARY_DIR}/test-results
         PROPERTIES LABELS unit)
+endif()
+endif()
+
+# --- Fuzzing and benchmarks ------------------------------------------------
+if(TCPIP_BUILD_FUZZERS)
+    add_subdirectory(fuzz)
+endif()
+if(TCPIP_BUILD_BENCH)
+    add_subdirectory(bench)
 endif()

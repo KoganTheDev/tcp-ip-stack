@@ -1,6 +1,10 @@
 {
   "version": 2,
-  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
   "configurePresets": [
     {
       "name": "base",
@@ -24,7 +28,9 @@
       "inherits": "base",
       "displayName": "Release",
       "description": "Optimised (-O3 -DNDEBUG), still with -g.",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
     },
     {
       "name": "asan",
@@ -65,25 +71,92 @@
       "cacheVariables": {
         "CMAKE_CXX_FLAGS": "-Wextra -Werror -Wno-missing-field-initializers -Wno-unused-parameter"
       }
+    },
+    {
+      "name": "fuzz",
+      "inherits": "base",
+      "displayName": "libFuzzer + ASan + UBSan (clang)",
+      "description": "Stack instrumented with fuzzer-no-link; harnesses in fuzz/ link the fuzzer runtime. Only the stack and the harnesses are built. `make fuzz` runs them.",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_CXX_FLAGS": "-O1 -fno-omit-frame-pointer -fsanitize=fuzzer-no-link,address,undefined -fno-sanitize-recover=undefined",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined",
+        "TCPIP_BUILD_TESTS": "OFF",
+        "TCPIP_BUILD_APPS": "OFF",
+        "TCPIP_BUILD_FUZZERS": "ON"
+      }
+    },
+    {
+      "name": "bench",
+      "inherits": "base",
+      "displayName": "Benchmarks (Release, -O2 -g)",
+      "description": "Optimised build of the stack plus the Google Benchmark binaries in bench/. -O2 -DNDEBUG rather than release's -O3 so the numbers track what a normal optimised build does.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_FLAGS_RELEASE": "-O2 -g -DNDEBUG",
+        "TCPIP_BUILD_TESTS": "OFF",
+        "TCPIP_BUILD_APPS": "OFF",
+        "TCPIP_BUILD_BENCH": "ON"
+      }
     }
   ],
   "buildPresets": [
-    { "name": "debug", "configurePreset": "debug" },
-    { "name": "release", "configurePreset": "release" },
-    { "name": "asan", "configurePreset": "asan" },
-    { "name": "tsan", "configurePreset": "tsan" },
-    { "name": "coverage", "configurePreset": "coverage" },
-    { "name": "strict", "configurePreset": "strict" }
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan"
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan"
+    },
+    {
+      "name": "coverage",
+      "configurePreset": "coverage"
+    },
+    {
+      "name": "strict",
+      "configurePreset": "strict"
+    },
+    {
+      "name": "fuzz",
+      "configurePreset": "fuzz"
+    },
+    {
+      "name": "bench",
+      "configurePreset": "bench"
+    }
   ],
   "testPresets": [
     {
       "name": "base",
       "hidden": true,
-      "output": { "outputOnFailure": true },
-      "filter": { "include": { "label": "unit" } }
+      "output": {
+        "outputOnFailure": true
+      },
+      "filter": {
+        "include": {
+          "label": "unit"
+        }
+      }
     },
-    { "name": "debug", "inherits": "base", "configurePreset": "debug" },
-    { "name": "release", "inherits": "base", "configurePreset": "release" },
+    {
+      "name": "debug",
+      "inherits": "base",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "configurePreset": "release"
+    },
     {
       "name": "asan",
       "inherits": "base",
@@ -97,14 +170,22 @@
       "name": "tsan",
       "inherits": "base",
       "configurePreset": "tsan",
-      "environment": { "TSAN_OPTIONS": "halt_on_error=1" }
+      "environment": {
+        "TSAN_OPTIONS": "halt_on_error=1"
+      }
     },
     {
       "name": "coverage",
       "inherits": "base",
       "configurePreset": "coverage",
-      "environment": { "LLVM_PROFILE_FILE": "${sourceDir}/build/coverage/profraw/%p.profraw" }
+      "environment": {
+        "LLVM_PROFILE_FILE": "${sourceDir}/build/coverage/profraw/%p.profraw"
+      }
     },
-    { "name": "strict", "inherits": "base", "configurePreset": "strict" }
+    {
+      "name": "strict",
+      "inherits": "base",
+      "configurePreset": "strict"
+    }
   ]
 }
