@@ -22,7 +22,18 @@ Ip::Ip(const Bytes& bytes)
     this->from_bytes(bytes);
 }
 
+Ip::Ip(const Bytes& bytes, bool parse_transport)
+{
+    // NOLINTNEXTLINE(clang-analyzer-optin.cplusplus.VirtualCall): intended: parses with this class's own _parse
+    this->_parse(bytes, parse_transport);
+}
+
 void Ip::from_bytes(const Bytes& data)
+{
+    this->_parse(data, true);
+}
+
+void Ip::_parse(const Bytes& data, bool parse_transport)
 {
     if (data.size() < 20)
     // ip header minimum size when IHL = 5 and there`s no options field
@@ -99,6 +110,15 @@ void Ip::from_bytes(const Bytes& data)
     if (is_fragment)
     {
         this->_next_layer = std::make_unique<Raw>(std::move(payload));
+        return;
+    }
+
+    if (!parse_transport)
+    {
+        if (!payload.empty())
+        {
+            this->_next_layer = std::make_unique<Raw>(std::move(payload));
+        }
         return;
     }
 

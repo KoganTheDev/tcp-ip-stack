@@ -15,11 +15,22 @@ Ethernet::Ethernet(const Bytes& data)
     this->from_bytes(data);
 }
 
+Ethernet::Ethernet(const Bytes& data, bool parse_ip_payload)
+{
+    // NOLINTNEXTLINE(clang-analyzer-optin.cplusplus.VirtualCall): intended: parses with this class's own _parse
+    this->_parse(data, parse_ip_payload);
+}
+
 Ethernet::Ethernet(const MacAddress& src, const MacAddress& dest, EtherType ethernet_protocol)
     : _src(src), _dest(dest), _ethernet_protocol(ethernet_protocol)
 {}
 
 void Ethernet::from_bytes(const Bytes& data)
+{
+    this->_parse(data, true);
+}
+
+void Ethernet::_parse(const Bytes& data, bool parse_ip_payload)
 {
     if (data.size() < 14)
     {
@@ -35,7 +46,7 @@ void Ethernet::from_bytes(const Bytes& data)
         this->_next_layer = std::make_unique<Arp>(data.slice(14, 28));
         break;
     case EtherType::IPv4:
-        this->_next_layer = std::make_unique<Ip>(data.slice(14));
+        this->_next_layer = std::make_unique<Ip>(data.slice(14), parse_ip_payload);
         break;
     default:
         this->_next_layer = std::make_unique<Raw>(data.slice(14));

@@ -29,6 +29,11 @@ public:
     Ethernet() = default;
     Ethernet(
         const Bytes& data); // Constructor that gets a bytestream and serializes it directly into an Ethernet object
+    // As above, but an IPv4 payload is parsed only as far as its IP header; the
+    // transport payload is left as opaque Raw bytes. The receive path uses this
+    // so that "for me / forward / drop" is decided from the IP header alone and
+    // a transit packet is relayed whatever its transport header looks like.
+    Ethernet(const Bytes& data, bool parse_ip_payload);
     Ethernet(const MacAddress& src, const MacAddress& dest, EtherType ethernet_protocol);
 
     // Implement protocol layer interface
@@ -42,6 +47,8 @@ public:
     EtherType get_ethernet_protocol() const { return this->_ethernet_protocol; }
 
 private:
+    void _parse(const Bytes& data, bool parse_ip_payload);
+
     MacAddress _src;
     MacAddress _dest;
     EtherType _ethernet_protocol{IPv4};

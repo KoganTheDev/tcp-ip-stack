@@ -1096,7 +1096,13 @@ void NetworkStack::_handle_frame(size_t ingress, const Bytes& frame)
 {
     try
     {
-        Ethernet ethernet(frame);
+        // Parsed down to the IP header and no further: the decision to deliver,
+        // forward or drop is made from that header alone (RFC 1812 5.2), and the
+        // transport header is parsed in _handle_ip only for a packet that is for
+        // this host. Otherwise a transit packet whose L4 this stack's codecs
+        // reject, or whose protocol it has never heard of, would be dropped
+        // during parsing instead of relayed.
+        Ethernet ethernet(frame, false);
 
         // On a TAP device every frame that arrives really is for us, so this
         // check never fires and the stack ran without it for a long time. On a
@@ -1307,7 +1313,11 @@ void NetworkStack::_handle_ip(size_t ingress, const Ip& ip, const Bytes& ip_byte
         return;
     }
 
-    this->_dispatch_transport(ip);
+    // Only now, for a packet that is ours, is the transport header parsed. A
+    // failure throws to _handle_frame, which logs and drops it as it always did
+    // for an unparseable segment.
+    Ip complete(ip_bytes, true);
+    this->_dispatch_transport(complete);
 }
 
 void NetworkStack::_handle_ip_fragment(const Ip& ip)
@@ -2152,18 +2162,10 @@ void NetworkStack::_forward_ip(size_t ingress, const Ip& ip, const Bytes& ip_byt
         return;
     }
 
-    // Worth knowing about the packet that reaches here: the receive path has
-    // already parsed it all the way to L4, because Ip::from_bytes builds a Tcp,
-    // Udp or Icmp for the payload. So a transit packet whose transport header
-    // this stack's codecs reject is dropped during parsing and never reaches
-    // forwarding at all.
-    //
-    // A real router does not do that - it looks at the IP header and nothing
-    // else, which is why it can forward protocols it has never heard of. This
-    // one refuses to relay what it cannot parse, which is a deviation and is
-    // documented as one in the README rather than pretended away. Fixing it
-    // means deferring transport parsing until after the forwarding decision,
-    // which is a change to the codec rather than to this function.
+    // The packet that reaches here has been parsed down to its IP header only
+    // (see _handle_frame): like a real router this looks at that header and
+    // nothing else, which is why it can relay a protocol it has never heard of
+    // or a transport header its own codecs would reject.
     //
     // A corrupt header must not be forwarded - the destination it names cannot
     // be trusted, so passing it on would be sending a packet somewhere nobody

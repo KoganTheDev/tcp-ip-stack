@@ -29,6 +29,11 @@ public:
        uint16_t fragment_offset, uint8_t TTL, uint8_t protocol, uint16_t header_checksum, const Bytes& src_address,
        const Bytes& dest_address);
     Ip(const Bytes& bytes); // Constructor that gets a bytestream and serializes it directly into an IP object
+    // parse_transport = false reads the IP header only and keeps the payload as
+    // opaque Raw bytes, whatever the protocol. A router must decide from the IP
+    // header alone (RFC 1812 5.2), and a host should not spend a transport
+    // parse on a packet that is not its own.
+    Ip(const Bytes& bytes, bool parse_transport);
 
     void from_bytes(const Bytes& data);
     Bytes to_bytes();
@@ -83,6 +88,7 @@ private:
     // zeroed to compute over, once implicitly via to_bytes() afterward with the
     // real value in place.
     Bytes _header_to_bytes() const;
+    void _parse(const Bytes& data, bool parse_transport);
 
     //* Note: Check if IP_option (variable length, optional, not common) is needed as part of the ip4 header
     uint8_t _version; // IPv4 = 4

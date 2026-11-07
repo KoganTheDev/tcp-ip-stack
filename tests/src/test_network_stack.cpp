@@ -1976,11 +1976,9 @@ namespace
     // A packet from PEER_IP (on interface 0's network) to a destination that is
     // somebody else's, arriving on interface 0 with our MAC at L2 - which is
     // what a host does when it has picked this stack as its gateway.
-    // The payload is a REAL UDP datagram, not arbitrary bytes. The receive path
-    // parses transit traffic all the way to L4 before the forwarding decision is
-    // made (see _forward_ip), so a packet whose transport header does not parse
-    // is dropped rather than forwarded. A test using two loose bytes would be
-    // testing that limitation rather than the forwarding.
+    // The payload is a real UDP datagram. Forwarding no longer cares (see
+    // IpCompletion in test_ip_completion.cpp for opaque payloads), but tests
+    // that go on to inspect the relayed ports want something meaningful there.
     Bytes build_transit_packet(const IPv4Address& destination, uint8_t ttl, const Bytes& body = Bytes::from_hex("d0d0"),
                                const IPv4Address& source = PEER_IP)
     {
