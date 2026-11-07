@@ -48,7 +48,7 @@ It used to be a periodic 500 ms timer, which made 500 ms the resolution of every
 timeout in the stack (a 200 ms delayed ACK went out at the next tick, up to 500 ms after
 its data) and woke the server twice a second for nothing. The conversion from "ms until
 the next timer" to the `itimerspec` is `timer_setting_for()` in
-`include/timer_setting.h`; the one subtlety is that an `it_value` of {0, 0} *disarms* a
+the stack's `include/timer_setting.h` (shared with its socket layer); the one subtlety is that an `it_value` of {0, 0} *disarms* a
 timerfd, so "due now" is armed as 1 ns.
 
 Dispatch is tracked by `TcpConnection::get_id()`, not by raw pointer - a pointer held
