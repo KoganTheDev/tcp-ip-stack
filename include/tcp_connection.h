@@ -11,6 +11,7 @@
 #include "network_addresses.h"
 #include "reorder_buffer.h"
 #include "rtt_estimator.h"
+#include "send_scoreboard.h"
 #include "tcp.h"
 
 enum class TcpState
@@ -504,9 +505,9 @@ private:
     // has already delivered, and so refusing to send more - which is exactly
     // the stall SACK exists to avoid. A running total keeps it O(1) without
     // the assumption.
-    uint32_t _bytes_in_flight() const { return _unsacked_in_flight_bytes; }
+    uint32_t _bytes_in_flight() const { return _in_flight.unsacked_bytes(); }
 
-    // Applies the peer's SACK blocks to the in-flight deque. Returns true if
+    // Applies the peer's SACK blocks (if SACK is in use) to the scoreboard. Returns true if
     // anything was newly marked, which is what makes a duplicate ack
     // informative rather than merely repeated.
     bool _apply_sack_blocks(const Tcp& segment);
@@ -533,51 +534,6 @@ private:
     // nothing beyond what was sent (ISS < SEG.ACK =< SND.NXT)?
     bool _ack_acceptable_in_syn_sent(uint32_t ack) const;
 
-    // One segment this side sent and hasn't seen acked yet. end_seq is
-    // seq + however many sequence numbers it consumed (payload bytes, plus
-    // one each for SYN/FIN) - a cumulative ack covering end_seq clears it.
-    struct InFlightSegment
-    {
-        uint32_t seq{};
-        uint32_t end_seq{};
-        uint8_t flags{};
-        Bytes payload;
-        // How long this segment waits for its ack once its retransmit timer
-        // runs: the RTO when it was sent. Only the oldest unSACKed segment's
-        // timer runs (RFC 6298 5.3: one timer, restarted when an ack moves the
-        // window), so the others hold this until their turn comes.
-        int retransmit_ms_remaining{};
-        // When the timer, once running, fires - 0 until this segment becomes
-        // the oldest unSACKed one and its timer starts.
-        uint64_t retransmit_deadline_ms{};
-        int retransmit_attempts{};
-        // The connection's clock when this segment first went out. Storing the
-        // absolute moment rather than an age counter keeps timekeeping O(1):
-        // on_time_passed() would otherwise have to walk the whole window on
-        // every call just to age each entry, and this window is walked often
-        // enough already. Age is _now_ms - sent_at_ms, computed only when a
-        // segment is actually acked.
-        uint64_t sent_at_ms{};
-        // Named by a SACK block, so the peer holds it even though the
-        // cumulative ack has not reached it. It stays in this deque because the
-        // window cannot slide past it until everything before it is acked too -
-        // but it must not be counted as still travelling, and must never be the
-        // segment a retransmission picks.
-        bool sacked = false;
-        // Karn's algorithm: once a segment has been retransmitted, an ack for
-        // it is ambiguous - it could be acking the original or the
-        // retransmission, and those imply very different round-trip times.
-        // Such a segment never yields an RTT sample.
-        bool retransmitted{};
-    };
-
-    // The oldest in-flight segment the peer has NOT reported holding - the one
-    // a retransmission should actually resend. Without SACK this is always the
-    // front of the deque; with it, the front may already be sitting in the
-    // peer's reorder buffer, and resending that is pure waste. Declared here
-    // rather than with the other helpers because it names the type above.
-    InFlightSegment* _oldest_unsacked_segment();
-
     uint64_t _id;
     uint16_t _local_port;
     IPv4Address _remote_ip;
@@ -593,15 +549,9 @@ private:
     uint32_t _send_max;
     uint32_t _recv_next; // RCV.NXT - next sequence number expected from the peer
 
-    // the sliding window: ordered oldest-first by sequence number, so the
-    // front is always SND.UNA (or _send_next if empty - nothing
-    // outstanding). A cumulative ack pops everything it covers from the
-    // front; a timeout retransmits only the front entry.
-    std::deque<InFlightSegment> _in_flight;
-    // Running total of in-flight bytes not yet named by a SACK block. Kept
-    // incrementally because the alternative - summing the deque on every ack -
-    // is the hot path of the send loop.
-    uint32_t _unsacked_in_flight_bytes;
+    // The sliding window: every segment in flight, oldest first, with what
+    // SACK has said about each (see send_scoreboard.h).
+    SendScoreboard _in_flight;
     std::deque<Bytes> _send_queue; // data waiting for window room
     // Bytes sitting in _send_queue, kept alongside it so send_space_available()
     // is a subtraction rather than a walk over every queued chunk.

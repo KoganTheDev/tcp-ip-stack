@@ -1,6 +1,7 @@
 #include "tcp_connection.h"
 #include "raw.h"
 #include "logger.h"
+#include "tcp_sequence.h"
 
 #include <algorithm>
 #include <atomic>
@@ -11,22 +12,6 @@ namespace
     constexpr uint8_t FLAG_RST = 0x04;
     constexpr uint8_t FLAG_SYN = 0x02;
     constexpr uint8_t FLAG_FIN = 0x01;
-
-    // Wraparound-safe "does sequence number a sit at or before b" in TCP's
-    // modular sequence space. The unsigned difference is reinterpreted as
-    // signed, so the answer stays correct across a 2^32 wrap - the same idiom
-    // as the Linux kernel's before()/after().
-    //
-    // A plain `a <= b` is wrong here and fails in a way that only shows up
-    // after 4 GiB has moved on one connection: two in-flight segments
-    // straddling the wrap (say end_seq 0xFFFFFFFA and 4) compared against a
-    // legitimate cumulative ack of 4 would leave the first unretired forever,
-    // so the retransmit timer keeps firing on data the peer already has and
-    // the connection is torn down after MAX_RETRANSMIT_ATTEMPTS.
-    bool seq_at_or_before(uint32_t a, uint32_t b)
-    {
-        return static_cast<int32_t>(a - b) <= 0;
-    }
 
     const char* state_name(TcpState state)
     {
@@ -73,8 +58,8 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
       // are declared regardless of the order written here, so any divergence
       // is a lie about what actually happens - and a real hazard the moment
       // one member's initialiser reads another.
-      _unsacked_in_flight_bytes(0), _send_queued_bytes(0), _fin_requested(false), _time_wait_deadline_ms(0), _now_ms(1),
-      _persist_deadline_ms(0), _persist_backoff(0), _ack_pending(false), _ack_deadline_ms(0), _keepalive_enabled(false),
+      _send_queued_bytes(0), _fin_requested(false), _time_wait_deadline_ms(0), _now_ms(1), _persist_deadline_ms(0),
+      _persist_backoff(0), _ack_pending(false), _ack_deadline_ms(0), _keepalive_enabled(false),
       _keepalive_deadline_ms(1 + KEEPALIVE_IDLE_MS), _keepalive_probes_sent(0), _sack_permitted(false),
       _timestamps_negotiated(false), _ts_recent(0), _have_ts_recent(false), _local_mss(local_mss),
       _peer_mss(DEFAULT_PEER_MSS), _effective_mss(std::min(local_mss, DEFAULT_PEER_MSS)),
@@ -312,7 +297,7 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
         _send_max = _send_next;
     }
 
-    InFlightSegment entry;
+    SentSegment entry;
     entry.seq = seq;
     entry.end_seq = _send_next;
     entry.flags = full_flags;
@@ -322,8 +307,7 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
     entry.sent_at_ms = _now_ms;
     entry.retransmitted = false;
     entry.sacked = false;
-    _unsacked_in_flight_bytes += entry.end_seq - entry.seq;
-    _in_flight.push_back(std::move(entry));
+    _in_flight.push(std::move(entry));
 }
 
 void TcpConnection::_send_challenge_ack()
@@ -749,43 +733,8 @@ bool TcpConnection::_apply_sack_blocks(const Tcp& segment)
     {
         return false;
     }
-
-    bool marked_anything = false;
-    for (const Tcp::SackBlock& block : segment.get_sack_blocks())
-    {
-        for (InFlightSegment& entry : _in_flight)
-        {
-            if (entry.sacked)
-            {
-                continue;
-            }
-            // A block names a half-open range the peer holds. Only a segment
-            // wholly inside it is safe to mark: a partial overlap means the
-            // peer holds some of those bytes, and resending the segment is
-            // still the only way to deliver the rest.
-            if (seq_at_or_before(block.start, entry.seq) && seq_at_or_before(entry.end_seq, block.end))
-            {
-                entry.sacked = true;
-                _unsacked_in_flight_bytes -= entry.end_seq - entry.seq;
-                marked_anything = true;
-            }
-        }
-    }
-    return marked_anything;
+    return _in_flight.apply_sack(segment.get_sack_blocks());
 }
-
-TcpConnection::InFlightSegment* TcpConnection::_oldest_unsacked_segment()
-{
-    for (InFlightSegment& entry : _in_flight)
-    {
-        if (!entry.sacked)
-        {
-            return &entry;
-        }
-    }
-    return nullptr;
-}
-
 void TcpConnection::_handle_ack(const Tcp& segment)
 {
     // Apply the scoreboard before anything else looks at the window: what the
@@ -801,7 +750,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     uint32_t previous_peer_window = _peer_window;
     _set_peer_window(static_cast<uint32_t>(segment.get_window()) << peer_shift);
 
-    uint32_t snd_una = _in_flight.empty() ? _send_next : _in_flight.front().seq;
+    uint32_t snd_una = _in_flight.snd_una_or(_send_next);
 
     // RFC 5681 2's definition of a duplicate ack, all five conditions: data
     // outstanding, SND.UNA not moved, no payload, no SYN/FIN, and the window
@@ -832,12 +781,12 @@ void TcpConnection::_handle_ack(const Tcp& segment)
             // reorder buffer already; resending it would be pure waste. The
             // segment worth resending is the oldest one the peer has NOT
             // reported holding.
-            InFlightSegment* target = _oldest_unsacked_segment();
+            SentSegment* target = _in_flight.oldest_unsacked();
             if (target == nullptr)
             {
                 return; // everything outstanding is already held by the peer
             }
-            InFlightSegment& oldest = *target;
+            SentSegment& oldest = *target;
             uint32_t cwnd_before = _congestion->window();
             _transmit(oldest.flags, oldest.seq, oldest.payload);
             // Karn again: this segment has now been sent twice, so the ack
@@ -883,75 +832,17 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         _dup_ack_count = 0;
     }
 
-    bool fin_acked = false;
-    bool acked_anything = false;
-    uint32_t bytes_acked = 0;
-
-    // cumulative ack: everything whose end_seq it covers is done, oldest
-    // (front) first - this is what lets several segments be in flight at
-    // once instead of stop-and-wait's exactly one
-    bool have_rtt_sample = false;
-    uint32_t rtt_sample_ms = 0;
-
-    while (!_in_flight.empty() && seq_at_or_before(_in_flight.front().end_seq, ack))
-    {
-        bytes_acked += _in_flight.front().end_seq - _in_flight.front().seq;
-        if (_in_flight.front().flags & FLAG_FIN)
-        {
-            fin_acked = true;
-        }
-        // Karn's algorithm: only a segment that was never retransmitted
-        // yields a usable round trip. For a retransmitted one there is no way
-        // to tell which transmission this ack answers, and guessing wrong in
-        // either direction corrupts the estimator - guess "the original" on a
-        // path that really did lose the segment and the sample is inflated by
-        // the entire timeout, which then feeds back into a longer timeout and
-        // an even more inflated next sample.
-        //
-        // The newest such segment in this batch wins: a cumulative ack can
-        // retire several at once, and the most recently sent one reflects the
-        // path as it is now.
-        if (!_in_flight.front().retransmitted)
-        {
-            rtt_sample_ms = static_cast<uint32_t>(_now_ms - _in_flight.front().sent_at_ms);
-            have_rtt_sample = true;
-        }
-        if (!_in_flight.front().sacked)
-        {
-            _unsacked_in_flight_bytes -= _in_flight.front().end_seq - _in_flight.front().seq;
-        }
-        _in_flight.pop_front();
-        acked_anything = true;
-    }
-
-    // A partial ack: one that lands inside the front segment rather than at
-    // its end. Its acknowledged prefix is trimmed off, so SND.UNA really moves
-    // to the ack. The case that makes this matter: after a zero-window probe
-    // byte is accepted the peer acks SND.NXT + 1, but the data released next
-    // starts at SND.NXT. If that segment is lost, the peer's duplicate acks
-    // all say SND.NXT + 1 - which never equalled an untrimmed SND.UNA, so
-    // fast retransmit could not fire and only the timeout recovered it.
-    // A segment carrying SYN is left whole: the SYN is not payload to trim.
-    if (!_in_flight.empty())
-    {
-        InFlightSegment& front = _in_flight.front();
-        bool inside = !seq_at_or_before(ack, front.seq) && !seq_at_or_before(front.end_seq, ack);
-        if (inside && !(front.flags & FLAG_SYN))
-        {
-            uint32_t trimmed = ack - front.seq;
-            if (trimmed <= front.payload.size())
-            {
-                front.payload = front.payload.slice(trimmed, front.payload.size() - trimmed);
-                front.seq = ack;
-                if (!front.sacked)
-                {
-                    _unsacked_in_flight_bytes -= trimmed;
-                }
-                bytes_acked += trimmed;
-                acked_anything = true;
-            }
-        }
-    }
+    // Cumulative ack: everything whose end_seq it covers is done, oldest
+    // first - this is what lets several segments be in flight at once instead
+    // of stop-and-wait's exactly one. Karn's algorithm picks the RTT sample:
+    // only a segment never retransmitted yields one, since for a retransmitted
+    // one there is no telling which transmission the ack answers.
+    SendScoreboard::Acked acked = _in_flight.acknowledge(ack);
+    bool fin_acked = acked.fin;
+    bool acked_anything = acked.any;
+    uint32_t bytes_acked = acked.bytes;
+    bool have_rtt_sample = acked.has_rtt_sample;
+    auto rtt_sample_ms = static_cast<uint32_t>(_now_ms - acked.sample_sent_at_ms);
 
     if (acked_anything)
     {
@@ -1196,7 +1087,6 @@ void TcpConnection::on_segment(const Tcp& segment)
             // and the handshake completes in SYN_RECEIVED once the peer acks
             // it. The window on a SYN is never scaled (RFC 7323 2.2).
             _in_flight.clear();
-            _unsacked_in_flight_bytes = 0;
             _send_next = _iss;
             _set_peer_window(segment.get_window());
             _transition(TcpState::SYN_RECEIVED);
@@ -1205,7 +1095,6 @@ void TcpConnection::on_segment(const Tcp& segment)
         }
 
         _in_flight.clear(); // our SYN is now acked
-        _unsacked_in_flight_bytes = 0;
         _set_peer_window(segment.get_window()); // a SYN-ACK's window is never scaled (RFC 7323 2.2)
         // The MSS is only now negotiated, and the window is denominated in
         // it, so this is where congestion control actually starts.
@@ -1259,7 +1148,6 @@ void TcpConnection::on_segment(const Tcp& segment)
         // and all.
         _update_ts_recent(segment);
         _in_flight.clear(); // only the SYN-ACK could have been in flight here
-        _unsacked_in_flight_bytes = 0;
         // After a simultaneous open the completing segment is the peer's
         // SYN-ACK, whose window is unscaled like that of any SYN.
         uint8_t peer_shift = (_window_scaling_negotiated && !segment.get_syn()) ? _peer_window_scale : 0;
@@ -1306,7 +1194,7 @@ void TcpConnection::on_segment(const Tcp& segment)
     // [SND.UNA - MAX.SND.WND, SND.MAX]. Below the window the segment is
     // dropped and acked, so an injected segment needs a plausible ACK as well
     // as an in-window sequence number.
-    uint32_t snd_una = _in_flight.empty() ? _send_next : _in_flight.front().seq;
+    uint32_t snd_una = _in_flight.snd_una_or(_send_next);
     if (segment.get_ack() && !seq_at_or_before(snd_una - _max_peer_window, segment.get_acknowledgement_number()))
     {
         LOG_DEBUG("TcpConnection[" << _id << "] dropping a segment acking " << segment.get_acknowledgement_number()
@@ -1511,7 +1399,7 @@ void TcpConnection::_track_stall()
 
 void TcpConnection::_start_retransmit_timer()
 {
-    InFlightSegment* oldest = _oldest_unsacked_segment();
+    SentSegment* oldest = _in_flight.oldest_unsacked();
     if (oldest != nullptr && oldest->retransmit_deadline_ms == 0)
     {
         oldest->retransmit_deadline_ms = _now_ms + static_cast<uint64_t>(oldest->retransmit_ms_remaining);
@@ -1575,7 +1463,7 @@ uint64_t TcpConnection::next_deadline_ms() const
         return deadline;
     }
 
-    for (const InFlightSegment& entry : _in_flight)
+    for (const SentSegment& entry : _in_flight)
     {
         if (!entry.sacked)
         {
@@ -1656,12 +1544,12 @@ void TcpConnection::_run_timers()
     // peer has not reported holding, since resending something already in its
     // reorder buffer achieves nothing.
     _start_retransmit_timer();
-    InFlightSegment* timed_out = _oldest_unsacked_segment();
+    SentSegment* timed_out = _in_flight.oldest_unsacked();
     if (timed_out == nullptr)
     {
         return; // everything outstanding is held by the peer; nothing to resend
     }
-    InFlightSegment& oldest = *timed_out;
+    SentSegment& oldest = *timed_out;
 
     if (_now_ms < oldest.retransmit_deadline_ms)
     {
@@ -1743,7 +1631,7 @@ size_t TcpConnection::send_space_available() const
 
 bool TcpConnection::has_sent_unacknowledged(uint32_t seq) const
 {
-    uint32_t snd_una = _in_flight.empty() ? _send_next : _in_flight.front().seq;
+    uint32_t snd_una = _in_flight.snd_una_or(_send_next);
     // modular: SND.UNA <= seq < SND.NXT, correct across the 2^32 wrap
     return seq_at_or_before(snd_una, seq) && !seq_at_or_before(_send_next, seq);
 }
@@ -1848,7 +1736,6 @@ void TcpConnection::abort()
     }
 
     _in_flight.clear();
-    _unsacked_in_flight_bytes = 0;
     _send_queue.clear();
     _send_queued_bytes = 0;
     _fin_requested = false;
