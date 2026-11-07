@@ -411,3 +411,131 @@ TYPED_TEST(EchoServerTest, ShutdownDeadlineClosesPeersThatNeverClose)
                           return client->eof();
                       }));
 }
+
+// ---------------------------------------------------------------------------
+// Running out of connections or fds. A level-triggered listener whose accept()
+// keeps failing (or that the server declines to accept from) is reported by
+// epoll_wait() on every pass, which is a busy loop and, if each pass logs, a
+// log flood. The server must stop watching the listener instead, and resume
+// when a connection closes. Counted through a wrapper that forwards to a real
+// ustack::Stack, so what is measured is the number of accept4() attempts.
+namespace
+{
+    class CountingStack
+    {
+    public:
+        explicit CountingStack(ustack::Stack& real) : _real(real) {}
+
+        int accept_calls = 0;
+        // When nonzero, accept4() fails with this errno without touching the stack.
+        int inject_accept_error = 0;
+
+        int socket(int d, int t, int p) { return _real.socket(d, t, p); }
+        int bind(int fd, const sockaddr* a, socklen_t l) { return _real.bind(fd, a, l); }
+        int listen(int fd, int b) { return _real.listen(fd, b); }
+        int accept4(int fd, sockaddr* a, socklen_t* l, int flags)
+        {
+            accept_calls++;
+            if (inject_accept_error != 0)
+            {
+                errno = inject_accept_error;
+                return -1;
+            }
+            return _real.accept4(fd, a, l, flags);
+        }
+        ssize_t send(int fd, const void* b, size_t n, int f) { return _real.send(fd, b, n, f); }
+        ssize_t recv(int fd, void* b, size_t n, int f) { return _real.recv(fd, b, n, f); }
+        int shutdown(int fd, int how) { return _real.shutdown(fd, how); }
+        int close(int fd) { return _real.close(fd); }
+        int setsockopt(int fd, int lv, int o, const void* v, socklen_t l) { return _real.setsockopt(fd, lv, o, v, l); }
+        int getsockname(int fd, sockaddr* a, socklen_t* l) { return _real.getsockname(fd, a, l); }
+        int epoll_create1(int f) { return _real.epoll_create1(f); }
+        int epoll_ctl(int ep, int op, int fd, epoll_event* e) { return _real.epoll_ctl(ep, op, fd, e); }
+        int epoll_wait(int ep, epoll_event* e, int n, int t) { return _real.epoll_wait(ep, e, n, t); }
+
+    private:
+        ustack::Stack& _real;
+    };
+
+    class AcceptPauseTest : public ::testing::Test
+    {
+    protected:
+        AcceptPauseTest() : counting(harness.server_stack()), server(counting, 1) { port = server.listen_on(0); }
+
+        std::unique_ptr<Client<ustack::Stack>> connect()
+        {
+            return std::make_unique<Client<ustack::Stack>>(harness.client_stack(), SimHarness::server_address(port));
+        }
+
+        void run_steps(int count)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                server.step(10);
+            }
+        }
+
+        SimHarness harness;
+        CountingStack counting;
+        EchoServer<CountingStack> server;
+        uint16_t port = 0;
+    };
+}
+
+TEST_F(AcceptPauseTest, AcceptFailureWithEmfilePausesTheListenerAndResumesAfterAClose)
+{
+    auto first = connect();
+    ASSERT_TRUE(until(server, [&] { return server.connection_count() == 1 && first->connected(); }));
+
+    counting.inject_accept_error = EMFILE;
+    auto second = connect();
+    run_steps(5);
+    int calls_when_paused = counting.accept_calls;
+    EXPECT_GE(calls_when_paused, 1) << "the failing accept() was never reached";
+    // 200 more passes: a listener still being watched would be reported, and
+    // accept() retried, on every one of them.
+    run_steps(200);
+    EXPECT_LE(counting.accept_calls - calls_when_paused, 1) << "the listener is still being polled: a busy loop";
+    EXPECT_EQ(server.connection_count(), 1u);
+
+    counting.inject_accept_error = 0;
+    first->close_now();
+    EXPECT_TRUE(until(server, [&] { return server.connection_count() == 1 && second->connected(); }))
+        << "accepting did not resume after a connection closed";
+    ASSERT_EQ(second->send("back"), 4);
+    std::string got;
+    EXPECT_TRUE(until(server,
+                      [&]
+                      {
+                          got += second->read_available();
+                          return got.size() >= 4;
+                      }));
+    EXPECT_EQ(got, "back");
+}
+
+TEST_F(AcceptPauseTest, ConnectionCapPausesAcceptingUntilAConnectionCloses)
+{
+    server.set_max_connections(2);
+    auto a = connect();
+    auto b = connect();
+    ASSERT_TRUE(until(server, [&] { return server.connection_count() == 2; }));
+    auto c = connect();
+    run_steps(5);
+    int calls_at_cap = counting.accept_calls;
+    run_steps(200);
+    EXPECT_EQ(counting.accept_calls, calls_at_cap) << "accept() was attempted while at the cap";
+    EXPECT_EQ(server.connection_count(), 2u);
+
+    a->close_now();
+    EXPECT_TRUE(until(server, [&] { return server.connection_count() == 2 && c->connected(); }));
+    // The queued client is served once it is let in.
+    ASSERT_EQ(c->send("in"), 2);
+    std::string got;
+    EXPECT_TRUE(until(server,
+                      [&]
+                      {
+                          got += c->read_available();
+                          return got.size() >= 2;
+                      }));
+    EXPECT_EQ(got, "in");
+}

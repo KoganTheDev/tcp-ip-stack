@@ -35,6 +35,7 @@ namespace
         // Whether any option that only means something to the userspace stack
         // was given, so the kernel build can refuse it rather than ignore it.
         bool stack_option_given = false;
+        size_t max_connections = 1024;
         size_t worker_count = 4;
         ChannelOptions channel;
         // A second link, and permission to relay between the two. Absent unless
@@ -65,6 +66,8 @@ namespace
                      "                          interface's real hardware address for nic\n"
                      "  --port N              TCP port to listen on; may be repeated (default 8080)\n"
                      "  --workers N           thread pool size (default 4)\n"
+                     "  --max-connections N   connections served at once (default 1024); beyond\n"
+                     "                          that, clients wait in the accept queue\n"
                      "\n"
                      "Router mode - a second interface, and permission to relay between them:\n"
                      "  --second-device NAME  interface name for the second link (implies nic)\n"
@@ -183,6 +186,15 @@ namespace
                     config.second_channel.prefix_length =
                         static_cast<uint8_t>(std::stoi(next_value(i, "--second-prefix")));
                 }
+                else if (flag == "--max-connections")
+                {
+                    int value = std::stoi(next_value(i, "--max-connections"));
+                    if (value < 1)
+                    {
+                        throw EXCEPTION(BaseException, "--max-connections must be at least 1");
+                    }
+                    config.max_connections = static_cast<size_t>(value);
+                }
                 else if (flag == "--workers")
                 {
                     config.worker_count = static_cast<size_t>(std::stoi(next_value(i, "--workers")));
@@ -293,6 +305,7 @@ int main(int argc, char** argv)
         // Declared after the stack, so it is destroyed first: it closes its
         // fds through the stack.
         EchoServer<decltype(stack)> server(stack, config.worker_count);
+        server.set_max_connections(config.max_connections);
         std::string port_list;
         for (uint16_t port : config.ports)
         {

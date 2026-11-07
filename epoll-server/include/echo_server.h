@@ -10,6 +10,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -67,6 +68,8 @@ class EchoServer
 {
 public:
     static constexpr int DEFAULT_SHUTDOWN_DEADLINE_MS = 5000;
+    static constexpr size_t DEFAULT_MAX_CONNECTIONS = 1024;
+    static constexpr int ACCEPT_RETRY_MS = 1000;
 
     EchoServer(StackT& stack, size_t worker_count)
         : _stack(stack), _epfd(stack.epoll_create1(0)), _thread_pool(worker_count)
@@ -153,6 +156,11 @@ public:
         {
             wait = wait < 0 ? this->_ms_to_deadline() : std::min(wait, this->_ms_to_deadline());
         }
+        if (this->_accept_retry_at.has_value())
+        {
+            int until_retry = this->_ms_until(*this->_accept_retry_at);
+            wait = wait < 0 ? until_retry : std::min(wait, until_retry);
+        }
 
         epoll_event events[64];
         int ready = this->_stack.epoll_wait(this->_epfd, events, 64, wait);
@@ -166,6 +174,13 @@ public:
         }
 
         this->_completion_queue.drain_and_run();
+
+        // Accepting stopped on a resource error, and nothing may have closed
+        // since (there can be no connection to close): try again now and then.
+        if (this->_accept_retry_at.has_value() && this->_ms_until(*this->_accept_retry_at) == 0)
+        {
+            this->_resume_accepting();
+        }
 
         if (this->_draining && this->_ms_to_deadline() == 0 && !this->_conns.empty())
         {
@@ -190,6 +205,8 @@ public:
             static_cast<void>(this->_stack.close(entry.second)); // also leaves the epoll
         }
         this->_listeners.clear();
+        this->_accept_paused = false;
+        this->_accept_retry_at.reset();
         std::vector<uint64_t> ids;
         for (const auto& entry : this->_conns)
         {
@@ -204,6 +221,10 @@ public:
     // How long after begin_shutdown() a peer that has not closed is waited
     // for. Set before shutdown begins; tests use a short one.
     void set_shutdown_deadline_ms(int ms) { this->_shutdown_deadline_ms = ms; }
+
+    // Connections served at once. At the cap the listeners are not watched
+    // (see _accept_all), so further clients wait in the stack's accept queue.
+    void set_max_connections(size_t max) { this->_max_connections = max; }
 
     // Shutdown has begun and every connection is gone.
     bool finished() const { return this->_draining && this->_conns.empty(); }
@@ -251,6 +272,12 @@ private:
         return this->_stack.epoll_ctl(this->_epfd, EPOLL_CTL_ADD, fd, &event) == 0;
     }
 
+    static int _ms_until(std::chrono::steady_clock::time_point when)
+    {
+        auto left = std::chrono::duration_cast<std::chrono::milliseconds>(when - std::chrono::steady_clock::now());
+        return left.count() <= 0 ? 0 : static_cast<int>(left.count());
+    }
+
     int _ms_to_deadline() const
     {
         auto left =
@@ -292,11 +319,31 @@ private:
         }
     }
 
+    // Accepts until the queue is empty, the cap is reached or accept() fails.
+    //
+    // The listeners are level-triggered, so anything that leaves a client in
+    // the accept queue unaccepted would have epoll_wait() report the listener
+    // again on every pass: a busy loop, and a log line per pass if it logs.
+    // So in both such cases - at the cap, or accept() failing with something
+    // other than "nothing waiting" (EMFILE and ENFILE when out of fds, ENOBUFS
+    // and ENOMEM when out of memory) - the listeners stop being watched
+    // (EPOLL_CTL_MOD with no events; ERR and HUP are not asked for either).
+    // They are watched again when a connection closes, which frees an fd and a
+    // slot, or after ACCEPT_RETRY_MS if there was nothing to close. The client
+    // waits in the stack's accept queue meanwhile, which is the honest
+    // behaviour for an overloaded server: it cannot be served yet. (The usual
+    // alternative, a spare fd to accept and close, would turn the client away;
+    // pausing is simpler and works on a stack with fds of its own.)
     void _accept_all(uint64_t listener_id)
     {
         int listen_fd = this->_listeners[listener_id];
         for (;;)
         {
+            if (this->_conns.size() >= this->_max_connections)
+            {
+                this->_pause_accepting(false);
+                return;
+            }
             int fd = this->_stack.accept4(listen_fd, nullptr, nullptr, SOCK_NONBLOCK);
             if (fd < 0)
             {
@@ -306,7 +353,8 @@ private:
                 }
                 if (errno != EAGAIN && errno != EWOULDBLOCK)
                 {
-                    LOG_ERROR("EchoServer: accept failed: " << errno_text(errno));
+                    this->_log_accept_error(errno);
+                    this->_pause_accepting(true);
                 }
                 return;
             }
@@ -322,6 +370,60 @@ private:
             conn.interest = EPOLLIN | EPOLLRDHUP;
             this->_conns[id] = std::move(conn);
         }
+    }
+
+    void _watch_listeners(bool watch)
+    {
+        for (const auto& entry : this->_listeners)
+        {
+            epoll_event event{};
+            event.events = watch ? static_cast<uint32_t>(EPOLLIN) : 0U;
+            event.data.u64 = entry.first;
+            if (this->_stack.epoll_ctl(this->_epfd, EPOLL_CTL_MOD, entry.second, &event) < 0)
+            {
+                LOG_ERROR("EchoServer: epoll_ctl MOD failed for a listener: " << errno_text(errno));
+            }
+        }
+    }
+
+    void _pause_accepting(bool retry_later)
+    {
+        if (!this->_accept_paused)
+        {
+            this->_accept_paused = true;
+            this->_watch_listeners(false);
+        }
+        if (retry_later)
+        {
+            this->_accept_retry_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(ACCEPT_RETRY_MS);
+        }
+    }
+
+    void _resume_accepting()
+    {
+        this->_accept_retry_at.reset();
+        if (this->_accept_paused && !this->_draining)
+        {
+            this->_accept_paused = false;
+            this->_watch_listeners(true);
+        }
+    }
+
+    // At most one line a second, with a count of the ones left out: under fd
+    // exhaustion every attempt fails the same way and says nothing new.
+    void _log_accept_error(int error)
+    {
+        auto now = std::chrono::steady_clock::now();
+        if (now - this->_last_accept_log < std::chrono::seconds(1))
+        {
+            this->_suppressed_accept_logs++;
+            return;
+        }
+        this->_last_accept_log = now;
+        LOG_ERROR("EchoServer: accept failed, pausing accepts: "
+                  << errno_text(error) << " (" << this->_conns.size() << " connections open, "
+                  << this->_suppressed_accept_logs << " similar messages suppressed)");
+        this->_suppressed_accept_logs = 0;
     }
 
     // Reads one chunk from an idle connection and sends it to the pool - or,
@@ -486,6 +588,11 @@ private:
         }
         static_cast<void>(this->_stack.close(it->second.fd));
         this->_conns.erase(it);
+        // A closed connection frees an fd and a slot.
+        if (this->_accept_paused && this->_conns.size() < this->_max_connections)
+        {
+            this->_resume_accepting();
+        }
     }
 
     void _destroy_all()
@@ -509,6 +616,13 @@ private:
     int _busy_count = 0;
 
     int _shutdown_deadline_ms = DEFAULT_SHUTDOWN_DEADLINE_MS;
+    size_t _max_connections = DEFAULT_MAX_CONNECTIONS;
+    // The listeners are not being watched (see _accept_all), and when to try
+    // again if no close will do it.
+    bool _accept_paused = false;
+    std::optional<std::chrono::steady_clock::time_point> _accept_retry_at;
+    std::chrono::steady_clock::time_point _last_accept_log;
+    size_t _suppressed_accept_logs = 0;
     bool _draining = false;
     std::chrono::steady_clock::time_point _deadline;
 };
