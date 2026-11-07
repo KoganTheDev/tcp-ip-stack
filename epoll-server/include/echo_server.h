@@ -208,6 +208,7 @@ public:
         this->_accept_paused = false;
         this->_accept_retry_at.reset();
         std::vector<uint64_t> ids;
+        ids.reserve(this->_conns.size());
         for (const auto& entry : this->_conns)
         {
             ids.push_back(entry.first);
