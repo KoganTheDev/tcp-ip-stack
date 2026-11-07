@@ -712,6 +712,14 @@ private:
     // sequence space, which the algorithm knows nothing about. It is told what
     // happened; it never works it out.
     std::unique_ptr<CongestionControl> _congestion;
+    // Times our SYN or SYN-ACK was retransmitted: more than one and the
+    // initial window is one segment (RFC 6928 section 2).
+    uint32_t _syn_retransmissions = 0;
+    // _now_ms when new data last went out, 0 once an idle restart has used
+    // it. See _restart_after_idle().
+    uint64_t _last_data_sent_ms = 0;
+    // RFC 5681 4.1 restart after idle: called before sending new data.
+    void _restart_after_idle();
     uint32_t _dup_ack_count;
     bool _in_fast_recovery;
 

@@ -4,6 +4,7 @@
 #include "raw.h"
 
 #include <memory>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -48,15 +49,17 @@ namespace
     constexpr uint32_t BIG_WINDOW_SEGMENTS = 32; // 46720 bytes, comfortably under 64 KiB
 
     // Slow-starts a freshly established algorithm to exactly `segments` worth
-    // of window. Exact, not approximate: slow start adds bytes_acked directly,
-    // so acknowledging (segments - 1) * MSS lands on the number precisely -
-    // which matters for the tests below that need two instances to reach an
-    // identical starting point by different routes.
+    // of window (at least the 10-segment initial window). Exact, not
+    // approximate: slow start adds bytes_acked directly, so acknowledging the
+    // difference lands on the number precisely - which matters for the tests
+    // below that need two instances to reach an identical starting point by
+    // different routes.
     std::unique_ptr<CongestionControl> established_at(CongestionControlAlgorithm algorithm, uint32_t segments)
     {
         auto cc = make_congestion_control(algorithm);
         cc->on_established(MSS);
-        acknowledge(*cc, (segments - 1) * MSS);
+        if (segments * MSS > cc->window())
+            acknowledge(*cc, segments * MSS - cc->window());
         REQUIRE_TRUE(cc->window() == segments * MSS, std::string("test setup: slow start could not reach ")
                                                          + std::to_string(segments) + " segments (ssthresh caps it)");
         return cc;
@@ -79,12 +82,12 @@ TEST(CongestionControl, SlowStartDoublesTheWindowEveryRoundTripInBothAlgorithms)
         auto cc = make_congestion_control(algorithm);
         cc->on_established(MSS);
 
-        ASSERT_TRUE(cc->window() == MSS) << std::string(cc->name()) + " should start at one segment";
+        ASSERT_TRUE(cc->window() == 10 * MSS) << std::string(cc->name()) + " should start at the initial window";
 
         // A round trip's worth of acks is one acknowledgement per byte of the
         // current window, and slow start turns each of those into another
-        // byte of window - so the window doubles.
-        for (uint32_t expected : {2u, 4u, 8u, 16u})
+        // byte of window - so the window doubles (until the 64 KiB ssthresh).
+        for (uint32_t expected : {20u, 40u})
         {
             acknowledge(*cc, cc->window());
             assert_near(cc->window(), expected * MSS, 0, std::string(cc->name()) + " slow start round trip");
@@ -286,7 +289,7 @@ TEST(CongestionControl, FastConvergenceAimsLowerWhenTheSecondLossComesBelowTheFi
     // The same second event, on a flow that has never seen a higher one.
     auto steady = make_congestion_control(CongestionControlAlgorithm::CUBIC);
     steady->on_established(MSS);
-    acknowledge(*steady, second_event_window - MSS);
+    acknowledge(*steady, second_event_window - steady->window());
     ASSERT_TRUE(steady->window() == second_event_window) << "the two setups should meet at the same window";
     steady->on_retransmit_timeout(second_event_window, 1000);
 
@@ -343,14 +346,99 @@ TEST(CongestionControl, TheWindowIsReDenominatedInTheMssTheHandshakeSettled)
     auto send_nothing = [](const Tcp&, const Bytes&) {};
     TcpConnection connection(8080, IPv4Address("10.0.0.1"), 12345, 1000, send_nothing);
 
-    ASSERT_TRUE(connection.get_congestion_window() == 1460)
+    ASSERT_TRUE(connection.get_congestion_window() == 10 * 1460)
         << "before the handshake the window is sized by what this side advertises";
 
     connection.accept_incoming_syn(500);
     connection.on_segment(*make_incoming_segment(501, 1001, FLAG_ACK));
 
     ASSERT_TRUE(connection.get_state() == TcpState::ESTABLISHED) << "handshake should complete";
-    ASSERT_TRUE(connection.get_congestion_window() == 536)
+    ASSERT_TRUE(connection.get_congestion_window() == 10 * 536)
         << "once established the window is denominated in the negotiated effective MSS, got "
                + std::to_string(connection.get_congestion_window());
+}
+
+// --- the initial window (RFC 6928) -------------------------------------------
+
+// IW = min(10*MSS, max(2*MSS, 14600)). One segment was the RFC 2001 value,
+// and it made every connection's first round trip wait out the peer's
+// delayed-ack timer: a single segment never triggers the "ack every second
+// segment" rule, so its ack came 200 ms late.
+TEST(CongestionControl, TheInitialWindowIsRfc6928s)
+{
+    for (auto algorithm : {CongestionControlAlgorithm::RENO, CongestionControlAlgorithm::CUBIC})
+    {
+        for (auto [mss, expected] : {std::pair<uint32_t, uint32_t>{1460, 14600}, {536, 5360}, {9000, 18000}})
+        {
+            auto cc = make_congestion_control(algorithm);
+            cc->on_established(mss);
+            ASSERT_TRUE(cc->window() == expected)
+                << cc->name() << " with MSS " << mss << " should start at " << expected << ", got " << cc->window();
+        }
+    }
+}
+
+// RFC 6928 section 2 (and RFC 5681 3.1): after a lost SYN or SYN-ACK the
+// initial window is one segment - but RFC 6928 asks not to fall back for a
+// single retransmission, which a 1 s initial RTO can cause spuriously.
+TEST(CongestionControl, TheInitialWindowIsOneSegmentAfterRepeatedSynRetransmissions)
+{
+    auto cc = make_congestion_control(CongestionControlAlgorithm::CUBIC);
+    cc->on_established(1460, 1);
+    ASSERT_TRUE(cc->window() == 14600) << "one SYN retransmission keeps the full initial window";
+    cc->on_established(1460, 2);
+    ASSERT_TRUE(cc->window() == 1460) << "two fall back to one segment";
+}
+
+// RFC 5681 4.1: after an idle period longer than the RTO, cwnd is cut to the
+// restart window RW = min(IW, cwnd) before sending again - the ack clock that
+// justified the larger window has stopped.
+TEST(CongestionControl, AnIdleConnectionRestartsFromTheInitialWindow)
+{
+    for (auto algorithm : {CongestionControlAlgorithm::RENO, CongestionControlAlgorithm::CUBIC})
+    {
+        auto cc = established_at(algorithm, BIG_WINDOW_SEGMENTS);
+        cc->on_idle_restart();
+        ASSERT_TRUE(cc->window() == 10 * MSS) << cc->name() << " should restart from IW, got " << cc->window();
+
+        auto small = make_congestion_control(algorithm);
+        small->on_established(MSS);
+        small->on_retransmit_timeout(10 * MSS, 0); // cwnd = 1 segment, the loss window
+        small->on_idle_restart();
+        ASSERT_TRUE(small->window() == MSS) << cc->name() << " never raises cwnd on restart (RW = min(IW, cwnd))";
+    }
+}
+
+// The connection side: an established connection puts ten full segments on
+// the wire at once, and one whose SYN went out three times puts one.
+TEST(CongestionControl, AConnectionSendsTenSegmentsInItsFirstFlight)
+{
+    std::vector<Bytes> sent;
+    auto record = [&sent](const Tcp&, const Bytes& payload)
+    {
+        if (!payload.empty())
+            sent.push_back(payload);
+    };
+    TcpConnection connection(8080, IPv4Address("10.0.0.1"), 12345, 1000, record);
+    connection.accept_incoming_syn(500, 1460);
+    connection.on_segment(*make_incoming_segment(501, 1001, FLAG_ACK));
+    connection.send(Bytes(64000u));
+    ASSERT_TRUE(sent.size() == 10) << "IW10: ten segments before any ack, got " << sent.size();
+
+    std::vector<Bytes> slow_sent;
+    TcpConnection slow(54321, IPv4Address("10.0.0.2"), 8080, 2000,
+                       [&slow_sent](const Tcp&, const Bytes& payload)
+                       {
+                           if (!payload.empty())
+                               slow_sent.push_back(payload);
+                       });
+    slow.initiate_connect();
+    slow.on_time_passed(1000); // SYN retransmitted
+    slow.on_time_passed(2000); // and again
+    auto syn_ack = std::make_unique<Tcp>(8080, 54321, 7000, 2001, 5, 0x12, 65535, 0, 0);
+    syn_ack->set_mss_option(1460);
+    slow.on_segment(*syn_ack);
+    ASSERT_TRUE(slow.get_state() == TcpState::ESTABLISHED) << "precondition: established";
+    slow.send(Bytes(64000u));
+    ASSERT_TRUE(slow_sent.size() == 1) << "after two SYN retransmissions, one segment; got " << slow_sent.size();
 }

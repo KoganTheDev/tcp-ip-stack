@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 
@@ -50,7 +51,25 @@ public:
     // quantity in here is denominated in. Also the reset point: a window
     // inherited from before the MSS was known would be measured in the wrong
     // unit.
-    void on_established(uint32_t mss);
+    //
+    // cwnd starts at RFC 6928's initial window (initial_window() below), or at
+    // one segment if this side's SYN or SYN-ACK had to be retransmitted more
+    // than once (RFC 6928 section 2; RFC 5681 3.1 says after any loss, but
+    // RFC 6928 asks not to fall back for a single retransmission, which the
+    // 1 s initial RTO can cause on a long path with no loss at all).
+    void on_established(uint32_t mss, uint32_t syn_retransmissions = 0);
+
+    // RFC 6928: IW = min(10*MSS, max(2*MSS, 14600)). Ten segments rather
+    // than one because a single segment never meets the peer's "ack every
+    // second segment" rule, so every connection's first round trip waited
+    // out its delayed-ack timer.
+    static uint32_t initial_window(uint32_t mss) { return std::min(10 * mss, std::max(2 * mss, 14600u)); }
+
+    // RFC 5681 4.1: nothing has been sent for longer than the RTO, so the ack
+    // clock that justified cwnd has stopped. cwnd drops to the restart window
+    // RW = min(IW, cwnd) - never raised, so the 1-segment loss window after a
+    // timeout stays what it is. ssthresh is kept.
+    void on_idle_restart();
 
     // A cumulative acknowledgement retired new data.
     //
@@ -112,6 +131,10 @@ protected:
     // congestion event and has to be cleared on a fresh connection. Reno has
     // none, which is the whole of what makes it classic.
     virtual void _on_reset() {}
+
+    // Optional hook for the restart after idle. CUBIC clears its epoch so its
+    // curve does not count the idle time as time spent growing.
+    virtual void _on_idle_restart() {}
 
     // cwnd expressed in segments, which is the unit RFC 8312's constants are
     // calibrated in. Floored at one segment so it is always safe to divide by:
@@ -205,6 +228,7 @@ protected:
     void _grow_in_congestion_avoidance(uint32_t bytes_acked, uint32_t bytes_in_flight, uint32_t srtt_ms,
                                        uint64_t now_ms) override;
     void _on_reset() override;
+    void _on_idle_restart() override { _epoch_running = false; }
 
 private:
     // RFC 8312's two parameters. C is the aggressiveness of the cubic term, in

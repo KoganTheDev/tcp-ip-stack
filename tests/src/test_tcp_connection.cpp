@@ -513,23 +513,24 @@ TEST(TcpConnection, RetransmitTimeoutCollapsesCongestionWindowToOneSegment)
 }
 
 // Full-sized (MSS) segments so the congestion *window*, not Nagle, governs
-// what can be in flight: the initial window is one MSS (536 here), so the
-// first full segment goes out and the second must queue until an ack frees
-// room, then drains.
+// what can be in flight: the initial window is ten MSS (RFC 6928; 536 bytes
+// each here), so ten full segments go out and the eleventh must queue until
+// an ack frees room, then drains.
 TEST(TcpConnection, CumulativeAckDrainsQueueIntoWindow)
 {
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent);
 
-    connection->send(Bytes(536)); // one MSS - fills the initial congestion window, goes out
-    connection->send(Bytes(536)); // second full segment - queued, window is full
-    ASSERT_TRUE(sent.size() == 1) << "the second full segment should queue behind the full congestion window";
+    for (int i = 0; i < 10; i++)
+        connection->send(Bytes(536)); // ten MSS - fills the initial congestion window, goes out
+    connection->send(Bytes(536)); // eleventh full segment - queued, window is full
+    ASSERT_TRUE(sent.size() == 10) << "the eleventh full segment should queue behind the full congestion window";
 
     // acking the first frees the window
     connection->on_segment(*make_incoming_segment(501, sent[0].seq + 536, FLAG_ACK));
 
-    ASSERT_TRUE(sent.size() == 2) << "acking the in-flight segment should let the queued one go out";
-    ASSERT_TRUE(sent[1].payload.size() == 536) << "the drained segment should be the full queued payload";
+    ASSERT_TRUE(sent.size() == 11) << "acking the in-flight segment should let the queued one go out";
+    ASSERT_TRUE(sent[10].payload.size() == 536) << "the drained segment should be the full queued payload";
 }
 
 // Two full-MSS segments in flight at once (Nagle only holds sub-MSS ones), so
@@ -708,13 +709,11 @@ TEST(TcpConnection, NegotiatedMssCapsSentSegmentSize)
     connection.on_segment(*make_incoming_segment(501, 1001, FLAG_ACK));
     sent.clear();
 
-    // the initial congestion window is also one MSS (100 bytes here), so
-    // only the first chunk goes out immediately - the rest queues, which is
-    // exactly slow start's IW=1MSS behavior, not a segmentation bug
+    // two full chunks go out at once (the initial window is ten segments);
+    // the 50-byte tail is held by Nagle while they are unacked
     connection.send(Bytes(250));
-    ASSERT_TRUE(sent.size() == 1)
-        << "only the first MSS-sized chunk should go out under the initial (1 MSS) congestion window";
-    ASSERT_TRUE(sent[0].payload.size() == 100)
+    ASSERT_TRUE(sent.size() == 2) << "the two MSS-sized chunks should go out, the sub-MSS tail held by Nagle";
+    ASSERT_TRUE(sent[0].payload.size() == 100 && sent[1].payload.size() == 100)
         << "the sent chunk must be capped at the negotiated 100-byte MSS, not sent as one 250-byte segment";
 }
 

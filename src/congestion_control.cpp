@@ -5,12 +5,18 @@
 
 // --- shared machinery -------------------------------------------------------
 
-void CongestionControl::on_established(uint32_t mss)
+void CongestionControl::on_established(uint32_t mss, uint32_t syn_retransmissions)
 {
     _mss = mss;
-    _cwnd = mss;
+    _cwnd = syn_retransmissions > 1 ? mss : initial_window(mss);
     _ssthresh = INITIAL_SSTHRESH;
     _on_reset();
+}
+
+void CongestionControl::on_idle_restart()
+{
+    _cwnd = std::min(_cwnd, initial_window(_mss));
+    _on_idle_restart();
 }
 
 void CongestionControl::on_ack(uint32_t bytes_acked, uint32_t bytes_in_flight, uint32_t srtt_ms, uint64_t now_ms)

@@ -343,6 +343,10 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
     uint32_t seq = _send_next;
     uint8_t full_flags = include_ack ? (flags | FLAG_ACK) : flags;
     _transmit(full_flags, seq, payload);
+    if (!payload.empty())
+    {
+        _last_data_sent_ms = _now_ms;
+    }
 
     // this segment carries our current RCV.NXT in its ack field, so it
     // discharges any pending delayed ack - exactly the piggyback delayed ack
@@ -710,8 +714,20 @@ void TcpConnection::_deliver(const Bytes& payload)
     }
 }
 
+void TcpConnection::_restart_after_idle()
+{
+    // RFC 5681 4.1: nothing sent for longer than the RTO, so cwnd falls back
+    // to the restart window before anything new goes out.
+    if (_in_flight.empty() && _last_data_sent_ms != 0 && _now_ms - _last_data_sent_ms > static_cast<uint64_t>(_rto_ms))
+    {
+        _congestion->on_idle_restart();
+        _last_data_sent_ms = 0; // once per idle period
+    }
+}
+
 void TcpConnection::_send_queued_while_window_allows()
 {
+    _restart_after_idle();
     while (!_send_queue.empty())
     {
         uint32_t effective_window = std::min(_congestion->window(), _peer_window);
@@ -1381,7 +1397,7 @@ void TcpConnection::on_segment(const Tcp& segment)
         _set_peer_window(segment.get_window()); // a SYN-ACK's window is never scaled (RFC 7323 2.2)
         // The MSS is only now negotiated, and the window is denominated in
         // it, so this is where congestion control actually starts.
-        _congestion->on_established(_effective_mss);
+        _congestion->on_established(_effective_mss, _syn_retransmissions);
 
         _transition(TcpState::ESTABLISHED);
         _send_pure_ack(); // completes the 3-way handshake
@@ -1438,7 +1454,7 @@ void TcpConnection::on_segment(const Tcp& segment)
         _set_peer_window(static_cast<uint32_t>(segment.get_window()) << peer_shift);
         // The MSS is only now negotiated, and the window is denominated in
         // it, so this is where congestion control actually starts.
-        _congestion->on_established(_effective_mss);
+        _congestion->on_established(_effective_mss, _syn_retransmissions);
         _transition(TcpState::ESTABLISHED);
         return;
     }
@@ -1715,6 +1731,10 @@ void TcpConnection::on_time_passed(uint32_t elapsed_ms)
     }
 
     oldest.retransmit_attempts += 1;
+    if (oldest.flags & FLAG_SYN)
+    {
+        _syn_retransmissions += 1; // decides the initial window, see on_established()
+    }
     if (oldest.retransmit_attempts > MAX_RETRANSMIT_ATTEMPTS)
     {
         LOG_WARNING("TcpConnection[" << _id << "] giving up after " << (oldest.retransmit_attempts - 1)
@@ -1786,6 +1806,8 @@ size_t TcpConnection::send(const Bytes& data)
     {
         return 0;
     }
+
+    _restart_after_idle();
 
     // split anything larger than the negotiated effective MSS - the
     // application shouldn't have to know what that negotiated value is
