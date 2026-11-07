@@ -318,6 +318,11 @@ public:
     // observable rather than silent.
     bool unbind_udp(uint16_t port);
 
+    // Whether anything - an application, DHCP, a DNS query - has the port
+    // bound. bind_udp() would hand that socket over rather than fail, so a
+    // socket layer asks this first to report EADDRINUSE.
+    bool udp_port_bound(uint16_t port) const { return _udp_sockets.count(port) != 0; }
+
     // Sends an ICMP Echo Request - a ping. identifier and sequence are echoed
     // back untouched by the peer, which is how a reply is matched to the
     // request that caused it; the payload comes back verbatim too, which is
