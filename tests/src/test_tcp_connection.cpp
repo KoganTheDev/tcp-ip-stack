@@ -2885,3 +2885,22 @@ TEST(TcpConnection, AFinOnTheSegmentCompletingTheHandshakeIsTaken)
     ASSERT_TRUE(connection.bytes_available() == 1) << "the byte is delivered";
     ASSERT_TRUE(connection.get_state() == TcpState::CLOSE_WAIT) << "and the FIN after it moves to CLOSE_WAIT";
 }
+
+// RFC 5681 4.2: "an immediate ACK SHOULD be generated when a segment fills in
+// all or part of a gap in the sequence space". The sender is in recovery,
+// waiting on exactly this ack to learn its retransmission arrived; delaying
+// it by up to 200 ms let the sender's own RTO (200 ms minimum) fire first and
+// turned every repaired hole into a spurious timeout.
+TEST(TcpConnection, ASegmentFillingAGapIsAckedAtOnce)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->set_data_ready_callback([&connection]() { connection->read(); });
+
+    connection->on_segment(*make_incoming_segment(601, 1001, FLAG_ACK, Bytes(100u)));
+    ASSERT_EQ(sent.size(), 1u) << "precondition: the out-of-order segment draws a duplicate ack";
+
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes(100u)));
+    ASSERT_EQ(sent.size(), 2u) << "the gap-filling segment must be acked immediately, not delayed";
+    ASSERT_EQ(sent[1].ack, 701u) << "acking everything now contiguous";
+}

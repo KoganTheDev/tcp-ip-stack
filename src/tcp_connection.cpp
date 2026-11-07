@@ -1324,14 +1324,26 @@ void TcpConnection::on_segment(const Tcp& segment)
 
             if (seq == _recv_next)
             {
+                // Something held out of order means this segment fills (part
+                // of) a gap - RFC 5681 4.2 wants that acked at once, since a
+                // sender in recovery is waiting on exactly this ack.
+                bool fills_gap = !_reorder_buffer.empty();
                 _deliver(payload);
 
                 // drain any buffered segments the gap-filler just unblocked
                 _drain_reorder_buffer();
 
-                // in-order data: the ack may be delayed (RFC 1122) to coalesce
-                // with the next segment or piggyback on our own data
-                _schedule_or_send_ack();
+                if (fills_gap)
+                {
+                    _send_pure_ack();
+                }
+                else
+                {
+                    // in-order data: the ack may be delayed (RFC 1122) to
+                    // coalesce with the next segment or piggyback on our own
+                    // data
+                    _schedule_or_send_ack();
+                }
             }
             else if (!seq_at_or_before(seq, _recv_next)) // seq after RCV.NXT, modulo 2^32
             {
