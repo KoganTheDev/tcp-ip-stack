@@ -301,3 +301,34 @@ TEST_F(SimNetworkTest, SameSeedReproducesAStackRunsFrameTiming)
     ASSERT_EQ(first, run(7));
     ASSERT_NE(first, run(8));
 }
+
+// A failing seed writes four files; a regression that fails thousands of
+// nightly seeds must not write thousands of sets. The first SIM_PCAP_LIMIT
+// failures in a process get captures, the rest are only counted.
+TEST(SimPcapLimit, OnlyTheFirstFailuresGetCaptures)
+{
+    uint64_t written = sim_pcaps_written;
+    uint64_t suppressed = sim_pcaps_suppressed;
+    const char* previous = std::getenv("SIM_PCAP_LIMIT");
+    std::string saved = previous != nullptr ? previous : "";
+
+    setenv("SIM_PCAP_LIMIT", "2", 1);
+    sim_pcaps_written = 0;
+    sim_pcaps_suppressed = 0;
+    bool first = sim_claim_capture_slot();
+    bool second = sim_claim_capture_slot();
+    bool third = sim_claim_capture_slot();
+    bool fourth = sim_claim_capture_slot();
+    uint64_t counted = sim_pcaps_suppressed;
+
+    sim_pcaps_written = written;
+    sim_pcaps_suppressed = suppressed;
+    if (previous != nullptr)
+        setenv("SIM_PCAP_LIMIT", saved.c_str(), 1);
+    else
+        unsetenv("SIM_PCAP_LIMIT");
+
+    ASSERT_TRUE(first && second) << "the first two failures get captures";
+    ASSERT_TRUE(!third && !fourth) << "later ones do not";
+    ASSERT_TRUE(counted == 2) << "but are counted";
+}

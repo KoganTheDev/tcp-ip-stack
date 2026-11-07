@@ -60,13 +60,21 @@ test: all
 # CPU by default), each logging to build/debug/sim-shard-<n>.log. Every shard
 # is waited for before failing, so one bad seed does not hide the others;
 # failing seeds leave their pcaps in build/debug/sim-pcaps.
+#
+# Captures are capped at about SIM_PCAP_LIMIT failing tests per run (default
+# 20): each shard gets an equal share, rounded up, through the binary's own
+# SIM_PCAP_LIMIT, and the rest of the failures are only counted. A regression
+# that fails thousands of nightly seeds would otherwise upload hundreds of MB
+# of captures of the same bug.
 SIM_JOBS ?= $(shell nproc 2>/dev/null || echo 1)
+SIM_PCAP_LIMIT ?= 20
 
 sim: all
 	@status=0; logs=""; \
 	for i in $$(seq 0 $$(($(SIM_JOBS) - 1))); do \
 	    logs="$$logs build/debug/sim-shard-$$i.log"; \
 	    GTEST_TOTAL_SHARDS=$(SIM_JOBS) GTEST_SHARD_INDEX=$$i \
+	    SIM_PCAP_LIMIT=$$(( ($(SIM_PCAP_LIMIT) + $(SIM_JOBS) - 1) / $(SIM_JOBS) )) \
 	        ./build/debug/run_tests --gtest_filter='*SimTransfer*' > build/debug/sim-shard-$$i.log 2>&1 & \
 	done; \
 	for job in $$(jobs -p); do wait $$job || status=1; done; \
@@ -74,6 +82,8 @@ sim: all
 	if [ $$status -ne 0 ]; then \
 	    echo "sim: failing seeds:"; \
 	    grep -h -E '^\[  FAILED  \] .*GetParam' $$logs | grep -v ' ms)$$' | sort -u; \
+	    echo "sim: captures written for $$(cat $$logs | grep -c 'frames as delivered') failing tests," \
+	         "not written for $$(cat $$logs | grep -c 'SIM PCAP \] not written') (SIM_PCAP_LIMIT=$(SIM_PCAP_LIMIT))"; \
 	    echo "sim: details in build/debug/sim-shard-*.log, captures in build/debug/sim-pcaps/"; \
 	fi; \
 	exit $$status

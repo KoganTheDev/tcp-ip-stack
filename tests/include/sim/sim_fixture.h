@@ -76,6 +76,34 @@ inline void sim_dump_trace(const PcapWriter& capture, const std::string& suffix)
         std::cerr << "[ SIM PCAP ] as text: " << path << "\n";
 }
 
+// How many failing tests in this process may write captures:
+// $SIM_PCAP_LIMIT, default 20. Past it a failure only says it was not
+// written. A 100000-seed nightly with a regression could otherwise write a
+// few hundred MB of captures for the same bug; the first few are what anyone
+// reads. `make sim` divides the limit between its shards.
+inline uint64_t sim_pcap_limit()
+{
+    const char* env = std::getenv("SIM_PCAP_LIMIT");
+    return env != nullptr && *env != '\0' ? std::strtoull(env, nullptr, 10) : 20;
+}
+
+// Failing tests in this process so far that wrote captures, and that did not.
+inline uint64_t sim_pcaps_written = 0;
+inline uint64_t sim_pcaps_suppressed = 0;
+
+// Called once per failing test: true (and counted as written) while under the
+// limit, false (and counted as suppressed) after.
+inline bool sim_claim_capture_slot()
+{
+    if (sim_pcaps_written < sim_pcap_limit())
+    {
+        sim_pcaps_written++;
+        return true;
+    }
+    sim_pcaps_suppressed++;
+    return false;
+}
+
 // Base fixture for simulator tests. The test creates `net`; if the test
 // fails, TearDown writes what the network carried to
 // <build dir>/sim-pcaps/<Suite>.<Test>.pcap (frames as delivered) and
@@ -102,10 +130,19 @@ protected:
         {
             std::cerr << "[ SIM PCAP ] seed " << net->seed() << ", failed at t=" << net->now_ms() << "ms\n"
                       << net->describe_links();
-            sim_dump_capture(net->delivered_capture(), "", "frames as delivered");
-            sim_dump_capture(net->transmitted_capture(), ".tx", "frames as transmitted");
-            sim_dump_trace(net->delivered_capture(), "");
-            sim_dump_trace(net->transmitted_capture(), ".tx");
+            if (sim_claim_capture_slot())
+            {
+                sim_dump_capture(net->delivered_capture(), "", "frames as delivered");
+                sim_dump_capture(net->transmitted_capture(), ".tx", "frames as transmitted");
+                sim_dump_trace(net->delivered_capture(), "");
+                sim_dump_trace(net->transmitted_capture(), ".tx");
+            }
+            else
+            {
+                std::cerr << "[ SIM PCAP ] not written: " << sim_pcaps_written
+                          << " failures in this process already have captures (SIM_PCAP_LIMIT); "
+                          << sim_pcaps_suppressed << " suppressed so far\n";
+            }
         }
         // Destroyed here rather than with the fixture so the stacks go before
         // the logger level is restored (they may log while shutting down).
