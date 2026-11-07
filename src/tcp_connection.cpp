@@ -577,6 +577,25 @@ void TcpConnection::_restart_after_idle()
 void TcpConnection::_send_queued_while_window_allows()
 {
     _restart_after_idle();
+    if (_in_recovery && _sack_permitted)
+    {
+        // During SACK recovery only the ack clock sends (RFC 6675 step C).
+        _arm_or_disarm_persist();
+        return;
+    }
+    if (_rto_recovery && _in_flight.empty())
+    {
+        _rto_recovery = false;
+    }
+    if (_rto_recovery)
+    {
+        // After a timeout the scoreboard's lost segments go first, then new
+        // data, all counted against the pipe rather than the in-flight total
+        // - which still holds the segments presumed lost.
+        _send_by_next_seg(_in_flight.pipe(), std::min(_congestion->window(), _peer_window), /*in_recovery=*/false);
+        _arm_or_disarm_persist();
+        return;
+    }
     while (!_send_queue.empty())
     {
         uint32_t effective_window = std::min(_congestion->window(), _peer_window);
@@ -761,7 +780,7 @@ void TcpConnection::_retransmit(SentSegment& segment)
     segment.retransmit_deadline_ms = _now_ms + static_cast<uint64_t>(_rtt.rto_ms());
 }
 
-void TcpConnection::_enter_recovery()
+void TcpConnection::_enter_recovery(uint32_t delivered)
 {
     // With SACK the front of the scoreboard may be sitting in the peer's
     // reorder buffer already; resending it would be pure waste. The segment
@@ -776,13 +795,126 @@ void TcpConnection::_enter_recovery()
     _recovery_point = _send_next; // RFC 6582 "recover", RFC 6675 RecoveryPoint
     _recovery_point_valid = true;
     _stats.recoveries += 1;
-    _congestion->on_fast_retransmit(_bytes_in_flight(), DUP_ACK_FAST_RETRANSMIT_THRESHOLD, _now_ms);
     // Note there is deliberately no RTO backoff here - duplicate acks prove
     // segments are still flowing, so unlike a timeout this is no evidence that
     // the path got slower.
-    _retransmit(*oldest);
+    if (_sack_permitted)
+    {
+        // RFC 6675 section 5 step 4: ssthresh from FlightSize (the policy's
+        // call how far), then retransmit the first segment presumed dropped
+        // (4.3) - whether or not IsLost() holds for it yet, since DupThresh
+        // duplicates arrived - and send whatever else NextSeg() allows.
+        uint32_t flight_size = _send_next - _in_flight.snd_una_or(_send_next);
+        _congestion->on_recovery_start(flight_size, _now_ms);
+        _congestion->set_recovery_window(_congestion->slow_start_threshold());
+        _in_flight.start_recovery();
+        _rescue_valid = false;
+        oldest->lost = true;
+        _retransmit(*oldest);
+        _sack_recovery_send(delivered);
+    }
+    else
+    {
+        _congestion->on_fast_retransmit(_bytes_in_flight(), DUP_ACK_FAST_RETRANSMIT_THRESHOLD, _now_ms);
+        _retransmit(*oldest);
+    }
     LOG_DEBUG("TcpConnection[" << _id << "] fast retransmit at seq=" << oldest->seq << " (3 duplicate acks), cwnd "
                                << cwnd_before << " -> " << _congestion->window());
+}
+
+void TcpConnection::_sack_recovery_send(uint32_t /*delivered*/)
+{
+    // RFC 6675 section 5 step (C): while cwnd - pipe >= 1 SMSS, send what
+    // NextSeg() picks.
+    _send_by_next_seg(_in_flight.pipe(), _congestion->window(), /*in_recovery=*/true);
+}
+
+bool TcpConnection::_send_one_new_segment(uint32_t pipe, uint32_t window)
+{
+    if (_send_queue.empty())
+    {
+        return false;
+    }
+    const Bytes& next = _send_queue.front();
+    uint32_t snd_una = _in_flight.snd_una_or(_send_next);
+    // The peer's window bounds new data by sequence space, as everywhere.
+    bool peer_window_allows = (_send_next - snd_una) + next.size() <= _peer_window;
+    bool nagle_holds = !_nodelay && next.size() < _max_segment_payload() && pipe > 0;
+    if (!peer_window_allows || nagle_holds || pipe + next.size() > window)
+    {
+        return false;
+    }
+    Bytes chunk = std::move(_send_queue.front());
+    _send_queue.pop_front();
+    _send_queued_bytes -= chunk.size();
+    _send_flags(0, chunk);
+    return true;
+}
+
+uint32_t TcpConnection::_send_by_next_seg(uint32_t pipe, uint32_t window, bool in_recovery)
+{
+    // RFC 6675 section 4 NextSeg(), and the loop of section 5 step (C). After
+    // a timeout (in_recovery false) only rules 1 and 2 apply: the RFC leaves
+    // that case open, and refilling the holes in order before sending new data
+    // is the "simple approach" it endorses (section 5.1).
+    uint32_t smss = static_cast<uint32_t>(_max_segment_payload());
+    uint32_t sent = 0;
+    while (pipe + smss <= window)
+    {
+        // (1) the lowest lost segment not yet retransmitted
+        if (SentSegment* lost = _in_flight.next_lost())
+        {
+            uint32_t length = lost->end_seq - lost->seq;
+            _retransmit(*lost);
+            pipe += length;
+            sent += length;
+            continue;
+        }
+        // (2) new data, if the peer's window has room for it
+        uint32_t queued_before = static_cast<uint32_t>(_send_queued_bytes);
+        if (_send_one_new_segment(pipe, window))
+        {
+            uint32_t length = queued_before - static_cast<uint32_t>(_send_queued_bytes);
+            pipe += length;
+            sent += length;
+            continue;
+        }
+        if (!in_recovery)
+        {
+            break;
+        }
+        // (3) a not-yet-lost hole below the highest SACKed octet
+        if (SentSegment* hole = _in_flight.next_speculative())
+        {
+            uint32_t length = hole->end_seq - hole->seq;
+            _retransmit(*hole);
+            pipe += length;
+            sent += length;
+            continue;
+        }
+        // (4) one rescue retransmission per recovery: the highest unSACKed
+        // segment, so a loss at the tail of the window is repaired without
+        // a timeout when nothing above it can produce duplicate acks. Allowed
+        // again only once the cumulative ack has passed the last one
+        // (HighACK > RescueRxt).
+        uint32_t snd_una = _in_flight.snd_una_or(_send_next);
+        if (!_rescue_valid || seq_before(_rescue_rxt, snd_una))
+        {
+            SentSegment* tail = _in_flight.highest_unsacked();
+            if (tail != nullptr && !tail->rexmit_in_recovery)
+            {
+                uint32_t length = tail->end_seq - tail->seq;
+                _retransmit(*tail);
+                _rescue_rxt = _recovery_point;
+                _rescue_valid = true;
+                pipe += length;
+                sent += length;
+                continue;
+            }
+        }
+        break;
+    }
+    return sent;
 }
 
 void TcpConnection::_handle_ack(const Tcp& segment)
@@ -790,7 +922,12 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     // Apply the scoreboard before anything else looks at the window: what the
     // peer reports holding changes how much is genuinely outstanding, and
     // therefore how much may be sent.
+    uint32_t sacked_before = _in_flight.sacked_bytes();
     bool sack_advanced = _apply_sack_blocks(segment);
+    if (_sack_permitted)
+    {
+        _in_flight.mark_losses(DUP_ACK_FAST_RETRANSMIT_THRESHOLD, static_cast<uint32_t>(_max_segment_payload()));
+    }
     uint32_t ack = segment.get_acknowledgement_number();
 
     // the peer's advertised window is worth updating even on a duplicate
@@ -825,20 +962,36 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         // lost (one or two can just be reordering; three in a row is the
         // threshold every real implementation uses before trusting it)
         _dup_ack_count += 1;
-        if (!_in_recovery && _dup_ack_count >= DUP_ACK_FAST_RETRANSMIT_THRESHOLD && _may_start_recovery(ack))
+        // RFC 6937's DeliveredData for an ack that does not move SND.UNA.
+        uint32_t delivered = _in_flight.sacked_bytes() - sacked_before;
+        // RFC 6675 section 5 step 3: recovery starts on DupThresh duplicates,
+        // or as soon as IsLost(HighACK + 1) holds - three segments SACKed
+        // above the first hole say the same thing even if some of the acks
+        // carrying them were lost.
+        bool loss_signalled =
+            _dup_ack_count >= DUP_ACK_FAST_RETRANSMIT_THRESHOLD
+            || (_sack_permitted && _in_flight.oldest_unsacked() != nullptr && _in_flight.oldest_unsacked()->lost);
+        if (_in_recovery && _sack_permitted)
         {
-            _enter_recovery();
+            _sack_recovery_send(delivered);
         }
-        else if (_in_recovery || sack_advanced)
+        else if (_in_recovery)
         {
-            // window inflation: each further duplicate ack means another
-            // segment left the network, so there's room for one more MSS
-            // in flight while waiting for the retransmit to be acked.
-            //
-            // A SACK that named something new is the same signal made
-            // explicit - it does not merely suggest a segment arrived, it says
-            // which - so it opens room even outside fast recovery.
+            // RFC 5681 3.2 step 4 / RFC 6582: each further duplicate means
+            // another segment left the network, so the window inflates by one
+            // MSS while the retransmission is outstanding.
             _congestion->on_recovery_inflate();
+            _send_queued_while_window_allows();
+        }
+        else if (loss_signalled && _may_start_recovery(ack))
+        {
+            _enter_recovery(delivered);
+        }
+        else if (sack_advanced || _rto_recovery)
+        {
+            // A segment the peer just reported holding no longer counts as in
+            // flight, so there may be room for new data - the same room RFC
+            // 3042's limited transmit grants, made exact by the SACK block.
             _send_queued_while_window_allows();
         }
         return;
@@ -858,6 +1011,10 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     // only a segment never retransmitted yields one, since for a retransmitted
     // one there is no telling which transmission the ack answers.
     SendScoreboard::Acked acked = _in_flight.acknowledge(ack);
+    // RFC 6937 DeliveredData: the change in SND.UNA plus the change in SACKed
+    // bytes. Retired SACKed segments are in both, so they cancel.
+    auto delivered = static_cast<uint32_t>(std::max<int64_t>(
+        0, static_cast<int64_t>(acked.bytes) + _in_flight.sacked_bytes() - static_cast<int64_t>(sacked_before)));
     bool fin_acked = acked.fin;
     bool acked_anything = acked.any;
     uint32_t bytes_acked = acked.bytes;
@@ -907,6 +1064,20 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         return; // nothing new acked yet
     }
 
+    if (_rto_recovery && seq_at_or_before(_recovery_point, ack))
+    {
+        _rto_recovery = false; // everything outstanding at the timeout is acknowledged
+    }
+
+    if (_in_recovery && _sack_permitted && !seq_at_or_before(_recovery_point, ack))
+    {
+        // RFC 6675 section 5 steps (B) and (C): a partial ack updates the
+        // scoreboard (done above) and the loop sends what NextSeg() picks.
+        // SND.UNA moved, so RFC 6298 5.3 restarts the timer for the new
+        // oldest segment.
+        _sack_recovery_send(delivered);
+        return;
+    }
     if (_in_recovery)
     {
         if (!seq_at_or_before(_recovery_point, ack))
@@ -927,9 +1098,9 @@ void TcpConnection::_handle_ack(const Tcp& segment)
             _send_queued_while_window_allows();
             return;
         }
-        // A full ack: everything outstanding at the start of recovery is
-        // acknowledged. Deflate back to ssthresh rather than keep the inflated
-        // window recovery was using.
+        // A full ack (RFC 6582 3.2 step 3; RFC 6675 step (A)): everything
+        // outstanding at the start of recovery is acknowledged. cwnd lands on
+        // ssthresh.
         _congestion->on_recovery_end();
         _in_recovery = false;
     }
@@ -1631,6 +1802,14 @@ void TcpConnection::_run_timers()
     _dup_ack_count = 0;
     _recovery_point = _send_next;
     _recovery_point_valid = true;
+    if (_sack_permitted && (oldest.flags & FLAG_SYN) == 0)
+    {
+        // RFC 6675 5.1: keep using SACK information after the timeout. Every
+        // unSACKed segment is presumed lost and refilled in order as acks
+        // reopen the window (see _send_queued_while_window_allows()).
+        _in_flight.mark_all_lost();
+        _rto_recovery = true;
+    }
 
     // Karn's second half - the part that is easy to miss and matters as much
     // as ignoring the ambiguous sample. Having lost a segment, the estimator
@@ -1673,6 +1852,7 @@ void TcpConnection::set_congestion_control(CongestionControlAlgorithm algorithm)
     bool synchronized = _state != TcpState::LISTEN && _state != TcpState::SYN_SENT && _state != TcpState::SYN_RECEIVED;
     _congestion->on_established(synchronized ? _effective_mss : _local_mss, _syn_retransmissions);
     _in_recovery = false;
+    _rto_recovery = false;
     _dup_ack_count = 0;
 }
 
@@ -1730,7 +1910,7 @@ size_t TcpConnection::send(const Bytes& data)
         // once anything is queued, everything after it must queue too -
         // otherwise a later, smaller chunk could jump ahead of an earlier
         // one still waiting on window room and arrive out of order
-        if (!_send_queue.empty() || nagle_holds
+        if (!_send_queue.empty() || nagle_holds || _scoreboard_drives_sending()
             || _bytes_in_flight() + chunk.size() > std::min(_congestion->window(), _peer_window))
         {
             _send_queued_bytes += chunk.size();
@@ -1744,6 +1924,11 @@ size_t TcpConnection::send(const Bytes& data)
         offset += chunk_size;
     }
 
+    if (_rto_recovery)
+    {
+        // queued above rather than sent: the pipe decides what goes out
+        _send_queued_while_window_allows();
+    }
     // if a zero window forced everything to queue with nothing in flight, the
     // persist timer is what will eventually unstick it
     _arm_or_disarm_persist();

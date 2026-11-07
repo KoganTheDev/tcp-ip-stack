@@ -133,3 +133,92 @@ TEST(TcpRecovery, NoSecondRecoveryForDuplicatesFromTheSameWindow)
     ASSERT_EQ(peer.connection->stats().recoveries, 1u);
     static_cast<void>(ssthresh_cwnd);
 }
+
+// --- RFC 6675: SACK-based recovery ---
+
+namespace
+{
+    // The peer's SACK report after receiving the listed segments (by index)
+    // while missing the ones before them; merged into ranges.
+    std::vector<Tcp::SackBlock> sack_of(const Peer& peer, const std::vector<uint32_t>& held)
+    {
+        std::vector<Tcp::SackBlock> blocks;
+        for (uint32_t n : held)
+        {
+            if (!blocks.empty() && blocks.back().end == peer.seg(n))
+                blocks.back().end = peer.seg(n + 1);
+            else
+                blocks.push_back({peer.seg(n), peer.seg(n + 1)});
+        }
+        return blocks;
+    }
+}
+
+// Three holes in one window (segments 0, 4 and 7). The SACK blocks name every
+// segment that arrived, so once IsLost() holds for 4 it is resent without
+// waiting for the ack of segment 0's retransmission - NewReno, which only
+// learns of a hole when a partial ack reaches it, needs a round trip per hole.
+TEST(TcpRecovery, SackRecoveryResendsEveryLostSegmentWithoutWaitingForPartialAcks)
+{
+    Peer peer = make_peer(/*sack=*/true);
+    send_segments(peer, 10);
+
+    std::vector<uint32_t> held;
+    for (uint32_t n : {1u, 2u, 3u, 5u, 6u, 8u, 9u})
+    {
+        held.push_back(n);
+        peer.ack(peer.seg(0), sack_of(peer, held));
+    }
+    ASSERT_EQ(peer.count_sent(peer.seg(0)), 2u) << "fast retransmit of the first hole";
+    ASSERT_EQ(peer.count_sent(peer.seg(4)), 2u) << "RFC 6675 NextSeg rule 1: 4 has 5, 6, 8, 9 SACKed above it";
+    for (uint32_t n : {1u, 2u, 3u, 5u, 6u, 8u, 9u})
+        ASSERT_EQ(peer.count_sent(peer.seg(n)), 1u) << "SACKed segment " << n << " must never be resent";
+    ASSERT_EQ(peer.connection->stats().recoveries, 1u);
+}
+
+// RFC 6675 section 5, step (A): the ack that covers RecoveryPoint ends
+// recovery, and cwnd settles at ssthresh.
+TEST(TcpRecovery, SackRecoveryEndsAtTheRecoveryPoint)
+{
+    Peer peer = make_peer(/*sack=*/true);
+    send_segments(peer, 10);
+    std::vector<uint32_t> held;
+    for (uint32_t n : {1u, 2u, 3u, 4u})
+    {
+        held.push_back(n);
+        peer.ack(peer.seg(0), sack_of(peer, held));
+    }
+    peer.ack(peer.seg(10));
+    // Reno: ssthresh = FlightSize / 2 = 5 segments.
+    ASSERT_EQ(peer.connection->get_congestion_window(), 5 * MSS);
+    // Fresh losses after the recovery point may start a new recovery.
+    send_segments(peer, 5);
+    std::vector<uint32_t> later;
+    for (uint32_t n : {11u, 12u, 13u})
+    {
+        later.push_back(n);
+        peer.ack(peer.seg(10), sack_of(peer, later));
+    }
+    ASSERT_EQ(peer.connection->stats().recoveries, 2u);
+}
+
+// RFC 6675 5.1: after a timeout the SACK information is still used. Every
+// unSACKed segment is presumed lost and refilled as the window reopens,
+// skipping what the peer holds - instead of one segment per timeout.
+TEST(TcpRecovery, AfterATimeoutTheHolesAreRefilledWithoutAnotherTimeout)
+{
+    Peer peer = make_peer(/*sack=*/true);
+    send_segments(peer, 5);
+    // 0 and 1 lost, 2 arrives (one duplicate ack - not enough for recovery).
+    peer.ack(peer.seg(0), sack_of(peer, {2}));
+    peer.connection->on_time_passed(1000);
+    ASSERT_EQ(peer.connection->stats().retransmit_timeouts, 1u);
+    ASSERT_EQ(peer.count_sent(peer.seg(0)), 2u);
+
+    // The retransmission of 0 is acked; 1 is still missing.
+    peer.ack(peer.seg(1), sack_of(peer, {2, 3, 4}));
+    ASSERT_EQ(peer.count_sent(peer.seg(1)), 2u) << "the next hole goes out on this ack, not after another RTO";
+    ASSERT_EQ(peer.count_sent(peer.seg(2)), 1u) << "a SACKed segment is skipped";
+    peer.ack(peer.seg(5));
+    ASSERT_EQ(peer.connection->stats().retransmit_timeouts, 1u);
+}

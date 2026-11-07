@@ -760,7 +760,26 @@ private:
     bool _may_start_recovery(uint32_t ack) const;
     // Fast retransmit: the first segment presumed lost goes out again, and
     // the congestion control is told.
-    void _enter_recovery();
+    void _enter_recovery(uint32_t delivered);
+    // After a timeout with SACK in use: the segments presumed lost are being
+    // refilled, until the ack reaches _recovery_point (RFC 6675 5.1).
+    bool _rto_recovery = false;
+    // RescueRxt (RFC 6675 NextSeg rule 4): where the last rescue
+    // retransmission was allowed from; invalid until one is sent.
+    uint32_t _rescue_rxt = 0;
+    bool _rescue_valid = false;
+    // Whether the scoreboard's pipe, rather than the in-flight total, decides
+    // what may be sent: SACK recovery, or refilling after a timeout.
+    bool _scoreboard_drives_sending() const { return (_in_recovery && _sack_permitted) || _rto_recovery; }
+    // RFC 6675 section 5 step (C) for one ack; `delivered` is RFC 6937's
+    // DeliveredData for it.
+    void _sack_recovery_send(uint32_t delivered);
+    // NextSeg() and transmit, while pipe + SMSS <= window. Rules 3 and 4 only
+    // in fast recovery. Returns the bytes sent.
+    uint32_t _send_by_next_seg(uint32_t pipe, uint32_t window, bool in_recovery);
+    // Sends the next queued chunk as new data if the peer's window, Nagle and
+    // `window` allow it.
+    bool _send_one_new_segment(uint32_t pipe, uint32_t window);
     // Resends one in-flight segment and restarts its retransmit timer.
     void _retransmit(SentSegment& segment);
 
