@@ -299,14 +299,13 @@ void NetworkStack::unlisten(uint16_t port)
     auto pending_it = this->_pending_accepts.find(port);
     if (pending_it != this->_pending_accepts.end())
     {
-        std::deque<ConnectionKey> pending = std::move(pending_it->second);
+        std::deque<uint64_t> pending = std::move(pending_it->second);
         this->_pending_accepts.erase(pending_it);
-        for (const ConnectionKey& key : pending)
+        for (uint64_t id : pending)
         {
-            auto connection_it = this->_connections.find(key);
-            if (connection_it != this->_connections.end())
+            if (TcpConnection* connection = this->_queued_connection(id))
             {
-                connection_it->second->abort();
+                connection->abort();
             }
         }
     }
@@ -336,15 +335,27 @@ bool NetworkStack::has_pending_accept(uint16_t port) const
     {
         return false;
     }
-    // Stale keys (see accept()) do not count: accept() would skip them.
-    for (const ConnectionKey& key : pending_it->second)
+    // Stale entries (see accept()) do not count: accept() would skip them.
+    for (uint64_t id : pending_it->second)
     {
-        if (this->_connections.count(key) != 0)
+        if (this->_queued_connection(id) != nullptr)
         {
             return true;
         }
     }
     return false;
+}
+
+TcpConnection* NetworkStack::_queued_connection(uint64_t connection_id) const
+{
+    TcpConnection* connection = this->find_connection(connection_id);
+    // Only passive opens are ever queued; checked anyway, so the accept queue
+    // cannot hand out a connection someone else opened whatever goes wrong.
+    if (connection == nullptr || connection->is_active_open())
+    {
+        return nullptr;
+    }
+    return connection;
 }
 
 TcpConnection* NetworkStack::accept(uint16_t port)
@@ -355,10 +366,11 @@ TcpConnection* NetworkStack::accept(uint16_t port)
         return nullptr;
     }
 
-    // Keep popping until a live connection is found. A queued key can go stale:
+    // Keep popping until a live connection is found. A queued id can go stale:
     // _reap_closed_connections() erases from _connections but never from
     // _pending_accepts, so a peer that RSTs immediately after handshaking leaves
-    // an entry here pointing at nothing.
+    // an entry here pointing at nothing. (Ids rather than four-tuples are what
+    // keep "nothing" from being some later connection on the same tuple.)
     //
     // Returning nullptr on the first stale key - as this did - hides every
     // genuinely ready connection queued behind it, because a caller treating
@@ -366,13 +378,12 @@ TcpConnection* NetworkStack::accept(uint16_t port)
     // stall accepts for all the connections behind it.
     while (!pending_it->second.empty())
     {
-        ConnectionKey key = pending_it->second.front();
+        uint64_t id = pending_it->second.front();
         pending_it->second.pop_front();
 
-        auto connection_it = this->_connections.find(key);
-        if (connection_it != this->_connections.end())
+        if (TcpConnection* connection = this->_queued_connection(id))
         {
-            return connection_it->second.get();
+            return connection;
         }
     }
     return nullptr;
@@ -383,7 +394,9 @@ TcpConnection* NetworkStack::connect(const IPv4Address& remote_ip, uint16_t remo
     if (local_port != 0)
     {
         // A port the caller chose (a socket bound before connect()): used as
-        // given, or refused if that exact four-tuple is taken.
+        // given, or refused if that exact four-tuple is taken - including by a
+        // connection still waiting in an accept queue, which is in
+        // _connections until it is accepted and closed.
         if (this->_connections.count(ConnectionKey{remote_ip, remote_port, local_port}) != 0)
         {
             return nullptr;
@@ -1419,7 +1432,7 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
         if (state_before == TcpState::SYN_RECEIVED && state_after != TcpState::SYN_RECEIVED
             && state_after != TcpState::CLOSED && !connection_it->second->is_active_open())
         {
-            this->_pending_accepts[key.local_port].push_back(key);
+            this->_pending_accepts[key.local_port].push_back(connection_it->second->get_id());
             if (this->_on_accept_ready)
             {
                 this->_on_accept_ready(key.local_port);
@@ -1623,7 +1636,7 @@ bool NetworkStack::_try_complete_cookie_handshake(const Ip& ip, const Tcp& tcp)
 
     TcpConnection* connection_ptr = connection.get();
     this->_register_connection(key, std::move(connection));
-    this->_pending_accepts[local_port].push_back(key);
+    this->_pending_accepts[local_port].push_back(connection_ptr->get_id());
     if (this->_on_accept_ready)
     {
         this->_on_accept_ready(local_port);

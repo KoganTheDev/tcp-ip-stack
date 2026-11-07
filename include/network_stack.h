@@ -765,7 +765,15 @@ private:
     EchoReplyFn _on_echo_reply;
     AcceptReadyFn _on_accept_ready;
     std::unordered_map<uint16_t, size_t> _listening_ports; // port -> backlog
-    std::unordered_map<uint16_t, std::deque<ConnectionKey>> _pending_accepts;
+    // Per listening port, the connections waiting for accept(), by id. Ids,
+    // not four-tuples: an entry can outlive its connection (reset and reaped
+    // before accept()), and a tuple left behind could name a different, later
+    // connection - an active open over the same tuple, which accept() would
+    // then hand out. An id names one connection, ever.
+    std::unordered_map<uint16_t, std::deque<uint64_t>> _pending_accepts;
+    // The connection a queued id names, if it is still live and still a
+    // passive open; nullptr for an entry to skip.
+    TcpConnection* _queued_connection(uint64_t connection_id) const;
     // Connections in SYN_RECEIVED, per local port: connection id -> the stack
     // clock when it was created. Ids only ever increase, so the map's order is
     // creation order - begin() is the oldest, which is what eviction needs -
