@@ -426,3 +426,108 @@ TEST(IpCompletion, TheQuoteOfAReassembledDatagramIsTheFirstFragmentsReceivedByte
     ASSERT_TRUE(err.quote.to_hex() == first.slice(ETH, 24 + 8).to_hex())
         << "the quote must be the first fragment as received (MF set, options, id), not a rebuilt header";
 }
+
+// --- task 4: ARP announcements (RFC 5227 2.3) --------------------------------
+
+namespace
+{
+    struct Announcement
+    {
+        bool found = false;
+        bool broadcast = false;
+        bool request = false;
+        std::string sender_mac, sender_ip, target_ip, target_mac;
+    };
+
+    std::vector<Announcement> announcements(const std::vector<Bytes>& frames)
+    {
+        std::vector<Announcement> out;
+        for (const Bytes& frame : frames)
+        {
+            Ethernet eth(frame);
+            if (eth.get_ethernet_protocol() != EtherType::ARP || !eth.has_next_layer())
+            {
+                continue;
+            }
+            const Arp* arp = dynamic_cast<const Arp*>(&eth.get_next_layer());
+            if (arp == nullptr)
+            {
+                continue;
+            }
+            Announcement a;
+            a.found = true;
+            a.broadcast = eth.get_dest() == MacAddress::BROADCAST;
+            a.request = arp->get_operation() == ArpOperation::REQUEST;
+            a.sender_mac = arp->get_sender_hardware_address().to_string();
+            a.sender_ip = arp->get_sender_protocol_address().to_string();
+            a.target_ip = arp->get_target_protocol_address().to_string();
+            a.target_mac = arp->get_target_hardware_address().to_string();
+            out.push_back(a);
+        }
+        return out;
+    }
+
+    InterfaceConfig config_with(const IPv4Address& ip)
+    {
+        InterfaceConfig config;
+        config.mac = LOCAL_MAC;
+        config.ip = ip;
+        config.prefix_length = 24;
+        return config;
+    }
+}
+
+TEST(IpCompletion, ConfiguringAnAddressAnnouncesItTwiceTwoSecondsApart)
+{
+    // RFC 5227 2.3: an ARP Announcement is a request whose sender and target
+    // IP are both the new address, broadcast, with a zero target hardware
+    // address; two of them, ANNOUNCE_INTERVAL (2 s) apart, so neighbours that
+    // missed the first refresh their caches.
+    auto channel = std::make_unique<FakePacketChannel>();
+    FakePacketChannel* wire = channel.get();
+    NetworkStack stack(std::move(channel), config_with(IPv4Address()));
+    wire->clear_outbound();
+
+    const IPv4Address bound("10.0.0.77");
+    stack.configure_interface(config_with(bound));
+
+    std::vector<Announcement> sent = announcements(wire->outbound_frames());
+    ASSERT_TRUE(sent.size() == 1) << "one announcement immediately, got " + std::to_string(sent.size());
+    ASSERT_TRUE(sent[0].request && sent[0].broadcast) << "an ARP request to the broadcast address";
+    ASSERT_TRUE(sent[0].sender_ip == bound.to_string() && sent[0].target_ip == bound.to_string())
+        << "sender and target IP both the announced address";
+    ASSERT_TRUE(sent[0].sender_mac == LOCAL_MAC.to_string() && sent[0].target_mac == "00:00:00:00:00:00")
+        << "our MAC as sender, zero target hardware address";
+
+    wire->clear_outbound();
+    stack.on_time_passed(1900);
+    ASSERT_TRUE(announcements(wire->outbound_frames()).empty()) << "not before the 2 s interval";
+    stack.on_time_passed(200);
+    ASSERT_TRUE(announcements(wire->outbound_frames()).size() == 1) << "the second after 2 s";
+    wire->clear_outbound();
+    stack.on_time_passed(10000);
+    ASSERT_TRUE(announcements(wire->outbound_frames()).empty()) << "and no more than two";
+}
+
+TEST(IpCompletion, ReconfiguringTheSameAddressDoesNotReannounceAndNoAddressAnnouncesNothing)
+{
+    auto channel = std::make_unique<FakePacketChannel>();
+    FakePacketChannel* wire = channel.get();
+    NetworkStack stack(std::move(channel), config_with(IPv4Address()));
+    stack.configure_interface(config_with(IPv4Address()));
+    ASSERT_TRUE(wire->outbound_frames().empty()) << "0.0.0.0 is not an address to announce";
+
+    stack.configure_interface(config_with(IPv4Address("10.0.0.77")));
+    wire->clear_outbound();
+    stack.configure_interface(config_with(IPv4Address("10.0.0.77")));
+    ASSERT_TRUE(wire->outbound_frames().empty()) << "a renewal that keeps the address says nothing new";
+}
+
+TEST(IpCompletion, TheSecondAnnouncementIsAskedForByTheTimerQuery)
+{
+    auto channel = std::make_unique<FakePacketChannel>();
+    NetworkStack stack(std::move(channel), config_with(IPv4Address()));
+    stack.configure_interface(config_with(IPv4Address("10.0.0.77")));
+    NextTimer next = stack.ms_until_next_timer();
+    ASSERT_TRUE(next.has_value() && *next <= 2000) << "an event loop must wake for the second announcement";
+}

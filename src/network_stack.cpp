@@ -12,6 +12,9 @@ namespace
     constexpr uint16_t FIRST_EPHEMERAL_PORT = 49152; // IANA dynamic/private range starts here
     constexpr int ARP_MAX_RETRIES = 3;
     constexpr int ARP_RETRY_MS = 2000;
+    // RFC 5227 section 1.1: ANNOUNCE_NUM and ANNOUNCE_INTERVAL.
+    constexpr int ARP_ANNOUNCE_NUM = 2;
+    constexpr int ARP_ANNOUNCE_INTERVAL_MS = 2000;
     // RFC 791 suggests 15 seconds for reassembly. Short on purpose - a partial
     // datagram is memory held for something that may never arrive.
     constexpr int FRAGMENT_TIMEOUT_MS = 15000;
@@ -193,6 +196,7 @@ NetworkStack::NetworkStack(std::unique_ptr<PacketChannel> channel, const Interfa
     require_unicast_mac(config.mac);
     this->_interfaces.push_back(std::make_unique<Interface>(std::move(channel), config, ARP_ENTRY_TTL_MS));
     this->configure_interface(config);
+    this->_constructed = true;
 }
 
 NetworkStack::SeededSecrets NetworkStack::SeededSecrets::from_seed(uint64_t seed)
@@ -238,6 +242,7 @@ uint32_t NetworkStack::_next_isn(uint16_t local_port, const IPv4Address& remote_
 void NetworkStack::configure_interface(const InterfaceConfig& config)
 {
     require_unicast_mac(config.mac);
+    const IPv4Address previous_ip = this->_primary().config.ip;
     this->_primary().config = config;
 
     // Rebuild the routes that follow from the addressing rather than adding to
@@ -272,6 +277,22 @@ void NetworkStack::configure_interface(const InterfaceConfig& config)
         {
             this->_routes.add(other.ip, other.prefix_length, IPv4Address(), index);
         }
+    }
+
+    // Announce a newly configured address (RFC 5227 2.3), which is what a DHCP
+    // bind goes through as well. Not when the address is unchanged - a lease
+    // renewal says nothing new - and not from the constructor, where nothing
+    // has been on the wire yet and frames sent before the caller has even set
+    // the stack up would only surprise it. Not preceded by an RFC 5227
+    // probe: that is a conflict check for DHCP to make before binding and is
+    // not done here.
+    Interface& primary = this->_primary();
+    primary.announcements_remaining = 0;
+    if (primary.config.has_address() && !(primary.config.ip == previous_ip) && this->_constructed)
+    {
+        this->_send_arp_announcement(0);
+        primary.announcements_remaining = ARP_ANNOUNCE_NUM - 1;
+        primary.ms_until_announcement = ARP_ANNOUNCE_INTERVAL_MS;
     }
 
     LOG_DEBUG("NetworkStack: interface configured - ip="
@@ -968,9 +989,20 @@ void NetworkStack::on_time_passed(uint32_t elapsed_ms)
         this->_dns_resolver->on_time_passed(elapsed_ms);
     }
 
-    for (auto& interface : this->_interfaces)
+    for (size_t index = 0; index < this->_interfaces.size(); index++)
     {
-        interface->arp_table.age(elapsed_ms);
+        Interface& interface = *this->_interfaces[index];
+        interface.arp_table.age(elapsed_ms);
+        if (interface.announcements_remaining > 0)
+        {
+            interface.ms_until_announcement -= static_cast<int>(elapsed_ms);
+            if (interface.ms_until_announcement <= 0)
+            {
+                this->_send_arp_announcement(index);
+                interface.announcements_remaining--;
+                interface.ms_until_announcement = ARP_ANNOUNCE_INTERVAL_MS;
+            }
+        }
     }
 
     // Refill proportionally to the time that actually passed, so the budget is
@@ -1074,6 +1106,10 @@ NextTimer NetworkStack::ms_until_next_timer() const
     for (const auto& interface : this->_interfaces)
     {
         fold_next_timer(next, interface->arp_table.ms_until_next_timer());
+        if (interface->announcements_remaining > 0)
+        {
+            fold_next_timer(next, interface->ms_until_announcement);
+        }
         for (const auto& request : interface->arp_requests_in_flight)
         {
             fold_next_timer(next, request.second.ms_until_retry);
@@ -2181,6 +2217,14 @@ void NetworkStack::_send_arp_request(size_t interface_index, const IPv4Address& 
     Ethernet request(interface.config.mac, MacAddress::BROADCAST, EtherType::ARP);
     request /= std::make_unique<Arp>(interface.config.mac, interface.config.ip, target_ip);
     this->_transmit(interface, request.to_bytes());
+}
+
+void NetworkStack::_send_arp_announcement(size_t interface_index)
+{
+    Interface& interface = *this->_interfaces.at(interface_index);
+    Ethernet announcement(interface.config.mac, MacAddress::BROADCAST, EtherType::ARP);
+    announcement /= std::make_unique<Arp>(interface.config.mac, interface.config.ip, interface.config.ip);
+    this->_transmit(interface, announcement.to_bytes());
 }
 
 void NetworkStack::_ensure_arp_resolution(size_t interface_index, const IPv4Address& ip)

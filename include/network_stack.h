@@ -629,10 +629,19 @@ private:
     // hole rather than a feature. Linux makes the same choice with
     // net.ipv4.ip_forward.
     bool _forwarding_enabled = false;
+    // False until the constructor has finished: configure_interface() does
+    // not announce the address it is given at construction.
+    bool _constructed = false;
     MacAddress _resolve_mac(size_t interface_index, const IPv4Address& ip) const;
 
     uint16_t _allocate_ephemeral_port();
     void _send_arp_request(size_t interface_index, const IPv4Address& target_ip);
+    // RFC 5227 2.3 ARP Announcement: a broadcast request whose sender and
+    // target IP are both this interface's address and whose target hardware
+    // address is zero. Tells neighbours holding a stale mapping for this
+    // address (a previous holder's MAC) to replace it. Sent when an address is
+    // configured, then once more ANNOUNCE_INTERVAL later.
+    void _send_arp_announcement(size_t interface_index);
     // Sends an ARP request for ip and registers its retry state, unless one is
     // already in flight for that ip - shared by connect() and UDP sends to a
     // peer whose MAC isn't cached yet.
@@ -688,6 +697,10 @@ private:
             int ms_until_retry;
         };
         std::unordered_map<IPv4Address, ArpRequestState> arp_requests_in_flight;
+        // RFC 5227 2.3: announcements still to send after the first, and the
+        // countdown to the next. Zero remaining means none is pending.
+        int announcements_remaining = 0;
+        int ms_until_announcement = 0;
         std::unordered_map<IPv4Address, std::vector<ConnectionKey>> pending_outbound_connects;
         std::unordered_map<IPv4Address, std::vector<PendingDatagram>> pending_outbound_datagrams;
     };
