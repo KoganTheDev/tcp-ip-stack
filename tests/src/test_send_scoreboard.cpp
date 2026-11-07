@@ -127,3 +127,103 @@ TEST(SendScoreboard, WorksAcrossTheSequenceWrap)
     ASSERT_EQ(acked.bytes, 2 * MSS);
     ASSERT_TRUE(board.empty());
 }
+
+// --- RFC 6675 queries ---
+
+namespace
+{
+    constexpr uint32_t DUP_THRESH = 3;
+}
+
+TEST(SendScoreboard, IsLostNeedsDupThreshSackedSegmentsAbove)
+{
+    SendScoreboard board = board_of(5); // 1000..6000
+    board.apply_sack({{2000, 4000}});   // two segments above the first
+    board.mark_losses(DUP_THRESH, MSS);
+    ASSERT_FALSE(board.front().lost) << "two SACKed segments above: could still be reordering";
+    board.apply_sack({{2000, 5000}});
+    board.mark_losses(DUP_THRESH, MSS);
+    ASSERT_TRUE(board.front().lost) << "RFC 6675 4: DupThresh SACKed segments above";
+}
+
+TEST(SendScoreboard, IsLostAlsoCountsSackedBytes)
+{
+    // Small segments: more than (DupThresh - 1) * SMSS SACKed bytes above
+    // marks a loss before DupThresh segments would, and with large SMSS
+    // the segment count still decides.
+    SendScoreboard board;
+    board.push(segment(1000, 100));
+    board.push(segment(1100, 1500));
+    board.push(segment(2600, 1500));
+    board.apply_sack({{1100, 4100}});
+    board.mark_losses(DUP_THRESH, 1000);
+    ASSERT_TRUE(board.front().lost) << "3000 bytes > 2 * 1000 SACKed above";
+}
+
+TEST(SendScoreboard, PipeCountsUnsackedNotLostPlusRetransmitted)
+{
+    SendScoreboard board = board_of(6);
+    board.apply_sack({{2000, 5000}}); // 3 SACKed above the first: it is lost
+    board.mark_losses(DUP_THRESH, MSS);
+    // in flight: 1000 (lost), 5000, 6000 -> pipe counts 5000 and 6000
+    ASSERT_EQ(board.pipe(), 2 * MSS);
+    board.front().rexmit_in_recovery = true;
+    ASSERT_EQ(board.pipe(), 3 * MSS) << "a retransmission is in the pipe again";
+}
+
+TEST(SendScoreboard, NextLostSegmentIsRuleOne)
+{
+    SendScoreboard board = board_of(8);
+    board.apply_sack({{2000, 4000}, {5000, 8000}});
+    board.mark_losses(DUP_THRESH, MSS);
+    SentSegment* first = board.next_lost();
+    ASSERT_NE(first, nullptr);
+    ASSERT_EQ(first->seq, 1000u);
+    first->rexmit_in_recovery = true;
+    SentSegment* second = board.next_lost();
+    ASSERT_NE(second, nullptr);
+    ASSERT_EQ(second->seq, 4000u);
+    second->rexmit_in_recovery = true;
+    ASSERT_EQ(board.next_lost(), nullptr) << "8000 has nothing SACKed above it";
+}
+
+TEST(SendScoreboard, SpeculativeCandidateIsBelowTheHighestSackOnly)
+{
+    SendScoreboard board = board_of(5);
+    board.apply_sack({{4000, 5000}}); // one SACKed above 1000..3000: not lost
+    board.mark_losses(DUP_THRESH, MSS);
+    ASSERT_EQ(board.next_lost(), nullptr);
+    SentSegment* rule3 = board.next_speculative();
+    ASSERT_NE(rule3, nullptr);
+    ASSERT_EQ(rule3->seq, 1000u);
+    for (SentSegment& s : board)
+        if (!s.sacked && s.seq < 4000)
+            s.rexmit_in_recovery = true;
+    ASSERT_EQ(board.next_speculative(), nullptr) << "5000 lies above the highest SACKed octet";
+}
+
+TEST(SendScoreboard, RescueCandidateIsTheHighestUnsackedSegment)
+{
+    SendScoreboard board = board_of(4);
+    board.apply_sack({{2000, 3000}});
+    ASSERT_EQ(board.highest_unsacked()->seq, 4000u);
+}
+
+TEST(SendScoreboard, MarkAllLostAfterATimeoutSkipsSackedSegments)
+{
+    SendScoreboard board = board_of(4);
+    board.apply_sack({{2000, 3000}});
+    board.front().rexmit_in_recovery = true;
+    board.mark_all_lost();
+    ASSERT_EQ(board.pipe(), 0u) << "everything unSACKed is presumed lost, nothing retransmitted yet";
+    ASSERT_EQ(board.next_lost()->seq, 1000u);
+}
+
+TEST(SendScoreboard, TracksSackedBytesForDeliveredData)
+{
+    SendScoreboard board = board_of(4);
+    board.apply_sack({{2000, 4000}});
+    ASSERT_EQ(board.sacked_bytes(), 2 * MSS);
+    board.acknowledge(4000);
+    ASSERT_EQ(board.sacked_bytes(), 0u) << "retired SACKed segments leave the count";
+}

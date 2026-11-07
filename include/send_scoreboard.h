@@ -41,6 +41,14 @@ struct SentSegment
     // and those imply very different round-trip times. Such a segment never
     // yields an RTT sample.
     bool retransmitted{};
+    // RFC 6675 IsLost() held true for it (see mark_losses()), or a
+    // retransmission timeout presumed it lost (mark_all_lost()). A lost
+    // segment has left the network: it no longer counts in the pipe.
+    bool lost = false;
+    // Retransmitted during the current loss recovery - RFC 6675's "at or
+    // below HighRxt", kept per segment. Counts in the pipe a second time, and
+    // takes the segment out of NextSeg()'s candidates until recovery restarts.
+    bool rexmit_in_recovery = false;
 };
 
 // The sender's scoreboard: every segment in flight, oldest first, with what
@@ -110,8 +118,47 @@ public:
     // hot path of the send loop, and the outer edges stopped being enough once
     // SACK can mark a segment in the middle as delivered.
     uint32_t unsacked_bytes() const { return _unsacked_bytes; }
+    // Bytes of segments named by SACK blocks and not yet cumulatively acked.
+    // Its change across an ack is the SACKed half of RFC 6937's DeliveredData.
+    uint32_t sacked_bytes() const { return _sacked_bytes; }
+
+    // --- RFC 6675 (conservative SACK-based loss recovery) ---
+    //
+    // Segment-granular, like the rest of the scoreboard: an octet range the
+    // RFC walks byte by byte is a segment here, which is what Linux's
+    // per-skb scoreboard does too.
+
+    // Sets `lost` on every unSACKed segment for which IsLost() holds
+    // (RFC 6675 section 4): dup_thresh SACKed segments above it, or more than
+    // (dup_thresh - 1) * smss SACKed bytes above it. The RFC's "discontiguous
+    // SACKed sequences" are counted as SACKed segments, each one an arrival
+    // the receiver reported. One pass from the top, O(segments). A mark is
+    // never cleared here: SACK information only grows.
+    void mark_losses(uint32_t dup_thresh, uint32_t smss);
+    // RFC 6675 5.1: after a retransmission timeout every unSACKed segment is
+    // presumed lost and none counts as retransmitted, so the holes are
+    // refilled in order as the window allows (SACKed segments are skipped).
+    void mark_all_lost();
+    // A new recovery episode: HighRxt goes back to HighACK, so nothing counts
+    // as retransmitted in it yet.
+    void start_recovery();
+
+    // RFC 6675 SetPipe(): bytes believed to be in the network - every
+    // unSACKed segment not lost, plus every one retransmitted in this
+    // recovery.
+    uint32_t pipe() const;
+    // NextSeg() rule 1: the lowest unSACKed segment that is lost and not yet
+    // retransmitted in this recovery.
+    SentSegment* next_lost();
+    // NextSeg() rule 3: the lowest unSACKed segment not yet retransmitted in
+    // this recovery that lies wholly below the highest SACKed octet, though
+    // IsLost() does not (yet) hold for it.
+    SentSegment* next_speculative();
+    // NextSeg() rule 4's candidate: the highest unSACKed segment.
+    SentSegment* highest_unsacked();
 
 private:
     Segments _segments;
     uint32_t _unsacked_bytes = 0;
+    uint32_t _sacked_bytes = 0;
 };
