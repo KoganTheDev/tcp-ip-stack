@@ -11,3 +11,5 @@ compile_commands.json
 # CMake preset build trees.
 build/
 http-get/http-get
+# Worktrees made for parallel agent work.
+.claude/worktrees/
