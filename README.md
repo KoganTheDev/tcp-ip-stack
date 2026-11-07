@@ -211,7 +211,27 @@ express at all until its timers stopped counting the application's polling cycle
 
 **Flow control that exists rather than being advertised.** Received data waits in a
 queue until the application reads it, so an application that stops reading genuinely
-closes the window and stops the sender. `send()` is bounded too and reports how much it
+closes the window and stops the sender. The window is never *shrunk*, though (RFC 1122
+4.2.2.16, RFC 9293 3.8.6): out-of-order data arrives inside the window already offered, so
+it is held without pulling the right edge back, as Linux's `tcp_select_window` does. When it
+did shrink by every buffered byte, each duplicate ACK carried a different window, failed RFC
+5681's "window unchanged" test, and fast retransmit never fired between two of these stacks.
+The sender also counts an ACK that SACKs new data as a duplicate (RFC 6675's definition), so
+a peer that does shrink cannot block fast retransmit either.
+
+**Ten segments in the first flight.** cwnd starts at RFC 6928's initial window,
+min(10*MSS, max(2*MSS, 14600)), for Reno and CUBIC alike; with a one-segment start every
+connection's first round trip waited out the peer's 200 ms delayed-ack timer. It falls back
+to one segment after more than one SYN or SYN-ACK retransmission, restarts from
+min(IW, cwnd) after an idle period longer than the RTO (RFC 5681 4.1), and the loss window
+after a timeout stays one segment.
+
+**Every segment carries its options.** One path builds every non-RST segment, so a
+retransmission, a zero-window probe or a keepalive carries a timestamp (RFC 7323 3.2) and a
+retransmitted SYN offers what the first did. The timestamp echoed follows RFC 7323 4.3
+(the earliest unacknowledged segment's, the hole-filling retransmission's) and is taken only
+from a segment that passed PAWS and the window check (5.3), so a spoofed out-of-window
+segment cannot advance it and make PAWS drop the real ones. `send()` is bounded too and reports how much it
 accepted, and `listen()` takes a backlog so the accept queue cannot be grown without
 limit by a peer.
 
@@ -349,15 +369,19 @@ half-close.
 stacks on virtual time (`SimClock`; nothing reads the real clock) over `NetemChannel` links
 that, per direction, lose, duplicate, corrupt, reorder, delay and jitter frames, serialize
 them at a given rate behind a bounded queue, and drop frames over an MTU. Every decision comes
-from one seeded `std::mt19937_64`, so a seed reproduces a run frame for frame. (The stack's
-ISNs come from `std::random_device` with no seam to inject them, so sequence numbers differ
-between runs; timing and sizes do not.)
+from one seeded `std::mt19937_64`, and each stack's secrets (ISN key and clock, SYN-cookie
+key) are derived from the same seed through the `NetworkStack::set_secret_seed()` test seam,
+so a seed reproduces a run byte for byte. A test can also pick a stack's secret seed itself,
+which is how `SimTcp.ATransferCrossesTheSequenceNumberWrap` puts both ISNs just below 2^32.
+Focused scenarios (a lost SYN-ACK, one lost segment, an odd MTU, the RTO under loss) live in
+`test_sim_tcp.cpp`; `NetemChannel::set_drop_filter()` drops one chosen frame.
 
 - **Property tests** (`test_sim_transfer.cpp`, ctest label `sim`): per seed, a random link and
   a random payload of up to 1 MiB, sent one way or echoed; the bytes must arrive intact and in
   order and both connections must close. `make sim` runs `SIM_SEEDS` seeds (default 200, a
-  few seconds) sharded over all CPUs; the nightly workflow runs 100000. Seeds that fail today
-  are kept, disabled, in `SimTransferRegression` with the diagnosis.
+  few seconds) sharded over all CPUs; the nightly workflow runs 100000. Every seed that has
+  ever failed is kept in `SimTransferRegression` (run by default) with what it found and
+  which fix turned it green.
 - **Conformance scripts** (`tests/scripts/*.pkt`): packetdrill-style scripts that play the peer
   of one stack - inject segments, state exactly what must come back and when. The syntax is
   documented in `tests/include/sim/pkt_runner.h`. `tests/scripts/pending/` holds scripts for
@@ -366,7 +390,9 @@ between runs; timing and sizes do not.)
 
 When a simulator test fails it writes `build/<preset>/sim-pcaps/<Suite>.<Test>.pcap` (frames as
 delivered), `...tx.pcap` (as transmitted, so the difference is what the link dropped) and a
-text rendering of each, and prints the paths.
+text rendering of each, and prints the paths - for the first `SIM_PCAP_LIMIT` failures (default
+20; `make sim` splits it between shards). Later failures are only counted, so a regression in
+the nightly run cannot upload hundreds of MB of captures of one bug.
 
 ```sh
 make sim                                   # 200 seeds
