@@ -1456,7 +1456,14 @@ void TcpConnection::on_segment(const Tcp& segment)
         // it, so this is where congestion control actually starts.
         _congestion->on_established(_effective_mss, _syn_retransmissions);
         _transition(TcpState::ESTABLISHED);
-        return;
+        // RFC 9293 3.10.7.4: "enter ESTABLISHED state and continue
+        // processing" - text and FIN on the completing segment are handled
+        // below like on any other. A simultaneous open's SYN-ACK is done here:
+        // its SYN would only draw a challenge ACK in a synchronized state.
+        if (segment.get_syn())
+        {
+            return;
+        }
     }
 
     if (_state == TcpState::CLOSED)

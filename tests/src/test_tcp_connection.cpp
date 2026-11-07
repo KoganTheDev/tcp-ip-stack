@@ -2692,3 +2692,36 @@ TEST(TcpConnection, NewSackInformationCountsAsADuplicateAckEvenIfTheWindowChange
     ASSERT_TRUE(sent.size() > before && sent[before].seq == lost)
         << "three acks each SACKing new data should fast-retransmit the hole, window changes notwithstanding";
 }
+
+// RFC 9293 3.10.7.4: in SYN_RECEIVED an acceptable ACK moves the connection
+// to ESTABLISHED "and continue processing" - the same segment's text (and
+// FIN) is then handled like any other. A peer whose bare final ACK was lost
+// completes the handshake with its first data segment instead, and that data
+// used to be dropped and had to be retransmitted.
+TEST(TcpConnection, DataOnTheSegmentCompletingTheHandshakeIsDelivered)
+{
+    std::vector<RecordedSegment> sent;
+    TcpConnection connection(8080, IPv4Address("10.0.0.1"), 12345, 1000,
+                             [&sent](const Tcp& header, const Bytes& payload)
+                             {
+                                 sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(),
+                                                 flags_of(header), payload, header.get_window(), false, 0, 0});
+                             });
+    connection.accept_incoming_syn(500);
+    connection.on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes::from_hex("68656c6c6f")));
+
+    ASSERT_TRUE(connection.get_state() == TcpState::ESTABLISHED) << "the ACK completes the handshake";
+    ASSERT_TRUE(connection.bytes_available() == 5) << "and the data it carries is delivered, not dropped";
+    ASSERT_TRUE(connection.read().to_hex() == "68656c6c6f") << "intact";
+}
+
+TEST(TcpConnection, AFinOnTheSegmentCompletingTheHandshakeIsTaken)
+{
+    std::vector<RecordedSegment> sent;
+    TcpConnection connection(8080, IPv4Address("10.0.0.1"), 12345, 1000, [](const Tcp&, const Bytes&) {});
+    connection.accept_incoming_syn(500);
+    connection.on_segment(*make_incoming_segment(501, 1001, FLAG_ACK | FLAG_FIN, Bytes::from_hex("aa")));
+
+    ASSERT_TRUE(connection.bytes_available() == 1) << "the byte is delivered";
+    ASSERT_TRUE(connection.get_state() == TcpState::CLOSE_WAIT) << "and the FIN after it moves to CLOSE_WAIT";
+}
