@@ -91,6 +91,10 @@ public:
     void step(uint64_t ms);
     // One step: to the next event, or of the configured granularity.
     void tick();
+    // One step, but never past max_ms from now: to the next event if it is
+    // sooner, else exactly max_ms (at least 1 ms). What a wait with a timeout
+    // needs - see UstackSimDriver.
+    void tick_within(uint64_t max_ms) { _tick(max_ms); }
 
     // Steps until predicate() is true or max_virtual_ms have passed; returns
     // whether it became true. Checked before the first step and after each.
