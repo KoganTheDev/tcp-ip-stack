@@ -58,7 +58,7 @@
 // connection, waits until nothing of it is in the pool or unwritten and calls
 // shutdown(SHUT_WR): the peer gets its answers and then a FIN. The server
 // goes on running until every peer has closed its side too (the connection is
-// then closed here) or SHUTDOWN_DEADLINE_MS has passed, whichever is first;
+// then closed here) or the shutdown deadline (5 s by default) has passed, whichever is first;
 // connections still open at the deadline are closed outright (a RST if the
 // peer's data is unread). Data a peer sends after our FIN is read and
 // discarded - nothing could be answered any more.
@@ -66,14 +66,14 @@ template <class StackT>
 class EchoServer
 {
 public:
-    static constexpr int SHUTDOWN_DEADLINE_MS = 5000;
+    static constexpr int DEFAULT_SHUTDOWN_DEADLINE_MS = 5000;
 
     EchoServer(StackT& stack, size_t worker_count)
         : _stack(stack), _epfd(stack.epoll_create1(0)), _thread_pool(worker_count)
     {
         if (this->_epfd < 0)
         {
-            throw EXCEPTION(SystemException, std::string("epoll_create1 failed: ") + std::strerror(errno));
+            throw EXCEPTION(SystemException, std::string("epoll_create1 failed: ") + errno_text(errno));
         }
     }
 
@@ -109,7 +109,7 @@ public:
         int fd = this->_stack.socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
         if (fd < 0)
         {
-            throw EXCEPTION(SystemException, std::string("socket failed: ") + std::strerror(errno));
+            throw EXCEPTION(SystemException, std::string("socket failed: ") + errno_text(errno));
         }
         int one = 1;
         static_cast<void>(this->_stack.setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)));
@@ -122,14 +122,14 @@ public:
             || this->_stack.listen(fd, backlog) < 0
             || this->_stack.getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) < 0)
         {
-            std::string why = std::strerror(errno);
+            std::string why = errno_text(errno);
             static_cast<void>(this->_stack.close(fd));
             throw EXCEPTION(SystemException, "cannot listen on port " + std::to_string(port) + ": " + why);
         }
         uint64_t id = this->_next_id++;
         if (!this->_epoll_add(fd, id, EPOLLIN))
         {
-            std::string why = std::strerror(errno);
+            std::string why = errno_text(errno);
             static_cast<void>(this->_stack.close(fd));
             throw EXCEPTION(SystemException, "epoll_ctl failed for the listening socket: " + why);
         }
@@ -158,7 +158,7 @@ public:
         int ready = this->_stack.epoll_wait(this->_epfd, events, 64, wait);
         if (ready < 0 && errno != EINTR)
         {
-            throw EXCEPTION(SystemException, std::string("epoll_wait failed: ") + std::strerror(errno));
+            throw EXCEPTION(SystemException, std::string("epoll_wait failed: ") + errno_text(errno));
         }
         for (int i = 0; i < ready; i++)
         {
@@ -184,7 +184,7 @@ public:
             return;
         }
         this->_draining = true;
-        this->_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(SHUTDOWN_DEADLINE_MS);
+        this->_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(this->_shutdown_deadline_ms);
         for (auto& entry : this->_listeners)
         {
             static_cast<void>(this->_stack.close(entry.second)); // also leaves the epoll
@@ -200,6 +200,10 @@ public:
             this->_shutdown_write_if_idle(id);
         }
     }
+
+    // How long after begin_shutdown() a peer that has not closed is waited
+    // for. Set before shutdown begins; tests use a short one.
+    void set_shutdown_deadline_ms(int ms) { this->_shutdown_deadline_ms = ms; }
 
     // Shutdown has begun and every connection is gone.
     bool finished() const { return this->_draining && this->_conns.empty(); }
@@ -302,14 +306,14 @@ private:
                 }
                 if (errno != EAGAIN && errno != EWOULDBLOCK)
                 {
-                    LOG_ERROR("EchoServer: accept failed: " << std::strerror(errno));
+                    LOG_ERROR("EchoServer: accept failed: " << errno_text(errno));
                 }
                 return;
             }
             uint64_t id = this->_next_id++;
             if (!this->_epoll_add(fd, id, EPOLLIN | EPOLLRDHUP))
             {
-                LOG_ERROR("EchoServer: epoll_ctl failed for a new connection: " << std::strerror(errno));
+                LOG_ERROR("EchoServer: epoll_ctl failed for a new connection: " << errno_text(errno));
                 static_cast<void>(this->_stack.close(fd));
                 continue;
             }
@@ -454,7 +458,7 @@ private:
         }
         else
         {
-            LOG_ERROR("EchoServer: epoll_ctl MOD failed: " << std::strerror(errno));
+            LOG_ERROR("EchoServer: epoll_ctl MOD failed: " << errno_text(errno));
         }
     }
 
@@ -504,6 +508,7 @@ private:
     uint64_t _next_id = 1;
     int _busy_count = 0;
 
+    int _shutdown_deadline_ms = DEFAULT_SHUTDOWN_DEADLINE_MS;
     bool _draining = false;
     std::chrono::steady_clock::time_point _deadline;
 };

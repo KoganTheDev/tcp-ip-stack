@@ -21,18 +21,18 @@ namespace
         return xsi_result == 0 ? buffer : "unknown error";
     }
 
-    std::string describe_errno(int error_number)
-    {
-        char buffer[256] = {};
-        return strerror_text(strerror_r(error_number, buffer, sizeof(buffer)), buffer);
-    }
-
     // errno captured once, before anything (a std::string allocation, say)
     // can change it.
     std::string with_errno(const std::string& message, int error_number)
     {
-        return message + "\nerror " + std::to_string(error_number) + ", " + describe_errno(error_number);
+        return message + "\nerror " + std::to_string(error_number) + ", " + errno_text(error_number);
     }
+}
+
+std::string errno_text(int error_number)
+{
+    char buffer[256] = {};
+    return strerror_text(strerror_r(error_number, buffer, sizeof(buffer)), buffer);
 }
 
 BaseException::BaseException(const std::string& message, const std::string& file, const std::string& func,
