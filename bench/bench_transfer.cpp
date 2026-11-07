@@ -29,14 +29,6 @@ namespace
     constexpr size_t PAYLOAD_BYTES = size_t{2} * 1024 * 1024;
     constexpr uint64_t MAX_VIRTUAL_MS = 15ULL * 60 * 1000;
 
-    // Same workaround as tests/src/test_sim_transfer.cpp: the stack sizes data
-    // segments by the negotiated MSS without leaving room for the TCP options
-    // it then adds, so at MTU 1500 full segments exceed the DF limit and are
-    // dropped. Lowering the effective MSS by the 40-byte option maximum, as an
-    // ICMP Fragmentation Needed would, keeps the transfer moving. Harmless once
-    // the stack accounts for options itself.
-    constexpr uint16_t MAX_TCP_OPTION_BYTES = 40;
-
     // One transfer. Returns the bytes the server received.
     size_t transfer(double loss, uint64_t seed)
     {
@@ -56,8 +48,6 @@ namespace
         const Bytes payload(static_cast<unsigned int>(PAYLOAD_BYTES));
         size_t sent = 0;
         size_t received = 0;
-        bool client_tuned = false;
-        bool server_tuned = false;
         uint64_t client_id = 0;
         uint64_t server_id = 0;
         bool server_accepted = false;
@@ -78,21 +68,11 @@ namespace
                 }
                 if (TcpConnection* c = server.find_connection(server_id); c != nullptr && server_accepted)
                 {
-                    if (!server_tuned)
-                    {
-                        server_tuned = true;
-                        c->reduce_effective_mss(static_cast<uint16_t>(c->get_effective_mss() - MAX_TCP_OPTION_BYTES));
-                    }
                     received += c->read().size();
                 }
                 if (TcpConnection* c = client.find_connection(client_id);
                     c != nullptr && c->get_state() == TcpState::ESTABLISHED)
                 {
-                    if (!client_tuned)
-                    {
-                        client_tuned = true;
-                        c->reduce_effective_mss(static_cast<uint16_t>(c->get_effective_mss() - MAX_TCP_OPTION_BYTES));
-                    }
                     while (sent < payload.size())
                     {
                         size_t accepted = c->send(payload.slice(sent, std::min<size_t>(65536, payload.size() - sent)));
