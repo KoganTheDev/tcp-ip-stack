@@ -2059,8 +2059,7 @@ void TcpConnection::set_congestion_control(CongestionControlAlgorithm algorithm)
     _congestion = make_congestion_control(algorithm);
     // Seeded as the constructor or the handshake would have: with the
     // negotiated MSS once there is one, the advertised one before.
-    bool synchronized = _state != TcpState::LISTEN && _state != TcpState::SYN_SENT
-                        && _state != TcpState::SYN_RECEIVED;
+    bool synchronized = _state != TcpState::LISTEN && _state != TcpState::SYN_SENT && _state != TcpState::SYN_RECEIVED;
     _congestion->on_established(synchronized ? _effective_mss : _local_mss, _syn_retransmissions);
     _in_fast_recovery = false;
     _dup_ack_count = 0;
