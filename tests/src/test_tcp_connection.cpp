@@ -928,9 +928,9 @@ TEST(TcpConnection, FinCarriedAlongsideDataIsConsumedAtTheEndOfThatData)
 TEST(TcpConnection, CumulativeAckRetiresSegmentsAcrossASequenceNumberWrap)
 {
     std::vector<RecordedSegment> sent;
-    // chosen so that, after the SYN and one 8-byte segment, the next two
-    // segments end at 0xFFFFFFFE (just short of the wrap) and 0x00000006 (past it)
-    uint32_t isn = 0xFFFFFFEDu;
+    // chosen so that, after the SYN and one 48-byte segment, the next two
+    // segments end at 0xFFFFFFFE (just short of the wrap) and 0x0000002E (past it)
+    uint32_t isn = 0xFFFFFF9Du;
     auto connection = std::make_unique<TcpConnection>(
         8080, IPv4Address("10.0.0.1"), 12345, isn,
         [&sent](const Tcp& header, const Bytes& payload)
@@ -939,28 +939,29 @@ TEST(TcpConnection, CumulativeAckRetiresSegmentsAcrossASequenceNumberWrap)
                             payload, header.get_window(), header.has_timestamp_option(), header.get_timestamp_value(),
                             header.get_timestamp_echo()});
         });
-    // an 8-byte peer MSS keeps the segments small enough to place precisely
-    connection->accept_incoming_syn(500, 8);
+    // the smallest peer MSS honoured (48) keeps the segments small enough to
+    // place precisely
+    connection->accept_incoming_syn(500, 48);
     connection->on_segment(*make_incoming_segment(501, isn + 1, FLAG_ACK));
     ASSERT_TRUE(connection->get_state() == TcpState::ESTABLISHED)
         << "handshake should complete regardless of where the ISN sits";
     sent.clear();
 
     // one full-MSS segment, acked, to grow cwnd to two segments' worth
-    connection->send(Bytes(8));
-    ASSERT_TRUE(sent.size() == 1) << "the first 8-byte segment should go out under the initial 1-MSS window";
-    connection->on_segment(*make_incoming_segment(501, isn + 9, FLAG_ACK));
+    connection->send(Bytes(48));
+    ASSERT_TRUE(sent.size() == 1) << "the first 48-byte segment should go out under the initial 1-MSS window";
+    connection->on_segment(*make_incoming_segment(501, isn + 49, FLAG_ACK));
 
-    // now two full-MSS segments fit at once: 0xFFFFFFF6..0xFFFFFFFE and
-    // 0xFFFFFFFE..0x00000006. Both are exactly MSS, so Nagle does not hold them.
-    connection->send(Bytes(16));
+    // now two full-MSS segments fit at once: 0xFFFFFFCE..0xFFFFFFFE and
+    // 0xFFFFFFFE..0x0000002E. Both are exactly MSS, so Nagle does not hold them.
+    connection->send(Bytes(96));
     ASSERT_TRUE(sent.size() == 3) << "two more full-MSS segments should be in flight once cwnd has grown";
-    uint32_t first_end = sent[1].seq + 8;
-    uint32_t second_end = sent[2].seq + 8;
+    uint32_t first_end = sent[1].seq + 48;
+    uint32_t second_end = sent[2].seq + 48;
     ASSERT_TRUE(first_end == 0xFFFFFFFEu) << "precondition: the first of the two must end just below the wrap";
-    ASSERT_TRUE(second_end == 0x00000006u) << "precondition: the second must end just past the wrap";
+    ASSERT_TRUE(second_end == 0x0000002Eu) << "precondition: the second must end just past the wrap";
 
-    // one cumulative ack covering both - numerically 6, which is *less than*
+    // one cumulative ack covering both - numerically 0x2E, which is *less than*
     // the first segment's end_seq of 0xFFFFFFFE despite logically following it
     connection->on_segment(*make_incoming_segment(501, second_end, FLAG_ACK));
 

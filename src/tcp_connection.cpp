@@ -332,7 +332,7 @@ void TcpConnection::_take_peer_syn_options(const Tcp& segment)
 {
     // RFC 7323 / RFC 2018: each option is in use only if both SYNs carried it,
     // and ours always does, so the peer's SYN decides.
-    _peer_mss = segment.has_mss_option() ? segment.get_mss_option() : DEFAULT_PEER_MSS;
+    _peer_mss = segment.has_mss_option() ? std::max(segment.get_mss_option(), MIN_PEER_MSS) : DEFAULT_PEER_MSS;
     _effective_mss = std::min(_local_mss, _peer_mss);
     _window_scaling_negotiated = segment.has_window_scale_option();
     _peer_window_scale = _window_scaling_negotiated ? segment.get_window_scale_option() : 0;
@@ -350,7 +350,7 @@ bool TcpConnection::_matches_recorded_syn_options(const Tcp& segment) const
     // Compared through what _take_peer_syn_options() derived from the SYN.
     // The timestamp's value is a clock reading and differs by design; only
     // its presence has to agree.
-    uint16_t mss = segment.has_mss_option() ? segment.get_mss_option() : DEFAULT_PEER_MSS;
+    uint16_t mss = segment.has_mss_option() ? std::max(segment.get_mss_option(), MIN_PEER_MSS) : DEFAULT_PEER_MSS;
     bool window_scale_agrees =
         segment.has_window_scale_option() == _window_scaling_negotiated
         && (!_window_scaling_negotiated || segment.get_window_scale_option() == _peer_window_scale);
@@ -393,7 +393,7 @@ void TcpConnection::accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss, bo
     EntryScope scope(*this);
     _sack_permitted = peer_permits_sack;
     _set_recv_next(peer_isn + 1); // the SYN itself consumes one sequence number
-    _peer_mss = peer_mss != 0 ? peer_mss : DEFAULT_PEER_MSS;
+    _peer_mss = peer_mss != 0 ? std::max(peer_mss, MIN_PEER_MSS) : DEFAULT_PEER_MSS;
     _effective_mss = std::min(_local_mss, _peer_mss);
     _window_scaling_negotiated =
         peer_supports_window_scaling; // we always send our own option, so it comes down to the peer's
@@ -418,7 +418,7 @@ void TcpConnection::accept_cookie_handshake(uint32_t peer_isn, uint16_t peer_mss
     _send_next += 1;
     _send_max = _send_next;
     _set_recv_next(peer_isn + 1);
-    _peer_mss = peer_mss != 0 ? peer_mss : DEFAULT_PEER_MSS;
+    _peer_mss = peer_mss != 0 ? std::max(peer_mss, MIN_PEER_MSS) : DEFAULT_PEER_MSS;
     _effective_mss = std::min(_local_mss, _peer_mss);
     _window_scaling_negotiated = false;
     _peer_window_scale = 0;
@@ -764,9 +764,13 @@ bool TcpConnection::_may_start_recovery(uint32_t ack) const
     return !_recovery_point_valid || seq_at_or_before(_recovery_point, ack);
 }
 
-void TcpConnection::_retransmit(SentSegment& segment)
+void TcpConnection::_retransmit(SentSegment& segment, bool rescue)
 {
     _transmit(segment.flags, segment.seq, segment.payload);
+    if (!rescue)
+    {
+        _in_flight.note_retransmitted(segment);
+    }
     _stats.retransmitted_segments += 1;
     // Karn: this segment has now been sent twice, so the ack that eventually
     // retires it can't be attributed to either transmission.
@@ -904,7 +908,7 @@ uint32_t TcpConnection::_send_by_next_seg(uint32_t pipe, uint32_t window, bool i
             if (tail != nullptr && !tail->rexmit_in_recovery)
             {
                 uint32_t length = tail->end_seq - tail->seq;
-                _retransmit(*tail);
+                _retransmit(*tail, /*rescue=*/true);
                 _rescue_rxt = _recovery_point;
                 _rescue_valid = true;
                 pipe += length;

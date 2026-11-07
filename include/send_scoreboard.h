@@ -156,9 +156,33 @@ public:
     SentSegment* next_speculative();
     // NextSeg() rule 4's candidate: the highest unSACKed segment.
     SentSegment* highest_unsacked();
+    // Records a retransmission by rule 1, 2 or 3 (or the fast retransmit):
+    // HighRxt moves up to its end. The rescue retransmission is not reported
+    // (RFC 6675: "HighRxt MUST NOT be updated").
+    void note_retransmitted(const SentSegment& segment);
+
+    // Scoreboard entries examined so far, by every query - a cost meter for
+    // tests: one ack must cost a bounded number of passes, whatever the
+    // peer's SACK pattern.
+    uint64_t visits() const { return _visits; }
 
 private:
     Segments _segments;
+    mutable uint64_t _visits = 0;
+    // The highest SACKed octet (end of the highest SACKed segment).
+    uint32_t _high_sack = 0;
+    bool _have_high_sack = false;
+    // RFC 6675 HighRxt; NextSeg() rules 1 and 3 only look above it.
+    uint32_t _high_rxt = 0;
+    bool _high_rxt_valid = false;
+    // Where the rule-1 and rule-3 searches resume (see next_lost()).
+    uint32_t _lost_cursor = 0;
+    uint32_t _speculative_cursor = 0;
+    // Index of the first segment whose seq is at or after `seq`.
+    size_t _first_index_at_or_after(uint32_t seq) const;
+    // HighRxt, or SND.UNA if that is higher (or there is no HighRxt yet).
+    uint32_t _search_start() const;
+    void _reset_high_rxt();
     uint32_t _unsacked_bytes = 0;
     uint32_t _sacked_bytes = 0;
 };

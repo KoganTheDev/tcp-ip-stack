@@ -3,6 +3,7 @@
 #include "raw.h"
 
 #include <algorithm>
+#include <iostream>
 #include <memory>
 #include <vector>
 
@@ -221,4 +222,84 @@ TEST(TcpRecovery, AfterATimeoutTheHolesAreRefilledWithoutAnotherTimeout)
     ASSERT_EQ(peer.count_sent(peer.seg(2)), 1u) << "a SACKed segment is skipped";
     peer.ack(peer.seg(5));
     ASSERT_EQ(peer.connection->stats().retransmit_timeouts, 1u);
+}
+
+// --- cost bounds ---
+
+// The peer's MSS option is floored at 48 bytes, Linux's TCP_MIN_SND_MSS (the
+// CVE-2019-11479 fix): an MSS of 1 would make every byte a segment, and
+// every per-segment cost - scoreboard walks, headers, timers - a per-byte one.
+TEST(TcpRecovery, ThePeersMssIsFlooredAt48Bytes)
+{
+    TcpConnection connection(8080, IPv4Address("10.0.0.1"), 12345, 1000, [](const Tcp&, const Bytes&) {});
+    connection.accept_incoming_syn(PEER_ISN, /*peer_mss=*/1, false, 0, false, 0, true);
+    ASSERT_EQ(connection.get_effective_mss(), 48);
+}
+
+// RFC 6675 recovery walks the scoreboard to pick each segment to send. With a
+// tiny MSS (over a thousand segments in flight) and every other segment
+// SACKed, a partial ack that frees most of the pipe sends hundreds of
+// retransmissions at once; restarting each NextSeg() search from the front of
+// the scoreboard made that ack cost segments * retransmissions visits. The
+// search resumes from HighRxt instead, so one ack costs a bounded number of
+// passes over the scoreboard.
+TEST(TcpRecovery, OneAckCostsABoundedNumberOfScoreboardVisits)
+{
+    constexpr uint32_t SMALL_MSS = 48;
+    std::vector<std::pair<uint32_t, size_t>> sent; // seq, length
+    TcpConnection connection(
+        8080, IPv4Address("10.0.0.1"), 12345, 1000, [&sent](const Tcp& header, const Bytes& payload)
+        { sent.emplace_back(header.get_sequence_number(), payload.size()); }, 1460, CongestionControlAlgorithm::RENO);
+    connection.accept_incoming_syn(PEER_ISN, static_cast<uint16_t>(SMALL_MSS), false, 0, false, 0, true);
+    auto ack = [&](uint32_t ack_seq, const std::vector<Tcp::SackBlock>& blocks)
+    {
+        Tcp segment(12345, 8080, PEER_ISN + 1, ack_seq, 5, FLAG_ACK, 65535, 0, 0);
+        if (!blocks.empty())
+            segment.set_sack_blocks(blocks);
+        connection.on_segment(segment);
+    };
+    ack(1001, {});
+    const uint32_t base = 1001;
+
+    // Slow start until the window holds over a thousand segments.
+    connection.send(Bytes(static_cast<unsigned int>(TcpConnection::SEND_BUFFER_CAPACITY)));
+    uint32_t acked = base;
+    for (int round = 0; round < 20 && connection.bytes_unacked() > 0; round++)
+    {
+        uint32_t highest = acked;
+        for (const auto& s : sent)
+            highest = std::max<uint32_t>(highest, s.first + static_cast<uint32_t>(s.second));
+        size_t in_flight_segments = (highest - acked) / SMALL_MSS;
+        if (in_flight_segments >= 1000)
+            break;
+        acked = highest;
+        ack(acked, {});
+        connection.send(Bytes(static_cast<unsigned int>(connection.send_space_available())));
+    }
+    uint32_t highest = acked;
+    for (const auto& s : sent)
+        highest = std::max<uint32_t>(highest, s.first + static_cast<uint32_t>(s.second));
+    const uint32_t segments = (highest - acked) / SMALL_MSS;
+    ASSERT_GE(segments, 1000u) << "precondition: a large window of tiny segments";
+
+    // Every odd segment arrives: each ack SACKs four more.
+    uint64_t worst = 0;
+    auto measured_ack = [&](uint32_t ack_seq, const std::vector<Tcp::SackBlock>& blocks)
+    {
+        uint64_t before = connection.scoreboard_visits();
+        ack(ack_seq, blocks);
+        worst = std::max(worst, connection.scoreboard_visits() - before);
+    };
+    for (uint32_t n = 1; n + 6 < segments; n += 8)
+    {
+        std::vector<Tcp::SackBlock> blocks;
+        for (uint32_t k = n; k < n + 8; k += 2)
+            blocks.push_back({acked + k * SMALL_MSS, acked + (k + 1) * SMALL_MSS});
+        measured_ack(acked, blocks);
+    }
+    // The first half of the window is repaired: a partial ack that drops the
+    // pipe by half, so a burst of lost segments goes out on this one ack.
+    measured_ack(acked + SMALL_MSS * (segments / 2), {});
+    ASSERT_LE(worst, 20u * segments) << "one ack visited " << worst << " scoreboard entries with " << segments
+                                     << " segments in flight";
 }

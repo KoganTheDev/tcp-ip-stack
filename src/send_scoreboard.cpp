@@ -28,6 +28,37 @@ void SendScoreboard::clear()
     _segments.clear();
     _unsacked_bytes = 0;
     _sacked_bytes = 0;
+    _have_high_sack = false;
+    _high_rxt_valid = false;
+}
+
+size_t SendScoreboard::_first_index_at_or_after(uint32_t seq) const
+{
+    // The deque is ordered by sequence number, so a binary search finds where
+    // a sequence number would sit. Offsets from the front keep the comparison
+    // correct across the 2^32 wrap.
+    if (_segments.empty() || seq_at_or_before(seq, _segments.front().seq))
+    {
+        return 0;
+    }
+    uint32_t origin = _segments.front().seq;
+    uint32_t target = seq - origin;
+    size_t low = 0;
+    size_t high = _segments.size();
+    while (low < high)
+    {
+        _visits++;
+        size_t middle = low + (high - low) / 2;
+        if (_segments[middle].seq - origin < target)
+        {
+            low = middle + 1;
+        }
+        else
+        {
+            high = middle;
+        }
+    }
+    return low;
 }
 
 bool SendScoreboard::apply_sack(const std::vector<Tcp::SackBlock>& blocks)
@@ -35,18 +66,28 @@ bool SendScoreboard::apply_sack(const std::vector<Tcp::SackBlock>& blocks)
     bool marked_anything = false;
     for (const Tcp::SackBlock& block : blocks)
     {
-        for (SentSegment& entry : _segments)
+        // Only segments from the block's start onwards can lie wholly inside
+        // it, and the walk ends with the block: O(log n + segments covered).
+        for (size_t i = _first_index_at_or_after(block.start); i < _segments.size(); ++i)
         {
+            _visits++;
+            SentSegment& entry = _segments[i];
+            if (!seq_at_or_before(entry.end_seq, block.end))
+            {
+                break;
+            }
             if (entry.sacked)
             {
                 continue;
             }
-            if (seq_at_or_before(block.start, entry.seq) && seq_at_or_before(entry.end_seq, block.end))
+            entry.sacked = true;
+            _unsacked_bytes -= entry.end_seq - entry.seq;
+            _sacked_bytes += entry.end_seq - entry.seq;
+            marked_anything = true;
+            if (!_have_high_sack || seq_before(_high_sack, entry.end_seq))
             {
-                entry.sacked = true;
-                _unsacked_bytes -= entry.end_seq - entry.seq;
-                _sacked_bytes += entry.end_seq - entry.seq;
-                marked_anything = true;
+                _high_sack = entry.end_seq;
+                _have_high_sack = true;
             }
         }
     }
@@ -115,6 +156,7 @@ SentSegment* SendScoreboard::oldest_unsacked()
 {
     for (SentSegment& entry : _segments)
     {
+        _visits++;
         if (!entry.sacked)
         {
             return &entry;
@@ -127,6 +169,7 @@ const SentSegment* SendScoreboard::oldest_unsacked() const
 {
     for (const SentSegment& entry : _segments)
     {
+        _visits++;
         if (!entry.sacked)
         {
             return &entry;
@@ -137,10 +180,12 @@ const SentSegment* SendScoreboard::oldest_unsacked() const
 
 void SendScoreboard::mark_losses(uint32_t dup_thresh, uint32_t smss)
 {
+    _lost_cursor = _search_start(); // new marks may lie anywhere above HighRxt
     uint32_t sacked_segments_above = 0;
     uint32_t sacked_bytes_above = 0;
     for (auto it = _segments.rbegin(); it != _segments.rend(); ++it)
     {
+        _visits++;
         if (it->sacked)
         {
             sacked_segments_above += 1;
@@ -153,24 +198,61 @@ void SendScoreboard::mark_losses(uint32_t dup_thresh, uint32_t smss)
     }
 }
 
+uint32_t SendScoreboard::_search_start() const
+{
+    if (_segments.empty())
+    {
+        return 0;
+    }
+    if (!_high_rxt_valid || seq_before(_high_rxt, _segments.front().seq))
+    {
+        return _segments.front().seq;
+    }
+    return _high_rxt;
+}
+
+void SendScoreboard::_reset_high_rxt()
+{
+    // HighRxt goes back to HighACK: nothing above it is retransmitted yet.
+    _high_rxt_valid = !_segments.empty();
+    _high_rxt = _segments.empty() ? 0 : _segments.front().seq;
+    _lost_cursor = _high_rxt;
+    _speculative_cursor = _high_rxt;
+}
+
+void SendScoreboard::note_retransmitted(const SentSegment& segment)
+{
+    // RFC 6675: HighRxt is the highest octet retransmitted (rule 4's rescue
+    // excepted, which the caller does not report).
+    if (!_high_rxt_valid || seq_before(_high_rxt, segment.end_seq))
+    {
+        _high_rxt = segment.end_seq;
+        _high_rxt_valid = true;
+    }
+}
+
 void SendScoreboard::mark_all_lost()
 {
     for (SentSegment& entry : _segments)
     {
+        _visits++;
         if (!entry.sacked)
         {
             entry.lost = true;
             entry.rexmit_in_recovery = false;
         }
     }
+    _reset_high_rxt();
 }
 
 void SendScoreboard::start_recovery()
 {
     for (SentSegment& entry : _segments)
     {
+        _visits++;
         entry.rexmit_in_recovery = false;
     }
+    _reset_high_rxt();
 }
 
 uint32_t SendScoreboard::pipe() const
@@ -178,6 +260,7 @@ uint32_t SendScoreboard::pipe() const
     uint32_t pipe = 0;
     for (const SentSegment& entry : _segments)
     {
+        _visits++;
         if (entry.sacked)
         {
             continue;
@@ -195,15 +278,33 @@ uint32_t SendScoreboard::pipe() const
     return pipe;
 }
 
+// Both NextSeg() searches resume from a cursor rather than from the front.
+// Everything a cursor has passed is a non-candidate that stays one until the
+// next mark_losses() (a segment only stops being a candidate - it is SACKed or
+// retransmitted - except when new loss marks appear, which resets the rule-1
+// cursor to HighRxt). So all the searches for one ack together walk the
+// scoreboard about once, rather than once per segment sent: the difference
+// between O(n) and O(n^2) per ack, which a peer that forces a small MSS and
+// SACKs every other segment could otherwise turn into a CPU sink.
+
 SentSegment* SendScoreboard::next_lost()
 {
-    for (SentSegment& entry : _segments)
+    uint32_t from = _search_start();
+    if (_high_rxt_valid && seq_before(from, _lost_cursor))
     {
+        from = _lost_cursor;
+    }
+    for (size_t i = _first_index_at_or_after(from); i < _segments.size(); ++i)
+    {
+        _visits++;
+        SentSegment& entry = _segments[i];
         if (!entry.sacked && entry.lost && !entry.rexmit_in_recovery)
         {
+            _lost_cursor = entry.seq;
             return &entry;
         }
     }
+    _lost_cursor = _segments.empty() ? from : _segments.back().end_seq;
     return nullptr;
 }
 
@@ -211,24 +312,31 @@ SentSegment* SendScoreboard::next_speculative()
 {
     // The highest SACKed octet bounds the search: above it nothing is known
     // about the segments yet, and they are most likely just in flight.
-    auto highest_sacked =
-        std::find_if(_segments.rbegin(), _segments.rend(), [](const SentSegment& entry) { return entry.sacked; });
-    if (highest_sacked == _segments.rend())
+    if (!_have_high_sack)
     {
         return nullptr;
     }
-    uint32_t high_sack = highest_sacked->end_seq;
-    for (SentSegment& entry : _segments)
+    uint32_t from = _search_start();
+    if (_high_rxt_valid && seq_before(from, _speculative_cursor))
     {
-        if (!seq_at_or_before(entry.end_seq, high_sack))
+        from = _speculative_cursor;
+    }
+    for (size_t i = _first_index_at_or_after(from); i < _segments.size(); ++i)
+    {
+        _visits++;
+        SentSegment& entry = _segments[i];
+        if (!seq_at_or_before(entry.end_seq, _high_sack))
         {
-            break;
+            _speculative_cursor = entry.seq;
+            return nullptr;
         }
         if (!entry.sacked && !entry.rexmit_in_recovery)
         {
+            _speculative_cursor = entry.seq;
             return &entry;
         }
     }
+    _speculative_cursor = _segments.empty() ? from : _segments.back().end_seq;
     return nullptr;
 }
 
@@ -236,6 +344,7 @@ SentSegment* SendScoreboard::highest_unsacked()
 {
     for (auto it = _segments.rbegin(); it != _segments.rend(); ++it)
     {
+        _visits++;
         if (!it->sacked)
         {
             return &*it;

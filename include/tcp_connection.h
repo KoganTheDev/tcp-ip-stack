@@ -423,6 +423,8 @@ public:
         uint64_t recoveries = 0;             // entries into fast recovery
     };
     const Stats& stats() const { return _stats; }
+    // Scoreboard entries the sender has examined, for cost tests.
+    uint64_t scoreboard_visits() const { return _in_flight.visits(); }
 
 private:
     void _transition(TcpState new_state);
@@ -781,7 +783,8 @@ private:
     // `window` allow it.
     bool _send_one_new_segment(uint32_t pipe, uint32_t window);
     // Resends one in-flight segment and restarts its retransmit timer.
-    void _retransmit(SentSegment& segment);
+    // `rescue` marks RFC 6675's rule-4 retransmission, which leaves HighRxt.
+    void _retransmit(SentSegment& segment, bool rescue = false);
 
     SendSegmentFn _send_segment;
     DataReadyFn _on_data_ready;
@@ -860,6 +863,11 @@ private:
     };
 
     static constexpr uint16_t DEFAULT_LOCAL_MSS = 1460; // 1500 (typical Ethernet MTU) - 20 (IP) - 20 (TCP)
+    // The smallest peer MSS option honoured: Linux's TCP_MIN_SND_MSS, the
+    // CVE-2019-11479 fix. An MSS of 1 would make every byte a segment and
+    // every per-segment cost - scoreboard walks, headers, timers - a
+    // per-byte one; a smaller option is taken as 48.
+    static constexpr uint16_t MIN_PEER_MSS = 48;
     static constexpr uint16_t DEFAULT_PEER_MSS = 536; // RFC 793's fallback when a peer's SYN carries no MSS option
     static constexpr uint8_t WINDOW_SCALE_SHIFT = 1; // this stack's advertised shift
     // Option sizes as Tcp serializes them: timestamps are two NOPs + 10
