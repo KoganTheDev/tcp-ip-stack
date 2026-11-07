@@ -9,14 +9,11 @@ if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     message(FATAL_ERROR "TCPIP_BUILD_FUZZERS needs clang (libFuzzer); use the fuzz preset")
 endif()
 
-# See the comment in that file: src/ does not link at -O1 under clang without it.
-set(FUZZ_LINK_WORKAROUND ${PROJECT_SOURCE_DIR}/fuzz/bytes_instantiations.cpp)
-
 set(FUZZ_PARSERS ethernet ipv4 tcp udp icmp arp dhcp dns)
 set(FUZZ_HARNESSES ${FUZZ_PARSERS} ip_reassembler stack)
 
 foreach(name IN LISTS FUZZ_HARNESSES)
-    set(sources ${PROJECT_SOURCE_DIR}/fuzz/${name}.cpp ${FUZZ_LINK_WORKAROUND})
+    set(sources ${PROJECT_SOURCE_DIR}/fuzz/${name}.cpp)
     # The stateful harness builds its handshake frames with the simulator's
     # frame builder, which is test code and lives under tests/.
     if(name STREQUAL "stack")
@@ -33,6 +30,6 @@ endforeach()
 # a few edge cases. Run by hand when the seeds should change (`make fuzz-seeds`);
 # the result is committed, so a fuzz run never needs it.
 add_executable(fuzz_gen_corpus ${PROJECT_SOURCE_DIR}/fuzz/gen_corpus.cpp
-    ${PROJECT_SOURCE_DIR}/tests/src/sim_tcp_frame.cpp ${FUZZ_LINK_WORKAROUND})
+    ${PROJECT_SOURCE_DIR}/tests/src/sim_tcp_frame.cpp)
 target_include_directories(fuzz_gen_corpus PRIVATE ${PROJECT_SOURCE_DIR}/tests/include)
 target_link_libraries(fuzz_gen_corpus PRIVATE tcpip)

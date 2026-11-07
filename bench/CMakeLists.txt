@@ -26,13 +26,10 @@ file(GLOB BENCH_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/bench/*.cpp)
 
 # The end-to-end benchmark drives the same network simulator the tests use, so
 # its sources are compiled in from tests/src/ rather than copied. They are
-# plain C++ (no GoogleTest). bytes_instantiations.cpp is the link workaround
-# explained in fuzz/bytes_instantiations.cpp: an optimised build does not link
-# without it.
+# plain C++ (no GoogleTest).
 add_executable(tcpip_bench ${BENCH_SOURCES}
     ${PROJECT_SOURCE_DIR}/tests/src/sim_network.cpp
     ${PROJECT_SOURCE_DIR}/tests/src/sim_netem_channel.cpp
-    ${PROJECT_SOURCE_DIR}/tests/src/sim_tcp_frame.cpp
-    ${PROJECT_SOURCE_DIR}/fuzz/bytes_instantiations.cpp)
+    ${PROJECT_SOURCE_DIR}/tests/src/sim_tcp_frame.cpp)
 target_include_directories(tcpip_bench PRIVATE ${PROJECT_SOURCE_DIR}/tests/include)
 target_link_libraries(tcpip_bench PRIVATE tcpip benchmark::benchmark)

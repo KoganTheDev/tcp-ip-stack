@@ -44,3 +44,20 @@ public:
     template <typename T>
     void append_int(T value);
 };
+
+// Defined here, beside its declaration, so every caller of Bytes sees it.
+// It used to live in utils.h, which dns.cpp and dhcp_client.cpp never
+// included: they linked only because some other translation unit happened
+// to emit the instantiation, which optimised (clang -O1, g++ -O2) builds stop
+// doing.
+template <typename T>
+void Bytes::append_int(T value)
+{
+    size_t offset = this->size();
+    this->resize(offset + sizeof(T));
+    for (size_t i = 0; i < sizeof(T); i++)
+    {
+        (*this)[offset + sizeof(T) - i - 1] = static_cast<byte_t>(value & 0xff);
+        value /= 0x100;
+    }
+}
