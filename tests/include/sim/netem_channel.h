@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <random>
@@ -115,6 +116,13 @@ public:
     LinkParams& params(Side from) { return _directions[from].params; }
     const LinkStats& stats(Side from) const { return _directions[from].stats; }
 
+    // A deterministic drop on top of the random impairments: called with
+    // every frame written from `from`, and the frame is lost if it returns
+    // true (counted in stats().lost). For a test that needs exactly one
+    // particular segment gone. Unset (the default) drops nothing.
+    using DropFilter = std::function<bool(const Bytes& frame)>;
+    void set_drop_filter(Side from, DropFilter filter) { _directions[from].drop_filter = std::move(filter); }
+
     // Nothing in flight in either direction.
     bool idle() const { return _directions[0].in_flight.empty() && _directions[1].in_flight.empty(); }
     // Some frame is ready to be read right now, at either end.
@@ -143,6 +151,7 @@ private:
         // Serialization start times of frames still waiting for the wire, to
         // enforce queue_limit.
         std::deque<uint64_t> waiting_starts_us;
+        DropFilter drop_filter;
     };
 
     void _transmit(Side from, const Bytes& frame);

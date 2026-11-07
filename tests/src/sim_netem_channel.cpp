@@ -78,6 +78,12 @@ void NetemChannel::_transmit(Side from, const Bytes& frame)
         _transmitted_capture->record(now_us, frame);
     }
 
+    if (direction.drop_filter && direction.drop_filter(frame))
+    {
+        direction.stats.lost++;
+        return;
+    }
+
     if (params.mtu != 0 && frame.size() > ETHERNET_HEADER_LENGTH + params.mtu)
     {
         direction.stats.mtu_dropped++;
