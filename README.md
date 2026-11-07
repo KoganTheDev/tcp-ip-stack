@@ -198,6 +198,26 @@ conflates "how often am I polled" with "how much time has passed", so an event l
 stalls for two seconds delivers one tick and the stack concludes half a second went by -
 retransmissions then run late by exactly however overloaded the machine was.
 
+**Timers driven by deadlines, not by a tick.** Measuring elapsed time fixed what a tick
+*means*; it left how often one arrives. The epoll server used a 500 ms periodic timerfd,
+so 500 ms was the resolution of every timer in the stack: a delayed ACK due 200 ms after
+its data went out up to 300 ms late, the whole of RFC 1122's 500 ms ceiling, and a
+retransmission at the 200 ms minimum RTO could wait as long again. And every tick walked
+every connection to decrement countdowns that were almost never due - linear in the
+connection table for nothing. So every timer is now the moment it is due rather than a
+countdown. Each `TcpConnection` reports its earliest deadline whenever one is armed or
+disarmed; `NetworkStack` keeps a min-heap of (deadline, connection id), and
+`on_time_passed` runs only the connections at its front - 5 ns per call with 10,000 idle
+connections, against 106 us when it walked them all. `ms_until_next_timer()` reports how
+long until the earliest timer anywhere in the stack (connections, ARP, reassembly, DHCP,
+DNS), and both applications sleep exactly that long: the epoll server re-arms a one-shot
+timerfd after every pass of its loop and disarms it when nothing is pending, so an idle
+server does not wake at all. Moving deadlines are cheap on purpose: an ack that pushes
+the retransmit timer later pushes nothing onto the heap - the earlier entry surfaces,
+finds nothing due, and is re-queued once per round trip. Heap entries name connections by
+id, so one for a connection reaped in the meantime is recognised and dropped rather than
+dereferenced.
+
 **Congestion control as a policy, not as the protocol.** Until it was pulled behind an
 interface, `TcpConnection` knew that a window halved on loss and grew by one MSS per RTT
 - which are Reno's answers, not TCP's. The seam sits where the two algorithms actually
@@ -376,6 +396,14 @@ which is how `SimTcp.ATransferCrossesTheSequenceNumberWrap` puts both ISNs just 
 Focused scenarios (a lost SYN-ACK, one lost segment, an odd MTU, the RTO under loss) live in
 `test_sim_tcp.cpp`; `NetemChannel::set_drop_filter()` drops one chosen frame.
 
+Virtual time advances event to event: each step jumps straight to the earliest of the next
+frame due on any link and the next timer due in any stack (`ms_until_next_timer()`), so a
+minute of TIME_WAIT is one step rather than 60,000. Nothing can happen in between, and
+`SimNetworkTest.EventDrivenSteppingMatchesOneMillisecondSteppingFrameForFrame` holds it to
+that: a lossy transfer, close and TIME_WAIT produce the same frames, byte for byte and at the
+same microsecond, as stepping one millisecond at a time (`set_event_driven(false)`). A stack
+that failed to report a deadline would make the two diverge at that frame.
+
 - **Property tests** (`test_sim_transfer.cpp`, ctest label `sim`): per seed, a random link and
   a random payload of up to 1 MiB, sent one way or echoed; the bytes must arrive intact and in
   order and both connections must close. `make sim` runs `SIM_SEEDS` seeds (default 200, a
@@ -516,6 +544,10 @@ branch > `gh-pages` / root**. Until then the numbers are recorded but there is n
 
 Profiled with `perf` and `callgrind` under concurrent load, not guessed at:
 
+- `on_time_passed()` visited every connection on every timer tick to decrement its
+  countdowns, nearly all of them for nothing: 106 us per call with 10,000 idle
+  connections. The connection timers are now deadlines in a min-heap, so a call costs
+  the timers that are due - 5 ns with the same 10,000 (`bench/bench_timers.cpp`).
 - `_reap_closed_connections()` scanned every connection on every event-loop tick and
   was 13.1% of total self time, the single largest cost in the binary. Replaced with an
   event-driven queue fed by the existing state-change callback: O(closed since last

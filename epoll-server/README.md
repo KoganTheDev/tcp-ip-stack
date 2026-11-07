@@ -33,6 +33,24 @@ would go) off the reactor thread, then hands the result back through
 `TcpConnection::send()`) itself. `EPOLLONESHOT` isn't used or needed here, since
 connections are never registered as separate epoll fds in the first place.
 
+### Timers
+
+The stack has no clock and no thread of its own: the reactor tells it how much time
+passed (`NetworkStack::on_time_passed`, measured with `clock_gettime(CLOCK_MONOTONIC)`)
+at the top of every pass of the loop, whatever woke it, so frames are processed against
+a current clock and anything due fires. What wakes the loop when nothing arrives is a
+one-shot `timerfd`, re-armed at the start of each pass for
+`NetworkStack::ms_until_next_timer()` - the earliest deadline of any timer in the stack:
+a delayed ACK, a retransmission, a persist or keepalive probe, TIME_WAIT, an ARP retry.
+With nothing pending it is disarmed and an idle server sleeps until a frame arrives.
+
+It used to be a periodic 500 ms timer, which made 500 ms the resolution of every
+timeout in the stack (a 200 ms delayed ACK went out at the next tick, up to 500 ms after
+its data) and woke the server twice a second for nothing. The conversion from "ms until
+the next timer" to the `itimerspec` is `timer_setting_for()` in
+`include/timer_setting.h`; the one subtlety is that an `it_value` of {0, 0} *disarms* a
+timerfd, so "due now" is armed as 1 ns.
+
 Dispatch is tracked by `TcpConnection::get_id()`, not by raw pointer - a pointer held
 across the thread-pool/completion-queue gap could dangle if `NetworkStack` reaps the
 connection first; `find_connection(id)` safely returns `nullptr` instead. It's also
