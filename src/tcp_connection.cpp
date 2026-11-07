@@ -473,7 +473,13 @@ Bytes TcpConnection::read(size_t max_bytes)
     // this it would sit blocked until its own persist probe happened to ask -
     // correct, but a whole probe interval slower than it needs to be. Only
     // worth a segment when the window was actually shut.
-    if (window_before == 0 && _advertised_window() > 0
+    // RFC 1122 4.2.3.3: a window that had fallen below one segment is as
+    // useless to the sender as a shut one, so reopening it past one segment
+    // (min(RCV.BUFF / 2, MSS)) is announced too.
+    uint32_t useful = std::min<uint32_t>(RECEIVE_BUFFER_CAPACITY / 2, _effective_mss);
+    bool reopened =
+        (window_before == 0 && _advertised_window() > 0) || (window_before < useful && _advertised_window() >= useful);
+    if (reopened
         && (_state == TcpState::ESTABLISHED || _state == TcpState::FIN_WAIT_1 || _state == TcpState::FIN_WAIT_2))
     {
         LOG_DEBUG("TcpConnection[" << _id << "] window reopened to " << _advertised_window()
@@ -631,7 +637,9 @@ void TcpConnection::_arm_or_disarm_persist()
     // their window updates); a cwnd-only block likewise clears itself as
     // in-flight data is acked. Only a zero peer window with an empty pipe can
     // deadlock on a single lost window-update ack.
-    bool should_persist = (_peer_window == 0) && !_send_queue.empty() && _in_flight.empty();
+    // A window that is open but too small for the next segment is the same
+    // deadlock: nothing goes out, so no ack comes back to say it grew.
+    bool should_persist = !_send_queue.empty() && _in_flight.empty() && _peer_window < _send_queue.front().size();
     if (should_persist)
     {
         if (_persist_deadline_ms == 0) // arm fresh; never restart an already-running timer

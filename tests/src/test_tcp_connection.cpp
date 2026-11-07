@@ -2905,3 +2905,45 @@ TEST(TcpConnection, ASegmentFillingAGapIsAckedAtOnce)
     ASSERT_EQ(sent.size(), 2u) << "the gap-filling segment must be acked immediately, not delayed";
     ASSERT_EQ(sent[1].ack, 701u) << "acking everything now contiguous";
 }
+
+// A peer window that is open but smaller than the next segment, with nothing
+// in flight, is as stuck as a shut one: nothing can be sent, so no ack will
+// ever come back to say the window grew. The persist timer has to cover it
+// too (RFC 9293 3.8.6.1), or the connection waits forever.
+TEST(TcpConnection, AWindowTooSmallForTheNextSegmentIsProbed)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent); // MSS 536
+    connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 100));
+    connection->send(Bytes(536u));
+    ASSERT_TRUE(sent.empty()) << "precondition: the segment does not fit the 100-byte window";
+
+    advance_ms(*connection, 2000);
+    ASSERT_FALSE(sent.empty()) << "a probe must go out so the peer re-advertises its window";
+}
+
+// RFC 1122 4.2.3.3 (receiver silly-window avoidance): the window is
+// re-advertised once it grows by min(RCV.BUFF / 2, MSS). A window that had
+// fallen below one segment is as useless to the sender as a shut one, so a
+// read that reopens it must say so, not only a read that reopens a zero one.
+TEST(TcpConnection, ReadingReopensAWindowThatHadFallenBelowOneSegment)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent); // MSS 536
+    uint32_t seq = 501;
+    uint32_t fill = TcpConnection::RECEIVE_BUFFER_CAPACITY - 100;
+    while (fill > 0)
+    {
+        uint32_t piece = std::min<uint32_t>(fill, 60000);
+        connection->on_segment(*make_incoming_segment(seq, 1001, FLAG_ACK, Bytes(piece)));
+        seq += piece;
+        fill -= piece;
+    }
+    connection->on_time_passed(500); // flush the delayed ack
+    size_t before = sent.size();
+    ASSERT_LT(sent.back().window, 536u) << "precondition: the advertised window is below one segment";
+
+    connection->read();
+    ASSERT_GT(sent.size(), before) << "the read must send a window update";
+    ASSERT_GE(sent.back().window, 536u);
+}
