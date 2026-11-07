@@ -65,6 +65,16 @@ simultaneous close rather than folding it into `FIN_WAIT_2`. On top of that:
   "I have everything below this" and nothing else, so one lost segment hides the eight
   behind it that arrived perfectly; SACK names what did arrive, so only the holes are
   resent
+- **SACK-based loss recovery** (RFC 6675) when SACK is negotiated: a per-segment
+  scoreboard (`SendScoreboard`) with IsLost(), the pipe estimate and NextSeg() rules 1-4,
+  rescue retransmission included; recovery entered on three duplicates or as soon as
+  IsLost(HighACK+1) holds, and left at RecoveryPoint. After a timeout the SACK
+  information is kept (section 5.1): every unSACKed segment is presumed lost and refilled
+  in order, skipping what the peer holds. How much each ack may send during recovery is
+  **Proportional Rate Reduction** (RFC 6937, with the slow start reduction bound), towards
+  the ssthresh the Reno or CUBIC policy chose. Without SACK it is NewReno (RFC 6582):
+  a partial ack resends the next hole and stays in recovery. Three losses in one flight
+  cost three retransmissions and no timeout (`SimRecovery` in the test suite)
 - **Keepalive** (RFC 1122 4.2.3.6), off by default as the RFC requires, probing one byte
   *behind* SND.NXT because that is the only segment that compels a reply without moving
   the stream
@@ -277,9 +287,10 @@ limit by a peer.
 
 These are documented decisions, not gaps that were missed:
 
-- **SACK recovery is not full RFC 6675.** The blocks themselves are sent and honoured
-  (see above); what is missing is the pipe estimate driving transmission during recovery,
-  and rescue retransmission. The scoreboard both would need does exist.
+- **No PRR without SACK, and no RACK/TLP, D-SACK or F-RTO.** Without SACK, recovery is
+  NewReno's window inflation; there is no SACK-less pipe estimate for PRR to work from.
+  Loss is detected by duplicate counts (DupThresh 3) rather than by time (RFC 8985), a
+  lost retransmission still costs a timeout, and a spurious timeout is not undone.
 - **No ECMP.** A route is keyed by destination and prefix, so two routes to one prefix by
   different interfaces cannot coexist. Equal-cost multipath needs a per-flow hash to keep
   a connection's packets on one path, which is a different project.
@@ -554,7 +565,8 @@ microbenchmarks (fetched at a pinned release): the Internet checksum at 64, 576,
 9000 bytes; parsing and serializing Ethernet + IPv4 + TCP with options; parsing a DNS
 response with name compression; the TCP reorder buffer, including a many-gaps worst case;
 the SACK scoreboard walk; and a simulated bulk transfer through the network simulator
-(bytes per wall second, with no loss and with 1% loss).
+(bytes per wall second, with no loss, 1% and 5% loss, and the simulated completion time
+as `virtual_ms`).
 
 ```sh
 make bench                                     # Release (-O2 -g)

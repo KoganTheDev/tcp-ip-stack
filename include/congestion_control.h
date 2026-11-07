@@ -19,8 +19,9 @@
 // from what looked tidy. Reno and CUBIC agree on almost everything:
 //
 //  - slow start, verbatim, including the ssthresh boundary
-//  - the RFC 5681 fast-recovery bookkeeping (inflate the window by one MSS per
-//    duplicate ack, deflate to ssthresh when the retransmit is acked)
+//  - the fast-recovery bookkeeping: RFC 5681/6582 window inflation without
+//    SACK, RFC 6937 PRR with it (the connection computes PRR's cwnd and sets
+//    it through set_recovery_window()), and cwnd = ssthresh at the end
 //  - that a retransmit timeout is a harsher signal than three duplicate acks
 //    and collapses the window to one segment
 //
