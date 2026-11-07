@@ -57,8 +57,10 @@ namespace
 class SimRecovery : public SimFixture
 {
 protected:
-    // drop: called with every data segment the client sends, numbered from 1;
-    // true loses it. Null for none (random loss comes from `wire`).
+    // drop: called with the first transmission of every data segment the
+    // client sends, numbered from 1; true loses it. Retransmissions are never
+    // dropped by it (or numbered), so "segment 60" means the same bytes
+    // whatever the recovery code resends. Null for none (random loss comes from `wire`).
     Result transfer(uint64_t seed, const LinkParams& wire, size_t size,
                     const std::function<bool(int index)>& drop = nullptr,
                     CongestionControlAlgorithm algorithm = CongestionControlAlgorithm::CUBIC)
@@ -72,6 +74,7 @@ protected:
         server_stack.listen(SERVER_PORT);
 
         int data_segments = 0;
+        std::set<uint32_t> seen;
         if (drop)
         {
             link.set_drop_filter(NetemChannel::A,
@@ -81,6 +84,8 @@ protected:
                                      std::string error;
                                      if (!tcp_frame::parse(frame, segment, error) || segment.payload.empty())
                                          return false;
+                                     if (!seen.insert(segment.seq).second)
+                                         return false; // a retransmission
                                      return drop(++data_segments);
                                  });
         }
