@@ -73,13 +73,13 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
       // are declared regardless of the order written here, so any divergence
       // is a lie about what actually happens - and a real hazard the moment
       // one member's initialiser reads another.
-      _unsacked_in_flight_bytes(0), _send_queued_bytes(0), _fin_requested(false), _time_wait_ms_remaining(0),
-      _now_ms(1), _srtt_scaled(0), _rttvar_scaled(0), _has_rtt_sample(false), _rto_ms(INITIAL_RTO_MS),
-      _persist_ms_remaining(0), _persist_backoff(0), _ack_pending(false), _ack_delay_ms_remaining(0),
-      _keepalive_enabled(false), _keepalive_idle_ms_remaining(KEEPALIVE_IDLE_MS), _keepalive_probe_ms_remaining(0),
-      _keepalive_probes_sent(0), _sack_permitted(false), _last_out_of_order_seq(0), _timestamps_negotiated(false),
-      _ts_recent(0), _have_ts_recent(false), _local_mss(local_mss), _peer_mss(DEFAULT_PEER_MSS),
-      _effective_mss(std::min(local_mss, DEFAULT_PEER_MSS)), _window_scaling_negotiated(false), _peer_window_scale(0),
+      _unsacked_in_flight_bytes(0), _send_queued_bytes(0), _fin_requested(false), _time_wait_deadline_ms(0), _now_ms(1),
+      _srtt_scaled(0), _rttvar_scaled(0), _has_rtt_sample(false), _rto_ms(INITIAL_RTO_MS), _persist_deadline_ms(0),
+      _persist_backoff(0), _ack_pending(false), _ack_deadline_ms(0), _keepalive_enabled(false),
+      _keepalive_deadline_ms(1 + KEEPALIVE_IDLE_MS), _keepalive_probes_sent(0), _sack_permitted(false),
+      _last_out_of_order_seq(0), _timestamps_negotiated(false), _ts_recent(0), _have_ts_recent(false),
+      _local_mss(local_mss), _peer_mss(DEFAULT_PEER_MSS), _effective_mss(std::min(local_mss, DEFAULT_PEER_MSS)),
+      _window_scaling_negotiated(false), _peer_window_scale(0),
       _peer_window(local_mss), // conservative placeholder until the handshake's real window arrives
       _max_peer_window(local_mss), _congestion(make_congestion_control(algorithm)), _dup_ack_count(0),
       _in_fast_recovery(false), _send_segment(std::move(send_segment)), _receive_queued_bytes(0)
@@ -347,7 +347,7 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
     // discharges any pending delayed ack - exactly the piggyback delayed ack
     // hopes for
     _ack_pending = false;
-    _ack_delay_ms_remaining = 0;
+    _ack_deadline_ms = 0;
 
     size_t consumed = payload.size();
     if (flags & FLAG_SYN)
@@ -430,7 +430,7 @@ void TcpConnection::_send_pure_ack()
     // blocks matter, and with no payload every block that fits goes on.
     _transmit(FLAG_ACK, _send_next, Bytes());
     _ack_pending = false;
-    _ack_delay_ms_remaining = 0;
+    _ack_deadline_ms = 0;
 }
 
 void TcpConnection::_schedule_or_send_ack()
@@ -446,7 +446,7 @@ void TcpConnection::_schedule_or_send_ack()
     else
     {
         _ack_pending = true;
-        _ack_delay_ms_remaining = DELAYED_ACK_MS;
+        _ack_deadline_ms = _now_ms + DELAYED_ACK_MS;
     }
 }
 
@@ -454,6 +454,7 @@ void TcpConnection::accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss, bo
                                         uint8_t peer_window_scale, bool peer_supports_timestamps,
                                         uint32_t peer_timestamp, bool peer_permits_sack)
 {
+    EntryScope scope(*this);
     _sack_permitted = peer_permits_sack;
     _set_recv_next(peer_isn + 1); // the SYN itself consumes one sequence number
     _peer_mss = peer_mss != 0 ? peer_mss : DEFAULT_PEER_MSS;
@@ -474,6 +475,7 @@ void TcpConnection::accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss, bo
 
 void TcpConnection::accept_cookie_handshake(uint32_t peer_isn, uint16_t peer_mss)
 {
+    EntryScope scope(*this);
     // Our SYN-ACK (seq = initial_seq, the cookie) went out from no state at
     // all, and the peer's ACK of it is what got us here - so its SYN is
     // consumed and acknowledged, and nothing is in flight.
@@ -492,6 +494,7 @@ void TcpConnection::accept_cookie_handshake(uint32_t peer_isn, uint16_t peer_mss
 
 void TcpConnection::set_data_ready_callback(DataReadyFn callback)
 {
+    EntryScope scope(*this);
     _on_data_ready = std::move(callback);
 
     // Data can already be waiting: a data-carrying segment may arrive in the
@@ -506,6 +509,7 @@ void TcpConnection::set_data_ready_callback(DataReadyFn callback)
 
 Bytes TcpConnection::read(size_t max_bytes)
 {
+    EntryScope scope(*this);
     uint32_t window_before = _advertised_window();
 
     Bytes taken;
@@ -546,6 +550,7 @@ Bytes TcpConnection::read(size_t max_bytes)
 
 void TcpConnection::reduce_effective_mss(uint16_t path_mss)
 {
+    EntryScope scope(*this);
     // RFC 1122's floor: every IPv4 host must handle a 576-byte datagram, so
     // 536 bytes of payload is the smallest MSS worth honouring. A report below
     // it is either a broken router or someone trying to make this stack emit
@@ -565,6 +570,7 @@ void TcpConnection::reduce_effective_mss(uint16_t path_mss)
 
 void TcpConnection::initiate_connect()
 {
+    EntryScope scope(*this);
     _active_open = true;
     _transition(TcpState::SYN_SENT);
     _send_flags(FLAG_SYN, Bytes(), false); // active open: bare SYN, nothing to ack yet
@@ -903,15 +909,15 @@ void TcpConnection::_arm_or_disarm_persist()
     bool should_persist = (_peer_window == 0) && !_send_queue.empty() && _in_flight.empty();
     if (should_persist)
     {
-        if (_persist_ms_remaining == 0) // arm fresh; never restart an already-running timer
+        if (_persist_deadline_ms == 0) // arm fresh; never restart an already-running timer
         {
             _persist_backoff = 0;
-            _persist_ms_remaining = PERSIST_BASE_MS;
+            _persist_deadline_ms = _now_ms + PERSIST_BASE_MS;
         }
     }
     else
     {
-        _persist_ms_remaining = 0;
+        _persist_deadline_ms = 0;
         _persist_backoff = 0;
     }
 }
@@ -946,14 +952,14 @@ void TcpConnection::_send_zero_window_probe()
 
 void TcpConnection::set_keepalive(bool enabled)
 {
+    EntryScope scope(*this);
     _keepalive_enabled = enabled;
     _reset_keepalive();
 }
 
 void TcpConnection::_reset_keepalive()
 {
-    _keepalive_idle_ms_remaining = KEEPALIVE_IDLE_MS;
-    _keepalive_probe_ms_remaining = 0;
+    _keepalive_deadline_ms = _now_ms + KEEPALIVE_IDLE_MS;
     _keepalive_probes_sent = 0;
 }
 
@@ -973,10 +979,10 @@ void TcpConnection::_send_keepalive_probe()
                                << KEEPALIVE_MAX_PROBES << " at seq=" << (_send_next - 1));
     _transmit(FLAG_ACK, _send_next - 1, Bytes());
     _keepalive_probes_sent += 1;
-    _keepalive_probe_ms_remaining = KEEPALIVE_PROBE_INTERVAL_MS;
+    _keepalive_deadline_ms = _now_ms + KEEPALIVE_PROBE_INTERVAL_MS;
 }
 
-void TcpConnection::_run_keepalive(uint32_t elapsed_ms)
+void TcpConnection::_run_keepalive()
 {
     // ESTABLISHED only. In every other state some other timer already owns the
     // question of how long to wait - TIME_WAIT counts down 2*MSL, a half-close
@@ -988,30 +994,24 @@ void TcpConnection::_run_keepalive(uint32_t elapsed_ms)
         return;
     }
 
-    if (_keepalive_probes_sent > 0)
+    // One deadline serves both phases - the idle wait before the first probe
+    // and the interval between probes. The idle wait is measured from the
+    // last segment heard. (It used to be a countdown that paused while data
+    // was in flight; but the pipe only ever empties on an ack, which restarts
+    // the wait anyway, so the two measure the same thing.)
+    if (_now_ms < _keepalive_deadline_ms)
     {
-        _keepalive_probe_ms_remaining -= static_cast<int>(elapsed_ms);
-        if (_keepalive_probe_ms_remaining > 0)
-        {
-            return;
-        }
-
-        if (_keepalive_probes_sent >= KEEPALIVE_MAX_PROBES)
-        {
-            LOG_WARNING("TcpConnection[" << _id << "] peer unresponsive after " << _keepalive_probes_sent
-                                         << " keepalive probes - closing");
-            _transition(TcpState::CLOSED);
-            return;
-        }
-        _send_keepalive_probe();
         return;
     }
 
-    _keepalive_idle_ms_remaining -= static_cast<int>(elapsed_ms);
-    if (_keepalive_idle_ms_remaining <= 0)
+    if (_keepalive_probes_sent >= KEEPALIVE_MAX_PROBES)
     {
-        _send_keepalive_probe();
+        LOG_WARNING("TcpConnection[" << _id << "] peer unresponsive after " << _keepalive_probes_sent
+                                     << " keepalive probes - closing");
+        _transition(TcpState::CLOSED);
+        return;
     }
+    _send_keepalive_probe();
 }
 
 void TcpConnection::_update_rto_from_sample(uint32_t rtt_ms)
@@ -1182,6 +1182,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
             // collapsing cwnd to one MSS and cancelling fast recovery, a
             // second and much harsher reaction to what is one loss event.
             oldest.retransmit_ms_remaining = _rto_ms;
+            oldest.retransmit_deadline_ms = _now_ms + static_cast<uint64_t>(_rto_ms);
             _congestion->on_fast_retransmit(_bytes_in_flight(), DUP_ACK_FAST_RETRANSMIT_THRESHOLD, _now_ms);
             _in_fast_recovery = true;
             LOG_DEBUG("TcpConnection[" << _id << "] fast retransmit at seq=" << oldest.seq
@@ -1283,7 +1284,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
 
     if (acked_anything)
     {
-        _stalled_ms = 0; // SND.UNA moved: progress, so the user timeout starts over
+        _stall_since_ms = _now_ms; // SND.UNA moved: progress, so the user timeout starts over
     }
 
     // A timestamp echo beats the ack clock, and beats it precisely where the
@@ -1356,7 +1357,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         if (_state == TcpState::CLOSING)
         {
             _transition(TcpState::TIME_WAIT);
-            _time_wait_ms_remaining = TIME_WAIT_MS;
+            _time_wait_deadline_ms = _now_ms + TIME_WAIT_MS;
             return;
         }
         if (_state == TcpState::LAST_ACK)
@@ -1383,7 +1384,7 @@ void TcpConnection::_handle_fin(uint32_t fin_seq)
         // resend the ack and restart the wait, without touching sequence
         // state again (it was already consumed by the first FIN)
         _send_pure_ack();
-        _time_wait_ms_remaining = TIME_WAIT_MS;
+        _time_wait_deadline_ms = _now_ms + TIME_WAIT_MS;
         return;
     }
 
@@ -1421,7 +1422,7 @@ void TcpConnection::_handle_fin(uint32_t fin_seq)
     {
         _send_pure_ack();
         _transition(TcpState::TIME_WAIT);
-        _time_wait_ms_remaining = TIME_WAIT_MS;
+        _time_wait_deadline_ms = _now_ms + TIME_WAIT_MS;
         return;
     }
 
@@ -1438,6 +1439,7 @@ void TcpConnection::_handle_fin(uint32_t fin_seq)
 
 void TcpConnection::on_segment(const Tcp& segment)
 {
+    EntryScope scope(*this);
     // Anything at all from the peer means the connection is not idle - even a
     // segment this stack is about to reject. Whether it was well-formed is a
     // different question from whether the peer is still there.
@@ -1772,6 +1774,7 @@ void TcpConnection::on_segment(const Tcp& segment)
 
 void TcpConnection::on_time_passed(uint32_t elapsed_ms)
 {
+    EntryScope scope(*this);
     if (_state == TcpState::CLOSED)
     {
         // idempotent no-op: in normal operation NetworkStack reaps a CLOSED
@@ -1786,13 +1789,143 @@ void TcpConnection::on_time_passed(uint32_t elapsed_ms)
 
     // the clock RTT is measured against - advanced before anything else, so a
     // segment sent from within this same call is stamped with the moment it
-    // actually went out
-    _now_ms += elapsed_ms;
+    // actually went out. On an external clock the owner has advanced it
+    // already, and the scope above has just read it.
+    if (_external_clock == nullptr)
+    {
+        _now_ms += elapsed_ms;
+    }
+    _run_timers();
+}
+
+void TcpConnection::run_due_timers()
+{
+    EntryScope scope(*this);
+    _run_timers();
+}
+
+uint64_t TcpConnection::now_ms() const
+{
+    return _external_clock != nullptr ? *_external_clock + _clock_offset : _now_ms;
+}
+
+void TcpConnection::use_external_clock(const uint64_t* clock_ms)
+{
+    // Unsigned wraparound makes the offset work whichever clock is ahead.
+    _clock_offset = _now_ms - *clock_ms;
+    _external_clock = clock_ms;
+}
+
+void TcpConnection::set_user_timeout(uint32_t ms)
+{
+    EntryScope scope(*this);
+    _user_timeout_ms = ms;
+}
+
+void TcpConnection::_track_stall()
+{
+    bool outstanding = !_in_flight.empty() || !_send_queue.empty();
+    if (!outstanding)
+    {
+        _stall_clock_running = false;
+    }
+    else if (!_stall_clock_running)
+    {
+        _stall_clock_running = true;
+        _stall_since_ms = _now_ms;
+    }
+}
+
+void TcpConnection::_start_retransmit_timer()
+{
+    InFlightSegment* oldest = _oldest_unsacked_segment();
+    if (oldest != nullptr && oldest->retransmit_deadline_ms == 0)
+    {
+        oldest->retransmit_deadline_ms = _now_ms + static_cast<uint64_t>(oldest->retransmit_ms_remaining);
+    }
+}
+
+void TcpConnection::_refresh_timer_deadline()
+{
+    if (_state != TcpState::CLOSED)
+    {
+        _track_stall();
+        _start_retransmit_timer();
+    }
+    uint64_t deadline = next_deadline_ms();
+    if (deadline != _reported_deadline_ms)
+    {
+        _reported_deadline_ms = deadline;
+        if (_on_timer_changed)
+        {
+            _on_timer_changed();
+        }
+    }
+}
+
+uint64_t TcpConnection::next_deadline_ms() const
+{
+    // Mirrors _run_timers() branch for branch: a timer counts here exactly
+    // when _run_timers() would look at it. One counted here that _run_timers()
+    // skips would be a deadline that never clears - a caller woken for it
+    // forever, finding nothing to do.
+    if (_state == TcpState::CLOSED)
+    {
+        return NO_DEADLINE;
+    }
+    if (_state == TcpState::TIME_WAIT)
+    {
+        return _time_wait_deadline_ms;
+    }
+
+    uint64_t now = now_ms();
+    uint64_t deadline = NO_DEADLINE;
+    if (_ack_pending)
+    {
+        deadline = std::min(deadline, _ack_deadline_ms);
+    }
+    if (_user_timeout_ms > 0 && (!_in_flight.empty() || !_send_queue.empty()))
+    {
+        uint64_t since = _stall_clock_running ? _stall_since_ms : now;
+        deadline = std::min(deadline, since + _user_timeout_ms);
+    }
+    if (_in_flight.empty())
+    {
+        if (_persist_deadline_ms != 0)
+        {
+            deadline = std::min(deadline, _persist_deadline_ms);
+        }
+        else if (_keepalive_enabled && _state == TcpState::ESTABLISHED)
+        {
+            deadline = std::min(deadline, _keepalive_deadline_ms);
+        }
+        return deadline;
+    }
+
+    for (const InFlightSegment& entry : _in_flight)
+    {
+        if (!entry.sacked)
+        {
+            uint64_t retransmit_at = entry.retransmit_deadline_ms != 0
+                                         ? entry.retransmit_deadline_ms
+                                         : now + static_cast<uint64_t>(entry.retransmit_ms_remaining);
+            deadline = std::min(deadline, retransmit_at);
+            break;
+        }
+    }
+    return deadline;
+}
+
+void TcpConnection::_run_timers()
+{
+    if (_state == TcpState::CLOSED)
+    {
+        return;
+    }
 
     if (_state == TcpState::TIME_WAIT)
     {
-        _time_wait_ms_remaining -= static_cast<int>(elapsed_ms);
-        if (_time_wait_ms_remaining <= 0)
+        if (_now_ms >= _time_wait_deadline_ms)
         {
             _transition(TcpState::CLOSED);
         }
@@ -1801,13 +1934,9 @@ void TcpConnection::on_time_passed(uint32_t elapsed_ms)
 
     // a delayed ack that never got coalesced or piggybacked must still be sent
     // within the delay bound, so the peer's own send window keeps advancing
-    if (_ack_pending)
+    if (_ack_pending && _now_ms >= _ack_deadline_ms)
     {
-        _ack_delay_ms_remaining -= static_cast<int>(elapsed_ms);
-        if (_ack_delay_ms_remaining <= 0)
-        {
-            _send_pure_ack();
-        }
+        _send_pure_ack();
     }
 
     // The user timeout (see set_user_timeout): counts only while there is
@@ -1815,20 +1944,13 @@ void TcpConnection::on_time_passed(uint32_t elapsed_ms)
     // retransmit give-up only watches segments in flight, so without this a
     // peer that stops reading but answers every probe held the connection,
     // and everything queued on it, forever.
-    if (_user_timeout_ms > 0 && (!_in_flight.empty() || !_send_queue.empty()))
+    _track_stall();
+    if (_user_timeout_ms > 0 && _stall_clock_running && _now_ms - _stall_since_ms >= _user_timeout_ms)
     {
-        _stalled_ms += elapsed_ms;
-        if (_stalled_ms >= _user_timeout_ms)
-        {
-            LOG_WARNING("TcpConnection[" << _id << "] no progress on outstanding data for " << _stalled_ms
-                                         << " ms - giving up");
-            _transition(TcpState::CLOSED);
-            return;
-        }
-    }
-    else
-    {
-        _stalled_ms = 0;
+        LOG_WARNING("TcpConnection[" << _id << "] no progress on outstanding data for " << (_now_ms - _stall_since_ms)
+                                     << " ms - giving up");
+        _transition(TcpState::CLOSED);
+        return;
     }
 
     if (_in_flight.empty())
@@ -1837,14 +1959,13 @@ void TcpConnection::on_time_passed(uint32_t elapsed_ms)
         // timer running instead. Persist and retransmit are mutually exclusive
         // (persist is only armed when _in_flight is empty), which is why this
         // lives inside the empty-pipe branch.
-        if (_persist_ms_remaining > 0)
+        if (_persist_deadline_ms != 0)
         {
-            _persist_ms_remaining -= static_cast<int>(elapsed_ms);
-            if (_persist_ms_remaining <= 0)
+            if (_now_ms >= _persist_deadline_ms)
             {
                 _send_zero_window_probe();
                 _persist_backoff = std::min(_persist_backoff + 1, PERSIST_MAX_BACKOFF_SHIFT);
-                _persist_ms_remaining = PERSIST_BASE_MS << _persist_backoff;
+                _persist_deadline_ms = _now_ms + (PERSIST_BASE_MS << _persist_backoff);
             }
             // Persist and keepalive must not both run. A peer with a shut
             // window is demonstrably alive - it is answering probes, it just
@@ -1853,7 +1974,7 @@ void TcpConnection::on_time_passed(uint32_t elapsed_ms)
             return;
         }
 
-        _run_keepalive(elapsed_ms);
+        _run_keepalive();
         return;
     }
 
@@ -1861,6 +1982,7 @@ void TcpConnection::on_time_passed(uint32_t elapsed_ms)
     // unacked one (real go-back-N). With SACK that is the oldest segment the
     // peer has not reported holding, since resending something already in its
     // reorder buffer achieves nothing.
+    _start_retransmit_timer();
     InFlightSegment* timed_out = _oldest_unsacked_segment();
     if (timed_out == nullptr)
     {
@@ -1868,8 +1990,7 @@ void TcpConnection::on_time_passed(uint32_t elapsed_ms)
     }
     InFlightSegment& oldest = *timed_out;
 
-    oldest.retransmit_ms_remaining -= static_cast<int>(elapsed_ms);
-    if (oldest.retransmit_ms_remaining > 0)
+    if (_now_ms < oldest.retransmit_deadline_ms)
     {
         return;
     }
@@ -1916,6 +2037,7 @@ void TcpConnection::on_time_passed(uint32_t elapsed_ms)
     _transmit(oldest.flags, oldest.seq, oldest.payload);
     oldest.retransmitted = true; // no RTT sample may ever come from it now
     oldest.retransmit_ms_remaining = _rto_ms;
+    oldest.retransmit_deadline_ms = _now_ms + static_cast<uint64_t>(_rto_ms);
 }
 
 size_t TcpConnection::send_space_available() const
@@ -1937,6 +2059,7 @@ size_t TcpConnection::bytes_unacked() const
 
 size_t TcpConnection::send(const Bytes& data)
 {
+    EntryScope scope(*this);
     if (_state != TcpState::ESTABLISHED && _state != TcpState::CLOSE_WAIT)
     {
         return 0;
@@ -1992,6 +2115,7 @@ size_t TcpConnection::send(const Bytes& data)
 
 void TcpConnection::close()
 {
+    EntryScope scope(*this);
     if (_state != TcpState::ESTABLISHED && _state != TcpState::CLOSE_WAIT)
     {
         return;
@@ -2009,6 +2133,7 @@ void TcpConnection::close()
 
 void TcpConnection::abort()
 {
+    EntryScope scope(*this);
     if (_state == TcpState::CLOSED)
     {
         return;
@@ -2035,6 +2160,6 @@ void TcpConnection::abort()
     _reorder_buffer.clear();
     _reorder_buffered_bytes = 0;
     _ack_pending = false;
-    _persist_ms_remaining = 0;
+    _persist_deadline_ms = 0;
     _transition(TcpState::CLOSED);
 }

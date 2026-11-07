@@ -107,7 +107,44 @@ public:
     // Reporting elapsed time instead means one call after that stall advances
     // everything by the full 2000 ms, and the caller is free to poll at any
     // cadence, regular or not.
+    //
+    // For a connection on its own clock (the default). One owned by a
+    // NetworkStack reads the stack's clock instead (see use_external_clock())
+    // and is driven by run_due_timers(); on such a connection elapsed_ms is
+    // ignored, because the stack has already advanced the clock it reads.
     void on_time_passed(uint32_t elapsed_ms);
+
+    // --- Deadlines ---
+    //
+    // Every timer on the connection is held as the absolute moment it is due
+    // on the connection's clock, not as a countdown. A countdown has to be
+    // decremented by every call whether or not anything is due, so whoever
+    // drives it must visit every connection on every tick: O(connections) per
+    // tick, for nothing, and a coarse tick fires everything late. A deadline
+    // can be asked for instead - next_deadline_ms() - so a stack can keep its
+    // connections in a queue ordered by deadline and visit only the ones due.
+
+    static constexpr uint64_t NO_DEADLINE = UINT64_MAX;
+    // The connection's clock: milliseconds, starting at 1 when it was made.
+    uint64_t now_ms() const;
+    // The earliest moment, on now_ms()'s clock, at which run_due_timers()
+    // has something to do, or NO_DEADLINE when no timer is armed. Driving the
+    // timers at or after it fires what is due; driving them earlier is
+    // harmless - nothing fires before its time.
+    uint64_t next_deadline_ms() const;
+    // Fires every timer that is due at now_ms(), each at most once - the same
+    // work on_time_passed() does after advancing its own clock.
+    void run_due_timers();
+    // Told whenever next_deadline_ms() may have changed: at the end of every
+    // call that can arm, re-arm or disarm a timer. NetworkStack uses it to
+    // keep its timer queue current without polling every connection.
+    using TimerChangedFn = std::function<void()>;
+    void set_timer_changed_callback(TimerChangedFn callback) { _on_timer_changed = std::move(callback); }
+    // Reads time from *clock_ms (NetworkStack's own clock) from now on,
+    // offset so that now_ms() carries on from where it is - the connection's
+    // timestamps and RTT samples are unchanged by the switch. *clock_ms must
+    // outlive the connection and never go backwards.
+    void use_external_clock(const uint64_t* clock_ms);
 
     // Application-facing API. send() before ESTABLISHED or after the peer's
     // FIN silently does nothing - there is no error channel back to the
@@ -215,7 +252,7 @@ public:
     // with "still zero" are not progress, which is the case it exists for: a
     // peer that stops reading would otherwise hold the connection forever.
     // 0 turns it off. Defaults to DEFAULT_USER_TIMEOUT_MS.
-    void set_user_timeout(uint32_t ms) { _user_timeout_ms = ms; }
+    void set_user_timeout(uint32_t ms);
 
     // A stable identity that outlives any single TcpConnection* - safe to
     // hand across a thread boundary and look up again later via
@@ -486,7 +523,14 @@ private:
         uint32_t end_seq{};
         uint8_t flags{};
         Bytes payload;
+        // How long this segment waits for its ack once its retransmit timer
+        // runs: the RTO when it was sent. Only the oldest unSACKed segment's
+        // timer runs (RFC 6298 5.3: one timer, restarted when an ack moves the
+        // window), so the others hold this until their turn comes.
         int retransmit_ms_remaining{};
+        // When the timer, once running, fires - 0 until this segment becomes
+        // the oldest unSACKed one and its timer starts.
+        uint64_t retransmit_deadline_ms{};
         int retransmit_attempts{};
         // The connection's clock when this segment first went out. Storing the
         // absolute moment rather than an age counter keeps timekeeping O(1):
@@ -547,9 +591,9 @@ private:
     // deferred until both drain, instead of clobbering in-flight state
     bool _fin_requested;
 
-    // counts down while in TIME_WAIT; reset if a duplicate FIN arrives
-    // (meaning our ack for it was likely lost)
-    int _time_wait_ms_remaining;
+    // when TIME_WAIT ends; pushed back if a duplicate FIN arrives (meaning
+    // our ack for it was likely lost)
+    uint64_t _time_wait_deadline_ms;
 
     // --- RTT estimation / adaptive RTO (RFC 6298, Jacobson & Karels) ---
     // A fixed retransmission timeout can only be wrong in one of two
@@ -568,8 +612,9 @@ private:
     // keep fractional precision in pure integer arithmetic - the same trick
     // the BSD implementation uses, and the reason there is no floating point
     // anywhere in this path.
-    // Monotonic millisecond clock, summed from what on_time_passed() reports.
-    // This is what RTT is measured against and, once timestamps are
+    // Monotonic millisecond clock: summed from what on_time_passed() reports,
+    // or read from the owning stack's clock (see use_external_clock()). Every
+    // timer deadline below is a moment on it. This is what RTT is measured against and, once timestamps are
     // negotiated, the value put in TSval - a millisecond clock sits squarely
     // inside RFC 7323's required 1 ms to 1 s per tick, which a counter of
     // application timer ticks only did by luck. It starts at 1 rather than 0
@@ -586,16 +631,16 @@ private:
     int _rto_ms;
 
     // --- zero-window persist timer ---
-    // milliseconds until the next zero-window probe, or 0 when the persist
+    // when the next zero-window probe goes out, or 0 when the persist
     // timer is disarmed. Unlike the retransmit timer this never gives up: a peer with a
     // full receive buffer is healthy, just not ready, so probing continues
     // (with exponential backoff) until the window reopens.
-    int _persist_ms_remaining;
+    uint64_t _persist_deadline_ms;
     int _persist_backoff; // shift applied to PERSIST_BASE_MS, capped at PERSIST_MAX_BACKOFF_SHIFT
 
     // --- delayed ACK ---
     bool _ack_pending;              // an in-order segment is awaiting a coalesced ack
-    int _ack_delay_ms_remaining; // countdown that forces a pending ack out on time
+    uint64_t _ack_deadline_ms;      // when a pending ack is forced out
 
     // --- keepalive (RFC 1122 4.2.3.6) ---
     //
@@ -608,13 +653,14 @@ private:
     // stating what it really expects. A wrong-looking segment is the point:
     // it is the only thing that compels a reply without moving the stream.
     bool _keepalive_enabled;
-    int _keepalive_idle_ms_remaining;   // time left before the first probe
-    int _keepalive_probe_ms_remaining;  // time left before the next probe, once probing
+    // When the next probe goes out: KEEPALIVE_IDLE_MS after the last segment
+    // heard, then KEEPALIVE_PROBE_INTERVAL_MS after each unanswered probe.
+    uint64_t _keepalive_deadline_ms;
     int _keepalive_probes_sent;         // consecutive unanswered probes
     void _send_keepalive_probe();
-    // Drives both keepalive countdowns. Called from on_time_passed() only when
-    // the pipe is empty and persist is not running - see the call site.
-    void _run_keepalive(uint32_t elapsed_ms);
+    // Sends the probe that is due, or gives up. Called from _run_timers() only
+    // when the pipe is empty and persist is not running - see the call site.
+    void _run_keepalive();
     // Rearms the idle timer and forgets any probing in progress. Called on
     // every segment received: hearing anything at all from the peer is the
     // definition of the connection not being idle.
@@ -756,7 +802,14 @@ private:
     uint32_t _user_timeout_ms = DEFAULT_USER_TIMEOUT_MS;
     // How long outstanding data has gone without progress. Reset by any ack
     // that moves SND.UNA, and whenever nothing is outstanding.
-    uint64_t _stalled_ms = 0;
+    // Since when, while there is something outstanding: the moment it became
+    // outstanding, or the last ack that moved SND.UNA.
+    uint64_t _stall_since_ms = 0;
+    bool _stall_clock_running = false;
+    // Starts or stops the stall clock above to match whether anything is
+    // outstanding right now. Run at the end of every entry point, so it notices
+    // the change within the same millisecond it happens.
+    void _track_stall();
 
     // --- congestion control ---
     //
@@ -796,6 +849,53 @@ private:
     size_t _receive_queued_bytes;
     bool _active_open = false; // see is_active_open()
     ChallengeAckGateFn _challenge_ack_gate;
+
+    // --- clock and deadline bookkeeping ---
+    //
+    // _now_ms is a cache of the clock, refreshed at the start of every entry
+    // point by an EntryScope: with an external clock, *_external_clock plus
+    // _clock_offset. Caching keeps every reader of _now_ms unchanged, and the
+    // clock cannot move during a call anyway - only the caller advances it.
+    const uint64_t* _external_clock = nullptr;
+    uint64_t _clock_offset = 0;
+    TimerChangedFn _on_timer_changed;
+    // What next_deadline_ms() said last time _on_timer_changed was told.
+    uint64_t _reported_deadline_ms = NO_DEADLINE;
+    void _sync_clock()
+    {
+        if (_external_clock != nullptr)
+        {
+            _now_ms = *_external_clock + _clock_offset;
+        }
+    }
+    // Starts the oldest unSACKed segment's retransmit timer if it is not
+    // running yet - the moment a segment becomes the oldest is the moment its
+    // timer starts.
+    void _start_retransmit_timer();
+    // The connection-side half of the deadline contract: catches up the
+    // bookkeeping that is decided by state rather than by an event (the stall
+    // clock, the retransmit timer's start) and reports a changed deadline.
+    void _refresh_timer_deadline();
+    // The timer work itself, at _now_ms. Shared by on_time_passed() and
+    // run_due_timers().
+    void _run_timers();
+    // Wraps every public entry point that can touch a timer: syncs the clock
+    // on the way in and refreshes the deadline on the way out, however the
+    // call returns. Nesting (a callback re-entering the connection) is fine:
+    // both halves are idempotent.
+    class EntryScope
+    {
+    public:
+        explicit EntryScope(TcpConnection& connection) : _connection(connection) { _connection._sync_clock(); }
+        ~EntryScope() { _connection._refresh_timer_deadline(); }
+        EntryScope(const EntryScope&) = delete;
+        EntryScope& operator=(const EntryScope&) = delete;
+        EntryScope(EntryScope&&) = delete;
+        EntryScope& operator=(EntryScope&&) = delete;
+
+    private:
+        TcpConnection& _connection;
+    };
 
     static constexpr uint16_t DEFAULT_LOCAL_MSS = 1460; // 1500 (typical Ethernet MTU) - 20 (IP) - 20 (TCP)
     static constexpr uint16_t DEFAULT_PEER_MSS = 536; // RFC 793's fallback when a peer's SYN carries no MSS option
