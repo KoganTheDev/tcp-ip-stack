@@ -2659,3 +2659,37 @@ TEST(TcpConnection, DuplicateAcksForOutOfOrderDataCarryAnUnchangedWindow)
         << sent[2].window;
     ASSERT_TRUE(connection->bytes_out_of_order() == 300) << "while the 300 bytes are held";
 }
+
+// RFC 6675 section 2: with SACK, a duplicate acknowledgment is one whose SACK
+// blocks name octets not acknowledged or SACKed before - nothing about the
+// window. A peer that shrinks its window as it buffers out-of-order data
+// (which RFC 1122 4.2.2.16 discourages, but which this stack itself did)
+// sends acks that fail RFC 5681's "window unchanged" test yet each report a
+// newly arrived segment; they are counted, so fast retransmit still fires.
+TEST(TcpConnection, NewSackInformationCountsAsADuplicateAckEvenIfTheWindowChanged)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_sack_connection(sent);
+    for (int i = 0; i < 3; i++) // slow start opens cwnd to four segments
+    {
+        sent.clear();
+        connection->send(Bytes(100u));
+        connection->on_segment(*make_incoming_segment(501, sent[0].seq + 100, FLAG_ACK));
+    }
+    sent.clear();
+
+    connection->send(Bytes(400u));
+    ASSERT_TRUE(sent.size() >= 4) << "precondition: four segments in flight, got " << sent.size();
+    uint32_t lost = sent[0].seq;
+    size_t before = sent.size();
+
+    for (uint32_t i = 1; i <= 3; i++)
+    {
+        auto ack =
+            std::make_unique<Tcp>(12345, 8080, 501, lost, 5, FLAG_ACK, static_cast<uint16_t>(65535 - 100 * i), 0, 0);
+        ack->set_sack_blocks({{lost + 100, lost + 100 + 100 * i}});
+        connection->on_segment(*ack);
+    }
+    ASSERT_TRUE(sent.size() > before && sent[before].seq == lost)
+        << "three acks each SACKing new data should fast-retransmit the hole, window changes notwithstanding";
+}

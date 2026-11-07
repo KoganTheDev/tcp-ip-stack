@@ -988,6 +988,12 @@ void TcpConnection::_handle_ack(const Tcp& segment)
                         && !static_cast<const Raw&>(segment.get_next_layer()).get_data().empty();
     bool is_duplicate_ack = !_in_flight.empty() && ack == snd_una && !carries_data && !segment.get_syn()
                             && !segment.get_fin() && _peer_window == previous_peer_window;
+    // RFC 6675 section 2: with SACK in use, an ACK whose blocks name octets
+    // not SACKed before is a duplicate acknowledgment whatever its window -
+    // it reports a segment that arrived past a hole, which is the loss
+    // signal itself. Counted too, so a peer that shrinks its window as it
+    // buffers out-of-order data cannot keep fast retransmit from firing.
+    is_duplicate_ack = is_duplicate_ack || (!_in_flight.empty() && ack == snd_una && sack_advanced);
 
     if (is_duplicate_ack)
     {
