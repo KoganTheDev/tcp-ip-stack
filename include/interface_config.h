@@ -45,10 +45,17 @@ struct InterfaceConfig
     bool has_address() const { return !(ip == IPv4Address()); }
     bool has_gateway() const { return !(gateway == IPv4Address()); }
 
-    // Largest IP payload that fits one frame, rounded down to the multiple of 8
-    // a non-last fragment's payload must be (the fragment offset field counts
-    // 8-byte units).
-    size_t max_ip_payload() const { return static_cast<size_t>((mtu - 20) & ~size_t(7)); }
+    // Largest IP payload that fits one frame: the MTU less a 20-byte header.
+    // An unfragmented packet may use all of it.
+    size_t max_ip_payload() const { return static_cast<size_t>(mtu - 20); }
+
+    // Largest payload of a fragment that is not the last: max_ip_payload()
+    // rounded down to a multiple of 8, because the fragment offset field
+    // counts 8-byte units (RFC 791). Only the offsets need the alignment, so
+    // this applies to non-last fragments alone - applying it to every packet,
+    // as max_ip_payload() once did, made a full-sized TCP segment on an MTU
+    // like 1006 two bytes too big for its own limit and dropped it.
+    size_t max_fragment_payload() const { return max_ip_payload() & ~size_t(7); }
 
     // What to advertise in the MSS option: the MTU less an IP and a TCP header.
     uint16_t local_mss() const { return static_cast<uint16_t>(mtu - 20 - 20); }

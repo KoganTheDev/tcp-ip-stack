@@ -2092,13 +2092,15 @@ void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol,
     // RFC 791 fragmentation: split into MTU-sized pieces sharing one
     // identification, each carrying its byte offset (in 8-byte units) and the
     // More-Fragments flag on every piece but the last, so the receiver can
-    // reassemble them. Only whole 8-byte-aligned chunks go in a non-last
-    // fragment (MAX_IP_FRAGMENT_PAYLOAD is a multiple of 8).
+    // reassemble them. A non-last fragment carries a multiple of 8 bytes
+    // (max_fragment_payload()), so every offset is expressible; the last may
+    // fill the frame.
     uint16_t identification = this->_next_ip_id++;
     size_t offset = 0;
     while (offset < payload.size())
     {
-        size_t chunk = std::min(max_ip_payload, payload.size() - offset);
+        size_t remaining = payload.size() - offset;
+        size_t chunk = remaining <= max_ip_payload ? remaining : interface.config.max_fragment_payload();
         bool more_fragments = offset + chunk < payload.size();
         uint8_t flags = more_fragments ? IP_FLAG_MORE_FRAGMENTS : 0;
 

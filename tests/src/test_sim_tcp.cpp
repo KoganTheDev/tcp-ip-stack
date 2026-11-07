@@ -422,3 +422,37 @@ TEST_F(SimTcp, AConnectionClosedByTheSegmentThatOpenedItIsStillAccepted)
     ASSERT_TRUE(dropped_ack) << "precondition: the bare ACK was lost";
     ASSERT_TRUE(accepted->get_state() == TcpState::CLOSE_WAIT) << "already half-closed by the peer";
 }
+
+// Only a fragment's offset has to be a multiple of 8 bytes (RFC 791); an
+// unfragmented packet may fill the MTU exactly. With an MTU of 1006 the IP
+// payload limit is 986, but it used to be rounded down to 984 for every
+// packet - while TCP's MSS (966) let a full segment be 986 bytes, so each
+// full-sized segment, sent Don't Fragment, was dropped by the stack itself.
+TEST_F(SimTcp, FullSizedSegmentsFitAnMtuThatIsNotAMultipleOfEight)
+{
+    LinkParams wire;
+    wire.delay_ms = 5;
+    wire.mtu = 1006;
+    net = std::make_unique<SimNetwork>(1006);
+    link = &net->add_link(wire, wire);
+    auto config = [](const MacAddress& mac, const IPv4Address& ip)
+    {
+        InterfaceConfig c;
+        c.mac = mac;
+        c.ip = ip;
+        c.prefix_length = 24;
+        c.mtu = 1006;
+        return c;
+    };
+    client_stack = &net->add_stack(link->take_endpoint(NetemChannel::A), config(CLIENT_MAC, CLIENT_IP));
+    server_stack = &net->add_stack(link->take_endpoint(NetemChannel::B), config(SERVER_MAC, SERVER_IP));
+    client_stack->add_static_arp_entry(SERVER_IP, SERVER_MAC);
+    server_stack->add_static_arp_entry(CLIENT_IP, CLIENT_MAC);
+    server_stack->listen(SERVER_PORT);
+
+    const Bytes payload = pattern(20000);
+    ASSERT_TRUE(send_one_way(payload, 10000))
+        << "the transfer should finish in well under 10 s; got " << server_received.size() << " of " << payload.size();
+    ASSERT_TRUE(server_received == payload) << "intact";
+    ASSERT_TRUE(client_stack->transmit_drops() == 0) << "nothing should have been dropped by the sender itself";
+}
