@@ -76,8 +76,8 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
       _unsacked_in_flight_bytes(0), _send_queued_bytes(0), _fin_requested(false), _time_wait_deadline_ms(0), _now_ms(1),
       _persist_deadline_ms(0), _persist_backoff(0), _ack_pending(false), _ack_deadline_ms(0), _keepalive_enabled(false),
       _keepalive_deadline_ms(1 + KEEPALIVE_IDLE_MS), _keepalive_probes_sent(0), _sack_permitted(false),
-      _last_out_of_order_seq(0), _timestamps_negotiated(false), _ts_recent(0), _have_ts_recent(false),
-      _local_mss(local_mss), _peer_mss(DEFAULT_PEER_MSS), _effective_mss(std::min(local_mss, DEFAULT_PEER_MSS)),
+      _timestamps_negotiated(false), _ts_recent(0), _have_ts_recent(false), _local_mss(local_mss),
+      _peer_mss(DEFAULT_PEER_MSS), _effective_mss(std::min(local_mss, DEFAULT_PEER_MSS)),
       _window_scaling_negotiated(false), _peer_window_scale(0),
       _peer_window(local_mss), // conservative placeholder until the handshake's real window arrives
       _max_peer_window(local_mss), _congestion(make_congestion_control(algorithm)), _dup_ack_count(0),
@@ -107,63 +107,16 @@ void TcpConnection::_transition(TcpState new_state)
 
 uint32_t TcpConnection::_receive_buffer_occupied() const
 {
-    return static_cast<uint32_t>(_reorder_buffered_bytes + _receive_queued_bytes);
+    return static_cast<uint32_t>(_reorder_buffer.bytes() + _receive_queued_bytes);
 }
 
 std::vector<Tcp::SackBlock> TcpConnection::_sack_blocks_to_report() const
 {
-    std::vector<Tcp::SackBlock> blocks;
-    if (_reorder_buffer.empty())
-    {
-        return blocks;
-    }
-
     // Only so many fit in 40 bytes of option space, and fewer alongside a
     // timestamp. The ones dropped are the oldest, which the peer has most
-    // likely already heard. Ranges are kept maximal (see _reorder_buffer), so
-    // each is one block and only the first `limit` need be read - the report
-    // costs the same however many ranges are held.
+    // likely already heard.
     size_t limit = _timestamps_negotiated ? Tcp::MAX_SACK_BLOCKS_WITH_TIMESTAMP : Tcp::MAX_SACK_BLOCKS;
-    for (auto it = _reorder_buffer.begin(); it != _reorder_buffer.end() && blocks.size() < limit; ++it)
-    {
-        blocks.push_back({static_cast<uint32_t>(it->first), static_cast<uint32_t>(it->second.end)});
-    }
-
-    // RFC 2018: the first block must name the range that most recently arrived,
-    // because it is the one the sender has not heard about yet. The rest repeat
-    // earlier reports, which is deliberate redundancy - a SACK option is not
-    // retransmitted, so repeating older blocks is what makes the mechanism
-    // survive a lost ack. The range is found by position: ranges lie after
-    // RCV.NXT, so a last-arrival at or behind it (already delivered) names none.
-    if (_reorder_buffer.size() > 1)
-    {
-        auto offset = static_cast<int32_t>(_last_out_of_order_seq - _recv_next);
-        if (offset > 0)
-        {
-            uint64_t position = _recv_next_unwrapped + static_cast<uint32_t>(offset);
-            auto latest = _reorder_buffer.upper_bound(position);
-            if (latest != _reorder_buffer.begin())
-            {
-                --latest;
-                if (position < latest->second.end)
-                {
-                    Tcp::SackBlock block{static_cast<uint32_t>(latest->first),
-                                         static_cast<uint32_t>(latest->second.end)};
-                    auto same = std::find_if(blocks.begin(), blocks.end(),
-                                             [&](const Tcp::SackBlock& b) { return b.start == block.start; });
-                    if (same != blocks.end())
-                    {
-                        std::swap(blocks[0], *same);
-                    }
-                    else
-                    {
-                        blocks[0] = block; // beyond the limit: it displaces the first
-                    }
-                }
-            }
-        }
-    }
-    return blocks;
+    return _reorder_buffer.sack_blocks(limit, _recv_next_unwrapped);
 }
 
 uint32_t TcpConnection::_advertised_window() const
@@ -582,256 +535,25 @@ void TcpConnection::_buffer_out_of_order(uint32_t seq, const Bytes& payload)
     // 3.10.7.4 trims a segment to the window): that is what bounds the
     // buffer by the window offered.
     uint64_t start = _recv_next_unwrapped + static_cast<uint32_t>(seq - _recv_next);
-    uint64_t end = std::min<uint64_t>(start + payload.size(), _recv_next_unwrapped + _advertised_window());
-    if (end <= start)
-    {
-        return;
-    }
-
-    // The parts of [start, end) not already held. Entries are disjoint, so
-    // one walk from the entry before start finds them; the walk is bounded by
-    // the entries this segment overlaps.
-    std::vector<std::pair<uint64_t, uint64_t>> gaps;
-    uint64_t cursor = start;
-    auto it = _reorder_buffer.upper_bound(start);
-    if (it != _reorder_buffer.begin())
-    {
-        cursor = std::max(cursor, std::prev(it)->second.end);
-    }
-    for (; it != _reorder_buffer.end() && it->first < end; ++it)
-    {
-        if (it->first > cursor)
-        {
-            gaps.emplace_back(cursor, it->first);
-        }
-        cursor = std::max(cursor, it->second.end);
-    }
-    if (cursor < end)
-    {
-        gaps.emplace_back(cursor, end);
-    }
-    if (gaps.empty())
-    {
-        return; // every byte of it is already held
-    }
-
-    // Every gap after the first starts where a range ends, so it extends that
-    // range; only the first can need a range of its own (and not even that if
-    // it touches the range after it). That is the only way the range count
-    // grows, and it is what the cap is checked for.
-    {
-        auto after = _reorder_buffer.lower_bound(gaps.front().first);
-        bool touches_before = false;
-        if (after != _reorder_buffer.begin())
-        {
-            touches_before = std::prev(after)->second.end == gaps.front().first;
-        }
-        bool touches_after = after != _reorder_buffer.end() && after->first == gaps.front().second;
-        if (!touches_before && !touches_after && _reorder_buffer.size() >= MAX_REORDER_SEGMENTS)
-        {
-            return; // dropped like a segment outside the window; the peer resends it
-        }
-    }
-
-    for (const auto& gap : gaps)
-    {
-        auto from = payload.begin() + static_cast<std::ptrdiff_t>(gap.first - start);
-        auto to = payload.begin() + static_cast<std::ptrdiff_t>(gap.second - start);
-        Bytes piece;
-        piece.assign(from, to);
-        _store_reorder_piece(gap.first, piece);
-        _reorder_buffered_bytes += gap.second - gap.first;
-    }
-    _last_out_of_order_seq = seq;
-}
-
-namespace
-{
-    // Chunk-size invariant for a reorder range: every chunk is smaller than
-    // 2 * C (C = REORDER_CHUNK_COALESCE_BYTES), and every chunk except the two
-    // at the ends of the range is at least C. A piece is cut into slices of at
-    // most C before it is stored, and a merge only ever joins a slice (or a
-    // seam chunk) to a chunk smaller than C, so no copy exceeds 2 * C bytes
-    // however large a segment the peer sends - and the range holds at most
-    // bytes / C + 2 chunks however small they are.
-    constexpr size_t C = TcpConnection::REORDER_CHUNK_COALESCE_BYTES;
-
-    bool is_small_chunk(const Bytes& chunk)
-    {
-        return chunk.size() < C;
-    }
-
-    // Adds one slice (at most C bytes) at the back of the list: into the last
-    // chunk if that is small, otherwise as a chunk of its own.
-    void append_slice(std::list<Bytes>& chunks, const byte_t* data, size_t length)
-    {
-        if (!chunks.empty() && is_small_chunk(chunks.back()))
-        {
-            chunks.back().insert(chunks.back().end(), data, data + length);
-        }
-        else
-        {
-            chunks.emplace_back();
-            chunks.back().assign(data, data + length);
-        }
-    }
-
-    // The same at the front.
-    void prepend_slice(std::list<Bytes>& chunks, const byte_t* data, size_t length)
-    {
-        if (!chunks.empty() && is_small_chunk(chunks.front()))
-        {
-            chunks.front().insert(chunks.front().begin(), data, data + length);
-        }
-        else
-        {
-            chunks.emplace_front();
-            chunks.front().assign(data, data + length);
-        }
-    }
-
-    void append_piece(std::list<Bytes>& chunks, const Bytes& piece)
-    {
-        for (size_t offset = 0; offset < piece.size(); offset += C)
-        {
-            append_slice(chunks, piece.data() + offset, std::min(C, piece.size() - offset));
-        }
-    }
-
-    void prepend_piece(std::list<Bytes>& chunks, const Bytes& piece)
-    {
-        for (size_t remaining = piece.size(); remaining > 0;)
-        {
-            size_t length = std::min(C, remaining);
-            remaining -= length;
-            prepend_slice(chunks, piece.data() + remaining, length);
-        }
-    }
-
-    // Moves `tail`'s chunks onto the end of `head`, then repairs the seam so
-    // no small chunk is left in the middle of the range. Two chunks whose sum
-    // is under 2 * C are merged (and the merge repeated while the result is
-    // still small); otherwise one is large and one small, and the small one is
-    // topped up to C from the large one. Every copy is at most 2 * C bytes.
-    void join_chunks(std::list<Bytes>& head, std::list<Bytes>& tail)
-    {
-        auto seam = std::prev(head.end());
-        head.splice(head.end(), tail);
-        auto next = std::next(seam);
-        while (next != head.end() && (is_small_chunk(*seam) || is_small_chunk(*next)))
-        {
-            if (seam->size() + next->size() < 2 * C)
-            {
-                seam->insert(seam->end(), next->begin(), next->end());
-                next = head.erase(next);
-            }
-            else if (is_small_chunk(*seam))
-            {
-                size_t need = C - seam->size();
-                seam->insert(seam->end(), next->begin(), next->begin() + static_cast<std::ptrdiff_t>(need));
-                next->erase(next->begin(), next->begin() + static_cast<std::ptrdiff_t>(need));
-                break;
-            }
-            else
-            {
-                size_t need = C - next->size();
-                next->insert(next->begin(), seam->end() - static_cast<std::ptrdiff_t>(need), seam->end());
-                seam->resize(seam->size() - need);
-                break;
-            }
-        }
-    }
-} // namespace
-
-void TcpConnection::_store_reorder_piece(uint64_t start, const Bytes& piece)
-{
-    uint64_t end = start + piece.size();
-    auto after = _reorder_buffer.lower_bound(start); // the piece lies in a hole, so this starts at or past `end`
-    bool touches_after = after != _reorder_buffer.end() && after->first == end;
-    auto before = _reorder_buffer.end();
-    if (after != _reorder_buffer.begin() && std::prev(after)->second.end == start)
-    {
-        before = std::prev(after);
-    }
-
-    if (before != _reorder_buffer.end())
-    {
-        append_piece(before->second.chunks, piece);
-        before->second.end = end;
-        if (touches_after)
-        {
-            // the piece bridged the two: one range
-            join_chunks(before->second.chunks, after->second.chunks);
-            before->second.end = after->second.end;
-            _reorder_buffer.erase(after);
-        }
-    }
-    else if (touches_after)
-    {
-        // the range after it now begins earlier, which changes its key
-        auto node = _reorder_buffer.extract(after);
-        node.key() = start;
-        prepend_piece(node.mapped().chunks, piece);
-        _reorder_buffer.insert(std::move(node));
-    }
-    else
-    {
-        ReorderRange range{end, {}};
-        append_piece(range.chunks, piece);
-        _reorder_buffer.emplace(start, std::move(range));
-    }
+    _reorder_buffer.insert(start, payload, _recv_next_unwrapped + _advertised_window());
 }
 
 void TcpConnection::_drain_reorder_buffer()
 {
-    // Every buffered segment that now starts at or before RCV.NXT is resolved:
+    // Every buffered range that now starts at or before RCV.NXT is resolved:
     // delivered if it extends past RCV.NXT (only that new tail), or discarded
-    // if RCV.NXT has already passed its end. Matching only an entry that
-    // starts exactly at RCV.NXT is not enough - when the in-order data that
-    // just arrived overlapped a buffered segment (a peer that coalesced its
+    // if RCV.NXT has already passed its end. Matching only a range that starts
+    // exactly at RCV.NXT is not enough - when the in-order data that just
+    // arrived overlapped a buffered segment (a peer that coalesced its
     // retransmissions, say), that segment starts behind RCV.NXT, is never
-    // matched, and sits counted against the receive window forever.
-    //
-    // The entries are processed earliest-first in SEQUENCE order. The map is
-    // keyed by unwrapped sequence number, so that is simply begin(), across
-    // the 2^32 wrap too, and each step is O(log n). (It used to be keyed by
-    // raw uint32_t, where the post-wrap entries sort first, and a rescan was
-    // correct but quadratic - a peer could make one gap-filler cost tens of
-    // seconds of CPU.)
-    while (!_reorder_buffer.empty())
+    // matched, and sits counted against the receive window forever. The range
+    // is removed before delivering: _deliver() runs the application's
+    // callback, which must not find a half-processed entry.
+    while (std::optional<Bytes> tail = _reorder_buffer.take_ready(_recv_next_unwrapped))
     {
-        auto it = _reorder_buffer.begin();
-        uint64_t start = it->first;
-        if (start > _recv_next_unwrapped)
+        if (!tail->empty())
         {
-            break; // the earliest entry is still beyond a gap, so all are
-        }
-        uint64_t end = it->second.end;
-        Bytes new_tail;
-        if (end > _recv_next_unwrapped)
-        {
-            // concatenate the chunks past what RCV.NXT has already covered:
-            // one copy of the delivered bytes, made once per range
-            uint64_t skip = _recv_next_unwrapped - start;
-            new_tail.reserve(static_cast<size_t>(end - _recv_next_unwrapped));
-            for (const Bytes& chunk : it->second.chunks)
-            {
-                if (skip >= chunk.size())
-                {
-                    skip -= chunk.size();
-                    continue;
-                }
-                new_tail.insert(new_tail.end(), chunk.begin() + static_cast<std::ptrdiff_t>(skip), chunk.end());
-                skip = 0;
-            }
-        }
-        // erase before delivering: _deliver() runs the application's
-        // callback, which must not find a half-processed entry here
-        _reorder_buffered_bytes -= static_cast<size_t>(end - start);
-        _reorder_buffer.erase(it);
-        if (!new_tail.empty())
-        {
-            _deliver(new_tail);
+            _deliver(*tail);
         }
     }
 }
@@ -2133,7 +1855,6 @@ void TcpConnection::abort()
     _receive_queue.clear();
     _receive_queued_bytes = 0;
     _reorder_buffer.clear();
-    _reorder_buffered_bytes = 0;
     _ack_pending = false;
     _persist_deadline_ms = 0;
     _close_as(TcpCloseReason::ABORTED);

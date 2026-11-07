@@ -2,15 +2,14 @@
 
 #include <cstdint>
 #include <functional>
-#include <list>
 #include <deque>
-#include <map>
 #include <memory>
 #include <vector>
 
 #include "bytes.h"
 #include "congestion_control.h"
 #include "network_addresses.h"
+#include "reorder_buffer.h"
 #include "rtt_estimator.h"
 #include "tcp.h"
 
@@ -343,46 +342,14 @@ public:
     // Bytes held out of order, waiting for a gap before them to fill. They
     // occupy the receive buffer but no longer shrink the advertised window
     // (see _advertised_window()), so this is the way to see them.
-    size_t bytes_out_of_order() const { return _reorder_buffered_bytes; }
-    // Chunk-size policy of a reorder range (C = this constant). A piece is cut
-    // into slices of at most C bytes; a slice is merged into the range's end
-    // chunk while that is smaller than C, else it becomes a chunk of its own.
-    // A chunk costs a list node and an allocation (about 100 bytes of
-    // overhead), so without merging a peer sending 1-byte pieces would make a
-    // chunk per byte: ~10 MB of overhead per connection within a 128 KiB
-    // window. Invariants: every chunk is smaller than 2C, and every chunk but
-    // the two at a range's ends is at least C - so a range has at most
-    // bytes / C + 2 chunks, and no merge or copy exceeds 2C bytes however
-    // large a segment the peer sends (a 60 KiB segment is stored as slices,
-    // copied once). 2048 is above a typical MSS, so a run of full-size
-    // segments is one chunk each, and small enough that a copy stays cheap.
-    static constexpr size_t REORDER_CHUNK_COALESCE_BYTES = 2048;
-    // The reorder buffer's shape, for tests: how many ranges it holds and how
-    // many chunks they hold between them (see REORDER_CHUNK_COALESCE_BYTES).
-    size_t reorder_range_count() const { return _reorder_buffer.size(); }
-    // The largest chunk held, for tests: no merge or copy exceeds twice the
-    // coalesce size, whatever segment sizes the peer sends.
-    size_t max_reorder_chunk_bytes() const
-    {
-        size_t largest = 0;
-        for (const auto& entry : _reorder_buffer)
-        {
-            for (const Bytes& chunk : entry.second.chunks)
-            {
-                largest = std::max(largest, chunk.size());
-            }
-        }
-        return largest;
-    }
-    size_t reorder_chunk_count() const
-    {
-        size_t count = 0;
-        for (const auto& entry : _reorder_buffer)
-        {
-            count += entry.second.chunks.size();
-        }
-        return count;
-    }
+    size_t bytes_out_of_order() const { return _reorder_buffer.bytes(); }
+    // See ReorderBuffer::CHUNK_COALESCE_BYTES.
+    static constexpr size_t REORDER_CHUNK_COALESCE_BYTES = ReorderBuffer::CHUNK_COALESCE_BYTES;
+    // The reorder buffer's shape, for tests: how many ranges it holds, how
+    // many chunks they hold between them, and the largest chunk.
+    size_t reorder_range_count() const { return _reorder_buffer.range_count(); }
+    size_t max_reorder_chunk_bytes() const { return _reorder_buffer.max_chunk_bytes(); }
+    size_t reorder_chunk_count() const { return _reorder_buffer.chunk_count(); }
 
     // How much this connection will queue on the send side before send()
     // starts accepting less than it is offered. The application's writes are
@@ -395,13 +362,9 @@ public:
     // because it is the number an application needs to reason about how much
     // it can afford not to read.
     static constexpr uint32_t RECEIVE_BUFFER_CAPACITY = 131072; // 128 KiB
-    // How many entries (disjoint byte ranges) the reorder buffer may hold,
-    // whatever their size. The window bounds the bytes but not the count, and each entry
-    // costs a map node and a step of every SACK report - so a peer sending
-    // one-byte segments could otherwise pin memory and CPU far beyond what the
-    // window suggests. A 128 KiB window holds ~90 full-sized segments, so
-    // legitimate traffic never comes near this.
-    static constexpr uint32_t MAX_REORDER_SEGMENTS = 1024;
+    // How many disjoint ranges the reorder buffer may hold (see
+    // ReorderBuffer::MAX_RANGES).
+    static constexpr uint32_t MAX_REORDER_SEGMENTS = ReorderBuffer::MAX_RANGES;
     // How long outstanding data may make no progress before the connection
     // is failed (see set_user_timeout()).
     static constexpr uint32_t DEFAULT_USER_TIMEOUT_MS = 300000;
@@ -712,9 +675,6 @@ private:
     // Reno alone it eventually resends the lot. SACK blocks name what did
     // arrive, so only the actual holes are retransmitted.
     bool _sack_permitted;
-    // Where the most recent out-of-order segment landed, so the first reported
-    // block can be the one the peer has not heard about yet.
-    uint32_t _last_out_of_order_seq;
 
     // The out-of-order ranges this side currently holds, as they would be
     // reported to the peer. One block per _reorder_buffer range, the range that
@@ -774,38 +734,10 @@ private:
         _peer_window = window;
         _max_peer_window = std::max(_max_peer_window, window);
     }
-    // Out-of-order data as disjoint byte ranges, keyed by the unwrapped
-    // (64-bit) sequence number of their first byte - drained into
-    // _recv_next/_deliver() as gaps fill in; bounded by RECEIVE_BUFFER_CAPACITY
-    // via _receive_buffer_occupied() and by MAX_REORDER_SEGMENTS entries.
-    //
-    // A new segment is cut against what is already held, so every byte is
-    // stored once however the segments overlap. Ranges are kept maximal: a
-    // piece that touches the range before or after it is joined to it, and
-    // two ranges a piece bridges become one. That makes each entry exactly
-    // one SACK block (so a report reads at most a handful of entries, not the
-    // whole buffer) and makes MAX_REORDER_SEGMENTS a count of ranges.
-    //
-    // A range keeps its bytes as a list of chunks, not as one contiguous
-    // buffer: appending a piece, prepending one, or joining two ranges is then
-    // O(1) (list splice) rather than a copy of what is already held - a peer
-    // cannot make the cost per segment grow with the size of the range. A
-    // piece is stored as chunks of bounded size - see
-    // REORDER_CHUNK_COALESCE_BYTES for the policy that bounds both a copy and
-    // the chunk count (and so the per-chunk memory overhead). The chunks are
-    // concatenated once, when the range is delivered.
-    //
-    // Unwrapped keys sort in true sequence order, so the earliest range is
-    // always begin() even across the 2^32 wrap.
-    struct ReorderRange
-    {
-        uint64_t end; // unwrapped, one past the last byte; the map key is the first
-        std::list<Bytes> chunks;
-    };
-    std::map<uint64_t, ReorderRange> _reorder_buffer;
-    // Stores one piece [start, start + piece.size()) that lies entirely in a
-    // hole of _reorder_buffer, joining it to whichever neighbours it touches.
-    void _store_reorder_piece(uint64_t start, const Bytes& piece);
+    // Out-of-order data (see reorder_buffer.h), positioned by unwrapped
+    // sequence number; drained into _recv_next/_deliver() as gaps fill in.
+    // Bounded by the window offered and by MAX_REORDER_SEGMENTS ranges.
+    ReorderBuffer _reorder_buffer;
     // RCV.NXT, unwrapped: advanced in lockstep with _recv_next, so the two are
     // equal modulo 2^32. Every buffered range lies after it and within the
     // window, so (seq - RCV.NXT) + this is a range's unwrapped position.
@@ -827,11 +759,6 @@ private:
     }
     // Stores whatever part of an out-of-order segment is not already held.
     void _buffer_out_of_order(uint32_t seq, const Bytes& payload);
-    // Total payload bytes in _reorder_buffer, kept alongside it like
-    // _receive_queued_bytes is for the receive queue. Summing the map instead
-    // was O(entries) on every segment received and every ack sent - quadratic
-    // over a buffer a peer can fill with tens of thousands of tiny segments.
-    size_t _reorder_buffered_bytes = 0;
     uint32_t _user_timeout_ms = DEFAULT_USER_TIMEOUT_MS;
     // How long outstanding data has gone without progress. Reset by any ack
     // that moves SND.UNA, and whenever nothing is outstanding.
