@@ -378,3 +378,47 @@ TEST_F(SimTcp, ATransferCrossesTheSequenceNumberWrap)
     ASSERT_TRUE(link->stats(NetemChannel::A).reordered + link->stats(NetemChannel::B).reordered > 0)
         << "precondition: the link reordered something";
 }
+
+// When the client's bare ACK is lost, the segment that completes the passive
+// open can be its FIN. The server then goes SYN_RECEIVED -> ESTABLISHED ->
+// CLOSE_WAIT within one segment, and must still hand the connection to
+// accept() - it is a connection the peer opened and already half-closed,
+// which the application has to see (and close) like any other.
+TEST_F(SimTcp, AConnectionClosedByTheSegmentThatOpenedItIsStillAccepted)
+{
+    LinkParams wire;
+    wire.delay_ms = 5;
+    wire.mtu = 1500;
+    build(293, wire, wire);
+    bool dropped_ack = false;
+    link->set_drop_filter(NetemChannel::A,
+                          [&](const Bytes& frame)
+                          {
+                              tcp_frame::Segment segment;
+                              std::string error;
+                              if (dropped_ack || !tcp_frame::parse(frame, segment, error)
+                                  || segment.flags != tcp_frame::ACK || !segment.payload.empty())
+                                  return false;
+                              dropped_ack = true; // the handshake's final, bare ACK
+                              return true;
+                          });
+
+    TcpConnection* client = client_stack->connect(SERVER_IP, SERVER_PORT);
+    ASSERT_TRUE(client != nullptr) << "connect() should create a connection";
+    uint64_t id = client->get_id();
+    ASSERT_TRUE(net->run_until(
+        [&]
+        {
+            TcpConnection* c = client_stack->find_connection(id);
+            return c != nullptr && c->get_state() == TcpState::ESTABLISHED;
+        },
+        5000))
+        << "the client should establish";
+    client_stack->find_connection(id)->close();
+
+    TcpConnection* accepted = nullptr;
+    ASSERT_TRUE(net->run_until([&] { return (accepted = server_stack->accept(SERVER_PORT)) != nullptr; }, 5000))
+        << "the server should be able to accept the connection its FIN completed";
+    ASSERT_TRUE(dropped_ack) << "precondition: the bare ACK was lost";
+    ASSERT_TRUE(accepted->get_state() == TcpState::CLOSE_WAIT) << "already half-closed by the peer";
+}

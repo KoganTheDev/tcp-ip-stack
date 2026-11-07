@@ -352,6 +352,12 @@ INSTANTIATE_TEST_SUITE_P(Seeds, SimTransfer,
 //    4677, 5784, 7399 and Echo 3488, 4423, 5578. They were not diagnosed one
 //    by one: the ISNs were still random then, so which seeds failed varied
 //    between runs, and all of them pass after the fixes above.
+//  - Echo 293 (and 70 others, empty payloads) broke when the segment
+//    completing a passive open started being processed in full: the client's
+//    FIN overtook its bare ACK, the server went SYN_RECEIVED -> ESTABLISHED
+//    -> CLOSE_WAIT on one segment, and NetworkStack only queued a connection
+//    for accept() on arrival in exactly ESTABLISHED. "fix: accept a
+//    connection whose opening segment also half-closed it".
 namespace
 {
     struct RegressionCase
@@ -382,10 +388,10 @@ TEST_P(SimTransferRegression, Transfer)
 
 INSTANTIATE_TEST_SUITE_P(
     Found, SimTransferRegression,
-    ::testing::Values(RegressionCase{9, false}, RegressionCase{330, false}, RegressionCase{1055, false},
-                      RegressionCase{2220, false}, RegressionCase{3488, true}, RegressionCase{4423, true},
-                      RegressionCase{4677, false}, RegressionCase{5578, false}, RegressionCase{5578, true},
-                      RegressionCase{5784, false}, RegressionCase{6580, false}, RegressionCase{6651, false},
-                      RegressionCase{7079, false}, RegressionCase{7284, false}, RegressionCase{7399, false},
-                      RegressionCase{7651, false}, RegressionCase{9524, true}),
+    ::testing::Values(RegressionCase{9, false}, RegressionCase{293, true}, RegressionCase{330, false},
+                      RegressionCase{1055, false}, RegressionCase{2220, false}, RegressionCase{3488, true},
+                      RegressionCase{4423, true}, RegressionCase{4677, false}, RegressionCase{5578, false},
+                      RegressionCase{5578, true}, RegressionCase{5784, false}, RegressionCase{6580, false},
+                      RegressionCase{6651, false}, RegressionCase{7079, false}, RegressionCase{7284, false},
+                      RegressionCase{7399, false}, RegressionCase{7651, false}, RegressionCase{9524, true}),
     regression_name);

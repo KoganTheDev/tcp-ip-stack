@@ -1175,8 +1175,14 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
         // Only a passive open belongs in the accept queue. An active open can
         // pass through SYN_RECEIVED too, by way of a simultaneous open, and it
         // already belongs to whoever called connect().
-        if (state_before == TcpState::SYN_RECEIVED && connection_it->second->get_state() == TcpState::ESTABLISHED
-            && !connection_it->second->is_active_open())
+        //
+        // Any synchronized state counts, not only ESTABLISHED: the segment
+        // that completes the handshake is processed in full (RFC 9293
+        // 3.10.7.4), so one carrying a FIN goes straight on to CLOSE_WAIT -
+        // still a connection the application must be given, to read and close.
+        TcpState state_after = connection_it->second->get_state();
+        if (state_before == TcpState::SYN_RECEIVED && state_after != TcpState::SYN_RECEIVED
+            && state_after != TcpState::CLOSED && !connection_it->second->is_active_open())
         {
             this->_pending_accepts[key.local_port].push_back(key);
         }
