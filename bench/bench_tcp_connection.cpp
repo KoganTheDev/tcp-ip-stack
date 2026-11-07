@@ -29,7 +29,8 @@ namespace
 
     // Our side is port 8080, the peer 12345. Peer ISN 500 (so RCV.NXT = 501),
     // ours 1000 (SND.NXT = 1001 once established).
-    std::unique_ptr<Tcp> peer_segment(uint32_t seq, uint32_t ack, const Bytes& payload = Bytes(), uint16_t window = 65535)
+    std::unique_ptr<Tcp> peer_segment(uint32_t seq, uint32_t ack, const Bytes& payload = Bytes(),
+                                      uint16_t window = 65535)
     {
         auto segment = std::make_unique<Tcp>(12345, 8080, seq, ack, 5, FLAG_ACK, window, 0, 0);
         if (!payload.empty())
@@ -76,7 +77,10 @@ static void BM_ReorderBuffer(benchmark::State& state)
 {
     const bool gaps = state.range(0) == 1;
     const uint32_t n = static_cast<uint32_t>(state.range(1));
-    const uint32_t length = gaps ? 32 : 100;
+    // 4096 segments of 100 bytes would overflow the 128 KiB receive window and
+    // be mostly dropped, which measures nothing; the largest case uses shorter
+    // segments so they all fit. (Shape 1 holds at most MAX_REORDER_SEGMENTS.)
+    const uint32_t length = gaps ? 32 : (n > 1024 ? 28 : 100);
     const uint32_t stride = gaps ? 2 * length : length;
 
     // Built once: Tcp is not copyable, but on_segment() only reads it.
@@ -128,9 +132,11 @@ BENCHMARK(BM_ReorderBuffer)
     ->Args({0, 16})
     ->Args({0, 256})
     ->Args({0, 1000})
+    ->Args({0, 4096})
     ->Args({1, 16})
     ->Args({1, 256})
-    ->Args({1, 1000});
+    ->Args({1, 1000})
+    ->Args({1, 4096});
 
 // One ack carrying four SACK blocks, handled by a sender with many segments in
 // flight: apply_sack_blocks walks the in-flight queue to mark what the peer
