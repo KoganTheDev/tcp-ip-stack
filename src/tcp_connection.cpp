@@ -640,6 +640,55 @@ void TcpConnection::_buffer_out_of_order(uint32_t seq, const Bytes& payload)
     _last_out_of_order_seq = seq;
 }
 
+namespace
+{
+    // The three ways bytes join a range's chunk list. A chunk smaller than
+    // REORDER_CHUNK_COALESCE_BYTES at the end being extended absorbs the new
+    // bytes (a copy of at most about that much, plus the new bytes), so the
+    // chunk count stays near bytes / that + 2 however small the pieces are.
+    bool is_small_chunk(const Bytes& chunk)
+    {
+        return chunk.size() < TcpConnection::REORDER_CHUNK_COALESCE_BYTES;
+    }
+
+    void append_piece(std::list<Bytes>& chunks, Bytes&& piece)
+    {
+        if (!chunks.empty() && is_small_chunk(chunks.back()))
+        {
+            chunks.back().insert(chunks.back().end(), piece.begin(), piece.end());
+        }
+        else
+        {
+            chunks.push_back(std::move(piece));
+        }
+    }
+
+    void prepend_piece(std::list<Bytes>& chunks, Bytes&& piece)
+    {
+        if (!chunks.empty() && is_small_chunk(chunks.front()))
+        {
+            chunks.front().insert(chunks.front().begin(), piece.begin(), piece.end());
+        }
+        else
+        {
+            chunks.push_front(std::move(piece));
+        }
+    }
+
+    // Moves `tail`'s chunks onto the end of `head`. If either chunk at the
+    // seam is small they are merged, so no small chunk is left in the middle
+    // of a range; otherwise nothing is copied.
+    void join_chunks(std::list<Bytes>& head, std::list<Bytes>& tail)
+    {
+        if (is_small_chunk(head.back()) || is_small_chunk(tail.front()))
+        {
+            head.back().insert(head.back().end(), tail.front().begin(), tail.front().end());
+            tail.pop_front();
+        }
+        head.splice(head.end(), tail);
+    }
+} // namespace
+
 void TcpConnection::_store_reorder_piece(uint64_t start, Bytes piece)
 {
     uint64_t end = start + piece.size();
@@ -653,12 +702,12 @@ void TcpConnection::_store_reorder_piece(uint64_t start, Bytes piece)
 
     if (before != _reorder_buffer.end())
     {
-        before->second.chunks.push_back(std::move(piece));
+        append_piece(before->second.chunks, std::move(piece));
         before->second.end = end;
         if (touches_after)
         {
-            // the piece bridged the two: one range, no bytes copied
-            before->second.chunks.splice(before->second.chunks.end(), after->second.chunks);
+            // the piece bridged the two: one range
+            join_chunks(before->second.chunks, after->second.chunks);
             before->second.end = after->second.end;
             _reorder_buffer.erase(after);
         }
@@ -668,7 +717,7 @@ void TcpConnection::_store_reorder_piece(uint64_t start, Bytes piece)
         // the range after it now begins earlier, which changes its key
         auto node = _reorder_buffer.extract(after);
         node.key() = start;
-        node.mapped().chunks.push_front(std::move(piece));
+        prepend_piece(node.mapped().chunks, std::move(piece));
         _reorder_buffer.insert(std::move(node));
     }
     else

@@ -2680,6 +2680,49 @@ TEST(TcpConnection, TheMostRecentRangeIsReportedFirstWhereverItLies)
         << h.sack[2].start << "," << h.sack[3].start;
 }
 
+// A chunk costs a list node and an allocation, so touching 1-byte pieces must
+// be coalesced into the range's end chunks rather than each becoming one: the
+// chunk count stays within bytes / REORDER_CHUNK_COALESCE_BYTES + 2 per range.
+TEST(TcpConnection, TouchingOneBytePiecesDoNotMakeAChunkEach)
+{
+    ReorderHarness h(500);
+    const uint32_t count = 6000;
+    const uint32_t middle = 10000;
+    for (uint32_t i = 0; i < count; i++)
+        h.arrive(middle + i, middle + 1 + i); // appended to the range
+    for (uint32_t i = 1; i <= count; i++)
+        h.arrive(middle - i, middle + 1 - i); // prepended to it
+    size_t bytes = h.connection->bytes_out_of_order();
+    ASSERT_TRUE(bytes == 2 * count) << "held " << bytes;
+    size_t ranges = h.connection->reorder_range_count();
+    ASSERT_TRUE(ranges == 1) << "one range, got " << ranges;
+    size_t bound = bytes / TcpConnection::REORDER_CHUNK_COALESCE_BYTES + 2 * ranges;
+    ASSERT_TRUE(h.connection->reorder_chunk_count() <= bound)
+        << h.connection->reorder_chunk_count() << " chunks for " << bytes << " bytes, bound " << bound;
+
+    h.arrive(501, middle - count);
+    ASSERT_TRUE(h.delivered.to_hex() == stream(501, middle + count).to_hex()) << "delivered whole, in order";
+}
+
+// Two ranges built from 1-byte pieces and then bridged: the small end chunks
+// that meet in the middle must not be left as interior chunks.
+TEST(TcpConnection, JoiningRangesBuiltFromOneBytePiecesKeepsTheChunkBound)
+{
+    ReorderHarness h(500);
+    for (uint32_t i = 0; i < 300; i++)
+    {
+        h.arrive(1000 + i, 1001 + i);
+        h.arrive(2000 + i, 2001 + i);
+    }
+    h.arrive(1300, 2000); // bridges the two
+    size_t bytes = h.connection->bytes_out_of_order();
+    ASSERT_TRUE(h.connection->reorder_range_count() == 1);
+    ASSERT_TRUE(h.connection->reorder_chunk_count() <= bytes / TcpConnection::REORDER_CHUNK_COALESCE_BYTES + 2)
+        << h.connection->reorder_chunk_count() << " chunks for " << bytes << " bytes";
+    h.arrive(501, 1000);
+    ASSERT_TRUE(h.delivered.to_hex() == stream(501, 2300).to_hex()) << "delivered whole, in order";
+}
+
 // The cap counts ranges. A piece that fills the hole between two held ranges
 // does not add one, so it is accepted even with the buffer at the cap.
 TEST(TcpConnection, APieceJoiningHeldRangesIsAcceptedAtTheCap)

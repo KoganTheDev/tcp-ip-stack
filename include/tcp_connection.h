@@ -258,6 +258,29 @@ public:
     // occupy the receive buffer but no longer shrink the advertised window
     // (see _advertised_window()), so this is the way to see them.
     size_t bytes_out_of_order() const { return _reorder_buffered_bytes; }
+    // A reorder range's end chunks absorb a touching piece while they are
+    // smaller than this, instead of the piece becoming a chunk of its own. A
+    // chunk costs a list node and an allocation (about 100 bytes of overhead),
+    // so without it a peer sending 1-byte pieces would make a chunk per byte:
+    // ~10 MB of overhead per connection within a 128 KiB window. With it every
+    // chunk but the two at a range's ends holds at least this much, so a range
+    // has at most bytes / this + 2 chunks. 2048 is above a typical MSS (so a
+    // run of full-size segments still gets a chunk each and nothing is copied
+    // for them) and low enough that the copy a small piece costs, at most this
+    // many bytes, stays negligible.
+    static constexpr size_t REORDER_CHUNK_COALESCE_BYTES = 2048;
+    // The reorder buffer's shape, for tests: how many ranges it holds and how
+    // many chunks they hold between them (see REORDER_CHUNK_COALESCE_BYTES).
+    size_t reorder_range_count() const { return _reorder_buffer.size(); }
+    size_t reorder_chunk_count() const
+    {
+        size_t count = 0;
+        for (const auto& entry : _reorder_buffer)
+        {
+            count += entry.second.chunks.size();
+        }
+        return count;
+    }
 
     // How much this connection will queue on the send side before send()
     // starts accepting less than it is offered. The application's writes are
@@ -668,11 +691,14 @@ private:
     // one SACK block (so a report reads at most a handful of entries, not the
     // whole buffer) and makes MAX_REORDER_SEGMENTS a count of ranges.
     //
-    // A range keeps its bytes as a list of chunks, one per piece stored, not
-    // as one contiguous buffer: appending a piece, prepending one, or joining
-    // two ranges is then O(1) (list splice) rather than a copy of what is
-    // already held - a peer cannot make the cost per segment grow with the
-    // size of the range. The chunks are concatenated once, when the range is
+    // A range keeps its bytes as a list of chunks, not as one contiguous
+    // buffer: appending a piece, prepending one, or joining two ranges is then
+    // O(1) (list splice) rather than a copy of what is already held - a peer
+    // cannot make the cost per segment grow with the size of the range. A
+    // piece is its own chunk unless the chunk at the end it joins is smaller
+    // than REORDER_CHUNK_COALESCE_BYTES, in which case it is merged into that
+    // one, bounding both the copy and the chunk count (and so the per-chunk
+    // memory overhead). The chunks are concatenated once, when the range is
     // delivered.
     //
     // Unwrapped keys sort in true sequence order, so the earliest range is
