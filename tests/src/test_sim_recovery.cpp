@@ -171,6 +171,9 @@ TEST_F(SimRecovery, ThreeLossesInOneFlightRecoverWithoutATimeout)
                                                              : "3 drops in one flight, cubic",
                r);
         ASSERT_TRUE(r.completed && r.intact) << r.describe();
+        ASSERT_EQ(r.stats.retransmit_timeouts, 0u) << "SACK recovery repairs all three holes: " << r.describe();
+        ASSERT_EQ(r.stats.retransmitted_segments, 3u) << "exactly the three lost segments: " << r.describe();
+        ASSERT_EQ(r.stats.recoveries, 1u) << r.describe();
     }
 }
 

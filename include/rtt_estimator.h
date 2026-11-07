@@ -35,7 +35,9 @@ public:
     // immediately notes that this is about 1980s clock granularity rather than
     // anything about the network. Linux uses 200 ms and so does this, because
     // a one-second floor on a datacentre path makes every loss cost a second
-    // of idle time to recover from. A deliberate deviation, written down.
+    // of idle time to recover from. A deliberate deviation, written down. Like
+    // Linux, the floor bounds the variance term, so the RTO is at least
+    // SRTT + 200 ms - always longer than a peer's 200 ms delayed ack.
     static constexpr int MIN_RTO_MS = 200;
     // RFC 6298 rule 2.5 permits an upper bound provided it is at least 60
     // seconds. Caps the exponential backoff so a connection to a black hole

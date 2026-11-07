@@ -40,8 +40,13 @@ void RttEstimator::on_sample(uint32_t rtt_ms)
         _srtt_scaled = _srtt_scaled - (_srtt_scaled >> SMOOTHING_SHIFT) + (sample_scaled >> SMOOTHING_SHIFT);
     }
 
-    // RTO = SRTT + max(G, K * RTTVAR).
-    uint32_t variance_term = std::max(CLOCK_GRANULARITY_MS * SCALE, VARIANCE_MULTIPLIER * _rttvar_scaled);
+    // RTO = SRTT + max(G, K * RTTVAR), with the floor on the variance term
+    // rather than on the total, as Linux has it (RTO >= SRTT + tcp_rto_min).
+    // A peer may hold an ack for up to 200 ms (RFC 1122 4.2.3.2), so a
+    // timeout of exactly the floor races every delayed ack on a short path;
+    // above SRTT + floor, the delayed ack always wins.
+    uint32_t variance_term = std::max({CLOCK_GRANULARITY_MS * SCALE, VARIANCE_MULTIPLIER * _rttvar_scaled,
+                                       static_cast<uint32_t>(MIN_RTO_MS) * SCALE});
     uint32_t rto_scaled = _srtt_scaled + variance_term;
 
     // Round up rather than truncate: a timeout is a deadline, and rounding it

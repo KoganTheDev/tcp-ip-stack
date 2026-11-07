@@ -31,14 +31,20 @@ TEST(RttEstimator, SamplesBelowTheClockGranularityAreClampedUpToIt)
         << "a zero sample means faster than the clock can see, not instant";
 }
 
-TEST(RttEstimator, RtoNeverFallsBelowTheFloor)
+// The floor applies to the variance term, not to the RTO as a whole (as
+// Linux does: RTO >= SRTT + tcp_rto_min). A peer may hold its ack for up to
+// 200 ms (RFC 1122 4.2.3.2; Linux and this stack both use 200), so an RTO of
+// exactly 200 ms on a short path fires as the delayed ack is on its way: a
+// spurious timeout on every odd segment that ends a burst.
+TEST(RttEstimator, RtoStaysAboveTheRoundTripPlusTheFloor)
 {
     RttEstimator rtt;
     for (int i = 0; i < 50; i++)
     {
-        rtt.on_sample(1);
+        rtt.on_sample(20);
     }
-    ASSERT_EQ(rtt.rto_ms(), RttEstimator::MIN_RTO_MS);
+    ASSERT_GE(rtt.rto_ms(), static_cast<int>(rtt.srtt_ms()) + RttEstimator::MIN_RTO_MS)
+        << "a delayed ack sent 200 ms after the data must arrive before the timeout fires";
 }
 
 TEST(RttEstimator, BackOffDoublesAndIsCapped)
