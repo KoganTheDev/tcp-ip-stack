@@ -351,7 +351,46 @@ public:
     // here means what its RFC says it means regardless of how often, or how
     // regularly, the caller gets round to calling. See
     // TcpConnection::on_time_passed() for the full argument.
+    //
+    // Only connections with a timer due are visited: they wait in a queue
+    // ordered by deadline (see _timer_queue), so the cost is the number of
+    // timers that fire, not the number of connections - an idle connection
+    // costs nothing here however many there are.
+    //
+    // Calling it more often than ms_until_next_timer() asks for is harmless,
+    // and is how the caller keeps the stack's clock current: the stack has no
+    // clock of its own, so anything it timestamps (an RTT sample, a TCP
+    // timestamp, a half-open connection's age) is stamped with the time last
+    // reported here. A reactor should report the time before each poll().
     void on_time_passed(uint32_t elapsed_ms);
+
+    // How long the caller may wait before on_time_passed() has anything to do:
+    // milliseconds until the earliest armed timer anywhere in the stack - a
+    // connection's, ARP's, reassembly's, DHCP's or DNS's - or std::nullopt
+    // when none is armed. 0 means something is already due.
+    //
+    // The contract: report time with on_time_passed() at or after this many
+    // milliseconds and whatever is due fires; earlier is harmless. Anything
+    // the caller does to the stack in the meantime (poll(), send(), close(),
+    // connect()) can arm a timer, so ask again after each of those - it is
+    // cheap enough to ask on every pass of an event loop.
+    //
+    // Relative rather than an absolute deadline because the stack's clock is
+    // only the sum of what on_time_passed() reported; the caller's own clock is
+    // the one to add this to. Saturates at UINT32_MAX, which is as far ahead
+    // as on_time_passed() can report anyway.
+    //
+    // Logically const; tidies the timer queue as it looks (see
+    // _tidy_timer_queue), which is why that is mutable.
+    NextTimer ms_until_next_timer() const;
+
+    // The stack's clock: the sum of every on_time_passed() so far.
+    uint64_t now_ms() const { return _now_ms; }
+
+    // Connections whose timers on_time_passed() has run, since the stack
+    // started - a cost counter. With nothing due it should not move, however
+    // many connections there are.
+    uint64_t connection_timer_runs() const { return _connection_timer_runs; }
 
 private:
     struct ConnectionKey
@@ -399,6 +438,18 @@ private:
     void _handle_udp(const Ip& ip, const Udp& udp);
     void _handle_icmp(const Ip& ip, const Icmp& icmp);
     void _reap_closed_connections();
+    // Puts a connection in the tables and in the timer queue. Every
+    // connection the stack creates comes through here.
+    void _register_connection(const ConnectionKey& key, std::unique_ptr<TcpConnection> connection);
+    // Makes the timer queue hold this connection's current deadline - called
+    // whenever it may have moved (TcpConnection's timer-changed callback) and
+    // after its timers have run.
+    void _schedule_connection_timer(uint64_t connection_id) const;
+    // Pops stale entries off the front of the timer queue until the front is
+    // a connection's real, current deadline.
+    void _tidy_timer_queue() const;
+    // The connection's next deadline on the stack's clock, or NO_DEADLINE.
+    uint64_t _connection_deadline(const TcpConnection& connection) const;
     // Wires a connection's state-change notification to push its id onto
     // _pending_reap_ids the instant it reaches CLOSED - never erases
     // directly here. This fires synchronously from inside the connection's
@@ -706,11 +757,54 @@ private:
     // refuses them; the resolver binds through _bind_udp_socket() instead.
     std::unordered_set<uint16_t> _resolver_ports;
     std::unordered_map<ConnectionKey, std::unique_ptr<TcpConnection>, ConnectionKeyHash> _connections;
-    // id -> key, not id -> TcpConnection* - find_connection() and reaping
-    // both need to reach the owning entry in _connections (keyed by
-    // ConnectionKey), and this is what makes that an O(1) hash lookup
-    // instead of a linear scan over every connection
-    std::unordered_map<uint64_t, ConnectionKey> _connections_by_id;
+    // Per connection id: its key, so reaping can reach the owning entry in
+    // _connections in O(1) rather than by a scan; the connection itself, so
+    // find_connection() and the timer queue need one lookup rather than two;
+    // and the deadline of its live entry in the timer queue.
+    struct ConnectionRecord
+    {
+        ConnectionKey key;
+        TcpConnection* connection = nullptr;
+        // The deadline of this connection's one live entry in _timer_queue,
+        // or NO_DEADLINE if it has none. An entry whose deadline differs is
+        // stale and is skipped when it surfaces. Invariant: never later than
+        // the connection's real deadline - see _schedule_connection_timer().
+        uint64_t queued_deadline = TcpConnection::NO_DEADLINE;
+    };
+    // mutable only for queued_deadline, which ms_until_next_timer() maintains.
+    mutable std::unordered_map<uint64_t, ConnectionRecord> _connections_by_id;
+
+    // The connection timer queue: a binary min-heap of (deadline on the
+    // stack's clock, connection id), so on_time_passed() reaches only the
+    // connections with something due. O(log n) to add an entry, O(log n) to
+    // take the earliest, O(1) to look at it.
+    //
+    // Entries are never updated or removed in place - a heap cannot find them
+    // to - so a connection's deadline moving makes its old entry stale, and
+    // stale entries are dropped when they reach the front. Two things keep
+    // that cheap. A deadline moving LATER (every ack re-arms the retransmit
+    // timer further out) pushes nothing: the existing, earlier entry stays and,
+    // when it surfaces, the connection is simply re-queued at its real
+    // deadline - one heap operation per round trip, not per ack. Only a
+    // deadline moving EARLIER needs a new entry. And when stale entries
+    // outnumber live ones the heap is rebuilt from the records, so it stays
+    // O(connections) in size.
+    //
+    // Ids rather than pointers, so an entry for a connection reaped in the
+    // meantime is detected (no record) instead of dereferenced.
+    struct TimerEntry
+    {
+        uint64_t deadline;
+        uint64_t connection_id;
+        // Ordered for std::*_heap, which builds a max-heap: "less" means later.
+        // Ties go to the lower id, so the order timers fire in is deterministic.
+        bool operator<(const TimerEntry& other) const
+        {
+            return deadline != other.deadline ? deadline > other.deadline : connection_id > other.connection_id;
+        }
+    };
+    mutable std::vector<TimerEntry> _timer_queue;
+    uint64_t _connection_timer_runs = 0;
     // ids that reached CLOSED since the last reap pass - see
     // _watch_for_close()'s comment for why this exists instead of scanning
     // every connection on every poll()/on_time_passed()

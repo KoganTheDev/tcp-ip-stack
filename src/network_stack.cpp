@@ -347,9 +347,7 @@ TcpConnection* NetworkStack::connect(const IPv4Address& remote_ip, uint16_t remo
         { this->_send_tcp_segment(remote_ip, header, payload); }, this->_primary().config.local_mss());
 
     TcpConnection* connection_ptr = connection.get();
-    this->_wire_connection(*connection_ptr);
-    this->_connections_by_id[connection_ptr->get_id()] = key;
-    this->_connections[key] = std::move(connection);
+    this->_register_connection(key, std::move(connection));
 
     // Resolve and queue against the NEXT HOP, not the peer. For an off-link
     // peer the ARP reply that unblocks this connection comes from the gateway
@@ -382,13 +380,7 @@ TcpConnection* NetworkStack::connect(const IPv4Address& remote_ip, uint16_t remo
 TcpConnection* NetworkStack::find_connection(uint64_t id) const
 {
     auto id_it = this->_connections_by_id.find(id);
-    if (id_it == this->_connections_by_id.end())
-    {
-        return nullptr;
-    }
-
-    auto connection_it = this->_connections.find(id_it->second);
-    return connection_it != this->_connections.end() ? connection_it->second.get() : nullptr;
+    return id_it != this->_connections_by_id.end() ? id_it->second.connection : nullptr;
 }
 
 DnsResolver& NetworkStack::_ensure_dns_resolver()
@@ -568,6 +560,99 @@ void NetworkStack::_wire_connection(TcpConnection& connection)
 {
     this->_watch_for_close(connection);
     connection.set_challenge_ack_gate([this]() { return this->_may_send_challenge_ack(); });
+    // One clock for the whole stack: a connection whose timers are not run
+    // (because none is due) must still see time pass, for its timestamps,
+    // its RTT samples and its idle restart.
+    connection.use_external_clock(&this->_now_ms);
+    uint64_t connection_id = connection.get_id();
+    connection.set_timer_changed_callback([this, connection_id]() { this->_schedule_connection_timer(connection_id); });
+}
+
+void NetworkStack::_register_connection(const ConnectionKey& key, std::unique_ptr<TcpConnection> connection)
+{
+    TcpConnection* connection_ptr = connection.get();
+    uint64_t connection_id = connection_ptr->get_id();
+    this->_wire_connection(*connection_ptr);
+    this->_connections_by_id[connection_id] = ConnectionRecord{key, connection_ptr, TcpConnection::NO_DEADLINE};
+    this->_connections[key] = std::move(connection);
+    // It may have armed a timer before it was wired (the SYN-ACK
+    // accept_incoming_syn() sent), when there was nobody to tell.
+    this->_schedule_connection_timer(connection_id);
+}
+
+uint64_t NetworkStack::_connection_deadline(const TcpConnection& connection) const
+{
+    // The connection reads this stack's clock through an offset, so the
+    // distance to its deadline is the same on both clocks.
+    uint64_t deadline = connection.next_deadline_ms();
+    if (deadline == TcpConnection::NO_DEADLINE)
+    {
+        return TcpConnection::NO_DEADLINE;
+    }
+    uint64_t now = connection.now_ms();
+    return this->_now_ms + (deadline > now ? deadline - now : 0);
+}
+
+void NetworkStack::_schedule_connection_timer(uint64_t connection_id) const
+{
+    auto record_it = this->_connections_by_id.find(connection_id);
+    if (record_it == this->_connections_by_id.end())
+    {
+        return; // not registered yet - _register_connection() schedules it
+    }
+    ConnectionRecord& record = record_it->second;
+    uint64_t deadline = this->_connection_deadline(*record.connection);
+    // Only an earlier deadline needs an entry. A later one (or none) leaves
+    // the existing entry to surface early and be re-queued then.
+    if (deadline >= record.queued_deadline)
+    {
+        return;
+    }
+    record.queued_deadline = deadline;
+    this->_timer_queue.push_back(TimerEntry{deadline, connection_id});
+    std::push_heap(this->_timer_queue.begin(), this->_timer_queue.end());
+
+    // Mostly stale: rebuild from the records, one entry per armed connection.
+    constexpr size_t SLACK = 64;
+    if (this->_timer_queue.size() > 2 * this->_connections_by_id.size() + SLACK)
+    {
+        this->_timer_queue.clear();
+        for (const auto& entry : this->_connections_by_id)
+        {
+            if (entry.second.queued_deadline != TcpConnection::NO_DEADLINE)
+            {
+                this->_timer_queue.push_back(TimerEntry{entry.second.queued_deadline, entry.first});
+            }
+        }
+        std::make_heap(this->_timer_queue.begin(), this->_timer_queue.end());
+    }
+}
+
+void NetworkStack::_tidy_timer_queue() const
+{
+    while (!this->_timer_queue.empty())
+    {
+        const TimerEntry& front = this->_timer_queue.front();
+        uint64_t connection_id = front.connection_id;
+        auto record_it = this->_connections_by_id.find(connection_id);
+        bool stale = record_it == this->_connections_by_id.end() || record_it->second.queued_deadline != front.deadline;
+        if (!stale)
+        {
+            // Live, but the connection's deadline may have moved later since
+            // it was queued (an ack re-armed its retransmit timer, say).
+            if (this->_connection_deadline(*record_it->second.connection) == front.deadline)
+            {
+                return;
+            }
+            record_it->second.queued_deadline = TcpConnection::NO_DEADLINE;
+        }
+        std::pop_heap(this->_timer_queue.begin(), this->_timer_queue.end());
+        this->_timer_queue.pop_back();
+        if (!stale)
+        {
+            this->_schedule_connection_timer(connection_id);
+        }
+    }
 }
 
 bool NetworkStack::_may_send_challenge_ack()
@@ -682,17 +767,47 @@ void NetworkStack::on_time_passed(uint32_t elapsed_ms)
 {
     this->_now_ms += elapsed_ms;
 
+    // Take every connection that is due off the queue first, then run them.
+    // Running one can arm new timers (re-queued below) or schedule another
+    // connection, and taking the batch up front is what bounds this call:
+    // each due connection runs once per call, as every connection used to
+    // when all of them were visited. Anything due again within this same
+    // millisecond waits for the next call.
+    std::vector<uint64_t> due;
+    while (!this->_timer_queue.empty() && this->_timer_queue.front().deadline <= this->_now_ms)
+    {
+        TimerEntry entry = this->_timer_queue.front();
+        std::pop_heap(this->_timer_queue.begin(), this->_timer_queue.end());
+        this->_timer_queue.pop_back();
+        auto record_it = this->_connections_by_id.find(entry.connection_id);
+        if (record_it == this->_connections_by_id.end() || record_it->second.queued_deadline != entry.deadline)
+        {
+            continue; // stale: reaped, or re-queued since
+        }
+        record_it->second.queued_deadline = TcpConnection::NO_DEADLINE;
+        due.push_back(entry.connection_id);
+    }
+
     // Each connection is isolated: an unexpected exception from one (a bug,
     // a codec error) drops that connection, not the reactor and every other
     // connection with it. A transient write failure never gets here -
     // _transmit() absorbs it - and the one thing let through is
     // FatalChannelError: the device is gone, which is every connection's
     // problem, and logging it per connection per tick would hide it.
-    for (auto& entry : this->_connections)
+    for (uint64_t connection_id : due)
     {
+        // Looked up again rather than held: nothing is reaped until the end
+        // of this function, but a callback may have added connections and
+        // rehashed the table.
+        TcpConnection* connection = this->find_connection(connection_id);
+        if (connection == nullptr)
+        {
+            continue;
+        }
+        this->_connection_timer_runs++;
         try
         {
-            entry.second->on_time_passed(elapsed_ms);
+            connection->run_due_timers();
         }
         catch (const FatalChannelError&)
         {
@@ -700,10 +815,13 @@ void NetworkStack::on_time_passed(uint32_t elapsed_ms)
         }
         catch (const std::exception& e)
         {
-            LOG_ERROR("NetworkStack: dropping connection " << entry.second->get_id()
+            LOG_ERROR("NetworkStack: dropping connection " << connection_id
                                                            << " after an error in its timers: " << e.what());
-            entry.second->fail(); // -> CLOSED, reaped below
+            connection->fail(); // -> CLOSED, reaped below
         }
+        // Queued again at its new deadline. If that is where it already was,
+        // the connection's callback did not fire, so this cannot be left to it.
+        this->_schedule_connection_timer(connection_id);
     }
 
     this->_reap_closed_connections();
@@ -797,6 +915,45 @@ void NetworkStack::on_time_passed(uint32_t elapsed_ms)
     }
 }
 
+NextTimer NetworkStack::ms_until_next_timer() const
+{
+    NextTimer next;
+
+    this->_tidy_timer_queue();
+    if (!this->_timer_queue.empty())
+    {
+        uint64_t deadline = this->_timer_queue.front().deadline;
+        fold_next_timer(next, deadline > this->_now_ms
+                                  ? static_cast<int64_t>(std::min<uint64_t>(deadline - this->_now_ms, UINT32_MAX))
+                                  : 0);
+    }
+
+    // The rest keep countdowns of their own, each bounded in size, so they
+    // are simply asked.
+    if (this->_dhcp_client)
+    {
+        fold_next_timer(next, this->_dhcp_client->ms_until_next_timer());
+    }
+    if (this->_dns_resolver)
+    {
+        fold_next_timer(next, this->_dns_resolver->ms_until_next_timer());
+    }
+    fold_next_timer(next, this->_reassembler.ms_until_next_timer());
+    for (const auto& interface : this->_interfaces)
+    {
+        fold_next_timer(next, interface->arp_table.ms_until_next_timer());
+        for (const auto& request : interface->arp_requests_in_flight)
+        {
+            fold_next_timer(next, request.second.ms_until_retry);
+        }
+    }
+    // Not timers, so not here: the ICMP error budget refills continuously
+    // from elapsed time, and the challenge-ACK window, SYN-cookie slot and
+    // half-open ages are read from the clock when a packet needs them. None
+    // of them makes anything happen by itself.
+    return next;
+}
+
 void NetworkStack::_reap_closed_connections()
 {
     // drains _pending_reap_ids instead of scanning every connection -
@@ -815,7 +972,9 @@ void NetworkStack::_reap_closed_connections()
         }
 
         LOG_DEBUG("NetworkStack: reaping closed connection id=" << connection_id);
-        this->_connections.erase(id_it->second);
+        // Its entries in the timer queue go stale with the record and are
+        // dropped as they surface.
+        this->_connections.erase(id_it->second.key);
         this->_connections_by_id.erase(id_it);
     }
 }
@@ -1292,10 +1451,8 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
         return;
     }
 
-    this->_wire_connection(*connection);
     this->_track_half_open(*connection, key.local_port);
-    this->_connections_by_id[connection->get_id()] = key;
-    this->_connections[key] = std::move(connection);
+    this->_register_connection(key, std::move(connection));
 }
 
 void NetworkStack::_send_syn_cookie(const Ip& ip, const Tcp& tcp)
@@ -1385,9 +1542,7 @@ bool NetworkStack::_try_complete_cookie_handshake(const Ip& ip, const Tcp& tcp)
     connection->accept_cookie_handshake(peer_isn, mss);
 
     TcpConnection* connection_ptr = connection.get();
-    this->_wire_connection(*connection_ptr);
-    this->_connections_by_id[connection_ptr->get_id()] = key;
-    this->_connections[key] = std::move(connection);
+    this->_register_connection(key, std::move(connection));
     this->_pending_accepts[local_port].push_back(key);
 
     // The completing ACK may carry data (or its window), so it is processed
