@@ -437,6 +437,55 @@ container with the kernel side addressed, then exercised with `ping`, `nc`,
 `tcpdump`, and a concurrent load test. That confirms ping, TCP echo, RST on a closed
 port, UDP port unreachable, and 720 out of 720 load connections.
 
+### Fuzzing
+
+The unit suite's fuzz tests feed each parser a fixed set of random inputs. Real fuzzing
+is coverage-guided: [libFuzzer](https://llvm.org/docs/LibFuzzer.html) keeps the inputs
+that reach new branches and mutates those, which is what finds the inputs random bytes
+almost never produce. [`fuzz/`](fuzz/) has one harness per parser (Ethernet, IPv4, TCP
+with its options, UDP, ICMP, ARP, DHCP, DNS), one that feeds the IP reassembler a
+sequence of fragments, and one stateful harness that feeds frames into a whole
+`NetworkStack` with a listening port and an established connection, running `poll()` and
+the timers between frames. Each has a small committed seed corpus in `fuzz/corpus/`,
+generated from the stack's own serializers by `fuzz/gen_corpus.cpp`.
+
+```sh
+make fuzz                      # every harness, 30 s each (needs clang)
+FUZZ_SECONDS=300 make fuzz     # longer
+```
+
+A crash leaves its reproducer in `build/fuzz/crashes/<harness>/`; replay it with
+`./build/fuzz/fuzz/fuzz_<harness> <file>`. CI runs 20 s per harness on every push, and
+the nightly workflow runs about 30 minutes in total with the grown corpus cached between
+runs.
+
+### Benchmarks
+
+[`bench/`](bench/) holds [Google Benchmark](https://github.com/google/benchmark)
+microbenchmarks (fetched at a pinned release): the Internet checksum at 64, 576, 1500 and
+9000 bytes; parsing and serializing Ethernet + IPv4 + TCP with options; parsing a DNS
+response with name compression; the TCP reorder buffer, including a many-gaps worst case;
+the SACK scoreboard walk; and a simulated bulk transfer through the network simulator
+(bytes per wall second, with no loss and with 1% loss).
+
+```sh
+make bench                                     # Release (-O2 -g)
+make bench BENCH_ARGS=--benchmark_filter=Reorder
+```
+
+On every push to `main`, [`bench.yml`](.github/workflows/bench.yml) runs them and appends
+the results to the `gh-pages` branch with
+[github-action-benchmark](https://github.com/benchmark-action/github-action-benchmark),
+which generates a chart per benchmark over commits. The charts are at
+`https://KoganTheDev.github.io/tcp-ip-stack/dev/bench/`. A 1.5x slowdown against the
+previous run fails the job and comments on the commit; the threshold is loose on purpose,
+because shared runners are noisy. Pull requests run the benchmarks and show the
+comparison in the job summary without publishing.
+
+One-time setup for the repository owner: after the first run on `main` has created the
+`gh-pages` branch, enable **Settings > Pages > Build and deployment > Deploy from a
+branch > `gh-pages` / root**. Until then the numbers are recorded but there is no page.
+
 ## Performance
 
 Profiled with `perf` and `callgrind` under concurrent load, not guessed at:

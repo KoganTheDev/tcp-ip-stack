@@ -9,12 +9,14 @@ Userspace TCP/IP stack in C++17 (Ethernet, ARP, IPv4, TCP, UDP, ICMP) over a Lin
 - scripts/ : end-to-end shell tests (veth, router, http-get)
 
 ## Commands
-The build is CMake (CMakePresets.json: debug, release, asan, tsan, coverage, strict; each builds into build/<preset>). The root Makefile wraps it:
+The build is CMake (CMakePresets.json: debug, release, asan, tsan, coverage, strict, fuzz, bench; each builds into build/<preset>). The root Makefile wraps it:
 - Build and run tests: `make test` (runner is build/debug/run_tests)
 - Address + UB sanitizers: `make asan`
 - Thread sanitizer: `make tsan`
 - Warnings as errors: `make strict`
 - Coverage (clang): `make coverage` (per-file table, HTML in build/coverage/html)
+- Fuzzing (clang, libFuzzer): `make fuzz` (harnesses in fuzz/, seeds in fuzz/corpus, FUZZ_SECONDS per harness, default 30; crashes land in build/fuzz/crashes/)
+- Microbenchmarks (Google Benchmark, Release): `make bench` (sources in bench/; BENCH_ARGS passes flags to the binary)
 - Clean: `make clean`
 - Without the wrapper: `cmake --preset debug && cmake --build --preset debug && ctest --preset debug -L unit`
 - One test: `./build/debug/run_tests --gtest_filter='TcpConnection.*'`
