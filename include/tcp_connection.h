@@ -258,20 +258,36 @@ public:
     // occupy the receive buffer but no longer shrink the advertised window
     // (see _advertised_window()), so this is the way to see them.
     size_t bytes_out_of_order() const { return _reorder_buffered_bytes; }
-    // A reorder range's end chunks absorb a touching piece while they are
-    // smaller than this, instead of the piece becoming a chunk of its own. A
-    // chunk costs a list node and an allocation (about 100 bytes of overhead),
-    // so without it a peer sending 1-byte pieces would make a chunk per byte:
-    // ~10 MB of overhead per connection within a 128 KiB window. With it every
-    // chunk but the two at a range's ends holds at least this much, so a range
-    // has at most bytes / this + 2 chunks. 2048 is above a typical MSS (so a
-    // run of full-size segments still gets a chunk each and nothing is copied
-    // for them) and low enough that the copy a small piece costs, at most this
-    // many bytes, stays negligible.
+    // Chunk-size policy of a reorder range (C = this constant). A piece is cut
+    // into slices of at most C bytes; a slice is merged into the range's end
+    // chunk while that is smaller than C, else it becomes a chunk of its own.
+    // A chunk costs a list node and an allocation (about 100 bytes of
+    // overhead), so without merging a peer sending 1-byte pieces would make a
+    // chunk per byte: ~10 MB of overhead per connection within a 128 KiB
+    // window. Invariants: every chunk is smaller than 2C, and every chunk but
+    // the two at a range's ends is at least C - so a range has at most
+    // bytes / C + 2 chunks, and no merge or copy exceeds 2C bytes however
+    // large a segment the peer sends (a 60 KiB segment is stored as slices,
+    // copied once). 2048 is above a typical MSS, so a run of full-size
+    // segments is one chunk each, and small enough that a copy stays cheap.
     static constexpr size_t REORDER_CHUNK_COALESCE_BYTES = 2048;
     // The reorder buffer's shape, for tests: how many ranges it holds and how
     // many chunks they hold between them (see REORDER_CHUNK_COALESCE_BYTES).
     size_t reorder_range_count() const { return _reorder_buffer.size(); }
+    // The largest chunk held, for tests: no merge or copy exceeds twice the
+    // coalesce size, whatever segment sizes the peer sends.
+    size_t max_reorder_chunk_bytes() const
+    {
+        size_t largest = 0;
+        for (const auto& entry : _reorder_buffer)
+        {
+            for (const Bytes& chunk : entry.second.chunks)
+            {
+                largest = std::max(largest, chunk.size());
+            }
+        }
+        return largest;
+    }
     size_t reorder_chunk_count() const
     {
         size_t count = 0;
@@ -695,11 +711,10 @@ private:
     // buffer: appending a piece, prepending one, or joining two ranges is then
     // O(1) (list splice) rather than a copy of what is already held - a peer
     // cannot make the cost per segment grow with the size of the range. A
-    // piece is its own chunk unless the chunk at the end it joins is smaller
-    // than REORDER_CHUNK_COALESCE_BYTES, in which case it is merged into that
-    // one, bounding both the copy and the chunk count (and so the per-chunk
-    // memory overhead). The chunks are concatenated once, when the range is
-    // delivered.
+    // piece is stored as chunks of bounded size - see
+    // REORDER_CHUNK_COALESCE_BYTES for the policy that bounds both a copy and
+    // the chunk count (and so the per-chunk memory overhead). The chunks are
+    // concatenated once, when the range is delivered.
     //
     // Unwrapped keys sort in true sequence order, so the earliest range is
     // always begin() even across the 2^32 wrap.
@@ -711,7 +726,7 @@ private:
     std::map<uint64_t, ReorderRange> _reorder_buffer;
     // Stores one piece [start, start + piece.size()) that lies entirely in a
     // hole of _reorder_buffer, joining it to whichever neighbours it touches.
-    void _store_reorder_piece(uint64_t start, Bytes piece);
+    void _store_reorder_piece(uint64_t start, const Bytes& piece);
     // RCV.NXT, unwrapped: advanced in lockstep with _recv_next, so the two are
     // equal modulo 2^32. Every buffered range lies after it and within the
     // window, so (seq - RCV.NXT) + this is a range's unwrapped position.

@@ -2723,6 +2723,52 @@ TEST(TcpConnection, JoiningRangesBuiltFromOneBytePiecesKeepsTheChunkBound)
     ASSERT_TRUE(h.delivered.to_hex() == stream(501, 2300).to_hex()) << "delivered whole, in order";
 }
 
+// No chunk is larger than twice the coalesce size, so no merge copies more
+// than that, whatever segment sizes a peer sends. A segment far larger than
+// the MSS is stored as several chunks.
+TEST(TcpConnection, ALargeOutOfOrderSegmentIsStoredAsBoundedChunks)
+{
+    const size_t limit = 2 * TcpConnection::REORDER_CHUNK_COALESCE_BYTES;
+    ReorderHarness h(500);
+    h.arrive(10000, 70000);
+    ASSERT_TRUE(h.connection->bytes_out_of_order() == 60000);
+    ASSERT_TRUE(h.connection->max_reorder_chunk_bytes() <= limit)
+        << "largest chunk " << h.connection->max_reorder_chunk_bytes();
+    ASSERT_TRUE(h.connection->reorder_chunk_count() <= 60000 / TcpConnection::REORDER_CHUNK_COALESCE_BYTES + 2)
+        << h.connection->reorder_chunk_count() << " chunks";
+
+    h.arrive(70000, 71000); // piece appended (the window ends near 71500 here)
+    h.arrive(5000, 10000); // and one prepended
+    ASSERT_TRUE(h.connection->max_reorder_chunk_bytes() <= limit)
+        << "largest chunk " << h.connection->max_reorder_chunk_bytes();
+    h.arrive(501, 5000);
+    ASSERT_TRUE(h.delivered.to_hex() == stream(501, 71000).to_hex()) << "delivered whole, in order";
+}
+
+// The seam of a bridge where one side's end chunk is small and the other's is
+// large: the bytes are rebalanced or merged within the same bound.
+TEST(TcpConnection, BridgingASmallChunkToALargeOneStaysWithinTheChunkBound)
+{
+    const size_t C = TcpConnection::REORDER_CHUNK_COALESCE_BYTES;
+    ReorderHarness h(500);
+    // range B: front chunk grown to 2C-1 by a prepend onto a C-1 chunk
+    h.arrive(20000, 20000 + C - 1);
+    h.arrive(20000 - C, 20000);
+    // range A: one chunk of C-2 bytes, then a 1-byte gap-closer leaves C-1
+    h.arrive(10000, 10000 + C - 2);
+    h.arrive(10000 + C - 2, 10000 + C - 1);
+    ASSERT_TRUE(h.connection->reorder_range_count() == 2);
+    h.arrive(10000 + C - 1, 20000 - C); // bridges A and B
+    ASSERT_TRUE(h.connection->reorder_range_count() == 1);
+    ASSERT_TRUE(h.connection->max_reorder_chunk_bytes() <= 2 * C)
+        << "largest chunk " << h.connection->max_reorder_chunk_bytes();
+    size_t bytes = h.connection->bytes_out_of_order();
+    ASSERT_TRUE(h.connection->reorder_chunk_count() <= bytes / C + 2)
+        << h.connection->reorder_chunk_count() << " chunks for " << bytes << " bytes";
+    h.arrive(501, 10000);
+    ASSERT_TRUE(h.delivered.to_hex() == stream(501, 20000 + C - 1).to_hex()) << "delivered whole, in order";
+}
+
 // The cap counts ranges. A piece that fills the hole between two held ranges
 // does not add one, so it is accepted even with the buffer at the cap.
 TEST(TcpConnection, APieceJoiningHeldRangesIsAcceptedAtTheCap)
