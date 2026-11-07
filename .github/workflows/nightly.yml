@@ -15,6 +15,10 @@ on:
         description: Number of seeds to run
         required: false
         default: "100000"
+      fuzz_seconds:
+        description: Seconds of fuzzing per harness
+        required: false
+        default: "180"
 
 # One nightly at a time; a manual run while the scheduled one is going waits.
 concurrency:
@@ -52,3 +56,59 @@ jobs:
             build/debug/sim-shard-*.log
           if-no-files-found: ignore
           retention-days: 14
+
+  # The same harnesses as the per-push fuzz job in ci.yml, run long: ten
+  # harnesses at 180 s is thirty minutes of fuzzing. Long enough to get past
+  # what a twenty-second run reaches (a bug three branches deep in the TCP
+  # option parser, a particular fragment interleaving), short enough to stay one
+  # job.
+  #
+  # The grown corpus is the point of running nightly: it is cached between runs,
+  # so each night starts from everything found before instead of from the
+  # committed seeds, and the coverage only goes up. Restore and save are
+  # separate steps so the save happens even when a harness crashed (a plain
+  # actions/cache step skips its save on failure), and the key carries the run
+  # id so every night saves a new, larger corpus; the restore key matches the
+  # newest. Per-push runs restore it read-only.
+  fuzz:
+    name: fuzz (${{ github.event.inputs.fuzz_seconds || '180' }} s per harness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: fuzz
+
+      - uses: ./.github/actions/install-libfuzzer
+
+      - name: Restore the grown corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: build/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+
+      - name: Fuzz every harness
+        env:
+          FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || '180' }}
+        run: make fuzz
+
+      - name: Save the grown corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: build/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+
+      - name: Upload reproducers and logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-nightly
+          path: |
+            build/fuzz/crashes/
+            build/fuzz/*.log
+          if-no-files-found: ignore
+          retention-days: 30

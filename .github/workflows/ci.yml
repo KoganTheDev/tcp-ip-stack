@@ -291,3 +291,53 @@ jobs:
           name: test-results-coverage
           path: test-results/
           if-no-files-found: ignore
+
+  # Coverage-guided fuzzing, briefly, on every push. The unit suite's fuzz tests
+  # replay a fixed 2000 random inputs per parser and are deterministic by design;
+  # this is the other half - libFuzzer steering by branch coverage, which is what
+  # finds the inputs random bytes almost never produce. Twenty seconds per
+  # harness (ten harnesses, a few minutes with the build) is enough to run the
+  # committed seeds through the current code, which alone catches a parser
+  # regression, and to re-find anything a change makes shallow. A clean result
+  # here means "nothing found in twenty seconds", not "nothing there"; the long
+  # run is in nightly.yml.
+  #
+  # The corpus the nightly run has grown is restored read-only (restore, never
+  # save: a per-push run is too short to add much and would churn the cache), so
+  # the push starts from where the long runs left off.
+  #
+  # A finding fails the job and uploads the reproducer. Replay it locally by
+  # building the fuzz preset (cmake --preset fuzz, then cmake --build --preset
+  # fuzz) and running ./build/fuzz/fuzz/fuzz_<harness> <downloaded file>.
+  fuzz:
+    name: fuzz (20 s per harness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: fuzz
+
+      - uses: ./.github/actions/install-libfuzzer
+
+      - name: Restore the grown corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: build/fuzz/corpus
+          key: fuzz-corpus-restore-only
+          restore-keys: fuzz-corpus-
+
+      - name: Fuzz every harness
+        run: make fuzz FUZZ_SECONDS=20
+
+      - name: Upload reproducers and logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            build/fuzz/crashes/
+            build/fuzz/*.log
+          if-no-files-found: ignore
