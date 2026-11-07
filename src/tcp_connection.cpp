@@ -175,7 +175,19 @@ std::vector<Tcp::SackBlock> TcpConnection::_sack_blocks_to_report() const
 uint32_t TcpConnection::_advertised_window() const
 {
     uint32_t occupied = _receive_buffer_occupied();
-    return occupied < RECEIVE_BUFFER_CAPACITY ? RECEIVE_BUFFER_CAPACITY - occupied : 0;
+    uint32_t free_space = occupied < RECEIVE_BUFFER_CAPACITY ? RECEIVE_BUFFER_CAPACITY - occupied : 0;
+    // Never shrink the window: RFC 1122 4.2.2.16 and RFC 9293 3.8.6 say a
+    // receiver SHOULD NOT move the right edge (RCV.NXT + RCV.WND) left.
+    // Out-of-order data lands inside the window already offered, so taking it
+    // out of free space and advertising the rest would pull the edge back by
+    // every byte buffered - and each duplicate ack would carry a smaller
+    // window, which fails RFC 5681's "window unchanged" test, so a peer's fast
+    // retransmit never fires. Linux does the same (tcp_select_window keeps
+    // the offered edge). The buffer is not overcommitted: the edge was offered
+    // from free space, and everything that has arrived since lies below it.
+    uint64_t promised =
+        _rcv_right_edge_unwrapped > _recv_next_unwrapped ? _rcv_right_edge_unwrapped - _recv_next_unwrapped : 0;
+    return std::max<uint32_t>(free_space, static_cast<uint32_t>(promised));
 }
 
 bool TcpConnection::_segment_acceptable(uint32_t seq, uint32_t length) const
@@ -209,8 +221,7 @@ bool TcpConnection::_ack_acceptable_in_syn_sent(uint32_t ack) const
 
 bool TcpConnection::_seq_in_receive_window(uint32_t seq) const
 {
-    uint32_t occupied = _receive_buffer_occupied();
-    uint32_t window = occupied < RECEIVE_BUFFER_CAPACITY ? RECEIVE_BUFFER_CAPACITY - occupied : 0;
+    uint32_t window = _advertised_window();
     if (window == 0)
     {
         return seq == _recv_next;
@@ -240,6 +251,10 @@ void TcpConnection::_transmit(uint8_t flags, uint32_t seq, const Bytes& payload)
     if (flags & FLAG_ACK)
     {
         _last_ack_sent = _recv_next;
+        // The right edge just offered, as the peer will compute it - from the
+        // scaled-down value actually sent.
+        uint64_t edge = _recv_next_unwrapped + (static_cast<uint64_t>(window_value) << our_shift);
+        _rcv_right_edge_unwrapped = std::max(_rcv_right_edge_unwrapped, edge);
     }
 }
 
@@ -559,8 +574,15 @@ void TcpConnection::initiate_connect()
 void TcpConnection::_buffer_out_of_order(uint32_t seq, const Bytes& payload)
 {
     // seq is after RCV.NXT and inside the window, so this is its position.
+    // Whatever runs past the window's right edge is not kept (RFC 9293
+    // 3.10.7.4 trims a segment to the window): that is what bounds the
+    // buffer by the window offered.
     uint64_t start = _recv_next_unwrapped + static_cast<uint32_t>(seq - _recv_next);
-    uint64_t end = start + payload.size();
+    uint64_t end = std::min<uint64_t>(start + payload.size(), _recv_next_unwrapped + _advertised_window());
+    if (end <= start)
+    {
+        return;
+    }
 
     // The parts of [start, end) not already held. Entries are disjoint, so
     // one walk from the entry before start finds them; the walk is bounded by

@@ -1981,13 +1981,10 @@ TEST(TcpConnection, LossRightAfterAnAcceptedProbeIsRecoveredByFastRetransmit)
 //
 // Since the buffer holds ranges, adjacent one-byte segments extend one entry
 // and cost nothing extra; it takes segments separated by gaps to make
-// entries, so that is what this sends. The bytes held are read back from the
-// advertised window (shift 1, so 2-byte resolution).
+// entries, so that is what this sends.
 TEST(TcpConnection, TheReorderBufferHoldsABoundedNumberOfSegments)
 {
-    uint32_t window = 0;
-    TcpConnection connection(8080, IPv4Address("10.0.0.1"), 12345, 1000, [&window](const Tcp& header, const Bytes&)
-                             { window = static_cast<uint32_t>(header.get_window()) << 1; });
+    TcpConnection connection(8080, IPv4Address("10.0.0.1"), 12345, 1000, [](const Tcp&, const Bytes&) {});
     connection.accept_incoming_syn(500, 1460, true, 0); // RCV.NXT = 501
     connection.on_segment(*make_incoming_segment(501, 1001, FLAG_ACK));
 
@@ -1997,7 +1994,7 @@ TEST(TcpConnection, TheReorderBufferHoldsABoundedNumberOfSegments)
         // one byte, then a one-byte hole: every segment needs an entry
         connection.on_segment(*make_incoming_segment(501 + 2 * i, 1001, FLAG_ACK, Bytes(1)));
     }
-    uint32_t held = TcpConnection::RECEIVE_BUFFER_CAPACITY - window;
+    size_t held = connection.bytes_out_of_order();
     ASSERT_TRUE(held == TcpConnection::MAX_REORDER_SEGMENTS)
         << "only MAX_REORDER_SEGMENTS entries may have been held, got " << held << " bytes";
 }
@@ -2593,22 +2590,23 @@ TEST(TcpConnection, ALongerSegmentAtABufferedStartKeepsItsNewBytes)
 }
 
 // Overlapping ranges are held once: one SACK block for the union, and the
-// window shrinks by the bytes actually held rather than by the sum of the
+// buffer holds the bytes actually received rather than the sum of the
 // segments that brought them.
 TEST(TcpConnection, OverlappingOutOfOrderSegmentsAreHeldOnce)
 {
     ReorderHarness h(500);
-    uint32_t full_window = 131072;
 
     h.arrive(510, 520);
     h.arrive(506, 530); // contains the first
     ASSERT_TRUE(h.sack.size() == 1 && h.sack[0].start == 506 && h.sack[0].end == 530) << "one block for the union";
-    ASSERT_TRUE(h.window == full_window - 24) << "24 bytes held, counted once; window " << h.window;
+    ASSERT_TRUE(h.connection->bytes_out_of_order() == 24)
+        << "24 bytes held, counted once; held " << h.connection->bytes_out_of_order();
 
     h.arrive(526, 540); // overlaps the tail
     h.arrive(502, 508); // overlaps the head, leaving 501 as the only gap
     ASSERT_TRUE(h.sack.size() == 1 && h.sack[0].start == 502 && h.sack[0].end == 540) << "still one block";
-    ASSERT_TRUE(h.window == full_window - 38) << "38 bytes held; window " << h.window;
+    ASSERT_TRUE(h.connection->bytes_out_of_order() == 38)
+        << "38 bytes held; held " << h.connection->bytes_out_of_order();
 
     h.arrive(501, 502);
     ASSERT_TRUE(h.delivered.to_hex() == stream(501, 540).to_hex()) << "the whole range is delivered, in order";
@@ -2626,4 +2624,38 @@ TEST(TcpConnection, OverlappingSegmentsAcrossTheSequenceWrapAreMerged)
         << "one block spanning the wrap";
     h.arrive(0xFFFFFFE1u, 0xFFFFFFE8u);
     ASSERT_TRUE(h.delivered.to_hex() == stream(0xFFFFFFE1u, 0x00000020u).to_hex()) << "delivered whole, in order";
+}
+
+// RFC 1122 4.2.2.16 / RFC 9293 3.8.6: the receiver does not shrink its window.
+// Out-of-order segments land inside the window already offered, so the
+// duplicate acks they draw keep the same right edge - and so the same window,
+// since RCV.NXT has not moved. RFC 5681's duplicate-ack test requires exactly
+// that; a window shrunk by every buffered byte meant no peer's fast
+// retransmit could ever fire.
+TEST(TcpConnection, DuplicateAcksForOutOfOrderDataCarryAnUnchangedWindow)
+{
+    // Window scaling on (shift 1), so the 128 KiB window is not capped at
+    // 65535 and a change in it shows.
+    std::vector<RecordedSegment> sent;
+    auto connection = std::make_unique<TcpConnection>(
+        8080, IPv4Address("10.0.0.1"), 12345, 1000,
+        [&sent](const Tcp& header, const Bytes& payload)
+        {
+            sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), flags_of(header),
+                            payload, header.get_window(), false, 0, 0});
+        });
+    connection->accept_incoming_syn(500, 1460, true, 0);
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK));
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes(10))); // in order
+    connection->on_time_passed(TEST_TICK_MS); // its delayed ack
+    sent.clear();
+
+    for (uint32_t i = 1; i <= 3; i++)
+        connection->on_segment(*make_incoming_segment(511 + 100 * i, 1001, FLAG_ACK, Bytes(100)));
+    ASSERT_TRUE(sent.size() == 3) << "each out-of-order segment draws an immediate duplicate ack";
+    ASSERT_TRUE(sent[0].ack == 511 && sent[1].ack == 511 && sent[2].ack == 511) << "all acking RCV.NXT";
+    ASSERT_TRUE(sent[0].window == sent[1].window && sent[1].window == sent[2].window)
+        << "and all advertising the same window: " << sent[0].window << ", " << sent[1].window << ", "
+        << sent[2].window;
+    ASSERT_TRUE(connection->bytes_out_of_order() == 300) << "while the 300 bytes are held";
 }

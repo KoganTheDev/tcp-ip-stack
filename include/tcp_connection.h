@@ -253,6 +253,10 @@ public:
 
     // Bytes waiting to be read. The application's share of the receive buffer.
     size_t bytes_available() const { return _receive_queued_bytes; }
+    // Bytes held out of order, waiting for a gap before them to fill. They
+    // occupy the receive buffer but no longer shrink the advertised window
+    // (see _advertised_window()), so this is the way to see them.
+    size_t bytes_out_of_order() const { return _reorder_buffered_bytes; }
 
     // How much this connection will queue on the send side before send()
     // starts accepting less than it is offered. The application's writes are
@@ -412,7 +416,8 @@ private:
     // gap to fill, plus in-order data the application has not read yet. What is
     // left of RECEIVE_BUFFER_CAPACITY after subtracting this is the window.
     uint32_t _receive_buffer_occupied() const;
-    // The window this side would advertise right now.
+    // The window this side would advertise right now: the free buffer space,
+    // but never less than what keeps the last offered right edge in place.
     uint32_t _advertised_window() const;
     // Folds one round-trip measurement into the smoothed RTT/variance pair
     // and recomputes _rto_ms from them (RFC 6298's estimator, Jacobson &
@@ -671,10 +676,15 @@ private:
     // equal modulo 2^32. Every buffered range lies after it and within the
     // window, so (seq - RCV.NXT) + this is a range's unwrapped position.
     uint64_t _recv_next_unwrapped = 0;
+    // RCV.NXT + RCV.WND as last advertised, unwrapped like the above: the
+    // right edge the window may never be pulled back from (RFC 1122
+    // 4.2.2.16). See _advertised_window().
+    uint64_t _rcv_right_edge_unwrapped = 0;
     void _set_recv_next(uint32_t value)
     {
         _recv_next = value;
         _recv_next_unwrapped = value;
+        _rcv_right_edge_unwrapped = 0; // nothing offered yet relative to this RCV.NXT
     }
     void _advance_recv_next(uint32_t count)
     {

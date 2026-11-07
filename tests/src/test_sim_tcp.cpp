@@ -208,3 +208,53 @@ TEST_F(SimTcp, ALostSynAckStillNegotiatesTheSameOptionsOnBothSides)
         }
     }
 }
+
+// RFC 5681 3.2: three duplicate acks after a single loss trigger a fast
+// retransmit, about one round trip after the loss - not a retransmission
+// timeout, which can be no shorter than 200 ms here. Between two of these
+// stacks it never fired: the receiver advertised a window shrunk by every
+// out-of-order byte it buffered, so no two duplicate acks carried the same
+// window and none met RFC 5681's "advertised window unchanged" condition.
+TEST_F(SimTcp, ASingleLossIsRepairedByFastRetransmit)
+{
+    LinkParams wire;
+    wire.delay_ms = 10;
+    wire.mtu = 1500;
+    build(5681, wire, wire);
+
+    // Lose the 10th data segment the client sends, once.
+    int data_segments = 0;
+    uint32_t lost_seq = 0;
+    link->set_drop_filter(NetemChannel::A,
+                          [&](const Bytes& frame)
+                          {
+                              tcp_frame::Segment segment;
+                              std::string error;
+                              if (!tcp_frame::parse(frame, segment, error) || segment.payload.empty())
+                                  return false;
+                              if (++data_segments != 10)
+                                  return false;
+                              lost_seq = segment.seq;
+                              return true;
+                          });
+
+    const Bytes payload = pattern(200000);
+    ASSERT_TRUE(send_one_way(payload, 60000)) << "the transfer should finish";
+    ASSERT_TRUE(server_received == payload) << "and arrive intact";
+    ASSERT_TRUE(lost_seq != 0) << "precondition: a data segment was dropped";
+
+    // When the lost segment was first sent, and when it was sent again.
+    std::vector<uint64_t> sent_at;
+    for (const PcapWriter::Record& record : net->transmitted_capture().records())
+    {
+        tcp_frame::Segment segment;
+        std::string error;
+        if (tcp_frame::parse(record.frame, segment, error) && segment.src_port != SERVER_PORT && segment.seq == lost_seq
+            && !segment.payload.empty())
+            sent_at.push_back(record.timestamp_us);
+    }
+    ASSERT_TRUE(sent_at.size() >= 2) << "the lost segment should have been retransmitted";
+    uint64_t gap_ms = (sent_at[1] - sent_at[0]) / 1000;
+    ASSERT_TRUE(gap_ms < 150) << "the retransmission came " << gap_ms
+                              << " ms after the loss on a 20 ms round trip - a timeout, not a fast retransmit";
+}
