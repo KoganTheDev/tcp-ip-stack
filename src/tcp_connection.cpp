@@ -818,12 +818,16 @@ void TcpConnection::_enter_recovery(uint32_t delivered)
         // duplicates arrived - and send whatever else NextSeg() allows.
         uint32_t flight_size = _send_next - _in_flight.snd_una_or(_send_next);
         _congestion->on_recovery_start(flight_size, _now_ms);
-        _congestion->set_recovery_window(_congestion->slow_start_threshold());
         _in_flight.start_recovery();
         _rescue_valid = false;
+        // RFC 6937: PRR starts from nothing delivered and nothing sent, and
+        // measures the reduction against the flight at the start.
+        _prr_delivered = 0;
+        _prr_out = 0;
+        _prr_recover_fs = flight_size;
+        // NextSeg() rule 1 picks this first: the lowest lost segment.
         oldest->lost = true;
-        _retransmit(*oldest);
-        _sack_recovery_send(delivered);
+        _sack_recovery_send(delivered, /*entering=*/true);
     }
     else
     {
@@ -834,11 +838,48 @@ void TcpConnection::_enter_recovery(uint32_t delivered)
                                << cwnd_before << " -> " << _congestion->window());
 }
 
-void TcpConnection::_sack_recovery_send(uint32_t /*delivered*/)
+void TcpConnection::_sack_recovery_send(uint32_t delivered, bool entering)
 {
-    // RFC 6675 section 5 step (C): while cwnd - pipe >= 1 SMSS, send what
-    // NextSeg() picks.
-    _send_by_next_seg(_in_flight.pipe(), _congestion->window(), /*in_recovery=*/true);
+    // RFC 6937 section 3 decides how much; RFC 6675's NextSeg() decides what.
+    // RFC 6675 alone sets cwnd = ssthresh on entry, so a sender with more
+    // than ssthresh in the pipe goes silent until the pipe drains below it,
+    // then sends one segment per ack; and after heavy loss it sends the whole
+    // of ssthresh - pipe in one burst. PRR spreads the reduction over the
+    // round trip in proportion to what is delivered, and when the pipe has
+    // fallen below ssthresh rebuilds it at slow-start pace (PRR-SSRB).
+    _prr_delivered += delivered;
+    uint32_t pipe = _in_flight.pipe();
+    uint32_t ssthresh = _congestion->slow_start_threshold();
+    auto smss = static_cast<int64_t>(_max_segment_payload());
+    int64_t sndcnt = 0;
+    if (pipe > ssthresh)
+    {
+        // Proportional Rate Reduction:
+        // sndcnt = CEIL(prr_delivered * ssthresh / RecoverFS) - prr_out
+        uint64_t recover_fs = std::max<uint64_t>(_prr_recover_fs, 1);
+        auto target = static_cast<int64_t>((_prr_delivered * ssthresh + recover_fs - 1) / recover_fs);
+        sndcnt = target - static_cast<int64_t>(_prr_out);
+    }
+    else
+    {
+        // Slow Start Reduction Bound:
+        // limit = MAX(prr_delivered - prr_out, DeliveredData) + MSS
+        int64_t limit = std::max(static_cast<int64_t>(_prr_delivered) - static_cast<int64_t>(_prr_out),
+                                 static_cast<int64_t>(delivered))
+                        + smss;
+        sndcnt = std::min(static_cast<int64_t>(ssthresh) - static_cast<int64_t>(pipe), limit);
+    }
+    sndcnt = std::max<int64_t>(sndcnt, 0);
+    if (entering)
+    {
+        // The fast retransmission itself goes out whatever the arithmetic
+        // says (RFC 6675 step 4.3; Linux forces it the same way).
+        sndcnt = std::max(sndcnt, smss);
+    }
+    // cwnd = pipe + sndcnt, and NextSeg() fills it (RFC 6675 step C).
+    uint32_t window = pipe + static_cast<uint32_t>(sndcnt);
+    _congestion->set_recovery_window(window);
+    _prr_out += _send_by_next_seg(pipe, window, /*in_recovery=*/true);
 }
 
 bool TcpConnection::_send_one_new_segment(uint32_t pipe, uint32_t window)

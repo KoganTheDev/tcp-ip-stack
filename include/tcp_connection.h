@@ -773,9 +773,15 @@ private:
     // Whether the scoreboard's pipe, rather than the in-flight total, decides
     // what may be sent: SACK recovery, or refilling after a timeout.
     bool _scoreboard_drives_sending() const { return (_in_recovery && _sack_permitted) || _rto_recovery; }
-    // RFC 6675 section 5 step (C) for one ack; `delivered` is RFC 6937's
-    // DeliveredData for it.
-    void _sack_recovery_send(uint32_t delivered);
+    // One ack's sending in SACK recovery: RFC 6937 PRR (with the slow start
+    // reduction bound) decides how much, RFC 6675 NextSeg() what. `delivered`
+    // is the ack's DeliveredData; `entering` forces the fast retransmission.
+    void _sack_recovery_send(uint32_t delivered, bool entering = false);
+    // RFC 6937 state: bytes delivered to the receiver and bytes sent since
+    // recovery began, and FlightSize at its start (RecoverFS).
+    uint64_t _prr_delivered = 0;
+    uint64_t _prr_out = 0;
+    uint32_t _prr_recover_fs = 0;
     // NextSeg() and transmit, while pipe + SMSS <= window. Rules 3 and 4 only
     // in fast recovery. Returns the bytes sent.
     uint32_t _send_by_next_seg(uint32_t pipe, uint32_t window, bool in_recovery);

@@ -303,3 +303,75 @@ TEST(TcpRecovery, OneAckCostsABoundedNumberOfScoreboardVisits)
     ASSERT_LE(worst, 20u * segments) << "one ack visited " << worst << " scoreboard entries with " << segments
                                      << " segments in flight";
 }
+
+// --- RFC 6937: Proportional Rate Reduction ---
+
+// Twenty segments in flight, the first lost, the rest SACKed one ack at a
+// time. RFC 6675 alone sets cwnd = ssthresh (ten) at once, so with seventeen
+// still in the pipe nothing at all is sent for half a round trip, then one
+// segment per ack - a silence, then a burst. PRR spreads the reduction over
+// the round trip: about one segment for every two delivered (Reno's ssthresh
+// is half the flight), from the first ack of recovery on.
+TEST(TcpRecovery, PrrSpreadsTheWindowReductionOverTheRecovery)
+{
+    Peer peer = make_peer(/*sack=*/true);
+    send_segments(peer, 10);
+    peer.ack(peer.seg(10)); // slow start: cwnd 10 -> 20
+    send_segments(peer, 30); // 20 go out, 10 wait
+    const uint32_t first = 10;
+    ASSERT_EQ(peer.sent.size(), 30u) << "precondition: twenty segments in flight";
+
+    std::vector<uint32_t> held;
+    size_t sent_before = peer.sent.size();
+    for (uint32_t n = first + 1; n <= first + 8; n++)
+    {
+        held.push_back(n);
+        peer.ack(peer.seg(first), sack_of(peer, held));
+    }
+    // Eight delivered: PRR has sent about four (the retransmission and three
+    // new segments); RFC 6675's cwnd - pipe would still be negative.
+    size_t sent_during = peer.sent.size() - sent_before;
+    ASSERT_GE(sent_during, 3u) << "PRR sends in proportion to what is delivered, from the start";
+    ASSERT_LE(sent_during, 5u) << "but no more than ssthresh / RecoverFS of it";
+
+    for (uint32_t n = first + 9; n < first + 20; n++)
+    {
+        held.push_back(n);
+        peer.ack(peer.seg(first), sack_of(peer, held));
+    }
+    sent_during = peer.sent.size() - sent_before;
+    // RFC 6937: over the whole recovery the sender sends about ssthresh -
+    // here 10 segments for 19 delivered (plus rounding).
+    ASSERT_GE(sent_during, 9u);
+    ASSERT_LE(sent_during, 11u);
+    uint32_t highest = 0;
+    for (const Sent& s : peer.sent)
+        highest = std::max<uint32_t>(highest, s.seq + static_cast<uint32_t>(s.length));
+    peer.ack(highest); // everything, including what PRR sent
+    // The first two duplicates each let one new segment out (their SACKed
+    // segment left the pipe), so FlightSize was 22 at entry: ssthresh 11.
+    ASSERT_EQ(peer.connection->get_congestion_window(), 11 * MSS) << "recovery ends with cwnd = ssthresh";
+}
+
+// PRR-SSRB: when losses leave the pipe below ssthresh, the window is rebuilt
+// at slow-start speed (one segment more than delivered per ack), not in one
+// burst of cwnd - pipe as RFC 6675 alone would send.
+TEST(TcpRecovery, PrrSlowStartReductionBoundLimitsTheBurstAfterHeavyLoss)
+{
+    Peer peer = make_peer(/*sack=*/true);
+    send_segments(peer, 10);
+    // 0..5 lost; 6, 7, 8 arrive. On the third duplicate all six are lost
+    // (three SACKed above each) and the pipe is empty.
+    std::vector<uint32_t> held;
+    for (uint32_t n : {6u, 7u, 8u})
+    {
+        held.push_back(n);
+        peer.ack(peer.seg(0), sack_of(peer, held));
+    }
+    size_t retransmitted = 0;
+    for (uint32_t n = 0; n < 6; n++)
+        retransmitted += peer.count_sent(peer.seg(n)) - 1;
+    // ssthresh is five segments, pipe zero: RFC 6675 would resend five at
+    // once. SSRB allows DeliveredData (one segment) + one MSS.
+    ASSERT_EQ(retransmitted, 2u) << "slow-start pace: delivered + 1 segment";
+}
