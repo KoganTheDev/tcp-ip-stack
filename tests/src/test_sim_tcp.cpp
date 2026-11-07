@@ -258,3 +258,37 @@ TEST_F(SimTcp, ASingleLossIsRepairedByFastRetransmit)
     ASSERT_TRUE(gap_ms < 150) << "the retransmission came " << gap_ms
                               << " ms after the loss on a 20 ms round trip - a timeout, not a fast retransmit";
 }
+
+// The simulator's promise is that a seed reproduces a run. Its own decisions
+// always did; the stacks' ISNs and SYN-cookie keys came from
+// std::random_device and the wall clock, so the bytes on the wire differed on
+// every run. SimNetwork now derives each stack's secrets from the seed.
+TEST_F(SimTcp, ASeedReproducesTheRunByteForByte)
+{
+    auto run = [this](uint64_t seed)
+    {
+        LinkParams lossy;
+        lossy.loss = 0.02;
+        lossy.delay_ms = 7;
+        lossy.jitter_ms = 3;
+        lossy.mtu = 1500;
+        server_received = Bytes();
+        server_id = 0;
+        build(seed, lossy, lossy);
+        REQUIRE_TRUE(send_one_way(pattern(50000), 60000), "the transfer should finish");
+        std::vector<Bytes> frames;
+        for (const PcapWriter::Record& record : net->transmitted_capture().records())
+            frames.push_back(record.frame);
+        return frames;
+    };
+    std::vector<Bytes> first = run(1234);
+    std::vector<Bytes> second = run(1234);
+    ASSERT_TRUE(first.size() == second.size())
+        << "the same seed sent " << first.size() << " then " << second.size() << " frames";
+    for (size_t i = 0; i < first.size(); i++)
+    {
+        ASSERT_TRUE(first[i] == second[i])
+            << "frame " << i << " differs between two runs of one seed: " << tcp_frame::describe(first[i]) << " vs "
+            << tcp_frame::describe(second[i]);
+    }
+}

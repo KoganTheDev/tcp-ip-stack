@@ -152,6 +152,46 @@ NetworkStack::NetworkStack(std::unique_ptr<PacketChannel> channel, const Interfa
     this->configure_interface(config);
 }
 
+NetworkStack::SeededSecrets NetworkStack::SeededSecrets::from_seed(uint64_t seed)
+{
+    // SplitMix64 (Steele, Lea and Flood 2014): consecutive outputs from one
+    // seed are well mixed, so neighbouring seeds give unrelated keys.
+    auto next = [&seed]()
+    {
+        seed += 0x9e3779b97f4a7c15ULL;
+        uint64_t z = seed;
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        return z ^ (z >> 31);
+    };
+    SeededSecrets secrets{};
+    secrets.isn_key_low = next();
+    secrets.isn_key_high = next();
+    secrets.cookie_key_low = next();
+    secrets.cookie_key_high = next();
+    secrets.challenge_ack_seed = next();
+    return secrets;
+}
+
+void NetworkStack::set_secret_seed(uint64_t seed)
+{
+    SeededSecrets secrets = SeededSecrets::from_seed(seed);
+    this->_isn_generator = IsnGenerator(secrets.isn_key_low, secrets.isn_key_high);
+    this->_syn_cookies = SynCookies(secrets.cookie_key_low, secrets.cookie_key_high);
+    this->_challenge_ack_rng.seed(static_cast<std::minstd_rand::result_type>(secrets.challenge_ack_seed));
+    this->_isn_on_virtual_clock = true;
+}
+
+uint32_t NetworkStack::_next_isn(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port) const
+{
+    const IPv4Address& local_ip = this->_primary().config.ip;
+    if (this->_isn_on_virtual_clock)
+    {
+        return this->_isn_generator.generate_at(local_ip, local_port, remote_ip, remote_port, this->_now_ms * 1000);
+    }
+    return this->_isn_generator.generate(local_ip, local_port, remote_ip, remote_port);
+}
+
 void NetworkStack::configure_interface(const InterfaceConfig& config)
 {
     require_unicast_mac(config.mac);
@@ -302,8 +342,7 @@ TcpConnection* NetworkStack::connect(const IPv4Address& remote_ip, uint16_t remo
     ConnectionKey key{remote_ip, remote_port, local_port};
 
     auto connection = std::make_unique<TcpConnection>(
-        local_port, remote_ip, remote_port,
-        this->_isn_generator.generate(this->_primary().config.ip, local_port, remote_ip, remote_port),
+        local_port, remote_ip, remote_port, this->_next_isn(local_port, remote_ip, remote_port),
         [this, remote_ip](const Tcp& header, const Bytes& payload)
         { this->_send_tcp_segment(remote_ip, header, payload); }, this->_primary().config.local_mss());
 
@@ -1226,8 +1265,7 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
     LOG_DEBUG("NetworkStack: accepting new connection from " << remote_ip.to_string() << ":" << key.remote_port
                                                              << " on port " << key.local_port);
     auto connection = std::make_unique<TcpConnection>(
-        key.local_port, remote_ip, key.remote_port,
-        this->_isn_generator.generate(this->_primary().config.ip, key.local_port, remote_ip, key.remote_port),
+        key.local_port, remote_ip, key.remote_port, this->_next_isn(key.local_port, remote_ip, key.remote_port),
         [this, remote_ip](const Tcp& header, const Bytes& payload)
         { this->_send_tcp_segment(remote_ip, header, payload); }, this->_primary().config.local_mss());
 

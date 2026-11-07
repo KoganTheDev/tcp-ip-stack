@@ -33,14 +33,13 @@
 // A router is a stack with more than one link: add_stack() for its first
 // endpoint, then stack.add_interface() for the others.
 //
-// What is reproducible: everything the simulator decides - which frames are
-// lost, duplicated, corrupted (and which bit), delayed and by how much - for a
-// given seed, as long as the stacks write the same frames. The stacks' ISNs
-// are NOT derived from the seed: NetworkStack draws its IsnGenerator secret
-// from std::random_device and adds the wall clock, and has no seam to inject
-// either. Behaviour does not depend on the absolute sequence numbers except
-// around a 2^32 wrap, so a seed still reproduces a run's frame timing and
-// sizes, but not its byte contents.
+// What is reproducible: everything, frame for frame and byte for byte. The
+// simulator's own decisions - which frames are lost, duplicated, corrupted
+// (and which bit), delayed and by how much - come from the seed, and so do the
+// stacks' secrets: add_stack() calls NetworkStack::set_secret_seed() with a
+// value derived from this network's seed and the stack's index, so ISNs and
+// SYN cookies repeat too. A test that needs particular sequence numbers (a
+// wrap past 2^32, say) calls set_secret_seed() again with a seed it chose.
 class SimNetwork
 {
 public:
@@ -101,6 +100,10 @@ public:
     std::string describe_links() const;
 
 private:
+    // The secret seed for the next stack added: the network seed and the
+    // stack's index, mixed so stacks get unrelated secrets.
+    uint64_t _stack_secret_seed() const { return _seed * 0x9e3779b97f4a7c15ULL + _stacks.size() + 1; }
+
     uint64_t _seed;
     SimClock _clock;
     std::mt19937_64 _engine;

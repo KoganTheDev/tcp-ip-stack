@@ -23,12 +23,14 @@ NetworkStack& SimNetwork::add_stack(std::unique_ptr<PacketChannel> channel, cons
                                     const IPv4Address& ip)
 {
     _stacks.push_back(std::make_unique<NetworkStack>(std::move(channel), mac, ip));
+    _stacks.back()->set_secret_seed(_stack_secret_seed());
     return *_stacks.back();
 }
 
 NetworkStack& SimNetwork::add_stack(std::unique_ptr<PacketChannel> channel, const InterfaceConfig& config)
 {
     _stacks.push_back(std::make_unique<NetworkStack>(std::move(channel), config));
+    _stacks.back()->set_secret_seed(_stack_secret_seed());
     return *_stacks.back();
 }
 

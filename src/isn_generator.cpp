@@ -140,7 +140,12 @@ uint32_t IsnGenerator::generate(const IPv4Address& local_ip, uint16_t local_port
     // actually protects the connection.
     auto now = std::chrono::system_clock::now().time_since_epoch();
     auto microseconds = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
-    auto clock_term = static_cast<uint32_t>(static_cast<uint64_t>(microseconds) / 4);
+    return generate_at(local_ip, local_port, remote_ip, remote_port, static_cast<uint64_t>(microseconds));
+}
 
+uint32_t IsnGenerator::generate_at(const IPv4Address& local_ip, uint16_t local_port, const IPv4Address& remote_ip,
+                                   uint16_t remote_port, uint64_t clock_us) const
+{
+    auto clock_term = static_cast<uint32_t>(clock_us / 4);
     return clock_term + offset_for(local_ip, local_port, remote_ip, remote_port);
 }

@@ -202,6 +202,31 @@ public:
     // logged: at this rate someone is likely guessing cookies.
     static constexpr uint64_t COOKIE_FAILURE_WARNING_THRESHOLD = 1024;
 
+    // TEST SEAM - never call this in production. Replaces every secret the
+    // stack drew from std::random_device - the ISN key (RFC 6528's F), the
+    // SYN-cookie key and the challenge-ACK jitter - with values derived from
+    // `seed`, and takes the ISN clock term (M) from this stack's own
+    // on_time_passed() clock rather than the wall clock. A deterministic
+    // simulator needs both: with them a seed reproduces every sequence number,
+    // and a test can choose a seed that puts an ISN just below 2^32. Without
+    // it (the default) nothing changes. Call before any traffic.
+    //
+    // Anyone who knows the seed can predict ISNs and mint SYN cookies, which
+    // is exactly what the secrets exist to prevent.
+    void set_secret_seed(uint64_t seed);
+
+    // What set_secret_seed() derives from a seed, exposed so a test can
+    // predict the ISNs a seeded stack will choose.
+    struct SeededSecrets
+    {
+        uint64_t isn_key_low;
+        uint64_t isn_key_high;
+        uint64_t cookie_key_low;
+        uint64_t cookie_key_high;
+        uint64_t challenge_ack_seed;
+        static SeededSecrets from_seed(uint64_t seed);
+    };
+
     // ACKs that arrived on a port in cookie mode and failed the cookie check,
     // since the stack started. Each is a forged or mangled ACK - a steadily
     // climbing count is a blind spoofer guessing cookies (see syn_cookie.h).
@@ -630,6 +655,10 @@ private:
     // secret, so an ordinary engine is enough - it only has to be
     // unpredictable to someone counting replies, not cryptographically.
     std::minstd_rand _challenge_ack_rng{std::random_device{}()};
+    // Set by set_secret_seed(): M comes from _now_ms, not the wall clock.
+    bool _isn_on_virtual_clock = false;
+    // The ISN for a new connection, from whichever clock is in use.
+    uint32_t _next_isn(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port) const;
     bool _challenge_ack_window_open = false; // false until the first challenge ACK draws a limit
     uint64_t _challenge_ack_window_start_ms = 0;
     uint64_t _challenge_ack_window_limit = 0;
