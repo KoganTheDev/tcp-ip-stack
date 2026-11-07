@@ -74,8 +74,7 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
       // is a lie about what actually happens - and a real hazard the moment
       // one member's initialiser reads another.
       _unsacked_in_flight_bytes(0), _send_queued_bytes(0), _fin_requested(false), _time_wait_deadline_ms(0), _now_ms(1),
-      _srtt_scaled(0), _rttvar_scaled(0), _has_rtt_sample(false), _rto_ms(INITIAL_RTO_MS), _persist_deadline_ms(0),
-      _persist_backoff(0), _ack_pending(false), _ack_deadline_ms(0), _keepalive_enabled(false),
+      _persist_deadline_ms(0), _persist_backoff(0), _ack_pending(false), _ack_deadline_ms(0), _keepalive_enabled(false),
       _keepalive_deadline_ms(1 + KEEPALIVE_IDLE_MS), _keepalive_probes_sent(0), _sack_permitted(false),
       _last_out_of_order_seq(0), _timestamps_negotiated(false), _ts_recent(0), _have_ts_recent(false),
       _local_mss(local_mss), _peer_mss(DEFAULT_PEER_MSS), _effective_mss(std::min(local_mss, DEFAULT_PEER_MSS)),
@@ -365,7 +364,7 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
     entry.end_seq = _send_next;
     entry.flags = full_flags;
     entry.payload = payload;
-    entry.retransmit_ms_remaining = _rto_ms;
+    entry.retransmit_ms_remaining = _rtt.rto_ms();
     entry.retransmit_attempts = 0;
     entry.sent_at_ms = _now_ms;
     entry.retransmitted = false;
@@ -861,7 +860,8 @@ void TcpConnection::_restart_after_idle()
 {
     // RFC 5681 4.1: nothing sent for longer than the RTO, so cwnd falls back
     // to the restart window before anything new goes out.
-    if (_in_flight.empty() && _last_data_sent_ms != 0 && _now_ms - _last_data_sent_ms > static_cast<uint64_t>(_rto_ms))
+    if (_in_flight.empty() && _last_data_sent_ms != 0
+        && _now_ms - _last_data_sent_ms > static_cast<uint64_t>(_rtt.rto_ms()))
     {
         _congestion->on_idle_restart();
         _last_data_sent_ms = 0; // once per idle period
@@ -1014,62 +1014,11 @@ void TcpConnection::_run_keepalive()
     _send_keepalive_probe();
 }
 
-void TcpConnection::_update_rto_from_sample(uint32_t rtt_ms)
+void TcpConnection::_take_rtt_sample(uint32_t rtt_ms)
 {
-    // A segment sent and acked between two calls to on_time_passed() measures
-    // as zero, which says "faster than this clock can see", not "instant".
-    // Clamp to the clock's own granularity so the estimator is never fed a
-    // round trip shorter than the shortest one it could actually observe.
-    if (rtt_ms < RTO_CLOCK_GRANULARITY_MS)
-    {
-        rtt_ms = RTO_CLOCK_GRANULARITY_MS;
-    }
-    uint32_t sample_scaled = rtt_ms * RTO_SCALE;
-
-    if (!_has_rtt_sample)
-    {
-        // RFC 6298 rule 2.2: the first measurement has no history to smooth
-        // against, so it becomes the mean outright, and the variance is
-        // seeded at half of it - a deliberately wide initial guess, since one
-        // sample says nothing yet about how much this path actually varies.
-        _srtt_scaled = sample_scaled;
-        _rttvar_scaled = sample_scaled / 2;
-        _has_rtt_sample = true;
-    }
-    else
-    {
-        // RFC 6298 rule 2.3. Order matters: RTTVAR is updated against the
-        // *old* SRTT, so the deviation measured is this sample's distance
-        // from the mean as it stood before this sample moved it.
-        //
-        // Both filters are written in the expanded "decay the old, add the
-        // scaled new" form rather than the RFC's compact
-        // `x += (new - x) * gain`. The compact form needs signed arithmetic:
-        // whenever a sample lands below the current mean, `new - x` is
-        // negative, and in unsigned arithmetic that wraps to an enormous
-        // positive value which the shift then folds straight into the
-        // estimate. The expanded form only ever adds and subtracts
-        // non-negative quantities, so it is exact in unsigned integers.
-        uint32_t error = sample_scaled > _srtt_scaled ? sample_scaled - _srtt_scaled : _srtt_scaled - sample_scaled;
-        _rttvar_scaled = _rttvar_scaled - (_rttvar_scaled >> RTT_VARIANCE_SHIFT) + (error >> RTT_VARIANCE_SHIFT);
-        _srtt_scaled = _srtt_scaled - (_srtt_scaled >> RTT_SMOOTHING_SHIFT) + (sample_scaled >> RTT_SMOOTHING_SHIFT);
-    }
-
-    // RTO = SRTT + max(G, K * RTTVAR), where G is the clock granularity. The
-    // max() matters on a very steady path: RTTVAR can converge toward zero,
-    // and without a floor of one granularity the timeout would collapse onto
-    // the mean itself, firing on the first sample that lands a hair above
-    // average.
-    uint32_t variance_term = std::max(RTO_CLOCK_GRANULARITY_MS * RTO_SCALE, RTO_VARIANCE_MULTIPLIER * _rttvar_scaled);
-    uint32_t rto_scaled = _srtt_scaled + variance_term;
-
-    // Round up rather than truncate: a timeout is a deadline, and rounding it
-    // down would systematically fire early.
-    int rto = static_cast<int>((rto_scaled + RTO_SCALE - 1) / RTO_SCALE);
-    _rto_ms = std::min(std::max(rto, MIN_RTO_MS), MAX_RTO_MS);
-
-    LOG_DEBUG("TcpConnection[" << _id << "] rtt sample " << rtt_ms << " ms -> srtt " << (_srtt_scaled / RTO_SCALE)
-                               << " rttvar " << (_rttvar_scaled / RTO_SCALE) << " rto " << _rto_ms);
+    _rtt.on_sample(rtt_ms);
+    LOG_DEBUG("TcpConnection[" << _id << "] rtt sample " << rtt_ms << " ms -> srtt " << _rtt.srtt_ms() << " rttvar "
+                               << _rtt.rttvar_ms() << " rto " << _rtt.rto_ms());
 }
 
 bool TcpConnection::_apply_sack_blocks(const Tcp& segment)
@@ -1181,8 +1130,8 @@ void TcpConnection::_handle_ack(const Tcp& segment)
             // *timeout* path can fire moments later for the same segment -
             // collapsing cwnd to one MSS and cancelling fast recovery, a
             // second and much harsher reaction to what is one loss event.
-            oldest.retransmit_ms_remaining = _rto_ms;
-            oldest.retransmit_deadline_ms = _now_ms + static_cast<uint64_t>(_rto_ms);
+            oldest.retransmit_ms_remaining = _rtt.rto_ms();
+            oldest.retransmit_deadline_ms = _now_ms + static_cast<uint64_t>(_rtt.rto_ms());
             _congestion->on_fast_retransmit(_bytes_in_flight(), DUP_ACK_FAST_RETRANSMIT_THRESHOLD, _now_ms);
             _in_fast_recovery = true;
             LOG_DEBUG("TcpConnection[" << _id << "] fast retransmit at seq=" << oldest.seq
@@ -1298,12 +1247,12 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         uint32_t echo = segment.get_timestamp_echo();
         if (echo != 0 && seq_at_or_before(echo, static_cast<uint32_t>(_now_ms)))
         {
-            _update_rto_from_sample(static_cast<uint32_t>(_now_ms) - echo);
+            _take_rtt_sample(static_cast<uint32_t>(_now_ms) - echo);
         }
     }
     else if (have_rtt_sample)
     {
-        _update_rto_from_sample(rtt_sample_ms);
+        _take_rtt_sample(rtt_sample_ms);
     }
 
     if (!acked_anything)
@@ -1343,7 +1292,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         // estimator has its first sample, which CUBIC reads as "no lookahead
         // yet". There is no second copy of the estimator behind the interface:
         // RFC 6298's is right here and there is no reason for two.
-        uint32_t srtt_ms = _has_rtt_sample ? _srtt_scaled / RTO_SCALE : 0;
+        uint32_t srtt_ms = _rtt.srtt_ms();
         _congestion->on_ack(bytes_acked, _bytes_in_flight(), srtt_ms, _now_ms);
     }
 
@@ -2028,18 +1977,18 @@ void TcpConnection::_run_timers()
     // scale without needing a sample to tell them so. The backed-off value
     // then *persists* until an unambiguous sample arrives, rather than being
     // recomputed from a now-stale estimator.
-    int rto_before = _rto_ms;
-    _rto_ms = std::min(_rto_ms * 2, MAX_RTO_MS);
+    int rto_before = _rtt.rto_ms();
+    _rtt.back_off();
 
     LOG_DEBUG("TcpConnection[" << _id << "] retransmit timeout at seq=" << oldest.seq << " (attempt "
                                << oldest.retransmit_attempts << "/" << MAX_RETRANSMIT_ATTEMPTS << "), cwnd "
                                << cwnd_before << " -> " << _congestion->window() << ", rto " << rto_before << " -> "
-                               << _rto_ms);
+                               << _rtt.rto_ms());
 
     _transmit(oldest.flags, oldest.seq, oldest.payload);
     oldest.retransmitted = true; // no RTT sample may ever come from it now
-    oldest.retransmit_ms_remaining = _rto_ms;
-    oldest.retransmit_deadline_ms = _now_ms + static_cast<uint64_t>(_rto_ms);
+    oldest.retransmit_ms_remaining = _rtt.rto_ms();
+    oldest.retransmit_deadline_ms = _now_ms + static_cast<uint64_t>(_rtt.rto_ms());
 }
 
 void TcpConnection::_report_send_space()

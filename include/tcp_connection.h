@@ -11,6 +11,7 @@
 #include "bytes.h"
 #include "congestion_control.h"
 #include "network_addresses.h"
+#include "rtt_estimator.h"
 #include "tcp.h"
 
 enum class TcpState
@@ -230,11 +231,11 @@ public:
 
     // The current retransmission timeout in milliseconds - what a freshly
     // sent segment will wait before being retransmitted. Starts at
-    // INITIAL_RTO_MS and thereafter tracks the measured round-trip time
-    // (see _update_rto_from_sample). Exposed for tests and for anyone
+    // RttEstimator::INITIAL_RTO_MS and thereafter tracks the measured
+    // round-trip time (see RttEstimator). Exposed for tests and for anyone
     // wanting to observe the estimator; nothing in the stack's own data
     // path reads it from outside.
-    int get_rto_ms() const { return _rto_ms; }
+    int get_rto_ms() const { return _rtt.rto_ms(); }
 
     // The congestion window in bytes, and which algorithm is computing it.
     // Same rationale as get_rto_ms(): observable from outside, read from
@@ -554,11 +555,8 @@ private:
     // The window this side would advertise right now: the free buffer space,
     // but never less than what keeps the last offered right edge in place.
     uint32_t _advertised_window() const;
-    // Folds one round-trip measurement into the smoothed RTT/variance pair
-    // and recomputes _rto_ms from them (RFC 6298's estimator, Jacobson &
-    // Karels' algorithm). Called only with an *unambiguous* sample - see
-    // Karn's algorithm at the call site in _handle_ack().
-    void _update_rto_from_sample(uint32_t rtt_ms);
+    // Feeds one unambiguous round-trip measurement to _rtt, logging it.
+    void _take_rtt_sample(uint32_t rtt_ms);
     // RFC 793 SS3.3's sequence-number acceptability test, done with unsigned
     // wraparound arithmetic (seq - _recv_next) so it's correct across a
     // sequence-number wraparound the same way real TCP's modular arithmetic
@@ -653,23 +651,6 @@ private:
     // our ack for it was likely lost)
     uint64_t _time_wait_deadline_ms;
 
-    // --- RTT estimation / adaptive RTO (RFC 6298, Jacobson & Karels) ---
-    // A fixed retransmission timeout can only be wrong in one of two
-    // directions: too short on a slow path and it retransmits segments that
-    // were merely still in transit, adding load to a link that is already the
-    // bottleneck; too long on a fast path and every real loss costs far more
-    // idle time than it needs to. The fix is to measure the round trip and
-    // derive the timeout from it - but the *mean* RTT alone is not enough,
-    // which is the lesson of the 1988 congestion collapse: on a loaded path
-    // RTT varies wildly, and a timeout set near the mean fires constantly on
-    // ordinary jitter. So the variance is tracked alongside the mean and the
-    // timeout is set several deviations out, where ordinary jitter cannot
-    // reach it and only a real loss can.
-    //
-    // Both are held scaled by RTO_SCALE so the exponential moving averages
-    // keep fractional precision in pure integer arithmetic - the same trick
-    // the BSD implementation uses, and the reason there is no floating point
-    // anywhere in this path.
     // Monotonic millisecond clock: summed from what on_time_passed() reports,
     // or read from the owning stack's clock (see use_external_clock()). Every
     // timer deadline below is a moment on it. This is what RTT is measured against and, once timestamps are
@@ -679,14 +660,8 @@ private:
     // so a zero TSecr unambiguously means "nothing to echo yet" rather than
     // "echoing the very first moment of the connection".
     uint64_t _now_ms;
-    uint32_t _srtt_scaled;  // smoothed RTT (SRTT), in ms * RTO_SCALE
-    uint32_t _rttvar_scaled; // RTT variation (RTTVAR), in ms * RTO_SCALE
-    bool _has_rtt_sample;   // false until the first measurement seeds the estimator
-    // The live timeout, in whole milliseconds. Doubled on every retransmission
-    // (Karn's second half: back off, and keep the backed-off value rather
-    // than recomputing it from an estimator no valid sample can currently
-    // update) and recomputed from SRTT/RTTVAR on the next unambiguous sample.
-    int _rto_ms;
+    // RTT estimation and the RTO it drives (RFC 6298) - see rtt_estimator.h.
+    RttEstimator _rtt;
 
     // --- zero-window persist timer ---
     // when the next zero-window probe goes out, or 0 when the persist
@@ -981,40 +956,6 @@ private:
     // specifies it says it means. That is the whole point of taking elapsed
     // time from the caller rather than counting its ticks.
     //
-    // RFC 6298 rule 2.1: before any RTT has been measured there is nothing to
-    // derive a timeout from, so the first one is a fixed conservative guess -
-    // the RFC's own one second. Every segment sent after the first ack comes
-    // back uses a measured value instead.
-    static constexpr int INITIAL_RTO_MS = 1000;
-    // Fixed-point shift for _srtt_scaled/_rttvar_scaled: eighths of a
-    // millisecond.
-    static constexpr uint32_t RTO_SCALE = 8;
-    // RFC 6298's alpha = 1/8 and beta = 1/4, as right-shifts. Powers of two
-    // are not an approximation chosen for speed - the original algorithm
-    // picked them precisely so the filters need no division at all.
-    static constexpr int RTT_SMOOTHING_SHIFT = 3;  // alpha = 1/8
-    static constexpr int RTT_VARIANCE_SHIFT = 2;   // beta  = 1/4
-    // RFC 6298's K: how many deviations above the smoothed mean the timeout
-    // sits. Four is what makes ordinary jitter unable to reach it.
-    static constexpr uint32_t RTO_VARIANCE_MULTIPLIER = 4;
-    // Assumed resolution of the caller's clock, and so the smallest
-    // difference in timing this connection can actually resolve. It is the G
-    // term in RFC 6298's RTO formula: the variance floor exists because on a
-    // very steady path RTTVAR converges toward zero, and without a floor the
-    // timeout would collapse onto the mean and fire on the first sample
-    // landing a hair above average.
-    static constexpr uint32_t RTO_CLOCK_GRANULARITY_MS = 100;
-    // RFC 6298 rule 2.4 says round a computed RTO up to one second, then
-    // immediately notes that this is about 1980s clock granularity rather than
-    // anything about the network. Linux uses 200 ms and so does this, because
-    // a one-second floor on a datacentre path makes every loss cost a second
-    // of idle time to recover from. Deviating from the RFC deliberately, and
-    // writing down why, is the point of putting it here.
-    static constexpr int MIN_RTO_MS = 200;
-    // RFC 6298 rule 2.5 permits an upper bound provided it is at least 60
-    // seconds. Caps the exponential backoff so a connection to a black hole
-    // stops doubling rather than growing without bound.
-    static constexpr int MAX_RTO_MS = 60000;
     static constexpr int MAX_RETRANSMIT_ATTEMPTS = 5;
 
     // TIME_WAIT lasts twice the maximum segment lifetime, and the doubling is
