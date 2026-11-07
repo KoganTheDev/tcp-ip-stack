@@ -29,8 +29,9 @@ namespace
     constexpr size_t PAYLOAD_BYTES = size_t{2} * 1024 * 1024;
     constexpr uint64_t MAX_VIRTUAL_MS = 15ULL * 60 * 1000;
 
-    // One transfer. Returns the bytes the server received.
-    size_t transfer(double loss, uint64_t seed)
+    // One transfer. Returns the bytes the server received; virtual_ms is how
+    // long it took on the simulated clock.
+    size_t transfer(double loss, uint64_t seed, uint64_t& virtual_ms)
     {
         SimNetwork net(seed);
         net.set_idle_step_ms(10);
@@ -84,17 +85,23 @@ namespace
             });
 
         net.run_until([&] { return received >= PAYLOAD_BYTES; }, MAX_VIRTUAL_MS);
+        virtual_ms = net.now_ms();
         return received;
     }
 }
 
-// Arg 0 is the loss rate in permille: 0 and 10 (1%).
+// Arg 0 is the loss rate in permille: 0, 10 (1%) and 50 (5%, several losses
+// per window - what SACK-based recovery is for).
 static void BM_SimulatedBulkTransfer(benchmark::State& state)
 {
     const double loss = static_cast<double>(state.range(0)) / 1000.0;
     for (auto _ : state)
     {
-        size_t received = transfer(loss, /*seed=*/1);
+        uint64_t virtual_ms = 0;
+        size_t received = transfer(loss, /*seed=*/1, virtual_ms);
+        // Simulated completion time: what loss recovery changes. The wall
+        // time is what the stack's CPU cost changes.
+        state.counters["virtual_ms"] = static_cast<double>(virtual_ms);
         if (received != PAYLOAD_BYTES)
         {
             state.SkipWithError("the transfer did not complete");
@@ -104,4 +111,4 @@ static void BM_SimulatedBulkTransfer(benchmark::State& state)
     }
     state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(PAYLOAD_BYTES));
 }
-BENCHMARK(BM_SimulatedBulkTransfer)->Arg(0)->Arg(10)->UseRealTime()->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_SimulatedBulkTransfer)->Arg(0)->Arg(10)->Arg(50)->UseRealTime()->Unit(benchmark::kMillisecond);

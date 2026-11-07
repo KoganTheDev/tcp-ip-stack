@@ -414,6 +414,16 @@ public:
     using ChallengeAckGateFn = std::function<bool()>;
     void set_challenge_ack_gate(ChallengeAckGateFn gate) { _challenge_ack_gate = std::move(gate); }
 
+    // Loss-recovery counters, for tests and measurement (Linux reports the
+    // same through TCP_INFO / nstat as TcpExtTCPLossProbes and friends).
+    struct Stats
+    {
+        uint64_t retransmitted_segments = 0; // every resend of an in-flight segment
+        uint64_t retransmit_timeouts = 0;    // RTO expiries that resent something
+        uint64_t recoveries = 0;             // entries into fast recovery
+    };
+    const Stats& stats() const { return _stats; }
+
 private:
     void _transition(TcpState new_state);
     // Records why, then moves to CLOSED. Every path to CLOSED goes through
@@ -759,6 +769,7 @@ private:
     size_t _receive_queued_bytes;
     bool _active_open = false; // see is_active_open()
     ChallengeAckGateFn _challenge_ack_gate;
+    Stats _stats;
     TcpCloseReason _close_reason = TcpCloseReason::NONE;
     bool _nodelay = false;
     SendSpaceFn _on_send_space;

@@ -789,6 +789,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
             SentSegment& oldest = *target;
             uint32_t cwnd_before = _congestion->window();
             _transmit(oldest.flags, oldest.seq, oldest.payload);
+            _stats.retransmitted_segments += 1;
             // Karn again: this segment has now been sent twice, so the ack
             // that eventually retires it can't be attributed to either
             // transmission. Note there is deliberately no RTO backoff here -
@@ -805,6 +806,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
             oldest.retransmit_deadline_ms = _now_ms + static_cast<uint64_t>(_rtt.rto_ms());
             _congestion->on_fast_retransmit(_bytes_in_flight(), DUP_ACK_FAST_RETRANSMIT_THRESHOLD, _now_ms);
             _in_fast_recovery = true;
+            _stats.recoveries += 1;
             LOG_DEBUG("TcpConnection[" << _id << "] fast retransmit at seq=" << oldest.seq
                                        << " (3 duplicate acks), cwnd " << cwnd_before << " -> "
                                        << _congestion->window());
@@ -1596,6 +1598,8 @@ void TcpConnection::_run_timers()
                                << _rtt.rto_ms());
 
     _transmit(oldest.flags, oldest.seq, oldest.payload);
+    _stats.retransmitted_segments += 1;
+    _stats.retransmit_timeouts += 1;
     oldest.retransmitted = true; // no RTT sample may ever come from it now
     oldest.retransmit_ms_remaining = _rtt.rto_ms();
     oldest.retransmit_deadline_ms = _now_ms + static_cast<uint64_t>(_rtt.rto_ms());
