@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <set>
 #include <csignal>
 #include <unordered_map>
@@ -67,7 +68,15 @@ private:
     // must be called exactly once.
     Server(uint16_t port, size_t worker_count, OpenedChannel opened);
 
-    void _create_retransmit_timer();
+    // The one-shot timerfd that wakes the loop when the stack next has timer
+    // work - see run() for how it is driven.
+    void _create_stack_timer();
+    // Reports the real time since the last report to the stack. Done on every
+    // pass of the loop, whatever woke it, so the stack's clock is current
+    // before frames are processed (their RTT samples and timestamps read it).
+    void _advance_stack_clock();
+    // Points the timerfd at the stack's next deadline, or disarms it.
+    void _arm_stack_timer();
     // Monotonic milliseconds since an arbitrary origin. Used only for
     // differences, so the origin does not matter - CLOCK_MONOTONIC is chosen
     // because it does not jump when the wall clock is stepped or the machine
@@ -121,6 +130,10 @@ private:
     // When the stack's timers were last advanced, so the next advance can
     // report the time that actually passed rather than the time intended to.
     uint64_t _last_timer_advance_ms;
+    // The monotonic millisecond the timerfd is armed to fire at, or nullopt
+    // when it is disarmed (or has fired, which disarms a one-shot timer). Saves
+    // a timerfd_settime() on every pass in which the deadline did not move.
+    std::optional<uint64_t> _timer_armed_for_ms;
 
     // Connections with a chunk currently in the thread pool. Nothing more is
     // needed, because unread data now stays in the stack's own receive queue

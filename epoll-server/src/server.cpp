@@ -2,20 +2,38 @@
 #include "exceptions.h"
 #include "logger.h"
 #include "packet_channel.h"
+#include "timer_setting.h"
 
 #include <sys/timerfd.h>
+#include <algorithm>
+#include <cstdint>
 #include <ctime>
 #include <unistd.h>
 #include <iostream>
 
-namespace
-{
-    // How often the stack's timers are advanced. This is now purely a polling
-    // cadence - a statement about resolution and wakeup cost, not about the
-    // duration of anything inside the stack. Every timeout in there is
-    // denominated in real milliseconds and is unaffected by changing this.
-    constexpr long TIMER_INTERVAL_MS = 500;
-}
+// How the stack's timers are driven.
+//
+// There used to be a periodic 500 ms timerfd here, and every expiry called
+// on_time_passed(). That made 500 ms the resolution of every timer in the
+// stack: a delayed ack due 200 ms after its data went out at the next tick, up
+// to 500 ms - the whole of RFC 1122's ceiling - and a retransmission at the
+// 200 ms minimum RTO could wait as long again. It also woke an idle server
+// twice a second for nothing, and each wakeup walked every connection.
+//
+// Now the timer is one-shot and follows the stack: after every pass of the
+// loop it is armed for NetworkStack::ms_until_next_timer() - the earliest
+// deadline of any timer anywhere in the stack - or disarmed when there is
+// none, so an idle server sleeps until a frame arrives. Anything the pass did
+// (a poll() that received data, a send(), a close()) may have armed a new
+// timer, which is why it is re-armed at the end of every pass rather than
+// only when it fires.
+//
+// What the stack is told is still measured, not assumed: every pass reports
+// the real time since the last one (clock_gettime(CLOCK_MONOTONIC)) before
+// doing anything else, whatever woke it. That is what fires the timers that
+// are due, and it also keeps the stack's clock current for the frames about to
+// be processed - an RTT sample or a TCP timestamp is only as good as the clock
+// it reads, and with the old tick that clock was up to 500 ms stale.
 
 Server::Server(uint16_t port, size_t worker_count, const ChannelOptions& channel_options)
     : Server(port, worker_count, open_channel(channel_options))
@@ -23,7 +41,7 @@ Server::Server(uint16_t port, size_t worker_count, const ChannelOptions& channel
 
 Server::Server(uint16_t port, size_t worker_count, OpenedChannel opened)
     : _port(port), _network_stack(std::move(opened.channel), opened.config), _epoll(), _completion_queue(),
-      _thread_pool(worker_count), _timer_fd(-1), _last_timer_advance_ms(0)
+      _thread_pool(worker_count), _timer_fd(-1), _last_timer_advance_ms(0), _timer_armed_for_ms()
 {
     this->_network_stack.listen(port);
     // One fd per interface. A frame arriving on one link wakes only that link's
@@ -36,7 +54,7 @@ Server::Server(uint16_t port, size_t worker_count, OpenedChannel opened)
         this->_stack_fds.insert(fd);
     }
     this->_epoll.add(this->_completion_queue.get_fd(), EPOLLIN | EPOLLET);
-    this->_create_retransmit_timer();
+    this->_create_stack_timer();
 }
 
 size_t Server::add_interface(const ChannelOptions& channel_options)
@@ -97,7 +115,7 @@ uint64_t Server::_monotonic_now_ms()
     return static_cast<uint64_t>(now.tv_sec) * 1000 + static_cast<uint64_t>(now.tv_nsec) / 1000000;
 }
 
-void Server::_create_retransmit_timer()
+void Server::_create_stack_timer()
 {
     this->_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
     if (this->_timer_fd < 0)
@@ -105,18 +123,41 @@ void Server::_create_retransmit_timer()
         throw EXCEPTION(SystemException, "timerfd_create() failed");
     }
 
-    itimerspec interval = {};
-    interval.it_value.tv_sec = TIMER_INTERVAL_MS / 1000;
-    interval.it_value.tv_nsec = (TIMER_INTERVAL_MS % 1000) * 1000000L;
-    interval.it_interval = interval.it_value;
+    // Created disarmed; run() arms it from the stack's first deadline.
+    this->_last_timer_advance_ms = _monotonic_now_ms();
+    this->_epoll.add(this->_timer_fd, EPOLLIN);
+}
 
-    if (timerfd_settime(this->_timer_fd, 0, &interval, nullptr) < 0)
+void Server::_advance_stack_clock()
+{
+    uint64_t now_ms = _monotonic_now_ms();
+    uint64_t elapsed_ms = now_ms - this->_last_timer_advance_ms;
+    this->_last_timer_advance_ms = now_ms;
+    // Called even when no whole millisecond has passed: the stack may have
+    // something due already (a deadline of 0), and on_time_passed(0) is what
+    // runs it. With nothing due it costs a comparison.
+    this->_network_stack.on_time_passed(static_cast<uint32_t>(std::min<uint64_t>(elapsed_ms, UINT32_MAX)));
+}
+
+void Server::_arm_stack_timer()
+{
+    std::optional<uint32_t> wait_ms = this->_network_stack.ms_until_next_timer();
+    std::optional<uint64_t> fire_at_ms;
+    if (wait_ms.has_value())
+    {
+        fire_at_ms = this->_last_timer_advance_ms + *wait_ms;
+    }
+    if (fire_at_ms == this->_timer_armed_for_ms)
+    {
+        return; // already armed for exactly this, or already disarmed
+    }
+
+    itimerspec setting = timer_setting_for(wait_ms);
+    if (timerfd_settime(this->_timer_fd, 0, &setting, nullptr) < 0)
     {
         throw EXCEPTION(SystemException, "timerfd_settime() failed");
     }
-
-    this->_last_timer_advance_ms = _monotonic_now_ms();
-    this->_epoll.add(this->_timer_fd, EPOLLIN);
+    this->_timer_armed_for_ms = fire_at_ms;
 }
 
 void Server::run(const volatile std::sig_atomic_t& stop_flag)
@@ -130,7 +171,14 @@ void Server::run(const volatile std::sig_atomic_t& stop_flag)
 
     while (!stop_flag)
     {
+        this->_arm_stack_timer();
         std::vector<epoll_event> events = this->_epoll.wait(stack_has_more_frames ? 0 : -1);
+
+        // First, whatever woke the loop: tell the stack how much time passed.
+        // This is what fires due timers - the timerfd only exists to end the
+        // wait above in time.
+        this->_advance_stack_clock();
+        bool timers_ran = false;
 
         bool polled_this_round = false;
         for (const epoll_event& event : events)
@@ -149,21 +197,13 @@ void Server::run(const volatile std::sig_atomic_t& stop_flag)
                 while (read(this->_timer_fd, &expirations, sizeof(expirations)) > 0)
                 {
                     // The fd must be drained or it stays readable forever. The
-                    // count it reports is deliberately ignored: it says how
-                    // many intervals elapsed, which is only the same as how
-                    // much time elapsed while the loop keeps up. Measuring the
-                    // clock covers both, including the case where this loop was
-                    // blocked long enough to miss several expirations outright.
+                    // count is ignored: the clock was already read above, and
+                    // the clock, not the timer, is what says how much time
+                    // passed.
                 }
-
-                uint64_t now_ms = _monotonic_now_ms();
-                uint64_t elapsed_ms = now_ms - this->_last_timer_advance_ms;
-                this->_last_timer_advance_ms = now_ms;
-                if (elapsed_ms > 0)
-                {
-                    this->_network_stack.on_time_passed(static_cast<uint32_t>(elapsed_ms));
-                    this->_flush_unsent();
-                }
+                // A one-shot timer that has fired is disarmed.
+                this->_timer_armed_for_ms.reset();
+                timers_ran = true;
             }
             else if (event.data.fd == this->_completion_queue.get_fd())
             {
@@ -182,6 +222,15 @@ void Server::run(const volatile std::sig_atomic_t& stop_flag)
             this->_flush_unsent();
             this->_close_finished_peers();
         }
+
+        // A timer that fired may have closed or failed something whose held
+        // response should now be dropped rather than retried forever.
+        if (timers_ran)
+        {
+            this->_flush_unsent();
+        }
+        // The timer is re-armed at the top of the next pass, from whatever
+        // deadline this pass left behind.
     }
 }
 
