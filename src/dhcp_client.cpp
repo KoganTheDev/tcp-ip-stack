@@ -390,3 +390,36 @@ void DhcpClient::on_time_passed(uint32_t elapsed_ms)
         }
     }
 }
+
+NextTimer DhcpClient::ms_until_next_timer() const
+{
+    // Exactly the countdowns on_time_passed() acts on in the current state. A
+    // countdown it has already acted on and now ignores (T1 while RENEWING,
+    // T2 while REBINDING) must not count: it stays at or below zero, and
+    // reporting it would ask to be woken immediately, forever.
+    NextTimer next;
+    switch (_state)
+    {
+    case DhcpClientState::INIT:
+        break;
+    case DhcpClientState::SELECTING:
+    case DhcpClientState::REQUESTING:
+        fold_next_timer(next, _retransmit_ms_remaining);
+        break;
+    case DhcpClientState::BOUND:
+        fold_next_timer(next, _renewal_ms_remaining);
+        fold_next_timer(next, _rebinding_ms_remaining);
+        fold_next_timer(next, _expiry_ms_remaining);
+        break;
+    case DhcpClientState::RENEWING:
+        fold_next_timer(next, _rebinding_ms_remaining);
+        fold_next_timer(next, _expiry_ms_remaining);
+        fold_next_timer(next, _retransmit_ms_remaining);
+        break;
+    case DhcpClientState::REBINDING:
+        fold_next_timer(next, _expiry_ms_remaining);
+        fold_next_timer(next, _retransmit_ms_remaining);
+        break;
+    }
+    return next;
+}

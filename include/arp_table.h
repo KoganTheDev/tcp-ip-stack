@@ -3,6 +3,7 @@
 #include <unordered_map>
 
 #include "network_addresses.h"
+#include "next_timer.h"
 
 // The stack's IP->MAC cache: learned (dynamic) mappings that expire after a
 // fixed amount of time unless refreshed, plus never-expiring static
@@ -46,6 +47,10 @@ public:
     // Ages every dynamic entry by the elapsed time and evicts those that reach
     // zero; static entries are untouched.
     void age(uint32_t elapsed_ms);
+
+    // Until the first dynamic entry expires, or nullopt if there are none.
+    // A scan, bounded by MAX_ENTRIES.
+    NextTimer ms_until_next_timer() const;
 
     size_t size() const { return _entries.size(); }
 

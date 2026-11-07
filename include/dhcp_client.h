@@ -7,6 +7,7 @@
 #include "bytes.h"
 #include "dhcp.h"
 #include "network_addresses.h"
+#include "next_timer.h"
 
 // What a completed lease actually told us. Deliberately a plain struct: it is
 // the boundary between "what the server said" and "what the stack does about
@@ -103,6 +104,9 @@ public:
 
     // Drives every timer: retransmission backoff, T1, T2, and expiry.
     void on_time_passed(uint32_t elapsed_ms);
+    // Until on_time_passed() next has something to do, or nullopt when it
+    // has nothing (INIT).
+    NextTimer ms_until_next_timer() const;
 
     DhcpClientState state() const { return _state; }
     const DhcpLease& lease() const { return _lease; }

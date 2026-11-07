@@ -202,3 +202,13 @@ void IpReassembler::age(uint32_t elapsed_ms, std::vector<Expired>& expired)
         }
     }
 }
+
+NextTimer IpReassembler::ms_until_next_timer() const
+{
+    NextTimer next;
+    for (const auto& partial : this->_partials)
+    {
+        fold_next_timer(next, partial.second.ms_remaining);
+    }
+    return next;
+}

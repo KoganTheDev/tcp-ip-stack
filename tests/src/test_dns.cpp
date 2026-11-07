@@ -697,3 +697,13 @@ TEST(Dns, APortTheHostReportsInUseIsNeverChosen)
             << "port " + std::to_string(q.source_port) + " was reported in use and must not be chosen";
     }
 }
+
+TEST(Dns, TheNextTimerIsTheOutstandingQuerysTimeout)
+{
+    ResolverHarness harness;
+    ASSERT_FALSE(harness.resolver.ms_until_next_timer().has_value()) << "nothing outstanding, nothing cached";
+    harness.resolver.resolve("example.com", harness.recorder());
+    ASSERT_EQ(harness.resolver.ms_until_next_timer(), std::optional<uint32_t>(2000)) << "the query's timeout";
+    harness.resolver.on_time_passed(500);
+    ASSERT_EQ(harness.resolver.ms_until_next_timer(), std::optional<uint32_t>(1500));
+}

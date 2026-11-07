@@ -6,6 +6,7 @@
 
 #include "bytes.h"
 #include "network_addresses.h"
+#include "next_timer.h"
 
 // Reassembles IPv4 datagrams that arrived in fragments (RFC 791 SS3.2).
 //
@@ -69,6 +70,10 @@ public:
     // Ages every partial datagram and drops those that ran out of time,
     // appending each one dropped to `expired`.
     void age(uint32_t elapsed_ms, std::vector<Expired>& expired);
+
+    // Until the first partial datagram times out, or nullopt if none is held.
+    // A scan, bounded by MAX_PENDING_DATAGRAMS.
+    NextTimer ms_until_next_timer() const;
 
     size_t pending_datagrams() const { return _partials.size(); }
     size_t buffered_bytes() const { return _buffered_bytes; }

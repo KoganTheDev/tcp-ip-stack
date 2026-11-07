@@ -517,3 +517,33 @@ TEST(Dhcp, ALegalInterfaceMtuIsTaken)
 
     ASSERT_TRUE(harness.acquired.size() == 1 && harness.acquired[0].mtu == 1400) << "a legal MTU is used as given";
 }
+
+// ms_until_next_timer() must name exactly the moments on_time_passed() acts:
+// a caller that sleeps until each one must find work every time it wakes - a
+// retry, T1, T2, expiry - and never be woken for nothing (a countdown already
+// acted on, reported forever as overdue).
+TEST(Dhcp, EveryDeadlineTheClientReportsIsOneItActsOn)
+{
+    ClientHarness idle;
+    ASSERT_FALSE(idle.client.ms_until_next_timer().has_value()) << "INIT arms nothing";
+    idle.client.start();
+    ASSERT_EQ(idle.client.ms_until_next_timer(), std::optional<uint32_t>(4000)) << "the first DISCOVER retry";
+
+    ClientHarness harness;
+    drive_to_bound(harness, 3600);
+    ASSERT_EQ(harness.client.ms_until_next_timer(), std::optional<uint32_t>(1800 * 1000)) << "T1, half the lease";
+
+    for (int wakeup = 0; wakeup < 40; wakeup++)
+    {
+        std::optional<uint32_t> wait = harness.client.ms_until_next_timer();
+        ASSERT_TRUE(wait.has_value() && *wait > 0) << "a held or sought lease always has a future deadline";
+        size_t sent_before = harness.sent.size();
+        DhcpClientState state_before = harness.client.state();
+        harness.client.on_time_passed(*wait - 1);
+        ASSERT_EQ(harness.sent.size(), sent_before) << "nothing fires a millisecond early";
+        harness.client.on_time_passed(1);
+        ASSERT_TRUE(harness.sent.size() > sent_before || harness.client.state() != state_before)
+            << "wakeup " << wakeup << " found nothing to do";
+    }
+    ASSERT_EQ(harness.losses, 1) << "the walk should have run past the lease's expiry";
+}
