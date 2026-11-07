@@ -24,13 +24,13 @@
 // match line for line, including EPOLLRDHUP on the peer's FIN, EPOLLIN|HUP|
 // RDHUP|ERR on a refused connection and a reset, ECONNREFUSED then 0 from
 // SO_ERROR (reported once, then cleared), EPIPE writing after SHUT_WR, and
-// ECONNRESET then EOF after a reset. The one difference is TIMING, not a
-// different set of events: after the server writes "tail" and closes at once,
-// ustack's FIN is (most likely) held behind the unacknowledged data until the
-// client's delayed ACK goes out (up to 200 ms), where Linux acknowledges
-// straight away. (Not investigated further; only the timing was established.) The step after "server close"
-// therefore settles for a full second on both stacks; with 50 ms ustack still
-// reports only EPOLLOUT and EAGAIN where the kernel already reports the FIN. The scenario covers connect,
+// ECONNRESET then EOF after a reset. One difference in TIMING was found and
+// fixed: after the server wrote "tail" and closed at once, ustack held its FIN
+// until the data was acknowledged - a whole client delayed-ack interval -
+// where Linux sends it straight behind the data. The step after "server
+// close" settled for a full second to hide that; it now settles like the rest
+// (TcpConnection.FinFollowsDataStillInFlightWithoutWaitingForItsAck). The
+// scenario covers connect,
 // accept, write, read, peer half-close (EPOLLRDHUP), reads at EOF, writes after
 // shutdown, close, a refused connection and a reset.
 using namespace stack_harness;
@@ -210,7 +210,7 @@ namespace
 
         // --- the server closes: FIN, so both directions are now finished ---
         REQUIRE_TRUE(server.close(sfd) == 0, errno_text(errno));
-        h.settle(1000);
+        h.settle(50);
         note("client events after server close", c.events());
         note("client recv at EOF", recv_text(client, cfd));
         REQUIRE_TRUE(client.close(cfd) == 0, errno_text(errno));

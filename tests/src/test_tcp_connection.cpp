@@ -312,17 +312,18 @@ TEST(TcpConnection, PeerFinDoesNotForceCloseBeforeOurResponse)
     connection->send(Bytes::from_hex("6f6b"));
     connection->close();
 
-    ASSERT_TRUE(sent.size() == 2) << "send() after the peer's FIN should still produce a data segment";
+    ASSERT_TRUE(sent.size() == 3) << "send() after the peer's FIN should still produce a data segment, then the FIN";
     ASSERT_TRUE(sent[1].payload.to_hex() == "6f6b") << "the queued response should have gone out, not been dropped";
-    ASSERT_TRUE(connection->get_state() == TcpState::CLOSE_WAIT)
-        << "close() must defer while the response is still awaiting its own ack - not send FIN early";
-
-    // peer acks the response - only now should the deferred close proceed
-    connection->on_segment(*make_incoming_segment(503, sent[1].seq + 2, FLAG_ACK));
-
-    ASSERT_TRUE(sent.size() == 3) << "the deferred FIN should be sent once the response is acked";
-    ASSERT_TRUE(sent[2].flags == (FLAG_ACK | FLAG_FIN)) << "the deferred close should now send our FIN";
+    // The FIN follows the response at once, sequenced after it - it does not
+    // wait for the response's ack (it used to, costing the peer a delayed-ack
+    // interval before it saw the end of the stream).
+    ASSERT_TRUE(sent[2].flags == (FLAG_ACK | FLAG_FIN)) << "close() sends our FIN behind the response";
+    ASSERT_TRUE(sent[2].seq == sent[1].seq + 2);
     ASSERT_TRUE(connection->get_state() == TcpState::LAST_ACK) << "should move to LAST_ACK after sending our own FIN";
+
+    // one ack covers the response and the FIN
+    connection->on_segment(*make_incoming_segment(502, sent[2].seq + 1, FLAG_ACK));
+    ASSERT_TRUE(connection->get_state() == TcpState::CLOSED);
 }
 
 TEST(TcpConnection, RetransmitsUnackedSegmentAfterTimeout)
@@ -2966,4 +2967,47 @@ TEST(TcpConnection, ALaterWriteTopsUpAPartialSegmentWaitingInTheQueue)
     connection->on_segment(*make_incoming_segment(501, sent[0].seq + 536, FLAG_ACK));
     ASSERT_EQ(sent.size(), 2u) << "only the final 464-byte tail is held by Nagle";
     ASSERT_EQ(sent[1].payload.size(), 536u) << "the 64-byte tail and the next write go out as one full segment";
+}
+
+// close() right after a write: the FIN goes out at once, behind the data
+// still in flight, as Linux sends it. It used to wait until every byte was
+// acknowledged - and with the peer delaying its ack, a whole delayed-ack
+// interval (up to 200 ms) passed before the peer learned the stream had ended
+// (the timing difference the ustack-vs-kernel differential test found).
+TEST(TcpConnection, FinFollowsDataStillInFlightWithoutWaitingForItsAck)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->send(Bytes::from_hex("7461696c")); // "tail", goes out at once
+    ASSERT_EQ(sent.size(), 1u);
+
+    connection->close();
+    ASSERT_EQ(sent.size(), 2u) << "the FIN must not wait for the data's ack";
+    ASSERT_TRUE(sent[1].flags & FLAG_FIN);
+    ASSERT_EQ(sent[1].seq, sent[0].seq + 4) << "sequenced right after the data";
+    ASSERT_TRUE(connection->get_state() == TcpState::FIN_WAIT_1);
+
+    connection->on_segment(*make_incoming_segment(501, sent[1].seq + 1, FLAG_ACK));
+    ASSERT_TRUE(connection->get_state() == TcpState::FIN_WAIT_2) << "one ack covers data and FIN";
+}
+
+// With data still queued at close(), the FIN rides on the last data segment
+// rather than following it in a segment of its own - and that last, short
+// segment is not held by Nagle: nothing more is coming to fill it.
+TEST(TcpConnection, FinIsPiggybackedOnTheLastQueuedSegment)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent); // MSS 536, cwnd 10 segments
+    connection->send(Bytes(536u * 10)); // fills the initial window
+    connection->send(Bytes(100u)); // queued: no room
+    ASSERT_EQ(sent.size(), 10u);
+    connection->close();
+    ASSERT_EQ(sent.size(), 10u) << "the FIN waits behind the queued data";
+
+    connection->on_segment(*make_incoming_segment(501, sent[0].seq + 536, FLAG_ACK));
+    ASSERT_EQ(sent.size(), 11u) << "the last data and the FIN go out together";
+    ASSERT_EQ(sent[10].payload.size(), 100u);
+    ASSERT_TRUE(sent[10].flags & FLAG_FIN) << "piggybacked on the last data segment";
+    ASSERT_TRUE(connection->get_state() == TcpState::FIN_WAIT_1);
+    ASSERT_EQ(connection->send(Bytes(1u)), 0u) << "nothing more may be sent after close()";
 }

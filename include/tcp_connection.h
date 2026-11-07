@@ -568,9 +568,15 @@ private:
     // Bytes sitting in _send_queue, kept alongside it so send_space_available()
     // is a subtraction rather than a walk over every queued chunk.
     size_t _send_queued_bytes;
-    // close() called while something was still in flight or queued -
-    // deferred until both drain, instead of clobbering in-flight state
+    // close() called while data was still queued: the FIN goes out with the
+    // last queued segment (see _send_chunk()).
     bool _fin_requested;
+    // Sends the FIN, on `payload` if there is one, and moves to FIN_WAIT_1 or
+    // LAST_ACK.
+    void _send_fin(const Bytes& payload);
+    // Sends one chunk taken off the send queue, with the FIN if it is the
+    // last one after close().
+    void _send_chunk(Bytes chunk);
 
     // when TIME_WAIT ends; pushed back if a duplicate FIN arrives (meaning
     // our ack for it was likely lost)

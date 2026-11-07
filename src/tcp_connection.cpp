@@ -613,7 +613,10 @@ void TcpConnection::_send_queued_while_window_allows()
         // still unacked - it goes out once the pipe drains (or the window/cwnd
         // frees up enough for a full segment). A full-sized segment is never
         // held.
-        if (!_nodelay && _send_queue.front().size() < _max_segment_payload() && _bytes_in_flight() > 0)
+        // After close() nothing more is coming to fill a short last segment,
+        // so it goes now (Linux pushes with Nagle off on close too).
+        bool final_chunk = _fin_requested && _send_queue.size() == 1;
+        if (!_nodelay && !final_chunk && _send_queue.front().size() < _max_segment_payload() && _bytes_in_flight() > 0)
         {
             break;
         }
@@ -621,7 +624,7 @@ void TcpConnection::_send_queued_while_window_allows()
         Bytes next_chunk = std::move(_send_queue.front());
         _send_queue.pop_front();
         _send_queued_bytes -= next_chunk.size();
-        _send_flags(0, next_chunk);
+        _send_chunk(std::move(next_chunk));
     }
 
     // whatever's left is blocked - if that's because the peer's window is shut
@@ -892,7 +895,8 @@ bool TcpConnection::_send_one_new_segment(uint32_t pipe, uint32_t window)
     uint32_t snd_una = _in_flight.snd_una_or(_send_next);
     // The peer's window bounds new data by sequence space, as everywhere.
     bool peer_window_allows = (_send_next - snd_una) + next.size() <= _peer_window;
-    bool nagle_holds = !_nodelay && next.size() < _max_segment_payload() && pipe > 0;
+    bool final_chunk = _fin_requested && _send_queue.size() == 1;
+    bool nagle_holds = !_nodelay && !final_chunk && next.size() < _max_segment_payload() && pipe > 0;
     if (!peer_window_allows || nagle_holds || pipe + next.size() > window)
     {
         return false;
@@ -900,7 +904,7 @@ bool TcpConnection::_send_one_new_segment(uint32_t pipe, uint32_t window)
     Bytes chunk = std::move(_send_queue.front());
     _send_queue.pop_front();
     _send_queued_bytes -= chunk.size();
-    _send_flags(0, chunk);
+    _send_chunk(std::move(chunk));
     return true;
 }
 
@@ -1193,10 +1197,9 @@ void TcpConnection::_handle_ack(const Tcp& segment)
 
     _send_queued_while_window_allows();
 
-    if (_in_flight.empty() && _send_queue.empty() && _fin_requested)
+    if (_send_queue.empty() && _fin_requested)
     {
-        _fin_requested = false;
-        close();
+        _send_fin(Bytes()); // the queue drained some other way (e.g. a probe)
     }
 }
 
@@ -1929,9 +1932,9 @@ size_t TcpConnection::bytes_unacked() const
 size_t TcpConnection::send(const Bytes& data)
 {
     EntryScope scope(*this);
-    if (_state != TcpState::ESTABLISHED && _state != TcpState::CLOSE_WAIT)
+    if ((_state != TcpState::ESTABLISHED && _state != TcpState::CLOSE_WAIT) || _fin_requested)
     {
-        return 0;
+        return 0; // closed for sending, even while the FIN waits behind queued data
     }
 
     // Take only what there is room for. Silently accepting everything and
@@ -2008,14 +2011,41 @@ void TcpConnection::close()
         return;
     }
 
-    if (!_in_flight.empty() || !_send_queue.empty())
+    // The FIN goes out as soon as everything queued has been sent - behind
+    // data still in flight, not after its ack, as Linux sends it. Waiting for
+    // the ack cost a peer's delayed-ack interval before it learned the stream
+    // had ended. With data still queued it rides on the last segment of it
+    // (see _send_queued_while_window_allows()).
+    _fin_requested = true;
+    if (_send_queue.empty())
     {
-        _fin_requested = true;
-        return;
+        _send_fin(Bytes());
     }
+    else
+    {
+        _send_queued_while_window_allows();
+    }
+}
 
+void TcpConnection::_send_fin(const Bytes& payload)
+{
+    _fin_requested = false;
     _transition(_state == TcpState::ESTABLISHED ? TcpState::FIN_WAIT_1 : TcpState::LAST_ACK);
-    _send_flags(FLAG_FIN);
+    _send_flags(FLAG_FIN, payload);
+}
+
+void TcpConnection::_send_chunk(Bytes chunk)
+{
+    // The last queued chunk after close() carries the FIN (RFC 9293 3.6:
+    // FIN may share a segment with data).
+    if (_fin_requested && _send_queue.empty())
+    {
+        _send_fin(chunk);
+    }
+    else
+    {
+        _send_flags(0, chunk);
+    }
 }
 
 void TcpConnection::abort()
