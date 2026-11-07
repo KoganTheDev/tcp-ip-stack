@@ -749,7 +749,20 @@ private:
     // RFC 5681 4.1 restart after idle: called before sending new data.
     void _restart_after_idle();
     uint32_t _dup_ack_count;
-    bool _in_fast_recovery;
+    // In fast recovery: entered on DupThresh duplicate acks, left on the ack
+    // that covers _recovery_point, or on a timeout.
+    bool _in_recovery;
+    // SND.NXT when the last recovery started or the last timeout fired - RFC
+    // 6582's "recover", RFC 6675's RecoveryPoint. Recovery ends when the
+    // cumulative ack reaches it, and no new one starts until it has.
+    uint32_t _recovery_point = 0;
+    bool _recovery_point_valid = false;
+    bool _may_start_recovery(uint32_t ack) const;
+    // Fast retransmit: the first segment presumed lost goes out again, and
+    // the congestion control is told.
+    void _enter_recovery();
+    // Resends one in-flight segment and restarts its retransmit timer.
+    void _retransmit(SentSegment& segment);
 
     SendSegmentFn _send_segment;
     DataReadyFn _on_data_ready;

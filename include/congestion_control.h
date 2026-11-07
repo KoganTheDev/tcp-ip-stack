@@ -107,6 +107,24 @@ public:
     // bookkeeping fiction.
     void on_recovery_end() { _cwnd = _ssthresh; }
 
+    // RFC 6582 section 3.2 step 3, NewReno's partial ack: an ack inside the
+    // recovery window took bytes_acked out of the network, so the inflated
+    // window shrinks by that much, then grows back by one MSS if at least one
+    // MSS was acknowledged - the retransmission that ack prompts must fit.
+    void on_partial_ack(uint32_t bytes_acked);
+
+    // Entering SACK-based recovery (RFC 6675 section 5 step 4.2, RFC 6937):
+    // the algorithm sets ssthresh from flight_size as on any congestion event,
+    // but cwnd is left alone - during recovery Proportional Rate Reduction
+    // sets it, through set_recovery_window(), and on_recovery_end() lands it
+    // on ssthresh. The ssthresh policy is the algorithm's either way: Reno
+    // halves, CUBIC multiplies by its beta.
+    void on_recovery_start(uint32_t flight_size, uint64_t now_ms) { _on_congestion_event(flight_size, now_ms); }
+
+    // RFC 6937: cwnd = pipe + sndcnt, recomputed on every ack in recovery.
+    // Floored at one segment so nothing that divides by it ever sees zero.
+    void set_recovery_window(uint32_t window) { _cwnd = std::min(std::max(window, _mss), MAX_CWND); }
+
     // Retransmit timeout: no acks got through at all, which is a much stronger
     // statement than "one segment went missing". Collapse to one segment and
     // slow-start back up.

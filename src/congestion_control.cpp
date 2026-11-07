@@ -58,6 +58,16 @@ void CongestionControl::on_recovery_inflate()
     _cwnd = std::min(_cwnd + _mss, MAX_CWND);
 }
 
+void CongestionControl::on_partial_ack(uint32_t bytes_acked)
+{
+    _cwnd -= std::min(bytes_acked, _cwnd);
+    if (bytes_acked >= _mss)
+    {
+        _cwnd += _mss;
+    }
+    _cwnd = std::max(_cwnd, _mss);
+}
+
 // --- Reno -------------------------------------------------------------------
 
 void RenoCongestionControl::_on_congestion_event(uint32_t bytes_in_flight, uint64_t /*now_ms*/)

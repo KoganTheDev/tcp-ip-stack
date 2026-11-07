@@ -66,7 +66,7 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
       _window_scaling_negotiated(false), _peer_window_scale(0),
       _peer_window(local_mss), // conservative placeholder until the handshake's real window arrives
       _max_peer_window(local_mss), _congestion(make_congestion_control(algorithm)), _dup_ack_count(0),
-      _in_fast_recovery(false), _send_segment(std::move(send_segment)), _receive_queued_bytes(0)
+      _in_recovery(false), _send_segment(std::move(send_segment)), _receive_queued_bytes(0)
 {
     // Seeded with the MSS this side advertises, which is all that is known
     // before the handshake. on_established() re-seeds it with the negotiated
@@ -735,6 +735,56 @@ bool TcpConnection::_apply_sack_blocks(const Tcp& segment)
     }
     return _in_flight.apply_sack(segment.get_sack_blocks());
 }
+bool TcpConnection::_may_start_recovery(uint32_t ack) const
+{
+    // RFC 6582 section 3.2 step 2 and RFC 6675 section 5.1: no new recovery
+    // until the cumulative ack reaches the point where the last one (or the
+    // last timeout) left off. Duplicates below it are echoes of losses already
+    // dealt with, and reacting to them again would cut the window twice for
+    // one congestion event.
+    return !_recovery_point_valid || seq_at_or_before(_recovery_point, ack);
+}
+
+void TcpConnection::_retransmit(SentSegment& segment)
+{
+    _transmit(segment.flags, segment.seq, segment.payload);
+    _stats.retransmitted_segments += 1;
+    // Karn: this segment has now been sent twice, so the ack that eventually
+    // retires it can't be attributed to either transmission.
+    segment.retransmitted = true;
+    segment.rexmit_in_recovery = true;
+    // Restart its retransmit timer. Without it the timer keeps counting down
+    // from wherever it already was, so the *timeout* path can fire moments
+    // later for the same segment - collapsing cwnd to one MSS and cancelling
+    // recovery, a second and much harsher reaction to one loss event.
+    segment.retransmit_ms_remaining = _rtt.rto_ms();
+    segment.retransmit_deadline_ms = _now_ms + static_cast<uint64_t>(_rtt.rto_ms());
+}
+
+void TcpConnection::_enter_recovery()
+{
+    // With SACK the front of the scoreboard may be sitting in the peer's
+    // reorder buffer already; resending it would be pure waste. The segment
+    // worth resending is the oldest one the peer has NOT reported holding.
+    SentSegment* oldest = _in_flight.oldest_unsacked();
+    if (oldest == nullptr)
+    {
+        return; // everything outstanding is already held by the peer
+    }
+    uint32_t cwnd_before = _congestion->window();
+    _in_recovery = true;
+    _recovery_point = _send_next; // RFC 6582 "recover", RFC 6675 RecoveryPoint
+    _recovery_point_valid = true;
+    _stats.recoveries += 1;
+    _congestion->on_fast_retransmit(_bytes_in_flight(), DUP_ACK_FAST_RETRANSMIT_THRESHOLD, _now_ms);
+    // Note there is deliberately no RTO backoff here - duplicate acks prove
+    // segments are still flowing, so unlike a timeout this is no evidence that
+    // the path got slower.
+    _retransmit(*oldest);
+    LOG_DEBUG("TcpConnection[" << _id << "] fast retransmit at seq=" << oldest->seq << " (3 duplicate acks), cwnd "
+                               << cwnd_before << " -> " << _congestion->window());
+}
+
 void TcpConnection::_handle_ack(const Tcp& segment)
 {
     // Apply the scoreboard before anything else looks at the window: what the
@@ -775,43 +825,11 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         // lost (one or two can just be reordering; three in a row is the
         // threshold every real implementation uses before trusting it)
         _dup_ack_count += 1;
-        if (_dup_ack_count == DUP_ACK_FAST_RETRANSMIT_THRESHOLD)
+        if (!_in_recovery && _dup_ack_count >= DUP_ACK_FAST_RETRANSMIT_THRESHOLD && _may_start_recovery(ack))
         {
-            // With SACK the front of the deque may be sitting in the peer's
-            // reorder buffer already; resending it would be pure waste. The
-            // segment worth resending is the oldest one the peer has NOT
-            // reported holding.
-            SentSegment* target = _in_flight.oldest_unsacked();
-            if (target == nullptr)
-            {
-                return; // everything outstanding is already held by the peer
-            }
-            SentSegment& oldest = *target;
-            uint32_t cwnd_before = _congestion->window();
-            _transmit(oldest.flags, oldest.seq, oldest.payload);
-            _stats.retransmitted_segments += 1;
-            // Karn again: this segment has now been sent twice, so the ack
-            // that eventually retires it can't be attributed to either
-            // transmission. Note there is deliberately no RTO backoff here -
-            // duplicate acks prove segments are still flowing, so unlike a
-            // timeout this is no evidence that the path got slower.
-            oldest.retransmitted = true;
-            // Restart this segment's retransmit countdown, exactly as the
-            // timeout path and _send_flags() both do. Without it the timer
-            // keeps counting down from wherever it already was, so the
-            // *timeout* path can fire moments later for the same segment -
-            // collapsing cwnd to one MSS and cancelling fast recovery, a
-            // second and much harsher reaction to what is one loss event.
-            oldest.retransmit_ms_remaining = _rtt.rto_ms();
-            oldest.retransmit_deadline_ms = _now_ms + static_cast<uint64_t>(_rtt.rto_ms());
-            _congestion->on_fast_retransmit(_bytes_in_flight(), DUP_ACK_FAST_RETRANSMIT_THRESHOLD, _now_ms);
-            _in_fast_recovery = true;
-            _stats.recoveries += 1;
-            LOG_DEBUG("TcpConnection[" << _id << "] fast retransmit at seq=" << oldest.seq
-                                       << " (3 duplicate acks), cwnd " << cwnd_before << " -> "
-                                       << _congestion->window());
+            _enter_recovery();
         }
-        else if (_in_fast_recovery || sack_advanced)
+        else if (_in_recovery || sack_advanced)
         {
             // window inflation: each further duplicate ack means another
             // segment left the network, so there's room for one more MSS
@@ -889,13 +907,31 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         return; // nothing new acked yet
     }
 
-    if (_in_fast_recovery)
+    if (_in_recovery)
     {
-        // the retransmit that triggered fast recovery is now confirmed
-        // received - deflate back to ssthresh rather than keep the
-        // inflated window fast recovery was using
+        if (!seq_at_or_before(_recovery_point, ack))
+        {
+            // RFC 6582 section 3.2 step 3, a partial ack: it covers the
+            // retransmission but not everything that was outstanding when
+            // recovery began, so the segment it stops at is lost too. Resent
+            // at once, staying in recovery - Reno would leave recovery here
+            // and wait for three more duplicates, or a timeout, for every
+            // further hole in the same window. The timer restarts on each
+            // partial ack (RFC 6582's "Slow-but-Steady" variant), as RFC 6298
+            // 5.3 has it restart whenever SND.UNA moves.
+            _congestion->on_partial_ack(bytes_acked);
+            if (SentSegment* next = _in_flight.oldest_unsacked())
+            {
+                _retransmit(*next);
+            }
+            _send_queued_while_window_allows();
+            return;
+        }
+        // A full ack: everything outstanding at the start of recovery is
+        // acknowledged. Deflate back to ssthresh rather than keep the inflated
+        // window recovery was using.
         _congestion->on_recovery_end();
-        _in_fast_recovery = false;
+        _in_recovery = false;
     }
     else
     {
@@ -1577,8 +1613,12 @@ void TcpConnection::_run_timers()
     // to decide.
     uint32_t cwnd_before = _congestion->window();
     _congestion->on_retransmit_timeout(_bytes_in_flight(), _now_ms);
-    _in_fast_recovery = false;
+    // RFC 6675 5.1 (and RFC 6582's "recover"): a timeout ends any recovery,
+    // and no new one starts until everything sent so far is acknowledged.
+    _in_recovery = false;
     _dup_ack_count = 0;
+    _recovery_point = _send_next;
+    _recovery_point_valid = true;
 
     // Karn's second half - the part that is easy to miss and matters as much
     // as ignoring the ambiguous sample. Having lost a segment, the estimator
@@ -1597,12 +1637,8 @@ void TcpConnection::_run_timers()
                                << cwnd_before << " -> " << _congestion->window() << ", rto " << rto_before << " -> "
                                << _rtt.rto_ms());
 
-    _transmit(oldest.flags, oldest.seq, oldest.payload);
-    _stats.retransmitted_segments += 1;
     _stats.retransmit_timeouts += 1;
-    oldest.retransmitted = true; // no RTT sample may ever come from it now
-    oldest.retransmit_ms_remaining = _rtt.rto_ms();
-    oldest.retransmit_deadline_ms = _now_ms + static_cast<uint64_t>(_rtt.rto_ms());
+    _retransmit(oldest); // no RTT sample may ever come from it now
 }
 
 void TcpConnection::_report_send_space()
@@ -1624,7 +1660,7 @@ void TcpConnection::set_congestion_control(CongestionControlAlgorithm algorithm)
     // negotiated MSS once there is one, the advertised one before.
     bool synchronized = _state != TcpState::LISTEN && _state != TcpState::SYN_SENT && _state != TcpState::SYN_RECEIVED;
     _congestion->on_established(synchronized ? _effective_mss : _local_mss, _syn_retransmissions);
-    _in_fast_recovery = false;
+    _in_recovery = false;
     _dup_ack_count = 0;
 }
 
