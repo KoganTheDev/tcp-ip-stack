@@ -41,23 +41,6 @@ namespace
     // the run actually stalls.
     constexpr uint64_t MAX_VIRTUAL_MS = 15ULL * 60 * 1000;
 
-    // OPTION_ROOM_WORKAROUND - see SimTransferRegression at the bottom of this file.
-    // below. The stack sizes data segments by the negotiated MSS alone, without
-    // subtracting the TCP options it then adds (12 bytes of timestamps on
-    // every segment, up to 40 with SACK blocks). RFC 9293 3.7.1 requires the
-    // subtraction. With timestamps negotiated - always, between two of these
-    // stacks - every full-sized segment is 1460 + 32 bytes of TCP, over the
-    // 1480 an MTU of 1500 allows, and NetworkStack drops it itself ("exceeds
-    // the 1480-byte limit and was marked Don't Fragment"). Retransmissions are
-    // dropped the same way, so any transfer over one segment stalls and fails.
-    //
-    // Until that is fixed, the application lowers its own effective MSS by the
-    // 40-byte option maximum through the public reduce_effective_mss() as soon
-    // as each connection is established - the same call an ICMP Fragmentation
-    // Needed would trigger - so the rest of the stack can be tested. Turn this
-    // off to see the bug.
-    constexpr uint16_t MAX_TCP_OPTION_BYTES = 40;
-
     uint64_t env_u64(const char* name, uint64_t fallback)
     {
         const char* value = std::getenv(name);
@@ -73,7 +56,6 @@ namespace
         LinkParams server_to_client;
         size_t payload_size = 0;
         size_t write_size = 0; // largest single send() the client application makes
-        bool option_room_workaround = true;
 
         std::string describe() const
         {
@@ -153,7 +135,6 @@ namespace
     {
         uint64_t id = 0;
         bool have_connection = false;
-        bool established_once = false;
         bool close_requested = false;
         std::vector<TcpState> states;
         Bytes received;
@@ -235,15 +216,6 @@ protected:
                     client.received |= c->read();
             });
 
-        auto on_established = [&](TcpConnection* c, Peer& peer)
-        {
-            if (peer.established_once)
-                return;
-            peer.established_once = true;
-            if (scenario.option_room_workaround)
-                c->reduce_effective_mss(static_cast<uint16_t>(c->get_effective_mss() - MAX_TCP_OPTION_BYTES));
-        };
-
         net->add_tick_hook(
             [&]()
             {
@@ -252,7 +224,6 @@ protected:
                     if (TcpConnection* accepted = server_stack.accept(SERVER_PORT))
                     {
                         server.attach(accepted);
-                        on_established(accepted, server);
                         accepted->set_data_ready_callback(
                             [&]()
                             {
@@ -271,7 +242,6 @@ protected:
                 {
                     if (c->get_state() == TcpState::ESTABLISHED)
                     {
-                        on_established(c, client);
                         while (client.sent < payload.size())
                         {
                             size_t chunk = std::min(scenario.write_size, payload.size() - client.sent);
@@ -354,57 +324,51 @@ INSTANTIATE_TEST_SUITE_P(Seeds, SimTransfer,
                          [](const ::testing::TestParamInfo<uint64_t>& info) { return std::to_string(info.param); });
 
 // ---------------------------------------------------------------------------
-// Known failures, found by this suite (seeds 1..10000) and kept here, disabled,
-// so the per-push suite stays green while each stays one command away:
+// Regressions: every seed this suite has failed on (seeds 1..10000, before
+// Phase 3b), run by default. Each was a liveness failure, not corruption - no
+// seed ever delivered a wrong or reordered byte. Rerun one with
 //
-//     ./build/debug/run_tests --gtest_also_run_disabled_tests --gtest_filter='*SimTransferRegression*'
+//     ./build/debug/run_tests --gtest_filter='*SimTransferRegression*seed5578*'
 //
-// Every one is a liveness failure, not corruption: no seed delivered a wrong
-// or reordered byte. Diagnosis (from the pcaps; details in the
-// simulator report of 2026-11-06):
+// What they found, and the fix that turned each green:
 //
-//  A. Retransmissions are sent without any TCP options. TcpConnection's RTO
-//     and fast-retransmit paths call _build_header() directly, so a
-//     retransmitted data segment drops its timestamp (RFC 7323 3.2 says every
-//     non-RST segment MUST carry it once negotiated) and a retransmitted
-//     SYN or SYN-ACK drops MSS, window scale, SACK-permitted and timestamps.
-//  B. Consequence of A with timestamps: the receiver's TS.Recent is never
-//     refreshed by the retransmission, its ACKs echo a TSval from before the
-//     loss, and the sender takes now - TSecr as an RTT sample. The RTO climbs
-//     to tens of seconds and pins at MAX_RTO_MS (every failing trace shows
-//     60 s gaps between retransmissions).
-//  C. Consequence of A in the handshake (seed 7079): a lost SYN-ACK leads to an
-//     option-less SYN retransmission and an option-less SYN-ACK, so the client
-//     falls back to MSS 536 without timestamps while the server still
-//     believes timestamps were negotiated.
-//  D. Fast retransmit never fires between two of these stacks: the receiver
-//     counts out-of-order bytes against its advertised window, so every
-//     duplicate ACK carries a smaller window, and the sender's RFC 5681 test
-//     requires the window to be unchanged. Loss is only ever repaired by RTO,
-//     which B makes very slow.
-//
-// Together these turn a 1 MB transfer at a few % loss into more than the
-// 15 minutes of virtual time the test allows. Fixing A should fix most seeds.
+//  - Data segments sized by the MSS alone, without room for the 12-byte
+//    timestamp option, so every full segment exceeded the MTU (seed 9; "fix:
+//    leave room for TCP options inside the MSS"). The test used to lower the
+//    effective MSS itself to work around it.
+//  - Retransmissions, probes and keepalives sent without any TCP options
+//    (RTO path and fast retransmit called _build_header() directly): a
+//    retransmitted SYN/SYN-ACK lost MSS, window scale, SACK-permitted and
+//    timestamps, so a lost SYN-ACK split the negotiation (seed 7079: client
+//    on MSS 536 without timestamps, server with), and retransmitted data lost
+//    its timestamp, so the receiver kept echoing a TSval from before the loss
+//    and the RTO pinned at 60 s (1055, 5578, 6580, 6651, 7284, 7651, 9524).
+//    "fix: send every segment's options through one path", then "fix: echo
+//    the timestamp RFC 7323 4.3 says to echo".
+//  - Fast retransmit never fired: the receiver shrank its window by every
+//    out-of-order byte, so no duplicate ACK met RFC 5681's "window unchanged"
+//    test. "fix: never shrink the advertised window for out-of-order data".
+//  - The 10000-seed run that started Phase 3b also failed OneWay 330, 2220,
+//    4677, 5784, 7399 and Echo 3488, 4423, 5578. They were not diagnosed one
+//    by one: the ISNs were still random then, so which seeds failed varied
+//    between runs, and all of them pass after the fixes above.
 namespace
 {
     struct RegressionCase
     {
         uint64_t seed;
         bool echo;
-        bool option_room_workaround;
     };
 
     // Without this GoogleTest prints the struct as raw bytes, padding included.
     void PrintTo(const RegressionCase& c, std::ostream* out)
     {
-        *out << "seed " << c.seed << (c.echo ? " echo" : " one-way")
-             << (c.option_room_workaround ? "" : " without the option-room workaround");
+        *out << "seed " << c.seed << (c.echo ? " echo" : " one-way");
     }
 
     std::string regression_name(const ::testing::TestParamInfo<RegressionCase>& info)
     {
-        return std::string(info.param.echo ? "Echo" : "OneWay") + "_seed" + std::to_string(info.param.seed)
-               + (info.param.option_room_workaround ? "" : "_no_workaround");
+        return std::string(info.param.echo ? "Echo" : "OneWay") + "_seed" + std::to_string(info.param.seed);
     }
 }
 
@@ -413,24 +377,15 @@ class SimTransferRegression : public SimTransferBase, public ::testing::WithPara
 
 TEST_P(SimTransferRegression, Transfer)
 {
-    Scenario scenario = scenario_for(GetParam().seed);
-    scenario.option_room_workaround = GetParam().option_room_workaround;
-    run_transfer(scenario, GetParam().echo);
+    run_transfer(scenario_for(GetParam().seed), GetParam().echo);
 }
 
-// The DISABLED_ prefix on the instantiation is what disables these; remove a
-// case here once it passes.
-INSTANTIATE_TEST_SUITE_P(DISABLED_KnownFailures, SimTransferRegression,
-                         ::testing::Values(
-                             // Data segments sized without room for options
-                             // (see OPTION_ROOM_WORKAROUND above): any seed with
-                             // more than one segment of payload fails this way.
-                             RegressionCase{9, false, false},
-                             // A + B + D: RTO pinned at 60 s.
-                             RegressionCase{1055, false, true}, RegressionCase{5578, false, true},
-                             RegressionCase{6580, false, true}, RegressionCase{6651, false, true},
-                             RegressionCase{7284, false, true}, RegressionCase{7651, false, true},
-                             RegressionCase{9524, true, true},
-                             // C: option-less SYN/SYN-ACK retransmissions.
-                             RegressionCase{7079, false, true}),
-                         regression_name);
+INSTANTIATE_TEST_SUITE_P(
+    Found, SimTransferRegression,
+    ::testing::Values(RegressionCase{9, false}, RegressionCase{330, false}, RegressionCase{1055, false},
+                      RegressionCase{2220, false}, RegressionCase{3488, true}, RegressionCase{4423, true},
+                      RegressionCase{4677, false}, RegressionCase{5578, false}, RegressionCase{5578, true},
+                      RegressionCase{5784, false}, RegressionCase{6580, false}, RegressionCase{6651, false},
+                      RegressionCase{7079, false}, RegressionCase{7284, false}, RegressionCase{7399, false},
+                      RegressionCase{7651, false}, RegressionCase{9524, true}),
+    regression_name);
