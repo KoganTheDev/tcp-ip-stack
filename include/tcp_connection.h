@@ -579,7 +579,7 @@ private:
     void _send_fin(const Bytes& payload);
     // Sends one chunk taken off the send queue, with the FIN if it is the
     // last one after close().
-    void _send_chunk(Bytes chunk);
+    void _send_chunk(const Bytes& chunk);
 
     // when TIME_WAIT ends; pushed back if a duplicate FIN arrives (meaning
     // our ack for it was likely lost)

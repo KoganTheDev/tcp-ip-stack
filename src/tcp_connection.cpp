@@ -624,7 +624,7 @@ void TcpConnection::_send_queued_while_window_allows()
         Bytes next_chunk = std::move(_send_queue.front());
         _send_queue.pop_front();
         _send_queued_bytes -= next_chunk.size();
-        _send_chunk(std::move(next_chunk));
+        _send_chunk(next_chunk);
     }
 
     // whatever's left is blocked - if that's because the peer's window is shut
@@ -904,7 +904,7 @@ bool TcpConnection::_send_one_new_segment(uint32_t pipe, uint32_t window)
     Bytes chunk = std::move(_send_queue.front());
     _send_queue.pop_front();
     _send_queued_bytes -= chunk.size();
-    _send_chunk(std::move(chunk));
+    _send_chunk(chunk);
     return true;
 }
 
@@ -2034,7 +2034,7 @@ void TcpConnection::_send_fin(const Bytes& payload)
     _send_flags(FLAG_FIN, payload);
 }
 
-void TcpConnection::_send_chunk(Bytes chunk)
+void TcpConnection::_send_chunk(const Bytes& chunk)
 {
     // The last queued chunk after close() carries the FIN (RFC 9293 3.6:
     // FIN may share a segment with data).
