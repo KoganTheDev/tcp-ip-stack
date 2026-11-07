@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <list>
 #include <deque>
 #include <map>
 #include <memory>
@@ -598,9 +599,8 @@ private:
     uint32_t _last_out_of_order_seq;
 
     // The out-of-order ranges this side currently holds, as they would be
-    // reported to the peer. Derived from _reorder_buffer by merging adjacent
-    // entries - the buffer's ranges are disjoint but may touch, so what is
-    // logically one contiguous run can be several entries in it.
+    // reported to the peer. One block per _reorder_buffer range, the range that
+    // arrived last first.
     std::vector<Tcp::SackBlock> _sack_blocks_to_report() const;
 
     // --- timestamps and PAWS (RFC 7323) ---
@@ -662,16 +662,30 @@ private:
     // via _receive_buffer_occupied() and by MAX_REORDER_SEGMENTS entries.
     //
     // A new segment is cut against what is already held, so every byte is
-    // stored once however the segments overlap; a piece that starts exactly
-    // where an entry ends is appended to it. Two entries can still end up
-    // adjacent (a gap filled from its front edge) and are left as two rather
-    // than concatenated: joining them would copy the second, and a peer could
-    // make that copy happen once per segment - the SACK report and the drain
-    // treat adjacent entries as one range anyway.
+    // stored once however the segments overlap. Ranges are kept maximal: a
+    // piece that touches the range before or after it is joined to it, and
+    // two ranges a piece bridges become one. That makes each entry exactly
+    // one SACK block (so a report reads at most a handful of entries, not the
+    // whole buffer) and makes MAX_REORDER_SEGMENTS a count of ranges.
+    //
+    // A range keeps its bytes as a list of chunks, one per piece stored, not
+    // as one contiguous buffer: appending a piece, prepending one, or joining
+    // two ranges is then O(1) (list splice) rather than a copy of what is
+    // already held - a peer cannot make the cost per segment grow with the
+    // size of the range. The chunks are concatenated once, when the range is
+    // delivered.
     //
     // Unwrapped keys sort in true sequence order, so the earliest range is
     // always begin() even across the 2^32 wrap.
-    std::map<uint64_t, Bytes> _reorder_buffer;
+    struct ReorderRange
+    {
+        uint64_t end; // unwrapped, one past the last byte; the map key is the first
+        std::list<Bytes> chunks;
+    };
+    std::map<uint64_t, ReorderRange> _reorder_buffer;
+    // Stores one piece [start, start + piece.size()) that lies entirely in a
+    // hole of _reorder_buffer, joining it to whichever neighbours it touches.
+    void _store_reorder_piece(uint64_t start, Bytes piece);
     // RCV.NXT, unwrapped: advanced in lockstep with _recv_next, so the two are
     // equal modulo 2^32. Every buffered range lies after it and within the
     // window, so (seq - RCV.NXT) + this is a range's unwrapped position.
