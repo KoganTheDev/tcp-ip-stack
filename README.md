@@ -109,7 +109,11 @@ and bounds how much a peer can make it hold for datagrams that never complete.
 **ARP.** Request and reply in both directions, with a time-based TTL refreshed on
 received traffic, so an actively-talking peer never ages out mid-conversation. The table
 is bounded, and the stack only learns from ARP that targets its own address, so a shared
-segment cannot fill it or overwrite mappings it is using.
+segment cannot fill it or overwrite mappings it is using. A newly configured address
+(static, or from a DHCP bind) is announced as RFC 5227 section 2.3 describes: a broadcast
+request with sender and target IP both the address, sent twice, 2 s apart, so neighbours
+holding a stale mapping for it replace it. The RFC 5227 probe and conflict check before
+binding is not implemented.
 
 **Two transports.** A TAP device, or an `AF_PACKET` socket on a physical NIC, both behind
 one `PacketChannel` seam that nothing downstream can distinguish. The real-NIC path
@@ -123,7 +127,15 @@ bounded ARP resolution, the same way an active TCP open does.
 
 **ICMP.** Echo Request and Reply (so a real `ping` gets an answer), Destination
 Unreachable / Port Unreachable both generated and acted upon, and Time Exceeded for a
-datagram whose fragments never all arrived. Receiving a Destination Unreachable for a
+datagram whose fragments never all arrived. A datagram to this host with a protocol
+nothing handles draws Protocol Unreachable (RFC 1122 3.2.2.1). A header whose option
+list cannot be walked - a type octet with no length, a length under 2 or running past
+the header - is discarded with Parameter Problem, the pointer naming the octet (RFC 792,
+1122 3.2.2.5, 1812 4.3.2.7); unknown but well-framed options are ignored, and other bad
+headers (version, IHL, length, checksum) are dropped silently. Every error obeys the same
+rules (never about a broadcast, a non-first fragment or another error) and shares one
+rate limit, and quotes the offending packet's header and first 8 bytes as received -
+for a reassembled datagram, the first fragment's. Receiving a Destination Unreachable for a
 connection's own segment fails that connection immediately instead of letting it grind
 through the full retransmit budget.
 
@@ -184,6 +196,12 @@ segment carrying options this codec does not model, corrupting a connection the 
 only supposed to be relaying. The source address is not rewritten either: a router
 forwards, it does not translate, which is what lets the reply come back and what makes
 every hop visible to a traceroute.
+
+The forwarding decision is made from the IP header alone: the receive path parses a
+packet's transport header only if it is addressed to this host. So a router relays a
+protocol it has never heard of, or a TCP or UDP header its own codecs would reject,
+exactly as it would any other packet; a malformed IP option is the one header error it
+reports rather than relays.
 
 **Routing.** A subnet mask, a default gateway, and a route table with longest-prefix
 match, each route naming the interface to send by. Every send decides whether the destination is on-link, and so resolves the
@@ -262,12 +280,6 @@ These are documented decisions, not gaps that were missed:
 - **SACK recovery is not full RFC 6675.** The blocks themselves are sent and honoured
   (see above); what is missing is the pipe estimate driving transmission during recovery,
   and rescue retransmission. The scoreboard both would need does exist.
-- **A forwarded packet is parsed to L4 before the forwarding decision is made.** The
-  receive path builds a `Tcp`/`Udp`/`Icmp` for every payload, so transit traffic this
-  stack's codecs reject is dropped during parsing rather than relayed. A real router
-  reads the IP header and nothing else, which is why it can carry protocols it has never
-  heard of. Fixing it means deferring transport parsing until after the decision - a
-  codec change, not a forwarding one.
 - **No ECMP.** A route is keyed by destination and prefix, so two routes to one prefix by
   different interfaces cannot coexist. Equal-cost multipath needs a per-flow hash to keep
   a connection's packets on one path, which is a different project.
