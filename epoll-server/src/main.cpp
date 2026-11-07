@@ -4,12 +4,20 @@
 #include <iostream>
 #include <string>
 #include <typeinfo>
+#include <vector>
 #include <unistd.h>
 
-#include "server.h"
 #include "channel_factory.h"
+#include "echo_server.h"
 #include "exceptions.h"
 #include "logger.h"
+
+#ifdef EPOLL_SERVER_KERNEL
+#include "ustack/kernel_stack.h"
+#else
+#include "network_stack.h"
+#include "ustack/stack.h"
+#endif
 
 namespace
 {
@@ -22,7 +30,11 @@ namespace
 
     struct Config
     {
-        uint16_t port = 8080;
+        // --port may repeat; none given means 8080.
+        std::vector<uint16_t> ports;
+        // Whether any option that only means something to the userspace stack
+        // was given, so the kernel build can refuse it rather than ignore it.
+        bool stack_option_given = false;
         size_t worker_count = 4;
         ChannelOptions channel;
         // A second link, and permission to relay between the two. Absent unless
@@ -51,7 +63,7 @@ namespace
                      "  --mac AA:BB:...       override the MAC. Defaults to a fixed locally\n"
                      "                          administered address for tap, and to the\n"
                      "                          interface's real hardware address for nic\n"
-                     "  --port N              TCP port to listen on (default 8080)\n"
+                     "  --port N              TCP port to listen on; may be repeated (default 8080)\n"
                      "  --workers N           thread pool size (default 4)\n"
                      "\n"
                      "Router mode - a second interface, and permission to relay between them:\n"
@@ -98,6 +110,7 @@ namespace
                 }
                 else if (flag == "--transport")
                 {
+                    config.stack_option_given = true;
                     std::string value = next_value(i, "--transport");
                     if (value == "tap")
                     {
@@ -118,14 +131,17 @@ namespace
                 }
                 else if (flag == "--device")
                 {
+                    config.stack_option_given = true;
                     config.channel.device = next_value(i, "--device");
                 }
                 else if (flag == "--ip")
                 {
+                    config.stack_option_given = true;
                     config.channel.local_ip = IPv4Address(next_value(i, "--ip"));
                 }
                 else if (flag == "--prefix")
                 {
+                    config.stack_option_given = true;
                     int prefix = std::stoi(next_value(i, "--prefix"));
                     if (prefix < 0 || prefix > 32)
                     {
@@ -135,29 +151,34 @@ namespace
                 }
                 else if (flag == "--gateway")
                 {
+                    config.stack_option_given = true;
                     config.channel.gateway = IPv4Address(next_value(i, "--gateway"));
                 }
                 else if (flag == "--mac")
                 {
+                    config.stack_option_given = true;
                     config.channel.local_mac = MacAddress(next_value(i, "--mac"));
                 }
                 else if (flag == "--port")
                 {
-                    config.port = static_cast<uint16_t>(std::stoi(next_value(i, "--port")));
+                    config.ports.push_back(static_cast<uint16_t>(std::stoi(next_value(i, "--port"))));
                 }
                 else if (flag == "--second-device")
                 {
+                    config.stack_option_given = true;
                     config.router_mode = true;
                     config.second_channel.transport = Transport::RawNic;
                     config.second_channel.device = next_value(i, "--second-device");
                 }
                 else if (flag == "--second-ip")
                 {
+                    config.stack_option_given = true;
                     config.router_mode = true;
                     config.second_channel.local_ip = IPv4Address(next_value(i, "--second-ip"));
                 }
                 else if (flag == "--second-prefix")
                 {
+                    config.stack_option_given = true;
                     config.router_mode = true;
                     config.second_channel.prefix_length =
                         static_cast<uint8_t>(std::stoi(next_value(i, "--second-prefix")));
@@ -214,6 +235,14 @@ int main(int argc, char** argv)
         return exit_code;
     }
 
+#ifdef EPOLL_SERVER_KERNEL
+    if (config.stack_option_given)
+    {
+        std::cerr << "this is the kernel build (KERNEL=1): it listens on real kernel sockets, so the\n"
+                     "transport, address and interface options do not apply. Use --port and --workers.\n";
+        return 1;
+    }
+#else
     // Both transports need privilege: /dev/net/tun for a TAP device, and
     // CAP_NET_RAW for a packet socket. Checked here so the failure names its
     // own fix, rather than surfacing as an opaque EPERM from open() or socket().
@@ -225,34 +254,69 @@ int main(int argc, char** argv)
                   << argv[0] << "'.");
         return 1;
     }
+#endif
+    if (config.ports.empty())
+    {
+        config.ports.push_back(8080);
+    }
 
     try
     {
         static_cast<void>(std::signal(SIGINT, handle_shutdown_signal));
         static_cast<void>(std::signal(SIGTERM, handle_shutdown_signal));
-        static_cast<void>(std::signal(SIGPIPE, SIG_IGN)); // defensive - nothing here writes to a raw kernel socket
+        static_cast<void>(std::signal(SIGPIPE, SIG_IGN)); // defensive - sends use MSG_NOSIGNAL anyway
 
-        Server server(config.port, config.worker_count, config.channel);
-
+#ifdef EPOLL_SERVER_KERNEL
+        ustack::KernelStack stack;
+        const char* stack_name = "kernel sockets";
+#else
+        // The stack is assembled here, not by the server: every interface has
+        // to be on the NetworkStack before ustack::Stack's driver is built
+        // over it, and router mode adds a second one.
+        OpenedChannel opened = open_channel(config.channel);
+        auto network_stack = std::make_unique<NetworkStack>(std::move(opened.channel), opened.config);
         if (config.router_mode)
         {
-            server.add_interface(config.second_channel);
-            server.set_forwarding(true);
+            // A router is not a special kind of program: a stack with more than
+            // one interface and permission to relay. It still terminates its
+            // own TCP connections on both links.
+            OpenedChannel second = open_channel(config.second_channel);
+            network_stack->add_interface(std::move(second.channel), second.config);
+            network_stack->set_forwarding(true);
             LOG_INFO("epoll-server router mode: second interface "
                      << config.second_channel.device << " ip=" << config.second_channel.local_ip.to_string() << "/"
                      << static_cast<int>(config.second_channel.prefix_length) << " - forwarding enabled");
         }
+        ustack::Stack stack(std::move(network_stack));
+        const char* stack_name = "custom Ethernet/ARP/IP/TCP stack, no kernel sockets";
+#endif
+        // Declared after the stack, so it is destroyed first: it closes its
+        // fds through the stack.
+        EchoServer<decltype(stack)> server(stack, config.worker_count);
+        std::string port_list;
+        for (uint16_t port : config.ports)
+        {
+            uint16_t bound = server.listen_on(port);
+            port_list += (port_list.empty() ? "" : ",") + std::to_string(bound);
+        }
 
-        // One line stating everything that was actually resolved, including the
-        // MAC the factory picked. Worth its weight the first time something on
-        // a real network does not behave.
-        LOG_INFO("epoll-server listening on TCP port "
-                 << config.port << " | transport=" << (config.channel.transport == Transport::Tap ? "tap" : "nic")
+        // One line stating everything that was actually resolved. Worth its
+        // weight the first time something on a real network does not behave.
+#ifdef EPOLL_SERVER_KERNEL
+        LOG_INFO("epoll-server listening on TCP port(s) " << port_list << " | workers=" << config.worker_count << " ("
+                                                          << stack_name << ")");
+#else
+        LOG_INFO("epoll-server listening on TCP port(s) "
+                 << port_list << " | transport=" << (config.channel.transport == Transport::Tap ? "tap" : "nic")
                  << " device=" << config.channel.device << " ip=" << config.channel.local_ip.to_string() << "/"
                  << static_cast<int>(config.channel.prefix_length)
                  << " gateway=" << (config.channel.gateway.has_value() ? config.channel.gateway->to_string() : "none")
-                 << " workers=" << config.worker_count << " (custom Ethernet/ARP/IP/TCP stack, no kernel sockets)");
+                 << " workers=" << config.worker_count << " (" << stack_name << ")");
+#endif
 
+        // Returns after a SIGINT/SIGTERM once every connection has been
+        // flushed, half-closed and closed by its peer, or after the 5 s
+        // deadline.
         server.run(g_stop_flag);
 
         LOG_INFO("Shutting down");

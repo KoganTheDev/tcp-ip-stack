@@ -15,6 +15,21 @@ CXX = g++
 # rather than "No rule to make target".
 CXXFLAGS = -std=c++17 -Wall -Wextra -pthread -MMD -MP $(INCLUDES)
 
+# KERNEL=1 builds the same server logic (include/echo_server.h) against the
+# kernel's own sockets instead of this repo's stack: ustack::KernelStack, no TAP
+# device, no root, listening on a real kernel port. It is a different program
+# from the same sources, so it gets its own object directory and binary name:
+# sharing bin/ would let `make` link a main.o built for the other stack, and
+# overwriting epoll-server would break scripts/*.sh, which run that file.
+ifeq ($(KERNEL),1)
+CXXFLAGS += -DEPOLL_SERVER_KERNEL
+BIN = bin-kernel
+TARGET = epoll-server-kernel
+else
+BIN = bin
+TARGET = epoll-server
+endif
+
 # The root project's Ethernet/ARP/IP/TCP stack lives in ../src and is shared,
 # not duplicated here
 SRC_DIRS = src ../src
@@ -26,16 +41,14 @@ vpath %.cpp $(SRC_DIRS)
 # bin/. A list that has to be maintained in two places will eventually be
 # maintained in one.
 SOURCES = $(notdir $(wildcard src/*.cpp) $(wildcard ../src/*.cpp))
-OBJ = $(addprefix bin/,$(SOURCES:.cpp=.o))
+OBJ = $(addprefix $(BIN)/,$(SOURCES:.cpp=.o))
 DEPS = $(OBJ:.o=.d)
-
-TARGET = epoll-server
 
 $(TARGET): $(OBJ)
 	$(CXX) $(CXXFLAGS) -o $(TARGET) $^
 
-bin/%.o: %.cpp
-	@mkdir -p bin
+$(BIN)/%.o: %.cpp
+	@mkdir -p $(BIN)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # Dash-prefixed: the .d files do not exist on the first build, and their absence
@@ -44,6 +57,6 @@ bin/%.o: %.cpp
 -include $(DEPS)
 
 clean:
-	rm -rf bin $(TARGET)
+	rm -rf bin bin-kernel epoll-server epoll-server-kernel
 
 .PHONY: clean

@@ -33,6 +33,11 @@ endif()
 # benchmark build should not wait for either.
 option(TCPIP_BUILD_TESTS "Build the GoogleTest suite" ON)
 option(TCPIP_BUILD_APPS "Build epoll-server and http-get" ON)
+# epoll-server over the kernel's sockets (ustack::KernelStack) instead of this
+# repo's stack: the same server logic, no TAP device, no root. Off by default;
+# the binary is then named epoll-server-kernel so the two never share a name.
+# (The unit tests exercise the server against both stacks whatever this says.)
+option(TCPIP_EPOLL_SERVER_KERNEL "Build epoll-server against kernel sockets" OFF)
 option(TCPIP_BUILD_FUZZERS "Build the libFuzzer harnesses in fuzz/ (needs clang)" OFF)
 option(TCPIP_BUILD_BENCH "Build the Google Benchmark microbenchmarks in bench/" OFF)
 
@@ -87,6 +92,10 @@ file(GLOB EPOLL_SERVER_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/epoll-ser
 list(FILTER EPOLL_SERVER_SOURCES EXCLUDE REGEX "/(thread_pool|completion_queue)\\.cpp$")
 add_executable(epoll-server ${EPOLL_SERVER_SOURCES})
 target_compile_options(epoll-server PRIVATE -Wextra)
+if(TCPIP_EPOLL_SERVER_KERNEL)
+    target_compile_definitions(epoll-server PRIVATE EPOLL_SERVER_KERNEL)
+    set_target_properties(epoll-server PROPERTIES OUTPUT_NAME epoll-server-kernel)
+endif()
 target_link_libraries(epoll-server PRIVATE epoll_threaded)
 
 file(GLOB HTTP_GET_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/http-get/src/*.cpp)

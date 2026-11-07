@@ -13,3 +13,5 @@ build/
 http-get/http-get
 # Worktrees made for parallel agent work.
 .claude/worktrees/
+bin-kernel
+epoll-server/epoll-server-kernel
