@@ -28,6 +28,20 @@ enum class TcpState
     CLOSED,
 };
 
+// Why a connection reached CLOSED, for a socket layer that has to turn it into
+// an errno (SO_ERROR): ECONNRESET, ECONNREFUSED, ETIMEDOUT and so on. The
+// state machine itself has no use for it - CLOSED is CLOSED - which is why it
+// is a separate value read after the fact rather than a family of states.
+enum class TcpCloseReason
+{
+    NONE,        // still open, or closed cleanly (both FINs acknowledged, TIME_WAIT ran out)
+    RESET,       // the peer sent an acceptable RST
+    REFUSED,     // our SYN was answered by a RST, or by ICMP port/protocol unreachable
+    TIMED_OUT,   // retransmissions, the user timeout, or keepalive probes gave up
+    UNREACHABLE, // no route, or ARP for the next hop never answered
+    ABORTED,     // abort() was called locally, or an internal error dropped it
+};
+
 // A single TCP connection's state machine (RFC 793/5681/7323, still
 // deliberately narrowed on a few points - see the scope notes below). Owns
 // no socket, no Ethernet/IP/ARP knowledge, and no I/O: it only decides what
@@ -244,7 +258,41 @@ public:
     // Hard-closes without any teardown handshake - nothing has been
     // transmitted yet, so there's nothing to tear down. NetworkStack calls
     // this when an active open's ARP resolution exhausts its retries.
-    void fail() { _transition(TcpState::CLOSED); }
+    // reason says why, for close_reason(): UNREACHABLE for a failed ARP or a
+    // missing route, REFUSED for an ICMP port or protocol unreachable.
+    void fail(TcpCloseReason reason = TcpCloseReason::UNREACHABLE) { _close_as(reason); }
+
+    // Why the connection reached CLOSED; NONE while it has not, or when it
+    // closed cleanly. Kept after the transition so a socket layer can read it
+    // from a state-change callback and report it as SO_ERROR.
+    TcpCloseReason close_reason() const { return _close_reason; }
+
+    // The connection's own end and the peer's, for getsockname()/getpeername().
+    uint16_t get_local_port() const { return _local_port; }
+    const IPv4Address& get_remote_ip() const { return _remote_ip; }
+    uint16_t get_remote_port() const { return _remote_port; }
+
+    // TCP_NODELAY: turns Nagle's algorithm off, so a small segment goes out at
+    // once even with earlier data unacknowledged. Off by default, as on Linux:
+    // Nagle saves a lot of tiny packets for an application that writes a byte
+    // at a time, and costs a round trip of latency for one that writes a
+    // request and waits for the answer - which is the one that sets this.
+    void set_nodelay(bool enabled) { _nodelay = enabled; }
+    bool nodelay() const { return _nodelay; }
+
+    // TCP_CONGESTION: switches the congestion control algorithm. The new one
+    // starts from its initial window, as Linux's does when the algorithm is
+    // changed on a live socket - the window is the algorithm's state, and one
+    // algorithm's window is not a meaningful starting point for another.
+    void set_congestion_control(CongestionControlAlgorithm algorithm);
+
+    // Told when send_space_available() has grown - an ack let queued data go
+    // out, freeing room. A socket layer turns it into EPOLLOUT: without it an
+    // application that filled the send buffer could only find out it may write
+    // again by trying. Fired at the end of the entry point that freed the
+    // space, never from inside send() itself, which only ever shrinks it.
+    using SendSpaceFn = std::function<void()>;
+    void set_send_space_callback(SendSpaceFn callback) { _on_send_space = std::move(callback); }
 
     // Like Linux's TCP_USER_TIMEOUT (RFC 5482): the connection is failed once
     // data it has to send - in flight or queued - has made no progress, i.e.
@@ -403,6 +451,16 @@ public:
 
 private:
     void _transition(TcpState new_state);
+    // Records why, then moves to CLOSED. Every path to CLOSED goes through
+    // here, so close_reason() never disagrees with the transition.
+    void _close_as(TcpCloseReason reason)
+    {
+        _close_reason = reason;
+        _transition(TcpState::CLOSED);
+    }
+    // Fires the send-space callback if send_space_available() grew since it
+    // was last reported. Run at the end of every entry point (EntryScope).
+    void _report_send_space();
     // Builds and sends one segment - the only path any non-RST segment takes,
     // first transmission, retransmission, ack or probe alike, so what options
     // a segment carries never depends on which code sent it (RFC 7323 3.2: once
@@ -849,6 +907,11 @@ private:
     size_t _receive_queued_bytes;
     bool _active_open = false; // see is_active_open()
     ChallengeAckGateFn _challenge_ack_gate;
+    TcpCloseReason _close_reason = TcpCloseReason::NONE;
+    bool _nodelay = false;
+    SendSpaceFn _on_send_space;
+    // send_space_available() as of the last _report_send_space().
+    size_t _reported_send_space = SEND_BUFFER_CAPACITY;
 
     // --- clock and deadline bookkeeping ---
     //
@@ -887,7 +950,11 @@ private:
     {
     public:
         explicit EntryScope(TcpConnection& connection) : _connection(connection) { _connection._sync_clock(); }
-        ~EntryScope() { _connection._refresh_timer_deadline(); }
+        ~EntryScope()
+        {
+            _connection._refresh_timer_deadline();
+            _connection._report_send_space();
+        }
         EntryScope(const EntryScope&) = delete;
         EntryScope& operator=(const EntryScope&) = delete;
         EntryScope(EntryScope&&) = delete;

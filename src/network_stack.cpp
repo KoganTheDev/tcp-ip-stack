@@ -287,6 +287,66 @@ void NetworkStack::listen(uint16_t port, size_t backlog)
     this->_listening_ports[port] = backlog;
 }
 
+void NetworkStack::unlisten(uint16_t port)
+{
+    this->_listening_ports.erase(port);
+
+    // What Linux does when a listener closes: connections that finished the
+    // handshake were promised to an application that will now never take
+    // them, so their peers are told with a RST; half-open ones are dropped
+    // silently, and a client that answers late gets the ordinary RST for a
+    // segment matching no connection.
+    auto pending_it = this->_pending_accepts.find(port);
+    if (pending_it != this->_pending_accepts.end())
+    {
+        std::deque<ConnectionKey> pending = std::move(pending_it->second);
+        this->_pending_accepts.erase(pending_it);
+        for (const ConnectionKey& key : pending)
+        {
+            auto connection_it = this->_connections.find(key);
+            if (connection_it != this->_connections.end())
+            {
+                connection_it->second->abort();
+            }
+        }
+    }
+    auto half_open_it = this->_half_open_per_port.find(port);
+    if (half_open_it != this->_half_open_per_port.end())
+    {
+        // Copied: each fail() leaves SYN_RECEIVED, whose callback edits the map.
+        std::vector<uint64_t> ids;
+        for (const auto& entry : half_open_it->second)
+        {
+            ids.push_back(entry.first);
+        }
+        for (uint64_t id : ids)
+        {
+            if (TcpConnection* connection = this->find_connection(id))
+            {
+                connection->fail(TcpCloseReason::ABORTED);
+            }
+        }
+    }
+}
+
+bool NetworkStack::has_pending_accept(uint16_t port) const
+{
+    auto pending_it = this->_pending_accepts.find(port);
+    if (pending_it == this->_pending_accepts.end())
+    {
+        return false;
+    }
+    // Stale keys (see accept()) do not count: accept() would skip them.
+    for (const ConnectionKey& key : pending_it->second)
+    {
+        if (this->_connections.count(key) != 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 TcpConnection* NetworkStack::accept(uint16_t port)
 {
     auto pending_it = this->_pending_accepts.find(port);
@@ -318,20 +378,31 @@ TcpConnection* NetworkStack::accept(uint16_t port)
     return nullptr;
 }
 
-TcpConnection* NetworkStack::connect(const IPv4Address& remote_ip, uint16_t remote_port)
+TcpConnection* NetworkStack::connect(const IPv4Address& remote_ip, uint16_t remote_port, uint16_t local_port)
 {
+    if (local_port != 0)
+    {
+        // A port the caller chose (a socket bound before connect()): used as
+        // given, or refused if that exact four-tuple is taken.
+        if (this->_connections.count(ConnectionKey{remote_ip, remote_port, local_port}) != 0)
+        {
+            return nullptr;
+        }
+        return this->_open_connection(remote_ip, remote_port, local_port);
+    }
+
     // The allocator is a wrapping counter, so after one lap it hands out ports
     // that may still be in use. Only the full four-tuple has to be unique, so
     // skip a port only if it is in use to this same remote ip:port - storing
     // under a live key would destroy that connection in place, leaving the
     // application's pointer to it dangling and its id finding this one.
     constexpr size_t EPHEMERAL_PORT_COUNT = 65536 - FIRST_EPHEMERAL_PORT;
-    uint16_t local_port = 0;
+    uint16_t ephemeral_port = 0;
     bool found_free_port = false;
     for (size_t attempt = 0; attempt < EPHEMERAL_PORT_COUNT && !found_free_port; attempt++)
     {
-        local_port = this->_allocate_ephemeral_port();
-        found_free_port = this->_connections.count(ConnectionKey{remote_ip, remote_port, local_port}) == 0;
+        ephemeral_port = this->_allocate_ephemeral_port();
+        found_free_port = this->_connections.count(ConnectionKey{remote_ip, remote_port, ephemeral_port}) == 0;
     }
     if (!found_free_port)
     {
@@ -339,6 +410,11 @@ TcpConnection* NetworkStack::connect(const IPv4Address& remote_ip, uint16_t remo
                                                                                   << remote_port);
         return nullptr;
     }
+    return this->_open_connection(remote_ip, remote_port, ephemeral_port);
+}
+
+TcpConnection* NetworkStack::_open_connection(const IPv4Address& remote_ip, uint16_t remote_port, uint16_t local_port)
+{
     ConnectionKey key{remote_ip, remote_port, local_port};
 
     auto connection = std::make_unique<TcpConnection>(
@@ -817,7 +893,7 @@ void NetworkStack::on_time_passed(uint32_t elapsed_ms)
         {
             LOG_ERROR("NetworkStack: dropping connection " << connection_id
                                                            << " after an error in its timers: " << e.what());
-            connection->fail(); // -> CLOSED, reaped below
+            connection->fail(TcpCloseReason::ABORTED); // -> CLOSED, reaped below
         }
         // Queued again at its new deadline. If that is where it already was,
         // the connection's callback did not fire, so this cannot be left to it.
@@ -1344,6 +1420,10 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
             && state_after != TcpState::CLOSED && !connection_it->second->is_active_open())
         {
             this->_pending_accepts[key.local_port].push_back(key);
+            if (this->_on_accept_ready)
+            {
+                this->_on_accept_ready(key.local_port);
+            }
         }
         return;
     }
@@ -1392,7 +1472,7 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
                 LOG_WARNING("NetworkStack: port " << key.local_port << " has " << half_open
                                                   << " half-open connections - evicting the oldest, "
                                                   << (this->_now_ms - oldest_created) << " ms old");
-                oldest->fail();
+                oldest->fail(TcpCloseReason::ABORTED);
             }
             else
             {
@@ -1544,6 +1624,10 @@ bool NetworkStack::_try_complete_cookie_handshake(const Ip& ip, const Tcp& tcp)
     TcpConnection* connection_ptr = connection.get();
     this->_register_connection(key, std::move(connection));
     this->_pending_accepts[local_port].push_back(key);
+    if (this->_on_accept_ready)
+    {
+        this->_on_accept_ready(local_port);
+    }
 
     // The completing ACK may carry data (or its window), so it is processed
     // like any segment of an established connection.
@@ -1883,7 +1967,8 @@ void NetworkStack::_handle_icmp_error(const Icmp& icmp)
     }
 
     LOG_DEBUG("NetworkStack: failing a TCP connection on a hard ICMP error during its handshake");
-    connection->fail(); // -> CLOSED, reaped on the next poll()/on_time_passed() pass
+    // Linux maps both hard codes to ECONNREFUSED for a connect() in progress.
+    connection->fail(TcpCloseReason::REFUSED); // -> CLOSED, reaped on the next poll()/on_time_passed() pass
 }
 
 IPv4Address NetworkStack::_next_hop_for(const IPv4Address& destination) const

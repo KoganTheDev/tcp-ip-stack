@@ -188,6 +188,25 @@ public:
     void listen(uint16_t port, size_t backlog = DEFAULT_LISTEN_BACKLOG);
 
     static constexpr size_t DEFAULT_LISTEN_BACKLOG = 128;
+
+    // Stops accepting connections on a port, as closing a listening socket
+    // does: connections waiting in its accept queue are reset (their peers
+    // were told the handshake succeeded, and nobody will ever accept them),
+    // half-open ones are dropped silently. Connections already accepted are
+    // not affected.
+    void unlisten(uint16_t port);
+
+    // Whether accept(port) would return a connection right now. A socket
+    // layer's readiness test for a listening socket (EPOLLIN), which must not
+    // pop anything to find out.
+    bool has_pending_accept(uint16_t port) const;
+
+    // Told whenever a connection joins a port's accept queue, with that port.
+    // The listening-socket half of readiness notification: without it the
+    // only way to learn a connection is waiting is to keep calling accept().
+    // One slot, like the other application-facing callbacks here.
+    using AcceptReadyFn = std::function<void(uint16_t port)>;
+    void set_accept_ready_callback(AcceptReadyFn callback) { _on_accept_ready = std::move(callback); }
     // Separate from the backlog above, which counts only connections that
     // finished the handshake: how many may sit in SYN_RECEIVED on one listening
     // port at once. Without it a SYN flood (whose spoofed sources never
@@ -259,13 +278,14 @@ public:
     TcpConnection* accept(uint16_t port);
 
     // Actively opens a connection to remote_ip:remote_port from a freshly
-    // allocated ephemeral local port. Returns immediately with a connection
+    // allocated ephemeral local port, or from local_port if it is not 0 (a
+    // socket bound before connect()) - nullptr if that four-tuple is taken. Returns immediately with a connection
     // in SYN_SENT (or briefly LISTEN, if the peer's MAC still needs
     // resolving) - the handshake completes asynchronously as segments and
     // ARP replies arrive via poll(). The returned pointer has the same
     // whole-lifetime ownership as accept()'s. Returns nullptr if every
     // ephemeral port is already connected to this same remote ip:port.
-    TcpConnection* connect(const IPv4Address& remote_ip, uint16_t remote_port);
+    TcpConnection* connect(const IPv4Address& remote_ip, uint16_t remote_port, uint16_t local_port = 0);
 
     // Looks a connection up by the stable id from TcpConnection::get_id(),
     // or nullptr if it's since been reaped. This is the safe way to hold
@@ -602,6 +622,8 @@ private:
     // peer whose MAC isn't cached yet.
     void _ensure_arp_resolution(size_t interface_index, const IPv4Address& ip);
     void _fail_pending_outbound_connects(size_t interface_index, const IPv4Address& ip);
+    // connect()'s second half, once the local port is settled.
+    TcpConnection* _open_connection(const IPv4Address& remote_ip, uint16_t remote_port, uint16_t local_port);
 
     // A UDP datagram whose send had to wait on ARP resolution - enough to
     // rebuild it once the peer's MAC is known. Keyed (in Interface, below) by
@@ -741,6 +763,7 @@ private:
     static constexpr int MS_PER_SECOND = 1000;
     int _icmp_error_tokens_scaled;
     EchoReplyFn _on_echo_reply;
+    AcceptReadyFn _on_accept_ready;
     std::unordered_map<uint16_t, size_t> _listening_ports; // port -> backlog
     std::unordered_map<uint16_t, std::deque<ConnectionKey>> _pending_accepts;
     // Connections in SYN_RECEIVED, per local port: connection id -> the stack

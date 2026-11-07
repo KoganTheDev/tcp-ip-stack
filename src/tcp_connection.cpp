@@ -882,7 +882,7 @@ void TcpConnection::_send_queued_while_window_allows()
         // still unacked - it goes out once the pipe drains (or the window/cwnd
         // frees up enough for a full segment). A full-sized segment is never
         // held.
-        if (_send_queue.front().size() < _max_segment_payload() && _bytes_in_flight() > 0)
+        if (!_nodelay && _send_queue.front().size() < _max_segment_payload() && _bytes_in_flight() > 0)
         {
             break;
         }
@@ -1008,7 +1008,7 @@ void TcpConnection::_run_keepalive()
     {
         LOG_WARNING("TcpConnection[" << _id << "] peer unresponsive after " << _keepalive_probes_sent
                                      << " keepalive probes - closing");
-        _transition(TcpState::CLOSED);
+        _close_as(TcpCloseReason::TIMED_OUT);
         return;
     }
     _send_keepalive_probe();
@@ -1463,7 +1463,7 @@ void TcpConnection::on_segment(const Tcp& segment)
             // SYN, could come from anyone and is dropped.
             if (segment.get_ack() && _ack_acceptable_in_syn_sent(segment.get_acknowledgement_number()))
             {
-                _transition(TcpState::CLOSED);
+                _close_as(TcpCloseReason::REFUSED);
             }
             return;
         }
@@ -1484,7 +1484,9 @@ void TcpConnection::on_segment(const Tcp& segment)
             _send_challenge_ack();
             return;
         }
-        _transition(TcpState::CLOSED);
+        // A reset answering a SYN of ours (a simultaneous open still in
+        // SYN_RECEIVED) refuses the connection rather than resetting one.
+        _close_as(_state == TcpState::SYN_RECEIVED && _active_open ? TcpCloseReason::REFUSED : TcpCloseReason::RESET);
         return;
     }
 
@@ -1949,7 +1951,7 @@ void TcpConnection::_run_timers()
     {
         LOG_WARNING("TcpConnection[" << _id << "] no progress on outstanding data for " << (_now_ms - _stall_since_ms)
                                      << " ms - giving up");
-        _transition(TcpState::CLOSED);
+        _close_as(TcpCloseReason::TIMED_OUT);
         return;
     }
 
@@ -2004,7 +2006,7 @@ void TcpConnection::_run_timers()
     {
         LOG_WARNING("TcpConnection[" << _id << "] giving up after " << (oldest.retransmit_attempts - 1)
                                      << " retransmit attempts at seq=" << oldest.seq << " - closing");
-        _transition(TcpState::CLOSED);
+        _close_as(TcpCloseReason::TIMED_OUT);
         return;
     }
 
@@ -2038,6 +2040,30 @@ void TcpConnection::_run_timers()
     oldest.retransmitted = true; // no RTT sample may ever come from it now
     oldest.retransmit_ms_remaining = _rto_ms;
     oldest.retransmit_deadline_ms = _now_ms + static_cast<uint64_t>(_rto_ms);
+}
+
+void TcpConnection::_report_send_space()
+{
+    size_t space = send_space_available();
+    bool grew = space > _reported_send_space;
+    _reported_send_space = space;
+    if (grew && _on_send_space)
+    {
+        _on_send_space();
+    }
+}
+
+void TcpConnection::set_congestion_control(CongestionControlAlgorithm algorithm)
+{
+    EntryScope scope(*this);
+    _congestion = make_congestion_control(algorithm);
+    // Seeded as the constructor or the handshake would have: with the
+    // negotiated MSS once there is one, the advertised one before.
+    bool synchronized = _state != TcpState::LISTEN && _state != TcpState::SYN_SENT
+                        && _state != TcpState::SYN_RECEIVED;
+    _congestion->on_established(synchronized ? _effective_mss : _local_mss, _syn_retransmissions);
+    _in_fast_recovery = false;
+    _dup_ack_count = 0;
 }
 
 size_t TcpConnection::send_space_available() const
@@ -2088,7 +2114,8 @@ size_t TcpConnection::send(const Bytes& data)
         // in flight, so small writes coalesce into fewer, larger segments
         // instead of dribbling out one tiny packet at a time. A full-sized
         // segment, or one sent with an empty pipe, always goes immediately.
-        bool nagle_holds = chunk.size() < _max_segment_payload() && _bytes_in_flight() > 0;
+        // TCP_NODELAY (set_nodelay()) turns it off.
+        bool nagle_holds = !_nodelay && chunk.size() < _max_segment_payload() && _bytes_in_flight() > 0;
 
         // once anything is queued, everything after it must queue too -
         // otherwise a later, smaller chunk could jump ahead of an earlier
@@ -2161,5 +2188,5 @@ void TcpConnection::abort()
     _reorder_buffered_bytes = 0;
     _ack_pending = false;
     _persist_deadline_ms = 0;
-    _transition(TcpState::CLOSED);
+    _close_as(TcpCloseReason::ABORTED);
 }
