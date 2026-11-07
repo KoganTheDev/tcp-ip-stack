@@ -454,13 +454,17 @@ private:
     // Feeds one fragment to the reassembler and, if that completed a datagram,
     // rebuilds it and sends it on to _dispatch_transport as though it had
     // arrived whole.
-    void _handle_ip_fragment(const Ip& ip);
+    void _handle_ip_fragment(const Ip& ip, const Bytes& ip_bytes);
     // Protocol demux for a complete datagram. Split out of _handle_ip so a
     // reassembled datagram takes exactly the same path as one that was never
     // fragmented, rather than a parallel one that could drift from it.
-    void _dispatch_transport(const Ip& ip);
+    //
+    // `received` is the packet as it arrived - or, for a reassembled datagram,
+    // the first fragment's header plus the first 8 payload bytes as they
+    // arrived - and is what an ICMP error about it quotes (RFC 792).
+    void _dispatch_transport(const Ip& ip, const Bytes& received);
     void _handle_tcp(const Ip& ip, const Tcp& tcp);
-    void _handle_udp(const Ip& ip, const Udp& udp);
+    void _handle_udp(const Ip& ip, const Udp& udp, const Bytes& received);
     void _handle_icmp(const Ip& ip, const Icmp& icmp);
     void _reap_closed_connections();
     // Puts a connection in the tables and in the timer queue. Every
@@ -532,7 +536,14 @@ private:
     void _send_icmp_message(const IPv4Address& dest_ip, const Icmp& header, const Bytes& payload);
     // RFC 792: Destination Unreachable/Port Unreachable, for a UDP
     // datagram that arrived at a port nothing is bound to.
-    void _send_icmp_port_unreachable(const Ip& ip);
+    void _send_icmp_port_unreachable(const Ip& ip, const Bytes& received);
+    // Destination Unreachable code 2, for a datagram to this host carrying an
+    // IP protocol number nothing here handles (RFC 1122 3.2.2.1).
+    void _send_icmp_protocol_unreachable(const Ip& ip, const Bytes& received);
+    // Parameter Problem (RFC 792), code 0: `pointer` is the offset into the IP
+    // header of the octet that made the header undeliverable. Sent only when
+    // the datagram was discarded for it, by a host or a router alike.
+    void _send_icmp_parameter_problem(const Ip& ip, const Bytes& received, uint8_t pointer);
     // The two errors only a router generates, both quoting the packet that
     // caused them so the sender can tell which of its flows died.
     //
@@ -542,11 +553,11 @@ private:
     // timeout, is the one a host emits. This is what makes traceroute work:
     // each probe is sent with a TTL one larger than the last, and the hop that
     // discards it names itself by replying.
-    void _send_icmp_time_exceeded(const Ip& ip);
+    void _send_icmp_time_exceeded(const Ip& ip, const Bytes& received);
     // Destination Unreachable code 0 - no route. Distinct from the port
     // unreachable a host sends: that one means "this machine, wrong port", this
     // one means "I have no idea how to reach that network at all".
-    void _send_icmp_net_unreachable(const Ip& ip);
+    void _send_icmp_net_unreachable(const Ip& ip, const Bytes& received);
     // Consumes one token from the ICMP error budget, returning false when there
     // is none. Errors are generated in response to received traffic, so without
     // a bound a peer sets the rate at which this stack emits them - and can aim

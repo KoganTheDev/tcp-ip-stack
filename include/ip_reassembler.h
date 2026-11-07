@@ -54,6 +54,16 @@ public:
     Result offer(const IPv4Address& source, const IPv4Address& destination, uint16_t identification, uint8_t protocol,
                  uint16_t fragment_offset, bool more_fragments, const Bytes& payload, Bytes& out_datagram);
 
+    // The same, also remembering the IP header of fragment zero exactly as it
+    // arrived (`ip_header`, ignored for any other fragment) and handing it back
+    // in `out_first_header` when the datagram completes. An ICMP error about a
+    // reassembled datagram quotes the header the sender actually sent
+    // (RFC 792), and the rebuilt one differs from it in IHL and options, the
+    // flags and offset, the total length and the checksum.
+    Result offer(const IPv4Address& source, const IPv4Address& destination, uint16_t identification, uint8_t protocol,
+                 uint16_t fragment_offset, bool more_fragments, const Bytes& payload, const Bytes& ip_header,
+                 Bytes& out_datagram, Bytes& out_first_header);
+
     // What is known about a datagram that timed out - enough for the caller to
     // decide whether an ICMP Time Exceeded may be sent about it at all (this
     // class knows nothing about ICMP and should not).
@@ -113,6 +123,9 @@ private:
         size_t total_length = 0;           // known once the last fragment arrives
         bool have_last = false;
         size_t received_bytes = 0;
+        // Fragment zero's IP header as received (at most 60 bytes), kept for
+        // the ICMP quote; empty until that fragment arrives.
+        Bytes first_header;
         int ms_remaining = 0;
         IPv4Address source;
     };

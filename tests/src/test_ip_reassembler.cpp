@@ -33,6 +33,26 @@ namespace
     }
 }
 
+TEST(IpReassembler, ReturnsTheFirstFragmentsHeaderAsReceivedWhateverTheArrivalOrder)
+{
+    // The header is kept for the ICMP quote, and it is fragment zero's even
+    // when fragment zero is not the first to arrive.
+    IpReassembler reassembler(TIMEOUT_MS);
+    Bytes out;
+    Bytes first_header;
+    Bytes zero_header = Bytes::from_hex("4600001c123420008001000a0000000a0000000294040000");
+    Bytes other_header = Bytes::from_hex("45000014");
+
+    ASSERT_TRUE(reassembler.offer(SRC, DST, 4242, PROTO, 1, false, filled(4, 0xBB), other_header, out, first_header)
+                == IpReassembler::Result::Incomplete)
+        << "the last fragment alone is incomplete";
+    ASSERT_TRUE(reassembler.offer(SRC, DST, 4242, PROTO, 0, true, filled(8, 0xAA), zero_header, out, first_header)
+                == IpReassembler::Result::Complete)
+        << "fragment zero completes it";
+    ASSERT_TRUE(first_header.to_hex() == zero_header.to_hex())
+        << "the header handed back is fragment zero's, not the last fragment's";
+}
+
 TEST(IpReassembler, FragmentsReassembleInOrder)
 {
     IpReassembler reassembler(TIMEOUT_MS);

@@ -177,6 +177,148 @@ namespace
     const Bytes EIGHT_BYTES = Bytes::from_hex("0102030405060708");
 }
 
+// --- task 1: errors for what this host cannot handle ------------------------
+
+TEST(IpCompletion, AnUnknownProtocolToThisHostDrawsProtocolUnreachable)
+{
+    // RFC 1122 3.2.2.1: a destination host that cannot deliver a datagram
+    // because the protocol is not active MAY send Destination Unreachable
+    // code 2. Silence leaves the sender to guess.
+    Stack s = make_host();
+    Bytes frame = ip_frame(PEER_IP, LOCAL_IP, 64, 253, EIGHT_BYTES);
+    s.first->push_inbound(frame);
+    s.stack->poll();
+
+    IcmpOut err = first_icmp(s.first->outbound_frames());
+    ASSERT_TRUE(err.found) << "an unknown protocol should be answered";
+    ASSERT_TRUE(err.type == 3 && err.code == 2) << "Destination Unreachable, Protocol Unreachable (code 2)";
+    ASSERT_TRUE(err.quote.to_hex() == frame.slice(ETH, 28).to_hex()) << "quoting the header and the first 8 bytes";
+}
+
+TEST(IpCompletion, ProtocolUnreachableIsNotSentAboutABroadcast)
+{
+    Stack s = make_host();
+    s.first->push_inbound(
+        ip_frame(PEER_IP, IPv4Address("255.255.255.255"), 64, 253, EIGHT_BYTES, Bytes(), 1, MacAddress::BROADCAST));
+    s.stack->poll();
+    ASSERT_TRUE(!first_icmp(s.first->outbound_frames()).found) << "RFC 1122 3.2.2: no errors about broadcasts";
+}
+
+TEST(IpCompletion, ProtocolUnreachableSpendsTheErrorBudget)
+{
+    Stack s = make_host();
+    for (int i = 0; i < 60; i++)
+    {
+        s.first->push_inbound(ip_frame(PEER_IP, LOCAL_IP, 64, 253, EIGHT_BYTES));
+    }
+    s.stack->poll();
+    size_t errors = icmp_out(s.first->outbound_frames()).size();
+    ASSERT_TRUE(errors > 0 && errors < 60) << "rate limited, not muted: sent " + std::to_string(errors);
+}
+
+TEST(IpCompletion, ABadIpOptionLengthDrawsParameterProblemPointingAtIt)
+{
+    // RFC 1122 3.2.2.5 / RFC 792: a header error that makes the datagram
+    // undeliverable is reported with Parameter Problem, the pointer naming the
+    // offending octet. Option 0x88 with length 1 is below the minimum of 2:
+    // the length octet is byte 21 of the header.
+    Stack s = make_host();
+    Bytes frame = ip_frame(PEER_IP, LOCAL_IP, 64, 253, EIGHT_BYTES, Bytes::from_hex("88010000"));
+    s.first->push_inbound(frame);
+    s.stack->poll();
+
+    IcmpOut err = first_icmp(s.first->outbound_frames());
+    ASSERT_TRUE(err.found) << "a malformed option should be reported";
+    ASSERT_TRUE(err.type == 12 && err.code == 0) << "Parameter Problem, code 0 (pointer indicates the error)";
+    ASSERT_TRUE((err.rest >> 24) == 21) << "pointer at the length octet, got " + std::to_string(err.rest >> 24);
+    ASSERT_TRUE(err.quote.to_hex() == frame.slice(ETH, 24 + 8).to_hex()) << "quoting the whole 24-byte header + 8";
+}
+
+TEST(IpCompletion, AnOptionRunningPastTheHeaderDrawsParameterProblem)
+{
+    Stack s = make_host();
+    // type 0x82, length 8, but only 4 option bytes exist
+    s.first->push_inbound(ip_frame(PEER_IP, LOCAL_IP, 64, 253, EIGHT_BYTES, Bytes::from_hex("82080000")));
+    s.stack->poll();
+    IcmpOut err = first_icmp(s.first->outbound_frames());
+    ASSERT_TRUE(err.found && err.type == 12) << "an option longer than the header is malformed";
+    ASSERT_TRUE((err.rest >> 24) == 21) << "pointer at its length octet";
+}
+
+TEST(IpCompletion, AnOptionWithNoLengthOctetDrawsParameterProblem)
+{
+    Stack s = make_host();
+    // NOPs, then a type octet in the very last header byte
+    s.first->push_inbound(ip_frame(PEER_IP, LOCAL_IP, 64, 253, EIGHT_BYTES, Bytes::from_hex("01010194")));
+    s.stack->poll();
+    IcmpOut err = first_icmp(s.first->outbound_frames());
+    ASSERT_TRUE(err.found && err.type == 12) << "a type octet with no length is malformed";
+    ASSERT_TRUE((err.rest >> 24) == 23) << "pointer at the lone type octet";
+}
+
+TEST(IpCompletion, WellFormedOptionsDrawNoParameterProblem)
+{
+    // RFC 1122 3.2.1.8: an option this host does not implement is ignored, not
+    // an error. Router Alert, NOP padding and EOL are all well formed.
+    Stack s = make_host();
+    s.first->push_inbound(ip_frame(PEER_IP, LOCAL_IP, 64, 253, EIGHT_BYTES, Bytes::from_hex("94040000")));
+    s.first->push_inbound(ip_frame(PEER_IP, LOCAL_IP, 64, 253, EIGHT_BYTES, Bytes::from_hex("01000000")));
+    s.stack->poll();
+    for (const IcmpOut& err : icmp_out(s.first->outbound_frames()))
+    {
+        ASSERT_TRUE(err.type != 12) << "no Parameter Problem for a well-formed option";
+    }
+}
+
+TEST(IpCompletion, GarbageAfterEndOfOptionListIsNotParsed)
+{
+    // RFC 791: EOL ends the list; the bytes after it are padding.
+    Stack s = make_host();
+    s.first->push_inbound(ip_frame(PEER_IP, LOCAL_IP, 64, 253, EIGHT_BYTES, Bytes::from_hex("00ff0000")));
+    s.stack->poll();
+    for (const IcmpOut& err : icmp_out(s.first->outbound_frames()))
+    {
+        ASSERT_TRUE(err.type != 12) << "nothing after EOL is an option";
+    }
+}
+
+TEST(IpCompletion, ParameterProblemIsRateLimited)
+{
+    Stack s = make_host();
+    for (int i = 0; i < 60; i++)
+    {
+        s.first->push_inbound(ip_frame(PEER_IP, LOCAL_IP, 64, 253, EIGHT_BYTES, Bytes::from_hex("88010000")));
+    }
+    s.stack->poll();
+    size_t errors = icmp_out(s.first->outbound_frames()).size();
+    ASSERT_TRUE(errors > 0 && errors < 60) << "rate limited: " + std::to_string(errors);
+}
+
+TEST(IpCompletion, ParameterProblemIsNeverSentAboutABroadcastOrAnIcmpError)
+{
+    Stack s = make_host();
+    s.first->push_inbound(ip_frame(PEER_IP, IPv4Address("255.255.255.255"), 64, 253, EIGHT_BYTES,
+                                   Bytes::from_hex("88010000"), 2, MacAddress::BROADCAST));
+    // a Time Exceeded (type 11) carrying a malformed option: an error about an error
+    Bytes icmp_error = Bytes::from_hex("0b00000000000000");
+    icmp_error |= EIGHT_BYTES;
+    s.first->push_inbound(ip_frame(PEER_IP, LOCAL_IP, 64, 1, icmp_error, Bytes::from_hex("88010000"), 3));
+    s.stack->poll();
+    ASSERT_TRUE(icmp_out(s.first->outbound_frames()).empty()) << "no error about a broadcast or about an ICMP error";
+}
+
+TEST(IpCompletion, ARouterReportsAMalformedOptionInTransit)
+{
+    // RFC 1812 4.3.2.7 / 5.2.4.1: a router that discards a packet for a header
+    // error sends Parameter Problem.
+    Stack s = make_router();
+    s.first->push_inbound(ip_frame(PEER_IP, BEHIND_US, 64, 253, EIGHT_BYTES, Bytes::from_hex("88010000")));
+    s.stack->poll();
+    IcmpOut err = first_icmp(s.first->outbound_frames());
+    ASSERT_TRUE(err.found && err.type == 12 && (err.rest >> 24) == 21) << "reported, pointing at the length octet";
+    ASSERT_TRUE(ip_packet_to(s.second->outbound_frames(), BEHIND_US).empty()) << "and not forwarded";
+}
+
 // --- task 2: forwarding from the IP header alone ----------------------------
 
 namespace
@@ -242,4 +384,45 @@ TEST(IpCompletion, ATransportHeaderThatDoesNotParseIsStillDroppedWhenItIsForUs)
     s.first->push_inbound(ip_frame(PEER_IP, LOCAL_IP, 64, 6, Bytes::from_hex("9c40005000000001")));
     s.stack->poll();
     ASSERT_TRUE(s.first->outbound_frames().empty()) << "a short TCP segment to us is dropped silently";
+}
+
+// --- task 3: the quote of a reassembled datagram is what was received -------
+
+namespace
+{
+    Bytes fragment_frame(uint8_t protocol, const Bytes& slice, uint16_t offset_units, bool more, uint16_t id,
+                         const Bytes& options = Bytes())
+    {
+        Bytes frame = ip_frame(PEER_IP, LOCAL_IP, 64, protocol, slice, options, id);
+        uint16_t field = static_cast<uint16_t>((more ? 0x2000 : 0) | offset_units);
+        frame[ETH + 6] = static_cast<byte_t>(field >> 8);
+        frame[ETH + 7] = static_cast<byte_t>(field & 0xff);
+        size_t ihl = 20 + options.size();
+        Bytes header = frame.slice(ETH, ihl);
+        header[10] = 0;
+        header[11] = 0;
+        uint16_t checksum = internet_checksum(header);
+        frame[ETH + 10] = static_cast<byte_t>(checksum >> 8);
+        frame[ETH + 11] = static_cast<byte_t>(checksum & 0xff);
+        return frame;
+    }
+}
+
+TEST(IpCompletion, TheQuoteOfAReassembledDatagramIsTheFirstFragmentsReceivedBytes)
+{
+    Stack s = make_host();
+    // Protocol 253, two fragments; the first carries a Router Alert option, so
+    // a rebuilt 20-byte header would differ in IHL, flags, offset and length.
+    Bytes first = fragment_frame(253, Bytes::from_hex("00112233445566778899aabbccddeeff"), 0, true, 0x0777,
+                                 Bytes::from_hex("94040000"));
+    Bytes last =
+        fragment_frame(253, Bytes::from_hex("0102030405060708"), 2, false, 0x0777, Bytes::from_hex("94040000"));
+    s.first->push_inbound(first);
+    s.first->push_inbound(last);
+    s.stack->poll();
+
+    IcmpOut err = first_icmp(s.first->outbound_frames());
+    ASSERT_TRUE(err.found && err.type == 3 && err.code == 2) << "the reassembled datagram draws Protocol Unreachable";
+    ASSERT_TRUE(err.quote.to_hex() == first.slice(ETH, 24 + 8).to_hex())
+        << "the quote must be the first fragment as received (MF set, options, id), not a rebuilt header";
 }

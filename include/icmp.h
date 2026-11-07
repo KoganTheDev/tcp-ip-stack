@@ -11,6 +11,7 @@ enum IcmpType : uint8_t
     ICMP_DESTINATION_UNREACHABLE = 3,
     ICMP_ECHO_REQUEST = 8,
     ICMP_TIME_EXCEEDED = 11,
+    ICMP_PARAMETER_PROBLEM = 12,
 };
 
 enum IcmpCode : uint8_t
@@ -28,6 +29,9 @@ enum IcmpCode : uint8_t
     // low half of the rest-of-header field, which is what makes path MTU
     // discovery possible rather than a guessing game.
     ICMP_CODE_FRAGMENTATION_NEEDED = 4,
+    // Destination Unreachable, code 2: this host is the destination, but no
+    // module here handles that IP protocol number (RFC 1122 3.2.2.1).
+    ICMP_CODE_PROTOCOL_UNREACHABLE = 2,
     // Time Exceeded has two codes, and only the second applies to a host that
     // does not forward. Code 0 is the TTL running out in transit, which only a
     // router generates. Code 1 is a datagram whose remaining fragments never

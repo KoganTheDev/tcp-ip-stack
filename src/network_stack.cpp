@@ -5,6 +5,7 @@
 #include "logger.h"
 
 #include <algorithm>
+#include <optional>
 
 namespace
 {
@@ -59,11 +60,53 @@ namespace
     // are the ports (or ICMP id/sequence) the sender identifies the flow by,
     // so a quote sized for a 20-byte header cuts them off whenever there are
     // options.
-    Bytes icmp_error_quote(const Ip& ip)
+    //
+    // Taken from the bytes as received, never from a re-serialization: what
+    // the sender must recognise is its own packet, and a rebuilt header differs
+    // from it (options dropped, fragment fields cleared, a recomputed length).
+    // `received` need only begin with the header and 8 payload bytes.
+    Bytes icmp_error_quote(const Bytes& received)
     {
-        Bytes original = const_cast<Ip&>(ip).to_bytes();
-        size_t wanted = static_cast<size_t>(ip.get_IHL()) * 4 + 8;
-        return original.slice(0, std::min(wanted, original.size()));
+        size_t wanted = static_cast<size_t>(received[0] & 0x0f) * 4 + 8;
+        return received.slice(0, std::min(wanted, received.size()));
+    }
+
+    // RFC 791 option list check. Returns the pointer (offset into the header)
+    // of the first octet that makes the list unparseable, or nothing if it is
+    // well formed. Only the framing is checked, never the contents of an option
+    // this stack does not implement - those are ignored, not errors (RFC 1122
+    // 3.2.1.8) - so what remains is exactly the damage that stops a receiver
+    // from finding the end of an option: a type octet with no length octet
+    // after it, a length below the 2 octets of type+length, and a length that
+    // runs past the header. EOL ends the list; whatever follows is padding.
+    std::optional<uint8_t> malformed_option_pointer(const Bytes& packet)
+    {
+        const size_t header = static_cast<size_t>(packet[0] & 0x0f) * 4;
+        size_t i = IP_HEADER_SIZE;
+        while (i < header)
+        {
+            const uint8_t type = packet[i];
+            if (type == 0)
+            {
+                break;
+            }
+            if (type == 1)
+            {
+                i++;
+                continue;
+            }
+            if (i + 1 >= header)
+            {
+                return static_cast<uint8_t>(i); // type octet with no length octet
+            }
+            const size_t length = packet[i + 1];
+            if (length < 2 || i + length > header)
+            {
+                return static_cast<uint8_t>(i + 1); // the length octet is the wrong one
+            }
+            i += length;
+        }
+        return std::nullopt;
     }
 
     // The MSS this stack advertises and the point at which a datagram has to
@@ -1304,12 +1347,27 @@ void NetworkStack::_handle_ip(size_t ingress, const Ip& ip, const Bytes& ip_byte
         return;
     }
 
+    // A header whose options cannot even be walked cannot be processed, so the
+    // datagram is discarded and, if the rules on error messages allow it, the
+    // sender is told which octet was the trouble (RFC 792; RFC 1122 3.2.2.5
+    // and 3.2.1.8; RFC 1812 5.2.3). Everything else wrong with a header -
+    // version, IHL, length, checksum - is dropped silently: the fields that
+    // would say who to answer cannot be trusted.
+    if (std::optional<uint8_t> pointer = malformed_option_pointer(ip_bytes))
+    {
+        LOG_DEBUG("NetworkStack: dropping a packet from " << IPv4Address(ip.get_src_address()).to_string()
+                                                          << " with a malformed IP option at octet "
+                                                          << static_cast<int>(*pointer));
+        this->_send_icmp_parameter_problem(ip, ip_bytes, *pointer);
+        return;
+    }
+
     // MF set, or a nonzero fragment offset, means this is one piece of a larger
     // datagram. Each fragment carries its own header checksum, which is why
     // that is verified above rather than after reassembly.
     if (ip.get_ip_flag_m() || ip.get_fragment_offset() != 0)
     {
-        this->_handle_ip_fragment(ip);
+        this->_handle_ip_fragment(ip, ip_bytes);
         return;
     }
 
@@ -1317,10 +1375,10 @@ void NetworkStack::_handle_ip(size_t ingress, const Ip& ip, const Bytes& ip_byte
     // failure throws to _handle_frame, which logs and drops it as it always did
     // for an unparseable segment.
     Ip complete(ip_bytes, true);
-    this->_dispatch_transport(complete);
+    this->_dispatch_transport(complete, ip_bytes);
 }
 
-void NetworkStack::_handle_ip_fragment(const Ip& ip)
+void NetworkStack::_handle_ip_fragment(const Ip& ip, const Bytes& ip_bytes)
 {
     IPv4Address source(ip.get_src_address());
 
@@ -1334,9 +1392,12 @@ void NetworkStack::_handle_ip_fragment(const Ip& ip)
     }
 
     Bytes datagram;
+    Bytes first_header;
+    const size_t header_bytes = std::min(static_cast<size_t>(ip.get_IHL()) * 4, ip_bytes.size());
     IpReassembler::Result result =
         this->_reassembler.offer(source, IPv4Address(ip.get_dest_address()), ip.get_identification(), ip.get_protocol(),
-                                 ip.get_fragment_offset(), ip.get_ip_flag_m(), raw->get_data(), datagram);
+                                 ip.get_fragment_offset(), ip.get_ip_flag_m(), raw->get_data(),
+                                 ip_bytes.slice(0, header_bytes), datagram, first_header);
 
     if (result != IpReassembler::Result::Complete)
     {
@@ -1355,7 +1416,11 @@ void NetworkStack::_handle_ip_fragment(const Ip& ip)
     try
     {
         Ip complete(reassembled.to_bytes());
-        this->_dispatch_transport(complete);
+        // What an ICMP error will quote: the first fragment's header as it
+        // arrived, then the start of the payload.
+        Bytes received = first_header;
+        received |= datagram.slice(0, std::min<size_t>(8, datagram.size()));
+        this->_dispatch_transport(complete, received);
     }
     catch (const FatalChannelError&)
     {
@@ -1368,33 +1433,43 @@ void NetworkStack::_handle_ip_fragment(const Ip& ip)
     }
 }
 
-void NetworkStack::_dispatch_transport(const Ip& ip)
+void NetworkStack::_dispatch_transport(const Ip& ip, const Bytes& received)
 {
+    const uint8_t protocol = ip.get_protocol();
+    if (protocol != IpProtocol::TCP && protocol != IpProtocol::UDP && protocol != IpProtocol::ICMP)
+    {
+        // Addressed to this host, and nothing here handles that protocol.
+        // Telling the sender beats silence (RFC 1122 3.2.2.1); the usual rules
+        // and the rate limit apply, so a flood of these cannot make us a
+        // reflector.
+        LOG_DEBUG("NetworkStack: no handler for IP protocol " << static_cast<int>(protocol) << " from "
+                                                              << IPv4Address(ip.get_src_address()).to_string());
+        this->_send_icmp_protocol_unreachable(ip, received);
+        return;
+    }
+
     if (!ip.has_next_layer())
     {
         return;
     }
 
-    if (ip.get_protocol() == IpProtocol::TCP)
+    if (protocol == IpProtocol::TCP)
     {
         if (const Tcp* tcp = dynamic_cast<const Tcp*>(&ip.get_next_layer()))
         {
             this->_handle_tcp(ip, *tcp);
         }
     }
-    else if (ip.get_protocol() == IpProtocol::UDP)
+    else if (protocol == IpProtocol::UDP)
     {
         if (const Udp* udp = dynamic_cast<const Udp*>(&ip.get_next_layer()))
         {
-            this->_handle_udp(ip, *udp);
+            this->_handle_udp(ip, *udp, received);
         }
     }
-    else if (ip.get_protocol() == IpProtocol::ICMP)
+    else if (const Icmp* icmp = dynamic_cast<const Icmp*>(&ip.get_next_layer()))
     {
-        if (const Icmp* icmp = dynamic_cast<const Icmp*>(&ip.get_next_layer()))
-        {
-            this->_handle_icmp(ip, *icmp);
-        }
+        this->_handle_icmp(ip, *icmp);
     }
 }
 
@@ -1688,7 +1763,7 @@ void NetworkStack::_track_half_open(TcpConnection& connection, uint16_t local_po
         });
 }
 
-void NetworkStack::_handle_udp(const Ip& ip, const Udp& udp)
+void NetworkStack::_handle_udp(const Ip& ip, const Udp& udp, const Bytes& received)
 {
     IPv4Address src_ip(ip.get_src_address());
 
@@ -1720,7 +1795,7 @@ void NetworkStack::_handle_udp(const Ip& ip, const Udp& udp)
     {
         LOG_DEBUG("NetworkStack: dropping a UDP datagram to port "
                   << udp.get_dest_port() << " - nothing is bound there, sending ICMP Port Unreachable");
-        this->_send_icmp_port_unreachable(ip);
+        this->_send_icmp_port_unreachable(ip, received);
         return;
     }
 
@@ -2178,6 +2253,18 @@ void NetworkStack::_forward_ip(size_t ingress, const Ip& ip, const Bytes& ip_byt
         return;
     }
 
+    // The same option-framing check a host makes (see _handle_ip): a router
+    // that discards a packet for a header error reports it (RFC 1812 4.3.2.7
+    // and 5.2.3), and one it cannot walk the options of it cannot be trusted
+    // to relay.
+    if (std::optional<uint8_t> pointer = malformed_option_pointer(ip_bytes))
+    {
+        LOG_DEBUG("NetworkStack: not forwarding a packet from "
+                  << source.to_string() << " - malformed IP option at octet " << static_cast<int>(*pointer));
+        this->_send_icmp_parameter_problem(ip, ip_bytes, *pointer);
+        return;
+    }
+
     // RFC 1812 5.3.1: decrement, and if the result is zero the packet dies here
     // and the sender is told. TTL is a hop budget, and this is what makes a
     // routing loop terminate instead of circulating a packet forever - and what
@@ -2187,7 +2274,7 @@ void NetworkStack::_forward_ip(size_t ingress, const Ip& ip, const Bytes& ip_byt
     {
         LOG_DEBUG("NetworkStack: TTL expired forwarding a packet from "
                   << source.to_string() << " to " << destination.to_string() << " - reporting Time Exceeded");
-        this->_send_icmp_time_exceeded(ip);
+        this->_send_icmp_time_exceeded(ip, ip_bytes);
         return;
     }
 
@@ -2196,7 +2283,7 @@ void NetworkStack::_forward_ip(size_t ingress, const Ip& ip, const Bytes& ip_byt
     if (!this->_route_for(destination, next_hop, egress))
     {
         LOG_DEBUG("NetworkStack: no route to " << destination.to_string() << " - reporting Destination Unreachable");
-        this->_send_icmp_net_unreachable(ip);
+        this->_send_icmp_net_unreachable(ip, ip_bytes);
         return;
     }
 
@@ -2689,7 +2776,7 @@ bool NetworkStack::_may_report_error_about(const Ip& ip) const
                                        about_icmp_error);
 }
 
-void NetworkStack::_send_icmp_time_exceeded(const Ip& ip)
+void NetworkStack::_send_icmp_time_exceeded(const Ip& ip, const Bytes& received)
 {
     if (!this->_may_report_error_about(ip))
     {
@@ -2702,13 +2789,13 @@ void NetworkStack::_send_icmp_time_exceeded(const Ip& ip)
     }
 
     IPv4Address remote_ip(ip.get_src_address());
-    Bytes embedded = icmp_error_quote(ip);
+    Bytes embedded = icmp_error_quote(received);
 
     Icmp header(IcmpType::ICMP_TIME_EXCEEDED, ICMP_CODE_TTL_EXCEEDED, 0, 0, Bytes());
     this->_send_icmp_message(remote_ip, header, embedded);
 }
 
-void NetworkStack::_send_icmp_net_unreachable(const Ip& ip)
+void NetworkStack::_send_icmp_net_unreachable(const Ip& ip, const Bytes& received)
 {
     if (!this->_may_report_error_about(ip))
     {
@@ -2721,13 +2808,13 @@ void NetworkStack::_send_icmp_net_unreachable(const Ip& ip)
     }
 
     IPv4Address remote_ip(ip.get_src_address());
-    Bytes embedded = icmp_error_quote(ip);
+    Bytes embedded = icmp_error_quote(received);
 
     Icmp header(IcmpType::ICMP_DESTINATION_UNREACHABLE, ICMP_CODE_NET_UNREACHABLE, 0, 0, Bytes());
     this->_send_icmp_message(remote_ip, header, embedded);
 }
 
-void NetworkStack::_send_icmp_port_unreachable(const Ip& ip)
+void NetworkStack::_send_icmp_port_unreachable(const Ip& ip, const Bytes& received)
 {
     if (!this->_may_report_error_about(ip))
     {
@@ -2741,8 +2828,42 @@ void NetworkStack::_send_icmp_port_unreachable(const Ip& ip)
 
     IPv4Address remote_ip(ip.get_src_address());
 
-    Bytes embedded = icmp_error_quote(ip);
+    Bytes embedded = icmp_error_quote(received);
 
     Icmp header(IcmpType::ICMP_DESTINATION_UNREACHABLE, ICMP_CODE_PORT_UNREACHABLE, 0, 0, Bytes());
     this->_send_icmp_message(remote_ip, header, embedded);
+}
+
+void NetworkStack::_send_icmp_protocol_unreachable(const Ip& ip, const Bytes& received)
+{
+    if (!this->_may_report_error_about(ip))
+    {
+        return;
+    }
+    if (!this->_may_send_icmp_error())
+    {
+        LOG_DEBUG("NetworkStack: suppressing an ICMP Protocol Unreachable - error budget exhausted");
+        return;
+    }
+
+    Icmp header(IcmpType::ICMP_DESTINATION_UNREACHABLE, ICMP_CODE_PROTOCOL_UNREACHABLE, 0, 0, Bytes());
+    this->_send_icmp_message(IPv4Address(ip.get_src_address()), header, icmp_error_quote(received));
+}
+
+void NetworkStack::_send_icmp_parameter_problem(const Ip& ip, const Bytes& received, uint8_t pointer)
+{
+    if (!this->_may_report_error_about(ip))
+    {
+        return;
+    }
+    if (!this->_may_send_icmp_error())
+    {
+        LOG_DEBUG("NetworkStack: suppressing an ICMP Parameter Problem - error budget exhausted");
+        return;
+    }
+
+    // RFC 792: the pointer is the first octet of the message after the
+    // checksum; the other three are unused and zero.
+    Icmp header(IcmpType::ICMP_PARAMETER_PROBLEM, ICMP_CODE_NONE, 0, static_cast<uint32_t>(pointer) << 24, Bytes());
+    this->_send_icmp_message(IPv4Address(ip.get_src_address()), header, icmp_error_quote(received));
 }
