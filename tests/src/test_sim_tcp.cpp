@@ -2,6 +2,7 @@
 #include "sim/sim_fixture.h"
 #include "sim/sim_network.h"
 #include "sim/tcp_frame.h"
+#include "isn_generator.h"
 
 #include <algorithm>
 #include <functional>
@@ -291,4 +292,89 @@ TEST_F(SimTcp, ASeedReproducesTheRunByteForByte)
             << "frame " << i << " differs between two runs of one seed: " << tcp_frame::describe(first[i]) << " vs "
             << tcp_frame::describe(second[i]);
     }
+}
+
+namespace
+{
+    // A secret seed whose ISN for this 4-tuple, before the clock term, lands
+    // in [2^32 - high, 2^32 - low): just below the wrap.
+    uint64_t seed_with_isn_below_wrap(const IPv4Address& local_ip, uint16_t local_port, const IPv4Address& remote_ip,
+                                      uint16_t remote_port, uint32_t low, uint32_t high)
+    {
+        for (uint64_t seed = 1;; seed++)
+        {
+            NetworkStack::SeededSecrets secrets = NetworkStack::SeededSecrets::from_seed(seed);
+            IsnGenerator isn(secrets.isn_key_low, secrets.isn_key_high);
+            uint32_t below_wrap = 0u - isn.offset_for(local_ip, local_port, remote_ip, remote_port);
+            if (below_wrap >= low && below_wrap < high)
+                return seed;
+        }
+    }
+
+    // Whether `who` sent data segments on both sides of the 2^32 wrap.
+    bool crossed_the_wrap(const PcapWriter& capture, uint16_t from_port)
+    {
+        bool before = false;
+        bool after = false;
+        for (const PcapWriter::Record& record : capture.records())
+        {
+            tcp_frame::Segment segment;
+            std::string error;
+            if (!tcp_frame::parse(record.frame, segment, error) || segment.src_port != from_port
+                || segment.payload.empty())
+                continue;
+            before = before || segment.seq >= 0xfff00000u;
+            after = after || segment.seq < 0x00100000u;
+        }
+        return before && after;
+    }
+}
+
+// Both ISNs chosen (through the secret seed) to sit a little below 2^32, so
+// both directions of an echoed transfer cross the wrap mid-stream - with
+// reordering, so the reorder buffer and SACK blocks straddle it too. Every
+// sequence comparison in the stack is modular; this is the end-to-end check
+// that they all are.
+TEST_F(SimTcp, ATransferCrossesTheSequenceNumberWrap)
+{
+    constexpr uint16_t CLIENT_PORT = 49152; // the stack's first ephemeral port
+    // The client's ISN is taken at t=0 (no clock term); the server's when the
+    // SYN arrives, a few ms in - at most a few thousand 4-us ticks.
+    uint64_t client_seed = seed_with_isn_below_wrap(CLIENT_IP, CLIENT_PORT, SERVER_IP, SERVER_PORT, 60000, 150000);
+    uint64_t server_seed = seed_with_isn_below_wrap(SERVER_IP, SERVER_PORT, CLIENT_IP, CLIENT_PORT, 60000, 150000);
+
+    LinkParams wire;
+    wire.delay_ms = 5;
+    wire.reorder = 0.03;
+    wire.reorder_delay_ms = 3;
+    wire.mtu = 1500;
+    build(32, wire, wire);
+    client_stack->set_secret_seed(client_seed);
+    server_stack->set_secret_seed(server_seed);
+
+    Bytes client_received;
+    size_t echoed = 0;
+    observe = [&](TcpConnection& client, TcpConnection& server)
+    {
+        while (echoed < server_received.size())
+        {
+            size_t accepted = server.send(server_received.slice(echoed, server_received.size() - echoed));
+            echoed += accepted;
+            if (accepted == 0)
+                break;
+        }
+        client_received |= client.read();
+    };
+    const Bytes payload = pattern(size_t{256} * 1024);
+    ASSERT_TRUE(send_one_way(payload, 60000)) << "the server should receive everything";
+    ASSERT_TRUE(net->run_until([&] { return client_received.size() >= payload.size(); }, 60000))
+        << "and the client the whole echo; got " << client_received.size();
+    ASSERT_TRUE(server_received == payload) << "intact one way";
+    ASSERT_TRUE(client_received == payload) << "and the other";
+    ASSERT_TRUE(crossed_the_wrap(net->transmitted_capture(), CLIENT_PORT))
+        << "precondition: the client's data crossed 2^32";
+    ASSERT_TRUE(crossed_the_wrap(net->transmitted_capture(), SERVER_PORT))
+        << "precondition: the server's data crossed 2^32";
+    ASSERT_TRUE(link->stats(NetemChannel::A).reordered + link->stats(NetemChannel::B).reordered > 0)
+        << "precondition: the link reordered something";
 }
