@@ -210,9 +210,9 @@ disarmed; `NetworkStack` keeps a min-heap of (deadline, connection id), and
 `on_time_passed` runs only the connections at its front - 5 ns per call with 10,000 idle
 connections, against 106 us when it walked them all. `ms_until_next_timer()` reports how
 long until the earliest timer anywhere in the stack (connections, ARP, reassembly, DHCP,
-DNS), and both applications sleep exactly that long: the epoll server re-arms a one-shot
-timerfd after every pass of its loop and disarms it when nothing is pending, so an idle
-server does not wake at all. Moving deadlines are cheap on purpose: an ack that pushes
+DNS), and both applications sleep exactly that long: the epoll server (through
+`ustack::RealDriver`) re-arms a one-shot timerfd after every pass of its loop and disarms
+it when nothing is pending, so an idle server does not wake at all. Moving deadlines are cheap on purpose: an ack that pushes
 the retransmit timer later pushes nothing onto the heap - the earlier entry surfaces,
 finds nothing due, and is re-queued once per round trip. Heap entries name connections by
 id, so one for a connection reaped in the meantime is recognised and dropped rather than
@@ -362,13 +362,15 @@ visible.
 It runs in CI against real `dnsmasq` and a real HTTP server, neither of which has ever
 heard of this codebase.
 
-[`epoll-server/`](epoll-server/) is a multithreaded TCP echo server built on this
-stack. It is more interesting than it sounds, because replacing kernel sockets changes
-the concurrency structure completely: there is exactly one real file descriptor (the
-TAP device) rather than one per connection, and neither `NetworkStack` nor
-`TcpConnection` is thread-safe. So workers compute responses off the reactor thread and
-hand results back through an eventfd-backed completion queue, which the reactor drains
-and applies itself. See its own README for the full reasoning.
+[`epoll-server/`](epoll-server/) is a multithreaded TCP echo server written against the
+`ustack` socket API below, the way one is written against the kernel: accept, read, hand
+the work to a thread pool, write the answer back, all in one epoll loop. The logic is a
+template over the stack type, so the same source builds against this stack or, with
+`make -C epoll-server KERNEL=1`, against real kernel sockets. Workers never touch the
+stack (it is not thread-safe): they compute responses and hand them back through an
+eventfd-backed completion queue that the reactor drains. It listens on several ports,
+caps concurrent connections, and on SIGINT/SIGTERM flushes responses, half-closes every
+connection and waits for the peers (up to 5 s). See its own README.
 
 [`include/ustack/stack.h`](include/ustack/stack.h) is a socket API over the stack with
 the kernel's names, signatures and constants - `socket`, `bind`, `listen`, `accept4`,
@@ -382,6 +384,13 @@ It is non-blocking only (`socket()` requires `SOCK_NONBLOCK`), because the threa
 would block is the one that drives the stack; `epoll_wait()` is what runs it, through a
 driver that waits on the channel fds and a timerfd, or on the simulator's virtual time in
 tests. `pollable_fd()` lets it nest inside an application's own kernel epoll.
+
+[`include/ustack/kernel_stack.h`](include/ustack/kernel_stack.h) is `ustack::KernelStack`:
+the same method names and signatures, each forwarding to the real `::socket`,
+`::epoll_wait` and so on. Code written as a template over the stack type compiles against
+either, which is how the epoll server's tests run one set of scenarios on both, and how
+`test_stack_differential.cpp` records the epoll events, bytes and errno values of one
+scenario on each and compares them.
 
 ## Testing
 
