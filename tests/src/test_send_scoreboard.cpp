@@ -227,3 +227,23 @@ TEST(SendScoreboard, TracksSackedBytesForDeliveredData)
     board.acknowledge(4000);
     ASSERT_EQ(board.sacked_bytes(), 0u) << "retired SACKed segments leave the count";
 }
+
+// HighSACK describes the segments still on the scoreboard. Once the
+// cumulative ack has retired the segment it came from it must be forgotten:
+// kept, it is compared against sequence numbers that, 2^31 bytes later, read
+// as lying *below* it - and every unSACKed segment then looks like a hole
+// under the highest SACK, a candidate for a speculative retransmission.
+TEST(SendScoreboard, HighSackIsForgottenOnceTheAckPassesIt)
+{
+    SendScoreboard board;
+    board.push(segment(1000, MSS));
+    board.apply_sack({{1000, 2000}});
+    board.acknowledge(2000);
+    ASSERT_TRUE(board.empty());
+
+    // Half the sequence space later (a long transfer), nothing SACKed.
+    const uint32_t later = 2000u + 0x80001000u;
+    board.push(segment(later, MSS));
+    board.push(segment(later + MSS, MSS));
+    ASSERT_EQ(board.next_speculative(), nullptr) << "no SACKed data in flight, so no hole lies below a SACK";
+}

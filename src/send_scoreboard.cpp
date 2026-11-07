@@ -149,6 +149,19 @@ SendScoreboard::Acked SendScoreboard::acknowledge(uint32_t ack)
             }
         }
     }
+    // HighSACK and HighRxt describe segments still on the scoreboard. Once
+    // the cumulative ack reaches them they are forgotten: kept, they would be
+    // compared against sequence numbers 2^31 bytes on, where modular order
+    // inverts and a stale mark reads as lying above everything sent.
+    uint32_t snd_una = _segments.empty() ? ack : _segments.front().seq;
+    if (_have_high_sack && seq_at_or_before(_high_sack, snd_una))
+    {
+        _have_high_sack = false;
+    }
+    if (_high_rxt_valid && seq_at_or_before(_high_rxt, snd_una))
+    {
+        _high_rxt_valid = false;
+    }
     return acked;
 }
 
@@ -312,9 +325,10 @@ SentSegment* SendScoreboard::next_speculative()
 {
     // The highest SACKed octet bounds the search: above it nothing is known
     // about the segments yet, and they are most likely just in flight.
-    if (!_have_high_sack)
+    if (!_have_high_sack || _segments.empty() || !seq_before(_segments.front().seq, _high_sack)
+        || seq_before(_segments.back().end_seq, _high_sack))
     {
-        return nullptr;
+        return nullptr; // HighSACK must lie within what is on the scoreboard
     }
     uint32_t from = _search_start();
     if (_high_rxt_valid && seq_before(from, _speculative_cursor))
