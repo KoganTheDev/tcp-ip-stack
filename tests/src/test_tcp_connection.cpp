@@ -2625,6 +2625,77 @@ TEST(TcpConnection, OverlappingSegmentsAcrossTheSequenceWrapAreMerged)
     ASSERT_TRUE(h.delivered.to_hex() == stream(0xFFFFFFE1u, 0x00000020u).to_hex()) << "delivered whole, in order";
 }
 
+// A range is stored as a list of chunks, one per piece. Pieces that touch
+// join the range at its tail (append), at its head (the range's key moves) or
+// from both sides at once (two ranges become one); however they arrive, the
+// result is one range, one SACK block, and the bytes come out in order.
+TEST(TcpConnection, TouchingPiecesJoinIntoOneRangeInAnyArrivalOrder)
+{
+    ReorderHarness h(500); // RCV.NXT 501
+    h.arrive(530, 540);
+    h.arrive(510, 520);
+    ASSERT_TRUE(h.sack.size() == 2) << "two separate ranges so far";
+    h.arrive(520, 530); // bridges both
+    ASSERT_TRUE(h.sack.size() == 1 && h.sack[0].start == 510 && h.sack[0].end == 540) << "bridged into one block";
+    h.arrive(505, 510); // touches the head: the key moves
+    h.arrive(540, 545); // touches the tail
+    ASSERT_TRUE(h.sack.size() == 1 && h.sack[0].start == 505 && h.sack[0].end == 545)
+        << "one block after head and tail";
+    ASSERT_TRUE(h.connection->bytes_out_of_order() == 40) << "held " << h.connection->bytes_out_of_order();
+    h.arrive(501, 505);
+    ASSERT_TRUE(h.delivered.to_hex() == stream(501, 545).to_hex()) << "delivered whole, in order";
+    ASSERT_TRUE(h.connection->bytes_out_of_order() == 0);
+}
+
+// An in-order segment can end in the middle of a chunk of a buffered range;
+// the delivery skips whole chunks and part of one, and loses nothing.
+TEST(TcpConnection, InOrderDataEndingInsideABufferedChunkDeliversTheRest)
+{
+    ReorderHarness h(500);
+    h.arrive(510, 515);
+    h.arrive(515, 520);
+    h.arrive(520, 525);
+    h.arrive(501, 518); // covers the first chunk and part of the second
+    ASSERT_TRUE(h.delivered.to_hex() == stream(501, 525).to_hex()) << "every byte once, in order";
+    ASSERT_TRUE(h.connection->bytes_out_of_order() == 0);
+}
+
+// SACK reports at most four blocks (three with timestamps) without reading
+// the whole buffer: the most recently arrived range comes first wherever it
+// lies, and the others follow in sequence order.
+TEST(TcpConnection, TheMostRecentRangeIsReportedFirstWhereverItLies)
+{
+    ReorderHarness h(500);
+    for (uint32_t seq : {510u, 520u, 530u, 540u, 550u, 560u})
+        h.arrive(seq, seq + 4);
+    ASSERT_TRUE(h.sack.size() == 4);
+    ASSERT_TRUE(h.sack[0].start == 560 && h.sack[1].start == 520 && h.sack[2].start == 530 && h.sack[3].start == 540)
+        << "latest beyond the limit displaces the first; got " << h.sack[0].start << "," << h.sack[1].start << ","
+        << h.sack[2].start << "," << h.sack[3].start;
+
+    h.arrive(536, 538); // a new range between the third and fourth: now the latest
+    ASSERT_TRUE(h.sack.size() == 4 && h.sack[0].start == 536 && h.sack[1].start == 520 && h.sack[2].start == 530
+                && h.sack[3].start == 510)
+        << "latest within the limit swaps with the first; got " << h.sack[0].start << "," << h.sack[1].start << ","
+        << h.sack[2].start << "," << h.sack[3].start;
+}
+
+// The cap counts ranges. A piece that fills the hole between two held ranges
+// does not add one, so it is accepted even with the buffer at the cap.
+TEST(TcpConnection, APieceJoiningHeldRangesIsAcceptedAtTheCap)
+{
+    ReorderHarness h(500);
+    for (uint32_t i = 0; i < TcpConnection::MAX_REORDER_SEGMENTS; i++)
+        h.arrive(503 + 2 * i, 504 + 2 * i); // one byte, one-byte hole
+    ASSERT_TRUE(h.connection->bytes_out_of_order() == TcpConnection::MAX_REORDER_SEGMENTS);
+
+    h.arrive(4000, 4001); // would be a new range: refused
+    ASSERT_TRUE(h.connection->bytes_out_of_order() == TcpConnection::MAX_REORDER_SEGMENTS) << "a new range is refused";
+    h.arrive(504, 505); // fills the hole between the first two ranges
+    ASSERT_TRUE(h.connection->bytes_out_of_order() == TcpConnection::MAX_REORDER_SEGMENTS + 1)
+        << "a joining piece is kept";
+}
+
 // RFC 1122 4.2.2.16 / RFC 9293 3.8.6: the receiver does not shrink its window.
 // Out-of-order segments land inside the window already offered, so the
 // duplicate acks they draw keep the same right edge - and so the same window,
