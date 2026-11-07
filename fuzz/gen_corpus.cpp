@@ -124,7 +124,9 @@ namespace
     Bytes dns_response()
     {
         // header: id, response+RD+RA, 1 question, 1 answer
-        Bytes m = hex("123481800001000100000000" "076578616d706c6503636f6d00" "00010001");
+        Bytes m = hex("123481800001000100000000"
+                      "076578616d706c6503636f6d00"
+                      "00010001");
         m |= hex("c00c"
                  "0001"
                  "0001"
@@ -169,9 +171,9 @@ int main(int argc, char** argv)
     Bytes rst = tcp_frame::build(segment(1001, 0, tcp_frame::RST));
     Bytes fin = tcp_frame::build(segment(1001, 5000, tcp_frame::FIN | tcp_frame::ACK));
     Bytes arp_request = hex("ffffffffffff"
-                      "020000000002"
-                      "0806")
-                  | Arp(MAC_B, IP_B, IP_A).to_bytes();
+                            "020000000002"
+                            "0806")
+                        | Arp(MAC_B, IP_B, IP_A).to_bytes();
     Bytes ping = ip_frame(1, icmp_echo(8, Bytes::from_hex("00112233445566778899")));
 
     // --- ethernet
@@ -278,7 +280,9 @@ int main(int argc, char** argv)
     }
     save("dns", "response_with_compression", dns_response());
     save("dns", "self_pointer",
-         hex("123481800001000000000000" "c00c" "00010001"));
+         hex("123481800001000000000000"
+             "c00c"
+             "00010001"));
     save("dns", "huge_counts", hex("1234818000ff00ff00000000"));
     save("dns", "runt", hex("1234"));
 

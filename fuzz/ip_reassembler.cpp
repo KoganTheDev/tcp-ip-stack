@@ -62,8 +62,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
             reassembler.offer(source, destination, id, protocol, offset, more, payload, out);
         }
         catch (const BaseException&)
-        {
-        }
+        {}
     }
     return 0;
 }
