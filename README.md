@@ -370,6 +370,19 @@ TAP device) rather than one per connection, and neither `NetworkStack` nor
 hand results back through an eventfd-backed completion queue, which the reactor drains
 and applies itself. See its own README for the full reasoning.
 
+[`include/ustack/stack.h`](include/ustack/stack.h) is a socket API over the stack with
+the kernel's names, signatures and constants - `socket`, `bind`, `listen`, `accept4`,
+`connect`, `send`, `recv`, `sendto`, `recvfrom`, `shutdown`, `close`, `setsockopt`
+(`TCP_NODELAY`, `SO_KEEPALIVE`, `TCP_USER_TIMEOUT`, `SO_LINGER`, `TCP_CONGESTION`,
+`SO_ERROR`), plus its own `epoll_create1`/`epoll_ctl`/`epoll_wait` - returning -1 and
+setting `errno` as Linux would. Its fds are indexes into its own table, not kernel fds.
+The epoll is built like the kernel's: an interest list and a ready list filled by
+callbacks from the stack, with level-triggered, `EPOLLET` and `EPOLLONESHOT` semantics.
+It is non-blocking only (`socket()` requires `SOCK_NONBLOCK`), because the thread that
+would block is the one that drives the stack; `epoll_wait()` is what runs it, through a
+driver that waits on the channel fds and a timerfd, or on the simulator's virtual time in
+tests. `pollable_fd()` lets it nest inside an application's own kernel epoll.
+
 ## Testing
 
 Over 370 GoogleTest unit tests covering the protocol codecs, checksums, the TCP state machine, RTT
