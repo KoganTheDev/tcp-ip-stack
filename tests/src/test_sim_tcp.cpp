@@ -73,16 +73,23 @@ protected:
         server_stack->listen(SERVER_PORT);
     }
 
-    // Client sends `payload` and closes; the server reads it all. True once
-    // the server holds every byte (the close is not waited for).
+    // What send_one_way() is sending, and how much of it the client has
+    // accepted. Members, not locals: the tick hook outlives the call, and a
+    // test may keep the network running afterwards.
+    Bytes to_send;
+    size_t sent = 0;
+
+    // Client connects and sends `payload`; the server reads it all. True once
+    // the server holds every byte. Nobody closes.
     bool send_one_way(const Bytes& payload, uint64_t max_virtual_ms)
     {
         TcpConnection* connecting = client_stack->connect(SERVER_IP, SERVER_PORT);
         REQUIRE_TRUE(connecting != nullptr, "connect() should create a connection");
         client_id = connecting->get_id();
-        size_t sent = 0;
+        to_send = payload;
+        sent = 0;
         net->add_tick_hook(
-            [&, this]()
+            [this]()
             {
                 if (server_id == 0)
                 {
@@ -100,9 +107,9 @@ protected:
                 TcpConnection* c = client_stack->find_connection(client_id);
                 if (c != nullptr && c->get_state() == TcpState::ESTABLISHED)
                 {
-                    while (sent < payload.size())
+                    while (sent < to_send.size())
                     {
-                        size_t accepted = c->send(payload.slice(sent, payload.size() - sent));
+                        size_t accepted = c->send(to_send.slice(sent, to_send.size() - sent));
                         sent += accepted;
                         if (accepted == 0)
                             break;
@@ -112,7 +119,7 @@ protected:
                 if (observe && c != nullptr && s != nullptr)
                     observe(*c, *s);
             });
-        return net->run_until([&] { return server_received.size() >= payload.size(); }, max_virtual_ms);
+        return net->run_until([this] { return server_received.size() >= to_send.size(); }, max_virtual_ms);
     }
 };
 
