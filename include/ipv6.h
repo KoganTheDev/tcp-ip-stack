@@ -90,6 +90,10 @@ public:
     // The payload with any extension headers already skipped, ready to hand to
     // the transport named by get_upper_layer_protocol().
     const Bytes& get_upper_layer_payload() const { return _upper_layer_payload; }
+    // Whether the chain carried a Fragment header (RFC 8200 4.5). The payload
+    // is then a fragment, not a datagram, and the stack drops it rather than
+    // reassemble - see NetworkStack.
+    bool has_fragment_header() const { return _has_fragment_header; }
 
     static constexpr size_t HEADER_SIZE = 40;
     // How many extension headers one packet may chain before it is refused. A
@@ -109,6 +113,7 @@ private:
 
     uint8_t _upper_layer_protocol;
     Bytes _upper_layer_payload;
+    bool _has_fragment_header = false;
 };
 
 // The IPv6 transport checksum (RFC 8200 section 8.1).

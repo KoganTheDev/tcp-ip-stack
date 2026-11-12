@@ -40,6 +40,7 @@ Ipv6::Ipv6(const Bytes& bytes)
 
 void Ipv6::from_bytes(const Bytes& data)
 {
+    this->_has_fragment_header = false;
     if (data.size() < HEADER_SIZE)
     {
         throw EXCEPTION(BaseException, "IPv6 packet shorter than its 40-byte header");
@@ -100,6 +101,7 @@ void Ipv6::from_bytes(const Bytes& data)
         size_t length;
         if (next == IPV6_NEXT_FRAGMENT)
         {
+            this->_has_fragment_header = true;
             // Always 8 bytes, and its second byte is reserved rather than a
             // length. Reading it as a length is the classic way a skip loop
             // desynchronises on a fragmented packet.

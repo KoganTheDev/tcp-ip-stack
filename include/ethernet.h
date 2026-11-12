@@ -6,7 +6,7 @@
 
 // The `: uint16_t` is load-bearing, not decoration. Without an explicit
 // underlying type, an enum's range of *valid values* is only the smallest
-// bit-field that holds its enumerators - here 12 bits, since the largest is
+// bit-field that holds its enumerators - 12 bits when the largest was
 // 0x0806. Loading anything outside that range is undefined behavior, and this
 // field is read straight off the wire, where any of the 65536 values can
 // arrive. Naming the underlying type widens the valid range to all of
@@ -20,6 +20,7 @@ enum EtherType : uint16_t
 {
     IPv4 = 0x0800,
     ARP = 0x0806,
+    IPv6 = 0x86DD,
 };
 
 

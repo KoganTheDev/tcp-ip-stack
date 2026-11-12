@@ -107,6 +107,11 @@ public:
 
     const std::vector<Ipv6ConfiguredAddress>& addresses() const { return _addresses; }
     Ipv6AddressState state_of(const IPv6Address& address) const;
+    // Addresses still under DAD. A host must accept traffic to their
+    // solicited-node groups (RFC 4862 5.4.2) - that is how it hears another
+    // host's probe or defence - while using them for nothing else.
+    std::vector<IPv6Address> tentative_addresses() const;
+    bool is_tentative(const IPv6Address& address) const;
     // The link-local address this host computed for itself, once start() has
     // been called.
     const IPv6Address& link_local() const { return _link_local; }

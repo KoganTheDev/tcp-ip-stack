@@ -284,3 +284,20 @@ Ipv6AddressState Ipv6Autoconfig::state_of(const IPv6Address& address) const
     }
     return Ipv6AddressState::TENTATIVE;
 }
+
+std::vector<IPv6Address> Ipv6Autoconfig::tentative_addresses() const
+{
+    std::vector<IPv6Address> out;
+    out.reserve(this->_tentative.size());
+    for (const Tentative& tentative : this->_tentative)
+    {
+        out.push_back(tentative.address);
+    }
+    return out;
+}
+
+bool Ipv6Autoconfig::is_tentative(const IPv6Address& address) const
+{
+    return std::any_of(this->_tentative.begin(), this->_tentative.end(),
+                       [&address](const Tentative& t) { return t.address == address; });
+}

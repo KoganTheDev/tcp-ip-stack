@@ -109,6 +109,10 @@ public:
 
     // Observation, mostly for tests and diagnostics.
     bool contains(const IPv6Address& address) const;
+    // Whether there is an entry at all, INCOMPLETE included - that is,
+    // whether resolution is in flight or done. contains() is the narrower
+    // "has a usable link-layer address".
+    bool tracks(const IPv6Address& address) const { return _entries.count(address) != 0; }
     NeighbourState state_of(const IPv6Address& address) const;
     size_t size() const { return _entries.size(); }
 
