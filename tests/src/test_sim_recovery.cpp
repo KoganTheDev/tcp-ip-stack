@@ -44,6 +44,7 @@ namespace
         // Data segments delivered to the receiver whose sequence number it had
         // already received: retransmissions that were not needed.
         uint64_t spurious = 0;
+        uint64_t ce_marked = 0; // client frames the link marked CE
 
         std::string describe() const
         {
@@ -65,11 +66,13 @@ protected:
     // loses it. Null for none (random loss comes from `wire`).
     Result transfer(uint64_t seed, const LinkParams& wire, size_t size,
                     const std::function<bool(int index, int transmission)>& drop = nullptr,
-                    CongestionControlAlgorithm algorithm = CongestionControlAlgorithm::CUBIC)
+                    CongestionControlAlgorithm algorithm = CongestionControlAlgorithm::CUBIC,
+                    TcpEcnMode client_ecn = TcpEcnMode::PASSIVE)
     {
         net = std::make_unique<SimNetwork>(seed);
         NetemChannel& link = net->add_link(wire, wire);
         NetworkStack& client_stack = net->add_stack(link.take_endpoint(NetemChannel::A), CLIENT_MAC, CLIENT_IP);
+        client_stack.set_tcp_ecn(client_ecn);
         NetworkStack& server_stack = net->add_stack(link.take_endpoint(NetemChannel::B), SERVER_MAC, SERVER_IP);
         client_stack.add_static_arp_entry(SERVER_IP, SERVER_MAC);
         server_stack.add_static_arp_entry(CLIENT_IP, CLIENT_MAC);
@@ -132,6 +135,7 @@ protected:
         result.intact = received == payload;
         if (TcpConnection* c = client_stack.find_connection(client_id))
             result.stats = c->stats();
+        result.ce_marked = link.stats(NetemChannel::A).ce_marked;
 
         std::set<uint32_t> delivered;
         for (const PcapWriter::Record& record : net->delivered_capture().records())
@@ -247,4 +251,50 @@ TEST_F(SimRecovery, ATailLossIsRepairedWithoutATimeout)
     report("tail loss (last 2 full segments)", r);
     ASSERT_TRUE(r.completed && r.intact) << r.describe();
     ASSERT_EQ(r.stats.retransmit_timeouts, 0u) << r.describe();
+}
+
+// --- ECN (RFC 3168) ---
+
+// A link that marks instead of dropping: 2% of the client's ECN-capable
+// frames come out CE. The client asks for ECN (tcp_ecn = 1); the server
+// accepts by default (2). Every congestion signal arrives as a mark, so the
+// transfer needs no retransmission at all - and the window still reacts,
+// once per marked window. With ECN off the same link marks nothing (no
+// frame is ECN-capable) and the window never comes down.
+TEST_F(SimRecovery, CeMarksSlowTheSenderWithoutARetransmission)
+{
+    LinkParams marking = wire();
+    marking.ecn_mark = 0.02;
+    Result ecn = transfer(1, marking, 500000, nullptr, CongestionControlAlgorithm::CUBIC, TcpEcnMode::ON);
+    report("2% CE marks, ECN on", ecn);
+    std::cout << "[ RECOVERY ]   " << ecn.ce_marked << " frames marked, " << ecn.stats.ecn_reductions
+              << " cwnd reductions\n";
+    ASSERT_TRUE(ecn.completed && ecn.intact) << ecn.describe();
+    ASSERT_GT(ecn.ce_marked, 0u) << "precondition: the link marked frames";
+    ASSERT_EQ(ecn.stats.retransmitted_segments, 0u) << ecn.describe();
+    ASSERT_GT(ecn.stats.ecn_reductions, 0u) << "cwnd reacted to the marks";
+
+    Result plain = transfer(1, marking, 500000, nullptr, CongestionControlAlgorithm::CUBIC, TcpEcnMode::OFF);
+    ASSERT_EQ(plain.ce_marked, 0u) << "Not-ECT frames are never marked";
+    ASSERT_EQ(plain.stats.ecn_reductions, 0u);
+}
+
+// A bottleneck (1000 bytes/ms, 16 frames of buffer) with a step marker at
+// 5 queued frames, like DCTCP's K. Without ECN the queue overflows and
+// frames are tail-dropped; with it the sender backs off on the marks before
+// the queue is full.
+TEST_F(SimRecovery, AQueueThresholdMarkerKeepsTheQueueFromOverflowing)
+{
+    LinkParams bottleneck = wire();
+    bottleneck.bytes_per_ms = 1000;
+    bottleneck.queue_limit = 16;
+    bottleneck.ecn_mark_threshold = 5;
+    Result plain = transfer(1, bottleneck, 500000, nullptr, CongestionControlAlgorithm::CUBIC, TcpEcnMode::OFF);
+    Result ecn = transfer(1, bottleneck, 500000, nullptr, CongestionControlAlgorithm::CUBIC, TcpEcnMode::ON);
+    report("bottleneck, ECN off", plain);
+    report("bottleneck, ECN on", ecn);
+    ASSERT_TRUE(plain.completed && plain.intact && ecn.completed && ecn.intact);
+    ASSERT_GT(plain.stats.retransmitted_segments, 0u) << "precondition: without ECN the queue overflows";
+    ASSERT_GT(ecn.ce_marked, 0u);
+    ASSERT_EQ(ecn.stats.retransmitted_segments, 0u) << ecn.describe();
 }

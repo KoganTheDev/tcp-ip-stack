@@ -37,6 +37,15 @@ struct LinkParams
     // Largest Ethernet payload (the interface MTU, as `ip link` reports it);
     // larger frames are dropped. 0 = no limit.
     size_t mtu = 0;
+    // ECN marking (RFC 3168 section 5), as an AQM marks instead of dropping:
+    // an ECN-capable IPv4 frame (ECT(0) or ECT(1)) comes out CE, with its
+    // header checksum fixed. Not-ECT frames are never touched - dropping
+    // them is what `loss` and `queue_limit` are for.
+    double ecn_mark = 0.0; // per ECN-capable frame
+    // Mark every ECN-capable frame that finds at least this many frames
+    // waiting for the wire (a step marker, like DCTCP's K). Needs a finite
+    // bytes_per_ms. 0 = off.
+    size_t ecn_mark_threshold = 0;
 
     std::string describe() const;
 };
@@ -54,6 +63,7 @@ struct LinkStats
     uint64_t reordered = 0;
     uint64_t mtu_dropped = 0;
     uint64_t queue_dropped = 0;
+    uint64_t ce_marked = 0;
 
     std::string describe() const;
 };
@@ -159,6 +169,8 @@ private:
     };
 
     void _transmit(Side from, const Bytes& frame);
+    // Sets CE on an ECN-capable IPv4 frame; false if it is not one.
+    static bool _mark_ce(Bytes& frame);
     void _enqueue_copy(Direction& direction, Bytes frame, uint64_t wire_done_us);
     Bytes _receive(Side at);
     bool _due(const Direction& direction) const;

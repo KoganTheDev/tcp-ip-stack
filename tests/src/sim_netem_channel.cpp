@@ -18,7 +18,8 @@ std::string LinkParams::describe() const
         out << "unlimited";
     else
         out << bytes_per_ms << "B/ms";
-    out << " queue=" << queue_limit << " mtu=" << mtu;
+    out << " queue=" << queue_limit << " mtu=" << mtu << " ecn_mark=" << ecn_mark
+        << " ecn_threshold=" << ecn_mark_threshold;
     return out.str();
 }
 
@@ -27,7 +28,7 @@ std::string LinkStats::describe() const
     std::ostringstream out;
     out << "tx=" << transmitted << " delivered=" << delivered << " lost=" << lost << " dup=" << duplicated
         << " corrupt=" << corrupted << " reorder=" << reordered << " mtu_drop=" << mtu_dropped
-        << " queue_drop=" << queue_dropped;
+        << " queue_drop=" << queue_dropped << " ce=" << ce_marked;
     return out.str();
 }
 
@@ -94,12 +95,14 @@ void NetemChannel::_transmit(Side from, const Bytes& frame)
     // finished, and occupies it for size / rate. Microseconds, so a fast link
     // does not round every small frame to a whole millisecond.
     uint64_t wire_done_us = now_us;
+    size_t queued_frames = 0;
     if (params.bytes_per_ms != 0)
     {
         while (!direction.waiting_starts_us.empty() && direction.waiting_starts_us.front() <= now_us)
         {
             direction.waiting_starts_us.pop_front();
         }
+        queued_frames = direction.waiting_starts_us.size();
         if (params.queue_limit != 0 && direction.waiting_starts_us.size() >= params.queue_limit)
         {
             direction.stats.queue_dropped++;
@@ -122,13 +125,59 @@ void NetemChannel::_transmit(Side from, const Bytes& frame)
         return;
     }
 
+    // Drawn only when marking is configured, so a link without it consumes
+    // the same random numbers it always did and every existing seed replays.
+    Bytes sent = frame;
+    bool congested = (params.ecn_mark_threshold != 0 && queued_frames >= params.ecn_mark_threshold)
+                     || (params.ecn_mark > 0.0 && _random.chance(params.ecn_mark));
+    if (congested && _mark_ce(sent))
+    {
+        direction.stats.ce_marked++;
+    }
+
     bool duplicate = _random.chance(params.duplicate);
-    _enqueue_copy(direction, frame, wire_done_us);
+    _enqueue_copy(direction, sent, wire_done_us);
     if (duplicate)
     {
         direction.stats.duplicated++;
-        _enqueue_copy(direction, frame, wire_done_us);
+        _enqueue_copy(direction, sent, wire_done_us);
     }
+}
+
+bool NetemChannel::_mark_ce(Bytes& frame)
+{
+    constexpr size_t IP = ETHERNET_HEADER_LENGTH;
+    if (frame.size() < IP + 20 || frame[12] != 0x08 || frame[13] != 0x00)
+    {
+        return false;
+    }
+    uint8_t ecn = frame[IP + 1] & 0x03;
+    if (ecn != 0x01 && ecn != 0x02)
+    {
+        return false; // Not-ECT, or already CE
+    }
+    size_t header = static_cast<size_t>(frame[IP] & 0x0f) * 4;
+    if (header < 20 || frame.size() < IP + header)
+    {
+        return false;
+    }
+    frame[IP + 1] = static_cast<byte_t>(frame[IP + 1] | 0x03);
+    // Recomputed whole, as a router would after any header change.
+    frame[IP + 10] = 0;
+    frame[IP + 11] = 0;
+    uint32_t sum = 0;
+    for (size_t i = 0; i < header; i += 2)
+    {
+        sum += static_cast<uint32_t>(frame[IP + i] << 8 | frame[IP + i + 1]);
+    }
+    while (sum >> 16)
+    {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    auto checksum = static_cast<uint16_t>(~sum);
+    frame[IP + 10] = static_cast<byte_t>(checksum >> 8);
+    frame[IP + 11] = static_cast<byte_t>(checksum & 0xff);
+    return true;
 }
 
 void NetemChannel::_enqueue_copy(Direction& direction, Bytes frame, uint64_t wire_done_us)
