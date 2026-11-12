@@ -316,6 +316,10 @@ TEST(TcpRecovery, PrrSpreadsTheWindowReductionOverTheRecovery)
 {
     Peer peer = make_peer(/*sack=*/true);
     send_segments(peer, 10);
+    // A 10 ms round trip, so RACK's reordering window (RFC 8985: min_RTT / 4)
+    // is not zero: the flight below is delivered within one millisecond, and
+    // recovery should start on DupThresh as the arithmetic below assumes.
+    peer.connection->on_time_passed(10);
     peer.ack(peer.seg(10)); // slow start: cwnd 10 -> 20
     send_segments(peer, 30); // 20 go out, 10 wait
     const uint32_t first = 10;
@@ -374,4 +378,149 @@ TEST(TcpRecovery, PrrSlowStartReductionBoundLimitsTheBurstAfterHeavyLoss)
     // ssthresh is five segments, pipe zero: RFC 6675 would resend five at
     // once. SSRB allows DeliveredData (one segment) + one MSS.
     ASSERT_EQ(retransmitted, 2u) << "slow-start pace: delivered + 1 segment";
+}
+
+// --- RFC 8985: RACK ---
+
+// A retransmission can be lost too. RFC 6675 marks a segment lost by counting
+// what was SACKed above it, and once it has been retransmitted nothing above
+// it can be counted again, so a lost retransmission used to wait for the
+// RTO. RACK reasons in time instead (RFC 8985 6.2): a segment sent *after*
+// the retransmission has been delivered, so once the reordering window has
+// passed the retransmission is lost as well, and goes out again on that ack.
+TEST(TcpRecovery, RackDetectsALostRetransmissionWithoutATimeout)
+{
+    Peer peer = make_peer(/*sack=*/true);
+    send_segments(peer, 30); // ten go out, twenty wait for the window
+    std::vector<uint32_t> held;
+    for (uint32_t n = 1; n <= 9; n++)
+    {
+        peer.connection->on_time_passed(2);
+        held.push_back(n);
+        peer.ack(peer.seg(0), sack_of(peer, held));
+    }
+    ASSERT_EQ(peer.count_sent(peer.seg(0)), 2u) << "precondition: segment 0 retransmitted once";
+    size_t retransmission = 0;
+    for (size_t i = 0; i < peer.sent.size(); i++)
+        if (peer.sent[i].seq == peer.seg(0) && peer.sent[i].length > 0)
+            retransmission = i;
+    ASSERT_LT(retransmission + 1, peer.sent.size()) << "precondition: PRR sent new data after the retransmission";
+    uint32_t newest = (peer.sent.back().seq - peer.base) / MSS;
+
+    // The retransmission of 0 is lost as well; the newest segment, sent
+    // after it, arrives a round trip later.
+    peer.connection->on_time_passed(20);
+    for (uint32_t n = 10; n <= newest; n++)
+        held.push_back(n);
+    peer.ack(peer.seg(0), sack_of(peer, held));
+    ASSERT_EQ(peer.count_sent(peer.seg(0)), 3u) << "the lost retransmission must go out again on this ack";
+    ASSERT_EQ(peer.connection->stats().retransmit_timeouts, 0u);
+}
+
+// RACK waits a reordering window before calling a segment lost when only one
+// segment is SACKed outside recovery (RFC 8985 6.2 step 4: min_RTT / 4), and
+// the reordering timer (section 6.2, step 5) is what declares the loss if no
+// further ack arrives: three duplicate acks are no longer needed.
+TEST(TcpRecovery, RackReorderTimerDeclaresALossWithoutThreeDuplicates)
+{
+    Peer peer = make_peer(/*sack=*/true);
+    send_segments(peer, 4);
+    peer.connection->on_time_passed(40);
+    peer.ack(peer.seg(1)); // an RTT sample of 40 ms: min_RTT / 4 is 10 ms
+    send_segments(peer, 4);
+    peer.connection->on_time_passed(40);
+    // 1 lost, 2 SACKed: a single duplicate ack.
+    peer.ack(peer.seg(1), sack_of(peer, {2}));
+    ASSERT_EQ(peer.count_sent(peer.seg(1)), 1u) << "within the reordering window nothing is resent yet";
+    uint64_t deadline = peer.connection->next_deadline_ms();
+    ASSERT_LE(deadline, peer.connection->now_ms() + 10) << "the reordering timer is armed, not only the RTO";
+    peer.connection->on_time_passed(static_cast<uint32_t>(deadline - peer.connection->now_ms()));
+    ASSERT_EQ(peer.count_sent(peer.seg(1)), 2u) << "the reordering timer declared segment 1 lost";
+    ASSERT_EQ(peer.connection->stats().retransmit_timeouts, 0u);
+    ASSERT_EQ(peer.connection->stats().recoveries, 1u);
+}
+
+// A peer controls the SACK blocks RACK learns from, so their shape must not
+// set the cost. With over a thousand 48-byte segments in flight, the peer
+// SACKs them newest first, one per ack - each ack makes RACK.segment the
+// newest segment, so every older one is a loss candidate - then repeats the
+// same report many times and names data that was never sent. RACK's work on
+// each ack must stay proportional to what that ack changes (segments it
+// delivers or marks lost, and what is resent for them), plus a constant:
+// RFC 8985's transmit-time list, not a scan of everything in flight. (The
+// lookup of a block's first segment is a binary search, O(log n).)
+TEST(TcpRecovery, RackCostPerAckIsBoundedByWhatTheAckChanges)
+{
+    constexpr uint32_t SMALL_MSS = 48;
+    std::vector<std::pair<uint32_t, size_t>> sent;
+    TcpConnection connection(
+        8080, IPv4Address("10.0.0.1"), 12345, 1000, [&sent](const Tcp& header, const Bytes& payload)
+        { sent.emplace_back(header.get_sequence_number(), payload.size()); }, 1460, CongestionControlAlgorithm::RENO);
+    connection.accept_incoming_syn(PEER_ISN, static_cast<uint16_t>(SMALL_MSS), false, 0, false, 0, true);
+    uint16_t window = 65535;
+    auto ack = [&](uint32_t ack_seq, const std::vector<Tcp::SackBlock>& blocks)
+    {
+        Tcp segment(12345, 8080, PEER_ISN + 1, ack_seq, 5, FLAG_ACK, window, 0, 0);
+        if (!blocks.empty())
+            segment.set_sack_blocks(blocks);
+        connection.on_segment(segment);
+    };
+    ack(1001, {});
+    auto highest_sent = [&](uint32_t floor)
+    {
+        uint32_t highest = floor;
+        for (const auto& s : sent)
+            highest = std::max<uint32_t>(highest, s.first + static_cast<uint32_t>(s.second));
+        return highest;
+    };
+    connection.send(Bytes(static_cast<unsigned int>(TcpConnection::SEND_BUFFER_CAPACITY)));
+    uint32_t acked = 1001;
+    for (int round = 0; round < 20 && (highest_sent(acked) - acked) / SMALL_MSS < 1000; round++)
+    {
+        connection.on_time_passed(10);
+        acked = highest_sent(acked);
+        ack(acked, {});
+        connection.send(Bytes(static_cast<unsigned int>(connection.send_space_available())));
+    }
+    const uint32_t segments = (highest_sent(acked) - acked) / SMALL_MSS;
+    ASSERT_GE(segments, 1000u) << "precondition: a large window of tiny segments";
+    connection.on_time_passed(10);
+
+    uint64_t worst_excess = 0;
+    auto measured_ack = [&](uint32_t ack_seq, const std::vector<Tcp::SackBlock>& blocks)
+    {
+        uint64_t visits_before = connection.rack_visits();
+        uint64_t lost_before = connection.stats().rack_losses;
+        uint64_t retransmitted_before = connection.stats().retransmitted_segments;
+        ack(ack_seq, blocks);
+        uint64_t visits = connection.rack_visits() - visits_before;
+        uint64_t changed = 1 + (connection.stats().rack_losses - lost_before)
+                           + (connection.stats().retransmitted_segments - retransmitted_before);
+        worst_excess = std::max(worst_excess, visits > changed ? visits - changed : 0);
+    };
+    // The newest segment SACKed, again and again: every older one is a loss
+    // candidate, none is past the reordering window yet, and fewer than
+    // DupThresh are SACKed, so RFC 6675 marks nothing - RACK alone decides,
+    // on every one of these acks. A scan of the scoreboard would cost the
+    // whole flight each time. The window alternates, so the repeats are not
+    // duplicate acks (RFC 5681) and do not start a recovery.
+    const Tcp::SackBlock newest{acked + (segments - 1) * SMALL_MSS, acked + segments * SMALL_MSS};
+    for (int i = 0; i < 1000; i++)
+    {
+        window = static_cast<uint16_t>(65535 - (i % 2));
+        measured_ack(acked, {newest});
+    }
+    // Blocks above anything sent.
+    for (int i = 0; i < 1000; i++)
+    {
+        window = static_cast<uint16_t>(65535 - (i % 2));
+        measured_ack(acked, {{acked + (segments + 10) * SMALL_MSS, acked + (segments + 20) * SMALL_MSS}});
+    }
+    ASSERT_EQ(connection.stats().rack_losses, 0u) << "precondition: still inside the reordering window";
+    // The window runs out: the reordering timer marks the whole flight once.
+    connection.on_time_passed(5);
+    ASSERT_GE(connection.stats().rack_losses, segments - 1) << "precondition: RACK marked the flight lost";
+    measured_ack(acked, {newest, {acked + (segments - 2) * SMALL_MSS, acked + (segments - 1) * SMALL_MSS}});
+    ASSERT_LE(worst_excess, 2u) << "an ack cost RACK " << worst_excess << " visits beyond what it changed, with "
+                                << segments << " segments in flight";
 }

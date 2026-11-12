@@ -30,6 +30,16 @@ struct SentSegment
     // moment rather than an age counter keeps timekeeping O(1): age is
     // now - sent_at_ms, computed only when a segment is actually acked.
     uint64_t sent_at_ms{};
+    // RFC 8985's Segment.xmit_ts: when it last went out, first transmission
+    // or retransmission. Set by the scoreboard (push(), note_transmit()).
+    uint64_t xmit_ms{};
+    // Which transmission, counted across the connection, that was. RFC
+    // 8985's RACK_sent_after() breaks xmit_ts ties by end_seq, which assumes
+    // a clock fine enough that a tie means "sent in sequence order". At one
+    // millisecond a retransmission routinely shares its tick with later-
+    // sequenced originals, and would be judged sent before them - and lost the
+    // moment one is SACKed. The counter is the actual order.
+    uint64_t xmit_order{};
     // Named by a SACK block, so the peer holds it even though the cumulative
     // ack has not reached it. It stays in the scoreboard because the window
     // cannot slide past it until everything before it is acked too - but it
@@ -49,6 +59,12 @@ struct SentSegment
     // below HighRxt", kept per segment. Counts in the pipe a second time, and
     // takes the segment out of NextSeg()'s candidates until recovery restarts.
     bool rexmit_in_recovery = false;
+
+    // Links in the scoreboard's transmit-time list (see SendScoreboard's RACK
+    // section); owned by the scoreboard, never set by anyone else.
+    SentSegment* rack_prev = nullptr;
+    SentSegment* rack_next = nullptr;
+    bool in_rack_list = false;
 };
 
 // The sender's scoreboard: every segment in flight, oldest first, with what
@@ -65,6 +81,16 @@ class SendScoreboard
 public:
     using Segments = std::deque<SentSegment>;
 
+    SendScoreboard() = default;
+    // The RACK list points into the deque, so a copy would point into the
+    // original. A move is fine: moving a std::deque hands its storage over
+    // without relocating a single element.
+    SendScoreboard(const SendScoreboard&) = delete;
+    SendScoreboard& operator=(const SendScoreboard&) = delete;
+    SendScoreboard(SendScoreboard&& other) noexcept;
+    SendScoreboard& operator=(SendScoreboard&&) = delete;
+    ~SendScoreboard() = default;
+
     bool empty() const { return _segments.empty(); }
     size_t size() const { return _segments.size(); }
     SentSegment& front() { return _segments.front(); }
@@ -78,14 +104,26 @@ public:
     // nothing is outstanding.
     uint32_t snd_una_or(uint32_t snd_nxt) const { return _segments.empty() ? snd_nxt : _segments.front().seq; }
 
-    // Records a segment just sent, after everything already in flight.
+    // Records a segment just sent, after everything already in flight. Its
+    // sent_at_ms is its first xmit_ms.
     void push(SentSegment segment);
     void clear();
 
+    // What RACK needs to know about the ack being processed (RFC 8985 6.2
+    // step 2): the time, the minimum RTT, and the ack's TSecr if it has one.
+    struct AckContext
+    {
+        uint64_t now_ms = 0;
+        uint32_t min_rtt_ms = 0;
+        bool has_echo = false;
+        uint32_t echo = 0;
+    };
+
     // Marks every segment wholly inside one of the blocks. Returns true if
     // anything was newly marked, which is what makes a duplicate ack
-    // informative rather than merely repeated.
-    bool apply_sack(const std::vector<Tcp::SackBlock>& blocks);
+    // informative rather than merely repeated. With `rack`, every newly
+    // SACKed segment also feeds RACK.
+    bool apply_sack(const std::vector<Tcp::SackBlock>& blocks, const AckContext* rack = nullptr);
 
     // What a cumulative ack retired.
     struct Acked
@@ -105,7 +143,8 @@ public:
     // while the data released next starts at SND.NXT, and if that segment is
     // lost the duplicate acks all name SND.NXT + 1, which never equalled an
     // untrimmed SND.UNA, so fast retransmit could not fire.
-    Acked acknowledge(uint32_t ack);
+    // With `rack`, every newly acknowledged segment also feeds RACK.
+    Acked acknowledge(uint32_t ack, const AckContext* rack = nullptr);
 
     // The oldest segment the peer has NOT reported holding - the one a
     // retransmission should resend. Without SACK this is always the front;
@@ -160,24 +199,101 @@ public:
     // HighRxt moves up to its end. The rescue retransmission is not reported
     // (RFC 6675: "HighRxt MUST NOT be updated").
     void note_retransmitted(const SentSegment& segment);
+    // Marks one segment lost (the forced fast retransmission of RFC 6675
+    // 4.3), exactly as mark_losses() would.
+    void mark_lost(SentSegment& segment);
+
+    // --- RFC 8985 RACK ---
+    //
+    // RFC 6675 infers loss from what was SACKed *above* a segment, which
+    // says nothing once the segment has been retransmitted: the counts above
+    // it were all made before. RACK infers it from time: once a segment sent
+    // later than this one has been delivered, and a reordering window has
+    // passed, this one is lost - first transmission or retransmission alike.
+    //
+    // The candidates live in a doubly linked list in transmit order (the
+    // optimisation section 6.2 describes, as Linux has it): a segment joins
+    // the tail when it is sent or resent and leaves when it is delivered or
+    // marked lost. Its order is its xmit_ms order, so a loss scan starts at
+    // the oldest and stops at the first segment that is not yet due: each
+    // ack costs the segments it marks plus one, never a walk of everything
+    // in flight however the peer's SACK blocks are shaped.
+
+    // Starts one ack's RACK bookkeeping (call before apply_sack()).
+    void rack_begin_ack();
+    // A (re)transmission at now_ms: xmit_ms is now, and the segment moves to
+    // the tail of the transmit-time list (RFC 8985 6.1).
+    void note_transmit(SentSegment& segment, uint64_t now_ms);
+    // RACK.segment exists: something has been delivered since it was sent.
+    bool rack_valid() const { return _rack_valid; }
+    uint64_t rack_rtt_ms() const { return _rack_rtt_ms; }
+    // RACK.reordering_seen (step 3): an original transmission was delivered
+    // below RACK.fack.
+    bool reordering_seen() const { return _reordering_seen; }
+    // RACK.segs_sacked: segments currently SACKed.
+    uint32_t sacked_segments() const { return _sacked_segments; }
+    // RFC 8985 RACK_detect_loss() (step 5) with reordering window reo_wnd_ms:
+    // marks every candidate sent before RACK.segment whose
+    // xmit + RACK.rtt + reo_wnd has passed. Returns how many it marked, and in
+    // wait_ms how long until the next candidate would be due (0 for none) -
+    // when the reordering timer should fire. The earliest, not the RFC's
+    // latest: the timer re-runs this, which then finds the rest.
+    uint32_t rack_detect_loss(uint64_t now_ms, uint64_t reo_wnd_ms, uint64_t& wait_ms);
 
     // Scoreboard entries examined so far, by every query - a cost meter for
     // tests: one ack must cost a bounded number of passes, whatever the
     // peer's SACK pattern.
     uint64_t visits() const { return _visits; }
+    // The part of visits() spent by RACK: one per segment delivered or
+    // examined by a loss scan.
+    uint64_t rack_visits() const { return _rack_visits; }
 
 private:
     Segments _segments;
     mutable uint64_t _visits = 0;
+    uint64_t _rack_visits = 0;
     // The highest SACKed octet (end of the highest SACKed segment).
     uint32_t _high_sack = 0;
     bool _have_high_sack = false;
     // RFC 6675 HighRxt; NextSeg() rules 1 and 3 only look above it.
     uint32_t _high_rxt = 0;
     bool _high_rxt_valid = false;
-    // Where the rule-1 and rule-3 searches resume (see next_lost()).
+    // Where the rule-1 and rule-3 searches resume (see next_lost()). Every
+    // segment before the rule-1 cursor is not a candidate; marking one lost
+    // moves the cursor back to it (_lower_lost_cursor()). Invalid means "from
+    // SND.UNA".
     uint32_t _lost_cursor = 0;
+    bool _lost_cursor_valid = false;
     uint32_t _speculative_cursor = 0;
+    void _lower_lost_cursor(uint32_t seq);
+    // Marks newly lost: out of the RACK list, its retransmission (if any)
+    // out of the pipe, and back in NextSeg()'s reach.
+    void _set_lost(SentSegment& segment);
+
+    // RACK state (RFC 8985 5.3).
+    SentSegment* _rack_head = nullptr; // oldest (re)transmission among candidates
+    SentSegment* _rack_tail = nullptr;
+    void _rack_link(SentSegment& segment);
+    void _rack_unlink(SentSegment& segment);
+    // Steps 2 and 3 for one newly delivered segment. `cumulative`: delivered
+    // by the cumulative ack, so the ack's TSecr is about it (RFC 7323 4.3);
+    // for a SACKed one the echo is an older segment's and says nothing.
+    void _rack_delivered(const SentSegment& segment, const AckContext& rack, bool cumulative);
+    bool _rack_valid = false;
+    uint64_t _rack_xmit_order = 0; // RACK.segment's xmit_order (RACK.xmit_ts/end_seq)
+    uint64_t _next_xmit_order = 1;
+    uint64_t _rack_rtt_ms = 0;
+    uint32_t _rack_fack = 0;
+    bool _rack_fack_valid = false;
+    uint32_t _fack_at_ack_start = 0;
+    bool _fack_valid_at_ack_start = false;
+    // The newest xmit_ms whose RTT this ack has taken: segments are taken in
+    // whatever order the ack names them, and RACK.rtt is the most recently
+    // sent one's (the RFC walks them in xmit order and keeps the last).
+    uint64_t _ack_newest_xmit_order = 0;
+    bool _ack_has_rtt = false;
+    bool _reordering_seen = false;
+    uint32_t _sacked_segments = 0;
     // Index of the first segment whose seq is at or after `seq`.
     size_t _first_index_at_or_after(uint32_t seq) const;
     // HighRxt, or SND.UNA if that is higher (or there is no HighRxt yet).

@@ -4,6 +4,7 @@
 #include "sim/tcp_frame.h"
 
 #include <iostream>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -57,12 +58,13 @@ namespace
 class SimRecovery : public SimFixture
 {
 protected:
-    // drop: called with the first transmission of every data segment the
-    // client sends, numbered from 1; true loses it. Retransmissions are never
-    // dropped by it (or numbered), so "segment 60" means the same bytes
-    // whatever the recovery code resends. Null for none (random loss comes from `wire`).
+    // drop: called with every transmission of every data segment the client
+    // sends: the segment's number (from 1, in order of first transmission,
+    // so "segment 60" means the same bytes whatever the recovery code
+    // resends) and which transmission of it this is (1 for the first). True
+    // loses it. Null for none (random loss comes from `wire`).
     Result transfer(uint64_t seed, const LinkParams& wire, size_t size,
-                    const std::function<bool(int index)>& drop = nullptr,
+                    const std::function<bool(int index, int transmission)>& drop = nullptr,
                     CongestionControlAlgorithm algorithm = CongestionControlAlgorithm::CUBIC)
     {
         net = std::make_unique<SimNetwork>(seed);
@@ -74,7 +76,7 @@ protected:
         server_stack.listen(SERVER_PORT);
 
         int data_segments = 0;
-        std::set<uint32_t> seen;
+        std::map<uint32_t, std::pair<int, int>> seen; // seq -> (index, transmissions so far)
         if (drop)
         {
             link.set_drop_filter(NetemChannel::A,
@@ -84,9 +86,11 @@ protected:
                                      std::string error;
                                      if (!tcp_frame::parse(frame, segment, error) || segment.payload.empty())
                                          return false;
-                                     if (!seen.insert(segment.seq).second)
-                                         return false; // a retransmission
-                                     return drop(++data_segments);
+                                     auto [it, first] = seen.try_emplace(segment.seq, data_segments + 1, 0);
+                                     if (first)
+                                         data_segments++;
+                                     it->second.second++;
+                                     return drop(it->second.first, it->second.second);
                                  });
         }
 
@@ -165,8 +169,9 @@ TEST_F(SimRecovery, ThreeLossesInOneFlightRecoverWithoutATimeout)
 {
     for (CongestionControlAlgorithm algorithm : {CongestionControlAlgorithm::RENO, CongestionControlAlgorithm::CUBIC})
     {
-        Result r =
-            transfer(1, wire(), 400000, [](int index) { return index == 60 || index == 63 || index == 66; }, algorithm);
+        Result r = transfer(
+            1, wire(), 400000, [](int index, int transmission)
+            { return transmission == 1 && (index == 60 || index == 63 || index == 66); }, algorithm);
         report(algorithm == CongestionControlAlgorithm::RENO ? "3 drops in one flight, reno"
                                                              : "3 drops in one flight, cubic",
                r);
@@ -211,4 +216,19 @@ TEST_F(SimRecovery, RandomLossFivePercent)
         total.spurious += r.spurious;
     }
     report("5% loss, 5 seeds summed", total);
+}
+
+// The fast retransmission itself lost: segment 60 is dropped, and so is its
+// first retransmission. RFC 6675 cannot see the second loss - nothing above
+// a retransmitted segment can be counted again - so it used to cost an RTO.
+// RACK (RFC 8985) sees that data sent after the retransmission has arrived
+// and resends it on that ack.
+TEST_F(SimRecovery, ALostRetransmissionIsRepairedWithoutATimeout)
+{
+    Result r =
+        transfer(1, wire(), 400000, [](int index, int transmission) { return index == 60 && transmission <= 2; });
+    report("lost retransmission", r);
+    ASSERT_TRUE(r.completed && r.intact) << r.describe();
+    ASSERT_EQ(r.stats.retransmit_timeouts, 0u) << r.describe();
+    ASSERT_EQ(r.spurious, 0u) << r.describe();
 }

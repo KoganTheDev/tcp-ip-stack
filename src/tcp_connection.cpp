@@ -752,6 +752,12 @@ void TcpConnection::_run_keepalive()
 
 void TcpConnection::_take_rtt_sample(uint32_t rtt_ms)
 {
+    if (!_have_rack_min_rtt || rtt_ms <= _rack_min_rtt_ms || _now_ms - _rack_min_rtt_at_ms > MIN_RTT_WINDOW_MS)
+    {
+        _rack_min_rtt_ms = rtt_ms;
+        _rack_min_rtt_at_ms = _now_ms;
+        _have_rack_min_rtt = true;
+    }
     _rtt.on_sample(rtt_ms);
     LOG_DEBUG("TcpConnection[" << _id << "] rtt sample " << rtt_ms << " ms -> srtt " << _rtt.srtt_ms() << " rttvar "
                                << _rtt.rttvar_ms() << " rto " << _rtt.rto_ms());
@@ -763,7 +769,74 @@ bool TcpConnection::_apply_sack_blocks(const Tcp& segment)
     {
         return false;
     }
-    return _in_flight.apply_sack(segment.get_sack_blocks());
+    SendScoreboard::AckContext rack = _rack_context(segment);
+    return _in_flight.apply_sack(segment.get_sack_blocks(), &rack);
+}
+
+SendScoreboard::AckContext TcpConnection::_rack_context(const Tcp& segment) const
+{
+    SendScoreboard::AckContext rack;
+    rack.now_ms = _now_ms;
+    rack.min_rtt_ms = _rack_min_rtt_ms;
+    rack.has_echo = _timestamps_negotiated && segment.has_timestamp_option() && segment.get_timestamp_echo() != 0;
+    rack.echo = segment.get_timestamp_echo();
+    return rack;
+}
+
+uint64_t TcpConnection::_rack_reo_wnd_ms() const
+{
+    // RFC 8985 6.2 step 4. With no reordering seen, no wait at all in
+    // recovery or once DupThresh segments are SACKed: the evidence is the
+    // same RFC 6675 acts on. Otherwise a quarter of the minimum RTT, at most
+    // SRTT.
+    if (!_in_flight.reordering_seen()
+        && (_in_recovery || _rto_recovery || _in_flight.sacked_segments() >= DUP_ACK_FAST_RETRANSMIT_THRESHOLD))
+    {
+        return 0;
+    }
+    return std::min<uint64_t>(_rack_min_rtt_ms / 4, _rtt.srtt_ms());
+}
+
+uint32_t TcpConnection::_rack_detect_loss()
+{
+    bool zero_window =
+        !_in_flight.reordering_seen()
+        && (_in_recovery || _rto_recovery || _in_flight.sacked_segments() >= DUP_ACK_FAST_RETRANSMIT_THRESHOLD);
+    if (!_sack_permitted || _in_flight.empty() || (!_have_rack_min_rtt && !zero_window))
+    {
+        // Before any round trip has been measured there is no basis for a
+        // reordering window, so RACK waits for the evidence RFC 6675 acts on.
+        _rack_reo_deadline_ms = 0;
+        return 0;
+    }
+    uint64_t wait_ms = 0;
+    uint32_t marked = _in_flight.rack_detect_loss(_now_ms, _rack_reo_wnd_ms(), wait_ms);
+    _rack_reo_deadline_ms = wait_ms != 0 ? _now_ms + wait_ms : 0;
+    _stats.rack_losses += marked;
+    return marked;
+}
+
+void TcpConnection::_on_rack_reo_timer()
+{
+    // RFC 8985 6.2 step 5: the reordering window ran out with no ack to run
+    // the check, so the timer runs it - and acts on it as an ack would have.
+    _rack_reo_deadline_ms = 0;
+    if (_rack_detect_loss() == 0)
+    {
+        return;
+    }
+    if (_in_recovery && _sack_permitted)
+    {
+        _sack_recovery_send(0);
+    }
+    else if (_rto_recovery)
+    {
+        _send_queued_while_window_allows();
+    }
+    else if (!_in_recovery && _may_start_recovery(_in_flight.snd_una_or(_send_next)))
+    {
+        _enter_recovery(0);
+    }
 }
 bool TcpConnection::_may_start_recovery(uint32_t ack) const
 {
@@ -778,6 +851,7 @@ bool TcpConnection::_may_start_recovery(uint32_t ack) const
 void TcpConnection::_retransmit(SentSegment& segment, bool rescue)
 {
     _transmit(segment.flags, segment.seq, segment.payload);
+    _in_flight.note_transmit(segment, _now_ms); // RFC 8985 6.1
     if (!rescue)
     {
         _in_flight.note_retransmitted(segment);
@@ -829,7 +903,7 @@ void TcpConnection::_enter_recovery(uint32_t delivered)
         _prr_out = 0;
         _prr_recover_fs = flight_size;
         // NextSeg() rule 1 picks this first: the lowest lost segment.
-        oldest->lost = true;
+        _in_flight.mark_lost(*oldest);
         _sack_recovery_send(delivered, /*entering=*/true);
     }
     else
@@ -958,7 +1032,13 @@ uint32_t TcpConnection::_send_by_next_seg(uint32_t pipe, uint32_t window, bool i
         if (!_rescue_valid || seq_before(_rescue_rxt, snd_una))
         {
             SentSegment* tail = _in_flight.highest_unsacked();
-            if (tail != nullptr && !tail->rexmit_in_recovery)
+            // Only one sent more than a minimum round trip ago: before that
+            // nothing can have reported it missing (at exactly one, its ack
+            // may be the very next segment), and a needless copy would make
+            // the SACK for the original look to RACK like a delivery of the
+            // copy.
+            bool old_enough = tail != nullptr && _now_ms - tail->xmit_ms > _rack_min_rtt_ms;
+            if (tail != nullptr && !tail->rexmit_in_recovery && old_enough)
             {
                 uint32_t length = tail->end_seq - tail->seq;
                 _retransmit(*tail, /*rescue=*/true);
@@ -980,6 +1060,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     // peer reports holding changes how much is genuinely outstanding, and
     // therefore how much may be sent.
     uint32_t sacked_before = _in_flight.sacked_bytes();
+    _in_flight.rack_begin_ack();
     bool sack_advanced = _apply_sack_blocks(segment);
     if (_sack_permitted)
     {
@@ -1021,12 +1102,16 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         _dup_ack_count += 1;
         // RFC 6937's DeliveredData for an ack that does not move SND.UNA.
         uint32_t delivered = _in_flight.sacked_bytes() - sacked_before;
+        // RFC 8985 6.2 step 5: a segment sent before one just delivered, and
+        // older than the reordering window, is lost - a retransmission too.
+        bool rack_lost = _rack_detect_loss() > 0;
         // RFC 6675 section 5 step 3: recovery starts on DupThresh duplicates,
         // or as soon as IsLost(HighACK + 1) holds - three segments SACKed
         // above the first hole say the same thing even if some of the acks
-        // carrying them were lost.
+        // carrying them were lost. RACK finding a loss starts it too (RFC
+        // 8985 3.4): with timing on its side it need not wait for three.
         bool loss_signalled =
-            _dup_ack_count >= DUP_ACK_FAST_RETRANSMIT_THRESHOLD
+            _dup_ack_count >= DUP_ACK_FAST_RETRANSMIT_THRESHOLD || rack_lost
             || (_sack_permitted && _in_flight.oldest_unsacked() != nullptr && _in_flight.oldest_unsacked()->lost);
         if (_in_recovery && _sack_permitted)
         {
@@ -1067,7 +1152,8 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     // of stop-and-wait's exactly one. Karn's algorithm picks the RTT sample:
     // only a segment never retransmitted yields one, since for a retransmitted
     // one there is no telling which transmission the ack answers.
-    SendScoreboard::Acked acked = _in_flight.acknowledge(ack);
+    SendScoreboard::AckContext rack_context = _rack_context(segment);
+    SendScoreboard::Acked acked = _in_flight.acknowledge(ack, _sack_permitted ? &rack_context : nullptr);
     // RFC 6937 DeliveredData: the change in SND.UNA plus the change in SACKed
     // bytes. Retired SACKed segments are in both, so they cancel.
     auto delivered = static_cast<uint32_t>(std::max<int64_t>(
@@ -1126,6 +1212,16 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         _rto_recovery = false; // everything outstanding at the timeout is acknowledged
     }
 
+    // RFC 8985 6.2 step 5 on an ack that moved SND.UNA: a partial ack in
+    // recovery acts on what it marks through NextSeg() below; outside
+    // recovery a loss found here starts one, as three duplicates would.
+    uint32_t rack_lost = _rack_detect_loss();
+    if (rack_lost > 0 && !_in_recovery && !_rto_recovery && _may_start_recovery(ack))
+    {
+        _enter_recovery(delivered);
+        return;
+    }
+
     if (_in_recovery && _sack_permitted && !seq_at_or_before(_recovery_point, ack))
     {
         // RFC 6675 section 5 steps (B) and (C): a partial ack updates the
@@ -1160,6 +1256,16 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         // ssthresh.
         _congestion->on_recovery_end();
         _in_recovery = false;
+        // RACK may already have found losses past RecoveryPoint (it ran
+        // above, with the recovery's zero reordering window). They are a new
+        // congestion event, and nothing else would start its recovery until
+        // another duplicate ack arrived.
+        SentSegment* oldest = _sack_permitted ? _in_flight.oldest_unsacked() : nullptr;
+        if (oldest != nullptr && oldest->lost && !oldest->rexmit_in_recovery)
+        {
+            _enter_recovery(delivered);
+            return;
+        }
     }
     else
     {
@@ -1740,6 +1846,10 @@ uint64_t TcpConnection::next_deadline_ms() const
         return deadline;
     }
 
+    if (_rack_reo_deadline_ms != 0)
+    {
+        deadline = std::min(deadline, _rack_reo_deadline_ms);
+    }
     for (const SentSegment& entry : _in_flight)
     {
         if (!entry.sacked)
@@ -1793,6 +1903,7 @@ void TcpConnection::_run_timers()
 
     if (_in_flight.empty())
     {
+        _rack_reo_deadline_ms = 0;
         // nothing to retransmit - but a shut peer window may have the persist
         // timer running instead. Persist and retransmit are mutually exclusive
         // (persist is only armed when _in_flight is empty), which is why this
@@ -1814,6 +1925,15 @@ void TcpConnection::_run_timers()
 
         _run_keepalive();
         return;
+    }
+
+    if (_rack_reo_deadline_ms != 0 && _now_ms >= _rack_reo_deadline_ms)
+    {
+        _on_rack_reo_timer();
+        if (_state == TcpState::CLOSED || _in_flight.empty())
+        {
+            return;
+        }
     }
 
     // Simplified go-back-one: only one segment is resent per timeout, not every
@@ -1862,10 +1982,13 @@ void TcpConnection::_run_timers()
     {
         // RFC 6675 5.1: keep using SACK information after the timeout. Every
         // unSACKed segment is presumed lost and refilled in order as acks
-        // reopen the window (see _send_queued_while_window_allows()).
+        // reopen the window (see _send_queued_while_window_allows()). That
+        // covers RFC 8985 6.3's marking too, and leaves RACK nothing to wait
+        // for.
         _in_flight.mark_all_lost();
         _rto_recovery = true;
     }
+    _rack_reo_deadline_ms = 0;
 
     // Karn's second half - the part that is easy to miss and matters as much
     // as ignoring the ambiguous sample. Having lost a segment, the estimator

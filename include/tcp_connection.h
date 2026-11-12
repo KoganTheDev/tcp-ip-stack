@@ -66,8 +66,11 @@ enum class TcpCloseReason
 // in flight and what SACK said about it), RttEstimator (RFC 6298) and
 // ReorderBuffer (out-of-order receive data). This class coordinates them.
 //
+// With SACK, loss is also detected by time (RFC 8985 RACK), which is what
+// catches a lost retransmission without a timeout.
+//
 // Still deliberately out of scope (documented, not accidental): PRR without
-// SACK, RACK-TLP, D-SACK and F-RTO - see the README.
+// SACK, D-SACK and F-RTO - see the README.
 class TcpConnection
 {
 public:
@@ -424,10 +427,13 @@ public:
         uint64_t retransmitted_segments = 0; // every resend of an in-flight segment
         uint64_t retransmit_timeouts = 0;    // RTO expiries that resent something
         uint64_t recoveries = 0;             // entries into fast recovery
+        uint64_t rack_losses = 0;            // segments RACK (RFC 8985) marked lost
     };
     const Stats& stats() const { return _stats; }
     // Scoreboard entries the sender has examined, for cost tests.
     uint64_t scoreboard_visits() const { return _in_flight.visits(); }
+    // The part of it spent by RACK.
+    uint64_t rack_visits() const { return _in_flight.rack_visits(); }
 
 private:
     void _transition(TcpState new_state);
@@ -526,6 +532,8 @@ private:
     // anything was newly marked, which is what makes a duplicate ack
     // informative rather than merely repeated.
     bool _apply_sack_blocks(const Tcp& segment);
+    // What RACK needs from this ack (see SendScoreboard::AckContext).
+    SendScoreboard::AckContext _rack_context(const Tcp& segment) const;
 
     // Bytes occupying the receive buffer: out-of-order segments waiting for a
     // gap to fill, plus in-order data the application has not read yet. What is
@@ -536,6 +544,31 @@ private:
     uint32_t _advertised_window() const;
     // Feeds one unambiguous round-trip measurement to _rtt, logging it.
     void _take_rtt_sample(uint32_t rtt_ms);
+
+    // --- RACK (RFC 8985 section 6), with SACK only ---
+    //
+    // The scoreboard holds the per-segment state and does the marking (see
+    // send_scoreboard.h); this side owns the clock-driven parts: RACK.min_RTT,
+    // the reordering window and the reordering timer.
+    //
+    // RACK.min_RTT (6.2 step 1): a windowed minimum of the raw RTT samples -
+    // the lowest in the last MIN_RTT_WINDOW_MS, so a move to a longer path is
+    // eventually believed. Raw because RttEstimator floors its input at its
+    // clock granularity, and a quarter of that floor would be a reordering
+    // window five times the real round trip on a short path.
+    uint32_t _rack_min_rtt_ms = 0;
+    uint64_t _rack_min_rtt_at_ms = 0;
+    bool _have_rack_min_rtt = false;
+    static constexpr uint64_t MIN_RTT_WINDOW_MS = 300000; // Linux's tcp_min_rtt_wlen
+    // RFC 8985 6.2 step 4, RACK_update_reo_wnd() with reo_wnd_mult fixed at
+    // 1: the window grows only on D-SACK, which this stack does not parse.
+    uint64_t _rack_reo_wnd_ms() const;
+    // Runs RACK_detect_loss() and arms or disarms the reordering timer.
+    // Returns how many segments it marked lost.
+    uint32_t _rack_detect_loss();
+    // When the reordering timer fires (RFC 8985 6.2 step 5), or 0.
+    uint64_t _rack_reo_deadline_ms = 0;
+    void _on_rack_reo_timer();
     // RFC 793 SS3.3's sequence-number acceptability test, done with unsigned
     // wraparound arithmetic (seq - _recv_next) so it's correct across a
     // sequence-number wraparound the same way real TCP's modular arithmetic
