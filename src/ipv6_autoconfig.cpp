@@ -19,7 +19,7 @@ void Ipv6Autoconfig::start()
     this->_link_local = IPv6Address::link_local_from_mac(this->_mac);
     LOG_INFO("Ipv6Autoconfig: link-local " << this->_link_local.to_string() << " derived from "
                                            << this->_mac.to_string() << " - starting DAD");
-    this->_begin_dad(this->_link_local, 64);
+    this->_begin_dad(this->_link_local, 64, INFINITE_LIFETIME, INFINITE_LIFETIME);
 
     // Solicit a router rather than waiting for its periodic advertisement,
     // which can be tens of seconds away. A host that waits comes up slowly for
@@ -48,7 +48,8 @@ bool Ipv6Autoconfig::_already_configured(const IPv6Address& address) const
     return false;
 }
 
-void Ipv6Autoconfig::_begin_dad(const IPv6Address& address, uint8_t prefix_length)
+void Ipv6Autoconfig::_begin_dad(const IPv6Address& address, uint8_t prefix_length, uint32_t valid_lifetime_s,
+                                uint32_t preferred_lifetime_s)
 {
     if (this->_already_configured(address) || this->_addresses.size() + this->_tentative.size() >= MAX_ADDRESSES)
     {
@@ -60,6 +61,8 @@ void Ipv6Autoconfig::_begin_dad(const IPv6Address& address, uint8_t prefix_lengt
     tentative.prefix_length = prefix_length;
     tentative.probes_sent = 1;
     tentative.timer_ms = RETRANS_TIMER_MS;
+    tentative.valid_lifetime_s = valid_lifetime_s;
+    tentative.preferred_lifetime_s = preferred_lifetime_s;
     this->_tentative.push_back(tentative);
 
     // Sent from the unspecified address, which is the detail that makes this a
@@ -74,7 +77,9 @@ void Ipv6Autoconfig::_finish_dad(const Tentative& tentative)
     Ipv6ConfiguredAddress configured;
     configured.address = tentative.address;
     configured.prefix_length = tentative.prefix_length;
-    configured.state = Ipv6AddressState::PREFERRED;
+    configured.state = tentative.preferred_lifetime_s == 0 ? Ipv6AddressState::DEPRECATED : Ipv6AddressState::PREFERRED;
+    configured.valid_until_ms = this->_deadline(tentative.valid_lifetime_s);
+    configured.preferred_until_ms = this->_deadline(tentative.preferred_lifetime_s);
     this->_addresses.push_back(configured);
 
     LOG_INFO("Ipv6Autoconfig: " << tentative.address.to_string() << "/" << static_cast<int>(tentative.prefix_length)
@@ -159,9 +164,9 @@ void Ipv6Autoconfig::on_router_advertisement(const IPv6Address& router, const Ic
             // out by DHCPv6.
             continue;
         }
-        if (prefix.valid_lifetime == 0)
+        if (prefix.prefix.is_link_local() || prefix.preferred_lifetime > prefix.valid_lifetime)
         {
-            continue; // being withdrawn rather than offered
+            continue; // RFC 4862 5.5.3 (b), (c)
         }
         if (prefix.prefix_length != 64)
         {
@@ -187,10 +192,24 @@ void Ipv6Autoconfig::on_router_advertisement(const IPv6Address& router, const Ic
         }
 
         IPv6Address global(bytes);
+        auto existing = std::find_if(this->_addresses.begin(), this->_addresses.end(),
+                                     [&global](const Ipv6ConfiguredAddress& a) { return a.address == global; });
+        if (existing != this->_addresses.end())
+        {
+            if (existing->state != Ipv6AddressState::DUPLICATE)
+            {
+                this->_refresh_lifetimes(*existing, prefix.valid_lifetime, prefix.preferred_lifetime);
+            }
+            continue;
+        }
+        if (prefix.valid_lifetime == 0)
+        {
+            continue; // being withdrawn rather than offered
+        }
         if (!this->_already_configured(global))
         {
             LOG_INFO("Ipv6Autoconfig: forming " << global.to_string() << " from the advertised prefix - starting DAD");
-            this->_begin_dad(global, prefix.prefix_length);
+            this->_begin_dad(global, prefix.prefix_length, prefix.valid_lifetime, prefix.preferred_lifetime);
         }
     }
 }
@@ -200,6 +219,30 @@ void Ipv6Autoconfig::on_time_passed(uint32_t elapsed_ms)
     // Collected first: _finish_dad and _abandon both mutate _tentative, and
     // doing that while iterating it invalidates the iterator underneath.
     std::vector<Tentative> completed;
+    this->_clock_ms += elapsed_ms;
+
+    // RFC 4862 5.5.4: deprecated when the preferred lifetime runs out,
+    // removed when the valid one does.
+    for (auto it = this->_addresses.begin(); it != this->_addresses.end();)
+    {
+        if (it->state == Ipv6AddressState::DUPLICATE)
+        {
+            ++it;
+            continue;
+        }
+        if (this->_clock_ms >= it->valid_until_ms)
+        {
+            LOG_INFO("Ipv6Autoconfig: " << it->address.to_string() << " reached its valid lifetime - removed");
+            it = this->_addresses.erase(it);
+            continue;
+        }
+        if (it->state == Ipv6AddressState::PREFERRED && this->_clock_ms >= it->preferred_until_ms)
+        {
+            LOG_INFO("Ipv6Autoconfig: " << it->address.to_string() << " is deprecated");
+            it->state = Ipv6AddressState::DEPRECATED;
+        }
+        ++it;
+    }
 
     for (auto it = this->_tentative.begin(); it != this->_tentative.end();)
     {
@@ -255,6 +298,28 @@ void Ipv6Autoconfig::on_time_passed(uint32_t elapsed_ms)
 NextTimer Ipv6Autoconfig::ms_until_next_timer() const
 {
     NextTimer next;
+    auto fold_deadline = [this, &next](uint64_t deadline)
+    {
+        if (deadline == Ipv6ConfiguredAddress::FOREVER)
+        {
+            return;
+        }
+        fold_next_timer(next, deadline > this->_clock_ms
+                                  ? static_cast<int64_t>(std::min<uint64_t>(deadline - this->_clock_ms, UINT32_MAX))
+                                  : 0);
+    };
+    for (const Ipv6ConfiguredAddress& address : this->_addresses)
+    {
+        if (address.state == Ipv6AddressState::DUPLICATE)
+        {
+            continue;
+        }
+        fold_deadline(address.valid_until_ms);
+        if (address.state == Ipv6AddressState::PREFERRED)
+        {
+            fold_deadline(address.preferred_until_ms);
+        }
+    }
     for (const Tentative& tentative : this->_tentative)
     {
         fold_next_timer(next, tentative.timer_ms);
@@ -300,4 +365,40 @@ bool Ipv6Autoconfig::is_tentative(const IPv6Address& address) const
 {
     return std::any_of(this->_tentative.begin(), this->_tentative.end(),
                        [&address](const Tentative& t) { return t.address == address; });
+}
+
+uint64_t Ipv6Autoconfig::_deadline(uint32_t lifetime_s) const
+{
+    if (lifetime_s == INFINITE_LIFETIME)
+    {
+        return Ipv6ConfiguredAddress::FOREVER;
+    }
+    return this->_clock_ms + static_cast<uint64_t>(lifetime_s) * 1000;
+}
+
+void Ipv6Autoconfig::_refresh_lifetimes(Ipv6ConfiguredAddress& address, uint32_t valid_lifetime_s,
+                                        uint32_t preferred_lifetime_s)
+{
+    // The preferred lifetime is simply reset (5.5.3 (e) first bullet).
+    address.preferred_until_ms = this->_deadline(preferred_lifetime_s);
+    address.state = preferred_lifetime_s == 0 ? Ipv6AddressState::DEPRECATED : Ipv6AddressState::PREFERRED;
+
+    // The valid lifetime may grow freely, but RAs are unauthenticated, so one
+    // may not cut it below two hours - or a single forged RA with lifetime 0
+    // would strip every host on the link of its address.
+    const uint64_t two_hours_ms = static_cast<uint64_t>(MIN_VALID_LIFETIME_CUT_S) * 1000;
+    const uint64_t remaining = address.valid_until_ms == Ipv6ConfiguredAddress::FOREVER
+                                   ? UINT64_MAX
+                                   : address.valid_until_ms - this->_clock_ms;
+    const uint64_t advertised =
+        valid_lifetime_s == INFINITE_LIFETIME ? UINT64_MAX : static_cast<uint64_t>(valid_lifetime_s) * 1000;
+    if (advertised > two_hours_ms || advertised > remaining)
+    {
+        address.valid_until_ms = this->_deadline(valid_lifetime_s);
+    }
+    else if (remaining > two_hours_ms)
+    {
+        address.valid_until_ms = this->_clock_ms + two_hours_ms;
+    }
+    // else: two hours or less remain - the RA is ignored for this address.
 }

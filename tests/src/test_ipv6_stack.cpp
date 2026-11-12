@@ -707,3 +707,90 @@ TEST(Ipv6Stack, AnAdvertisementWithoutTargetLinkLayerAddressReleasesNothing)
     EXPECT_EQ(host.stack->ipv6_pending_packets(), 1u);
     EXPECT_EQ(host.stack->neighbour_cache()->state_of(PEER), NeighbourState::INCOMPLETE);
 }
+
+namespace
+{
+    // An RA from ROUTER_LL offering `prefix`/64 for SLAAC with the given
+    // lifetimes, in seconds.
+    void advertise_prefix(Host& host, const IPv6Address& prefix, uint32_t valid, uint32_t preferred)
+    {
+        Bytes ra = router_advertisement_body(0, ROUTER_MAC);
+        ra.append_int<uint8_t>(NDP_OPTION_PREFIX_INFORMATION);
+        ra.append_int<uint8_t>(4);
+        ra.append_int<uint8_t>(64);
+        ra.append_int<uint8_t>(0x40); // A only
+        ra.append_int<uint32_t>(valid);
+        ra.append_int<uint32_t>(preferred);
+        ra.append_int<uint32_t>(0);
+        ra |= prefix.get_address();
+        host.deliver(icmpv6_packet(ROUTER_LL, IPv6Address::all_nodes_multicast(), ICMPV6_ROUTER_ADVERTISEMENT, ra),
+                     IPv6Address::all_nodes_multicast().multicast_mac(), ROUTER_MAC);
+    }
+
+    std::optional<Ipv6AddressState> state_in_stack(const NetworkStack& stack, const IPv6Address& address)
+    {
+        for (const Ipv6ConfiguredAddress& configured : stack.ipv6_addresses())
+            if (configured.address == address)
+                return configured.state;
+        return std::nullopt;
+    }
+
+    const IPv6Address SLAAC_PREFIX("2001:db8:5::");
+    const IPv6Address SLAAC_ADDRESS("2001:db8:5::ff:fe00:a");
+    constexpr uint32_t TWO_HOURS_S = 7200;
+}
+
+// Security review: RAs filled the same slots add_ipv6_address() uses.
+TEST(Ipv6Stack, SlaacHasItsOwnCapAndCannotTakeStaticSlots)
+{
+    Host host;
+    host.stack->enable_ipv6();
+    host.stack->on_time_passed(1000);
+    for (int p = 0; p < 20; p++)
+    {
+        Bytes prefix = SLAAC_PREFIX.get_address();
+        prefix[5] = static_cast<byte_t>(p + 1);
+        advertise_prefix(host, IPv6Address(prefix), 86400, 86400);
+    }
+    host.stack->on_time_passed(1000);
+    for (size_t i = 0; i < NetworkStack::MAX_IPV6_ADDRESSES; i++)
+    {
+        Bytes address = LOCAL.get_address();
+        address[15] = static_cast<byte_t>(i + 1);
+        EXPECT_TRUE(host.stack->add_ipv6_address(IPv6Address(address))) << "static slot " << i;
+    }
+}
+
+// RFC 4862 5.5.4: deprecated at preferred expiry, gone at valid expiry.
+TEST(Ipv6Stack, SlaacAddressesDeprecateAndExpireOnTheirLifetimes)
+{
+    Host host;
+    host.stack->enable_ipv6();
+    host.stack->on_time_passed(1000);
+    advertise_prefix(host, SLAAC_PREFIX, 20, 10);
+    host.stack->on_time_passed(1000); // DAD
+    ASSERT_EQ(state_in_stack(*host.stack, SLAAC_ADDRESS), Ipv6AddressState::PREFERRED);
+
+    host.stack->on_time_passed(10000);
+    EXPECT_EQ(state_in_stack(*host.stack, SLAAC_ADDRESS), Ipv6AddressState::DEPRECATED);
+    host.stack->on_time_passed(10000);
+    EXPECT_EQ(state_in_stack(*host.stack, SLAAC_ADDRESS), std::nullopt) << "removed at valid-lifetime expiry";
+}
+
+// RFC 4862 5.5.3(e): an unauthenticated RA may not cut the remaining valid
+// lifetime below two hours - otherwise one forged RA withdraws every address.
+TEST(Ipv6Stack, AnRaCannotCutTheValidLifetimeBelowTwoHours)
+{
+    Host host;
+    host.stack->enable_ipv6();
+    host.stack->on_time_passed(1000);
+    advertise_prefix(host, SLAAC_PREFIX, 3 * 3600, 3 * 3600);
+    host.stack->on_time_passed(1000);
+    ASSERT_TRUE(state_in_stack(*host.stack, SLAAC_ADDRESS).has_value());
+
+    advertise_prefix(host, SLAAC_PREFIX, 0, 0); // a forged withdrawal
+    host.stack->on_time_passed(3600 * 1000);
+    EXPECT_TRUE(state_in_stack(*host.stack, SLAAC_ADDRESS).has_value()) << "still valid an hour later";
+    host.stack->on_time_passed((TWO_HOURS_S - 3600) * 1000 + 1000);
+    EXPECT_FALSE(state_in_stack(*host.stack, SLAAC_ADDRESS).has_value()) << "but no longer than two hours";
+}

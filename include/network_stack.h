@@ -401,8 +401,10 @@ public:
     // if MAX_IPV6_ADDRESSES are already configured.
     bool add_ipv6_address(const IPv6Address& address, uint8_t prefix_length = 64);
     bool ipv6_enabled() const { return _v6.enabled; }
-    // The addresses this host may use and answers for (DAD passed, or static).
-    const std::vector<Ipv6ConfiguredAddress>& ipv6_addresses() const { return _v6.addresses; }
+    // The addresses this host may use and answers for: static ones, then
+    // SLAAC ones that passed DAD and whose valid lifetime has not run out
+    // (PREFERRED, or DEPRECATED - still answered for, not chosen as a source).
+    std::vector<Ipv6ConfiguredAddress> ipv6_addresses() const;
     // Null unless enable_ipv6() was called.
     const Ipv6Autoconfig* ipv6_autoconfig() const { return _v6.autoconfig.get(); }
     // Null until IPv6 is on.
@@ -433,7 +435,7 @@ public:
     // full; existing ones age out on their advertised lifetimes.
     // NeighbourCache::MAX_ENTRIES and Ipv6Autoconfig::MAX_ADDRESSES bound those
     // two components the same way.
-    static constexpr size_t MAX_IPV6_ADDRESSES = 16;
+    static constexpr size_t MAX_IPV6_ADDRESSES = 16; // static; SLAAC has Ipv6Autoconfig::MAX_ADDRESSES
     static constexpr size_t MAX_IPV6_ON_LINK_PREFIXES = 16;
     static constexpr size_t MAX_IPV6_DEFAULT_ROUTERS = 4;
     static constexpr size_t MAX_IPV6_PENDING_PER_NEIGHBOUR = 16;
@@ -916,7 +918,7 @@ private:
         bool enabled = false;
         std::unique_ptr<NeighbourCache> neighbours;
         std::unique_ptr<Ipv6Autoconfig> autoconfig;
-        std::vector<Ipv6ConfiguredAddress> addresses;
+        std::vector<Ipv6ConfiguredAddress> addresses; // static only; SLAAC's live in autoconfig
         std::vector<Ipv6Route> on_link;
         std::vector<Ipv6Router> routers;
         // Whole IPv6 packets, built and checksummed, waiting for their next

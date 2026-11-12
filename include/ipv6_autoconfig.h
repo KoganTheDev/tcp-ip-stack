@@ -18,6 +18,9 @@ enum class Ipv6AddressState
     TENTATIVE,
     // Unique as far as anyone answered, and usable.
     PREFERRED,
+    // Its preferred lifetime ran out (RFC 4862 5.5.4): still valid, and still
+    // answered for, but not chosen as the source of anything new.
+    DEPRECATED,
     // Somebody else already has it. Abandoned rather than retried, because
     // retrying the same address would collide the same way.
     DUPLICATE,
@@ -28,6 +31,11 @@ struct Ipv6ConfiguredAddress
     IPv6Address address;
     uint8_t prefix_length = 64;
     Ipv6AddressState state = Ipv6AddressState::TENTATIVE;
+    // On the owner's clock (Ipv6Autoconfig's for SLAAC). The link-local and
+    // static addresses never expire.
+    static constexpr uint64_t FOREVER = UINT64_MAX;
+    uint64_t preferred_until_ms = FOREVER;
+    uint64_t valid_until_ms = FOREVER;
 };
 
 // Duplicate address detection (RFC 4862 section 5.4) and stateless address
@@ -128,7 +136,13 @@ public:
     static constexpr int ROUTER_SOLICITATION_INTERVAL_MS = 4000;
     static constexpr int MAX_ROUTER_SOLICITATIONS = 3;
     // Bounded: prefixes arrive from the link, and each one becomes an address.
+    // Its own cap, apart from NetworkStack's for static addresses, so RAs can
+    // never take the slots add_ipv6_address() needs.
     static constexpr size_t MAX_ADDRESSES = 8;
+    // RFC 4862 5.5.3(e): how far an unauthenticated RA may cut an address's
+    // remaining valid lifetime.
+    static constexpr uint32_t MIN_VALID_LIFETIME_CUT_S = 2 * 60 * 60;
+    static constexpr uint32_t INFINITE_LIFETIME = 0xffffffff;
 
 private:
     struct Tentative
@@ -137,9 +151,16 @@ private:
         uint8_t prefix_length;
         int probes_sent;
         int timer_ms;
+        uint32_t valid_lifetime_s;
+        uint32_t preferred_lifetime_s;
     };
 
-    void _begin_dad(const IPv6Address& address, uint8_t prefix_length);
+    void _begin_dad(const IPv6Address& address, uint8_t prefix_length, uint32_t valid_lifetime_s,
+                    uint32_t preferred_lifetime_s);
+    // RFC 4862 5.5.3(e): an RA for a prefix we already formed an address from.
+    void _refresh_lifetimes(Ipv6ConfiguredAddress& address, uint32_t valid_lifetime_s, uint32_t preferred_lifetime_s);
+    uint64_t _deadline(uint32_t lifetime_s) const;
+    uint64_t _clock_ms = 0;
     void _finish_dad(const Tentative& tentative);
     void _abandon(const IPv6Address& address);
     bool _already_configured(const IPv6Address& address) const;

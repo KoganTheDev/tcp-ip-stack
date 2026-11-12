@@ -128,15 +128,8 @@ void NetworkStack::enable_ipv6()
     this->_v6.autoconfig = std::make_unique<Ipv6Autoconfig>(
         this->_primary().config.mac, [this](const IPv6Address& target) { this->_send_dad_probe(target); },
         [this]() { this->_send_router_solicitation(); });
-    this->_v6.autoconfig->set_address_ready_callback(
-        [this](const IPv6Address& address, uint8_t prefix_length)
-        {
-            if (this->_is_our_ipv6(address) || this->_v6.addresses.size() >= MAX_IPV6_ADDRESSES)
-            {
-                return;
-            }
-            this->_v6.addresses.push_back({address, prefix_length, Ipv6AddressState::PREFERRED});
-        });
+    // SLAAC addresses stay in Ipv6Autoconfig, which owns their lifetimes and
+    // its own cap; _v6.addresses holds only static ones.
     this->_v6.autoconfig->start();
 }
 
@@ -153,7 +146,7 @@ bool NetworkStack::add_ipv6_address(const IPv6Address& address, uint8_t prefix_l
     }
     if (this->_v6.addresses.size() >= MAX_IPV6_ADDRESSES)
     {
-        return false;
+        return false; // static slots only: SLAAC counts against its own cap
     }
     this->_v6.addresses.push_back({address, prefix_length, Ipv6AddressState::PREFERRED});
 
@@ -168,9 +161,26 @@ bool NetworkStack::add_ipv6_address(const IPv6Address& address, uint8_t prefix_l
     return true;
 }
 
+std::vector<Ipv6ConfiguredAddress> NetworkStack::ipv6_addresses() const
+{
+    std::vector<Ipv6ConfiguredAddress> usable = this->_v6.addresses;
+    if (this->_v6.autoconfig)
+    {
+        for (const Ipv6ConfiguredAddress& configured : this->_v6.autoconfig->addresses())
+        {
+            if (configured.state == Ipv6AddressState::PREFERRED || configured.state == Ipv6AddressState::DEPRECATED)
+            {
+                usable.push_back(configured);
+            }
+        }
+    }
+    return usable;
+}
+
 bool NetworkStack::_is_our_ipv6(const IPv6Address& address) const
 {
-    return std::any_of(this->_v6.addresses.begin(), this->_v6.addresses.end(),
+    const std::vector<Ipv6ConfiguredAddress> usable = this->ipv6_addresses();
+    return std::any_of(usable.begin(), usable.end(),
                        [&address](const Ipv6ConfiguredAddress& a) { return a.address == address; });
 }
 
@@ -180,7 +190,7 @@ bool NetworkStack::_ipv6_group_joined(const IPv6Address& group) const
     {
         return true;
     }
-    for (const Ipv6ConfiguredAddress& configured : this->_v6.addresses)
+    for (const Ipv6ConfiguredAddress& configured : this->ipv6_addresses())
     {
         if (configured.address.solicited_node_multicast() == group)
         {
@@ -206,7 +216,8 @@ std::optional<IPv6Address> NetworkStack::_ipv6_source_for(const IPv6Address& des
     std::optional<IPv6Address> link_local;
     std::optional<IPv6Address> global;
     size_t best_match = 0;
-    for (const Ipv6ConfiguredAddress& configured : this->_v6.addresses)
+    bool global_deprecated = false;
+    for (const Ipv6ConfiguredAddress& configured : this->ipv6_addresses())
     {
         if (configured.address.is_link_local())
         {
@@ -222,10 +233,14 @@ std::optional<IPv6Address> NetworkStack::_ipv6_source_for(const IPv6Address& des
         {
             match++;
         }
-        if (!global || match > best_match)
+        // RFC 6724 rule 3 before rule 8: a deprecated address only when
+        // nothing preferred is left.
+        bool deprecated = configured.state == Ipv6AddressState::DEPRECATED;
+        if (!global || (global_deprecated && !deprecated) || (deprecated == global_deprecated && match > best_match))
         {
             global = configured.address;
             best_match = match;
+            global_deprecated = deprecated;
         }
     }
     if (link_scope)
@@ -878,7 +893,7 @@ void NetworkStack::_send_router_solicitation()
     // and only with a source address may the SLLA option ride along (RFC 4861
     // 4.1).
     std::optional<IPv6Address> link_local;
-    for (const Ipv6ConfiguredAddress& configured : this->_v6.addresses)
+    for (const Ipv6ConfiguredAddress& configured : this->ipv6_addresses())
     {
         if (configured.address.is_link_local())
         {

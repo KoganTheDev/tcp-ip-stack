@@ -506,9 +506,10 @@ namespace ustack
         {
             return fail(EINVAL); // a v4-mapped address on an IPv6-only socket
         }
+        const std::vector<Ipv6ConfiguredAddress> v6_addresses = _stack.ipv6_addresses();
         bool local = ip.is_v4() ? ip.v4() == IPv4Address() || ip.v4() == _stack.interface_config().ip
                                 : ip.v6().is_unspecified()
-                                      || std::any_of(_stack.ipv6_addresses().begin(), _stack.ipv6_addresses().end(),
+                                      || std::any_of(v6_addresses.begin(), v6_addresses.end(),
                                                      [&ip](const Ipv6ConfiguredAddress& configured)
                                                      { return configured.address == ip.v6(); });
         if (!local)
