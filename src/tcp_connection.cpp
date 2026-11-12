@@ -976,9 +976,11 @@ void TcpConnection::_tlp_process_ack(uint32_t ack, bool pure_dup_ack)
     {
         return;
     }
-    if (!_tlp_is_retrans)
+    // A probe of new data was delivered, or (a duplicate ack without SACK)
+    // both copies of a retransmitted one arrived: either way, no loss.
+    if (!_tlp_is_retrans || pure_dup_ack)
     {
-        _tlp_outstanding = false; // a probe of new data was delivered
+        _tlp_outstanding = false;
     }
     else if (seq_before(_tlp_end_seq, ack))
     {
@@ -994,10 +996,6 @@ void TcpConnection::_tlp_process_ack(uint32_t ack, bool pure_dup_ack)
             _congestion->on_recovery_end();
             _note_window_reduced();
         }
-    }
-    else if (pure_dup_ack)
-    {
-        _tlp_outstanding = false; // both copies arrived: there was no loss
     }
 }
 
