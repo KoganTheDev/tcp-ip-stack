@@ -22,6 +22,18 @@ enum IpFlag : uint8_t
     IP_FLAG_MORE_FRAGMENTS = 0x20, // MF
 };
 
+// RFC 3168 section 5: the ECN field, the low two bits of the old TOS octet
+// (the six above them are DSCP, RFC 2474). ECT(0) and ECT(1) say the
+// transport will react to congestion marks; a congested router may then set
+// CE instead of dropping the packet.
+enum class Ecn : uint8_t
+{
+    NOT_ECT = 0,
+    ECT_1 = 1,
+    ECT_0 = 2,
+    CE = 3,
+};
+
 class Ip : public ProtocolLayer
 {
 public:
@@ -55,6 +67,11 @@ public:
     uint8_t get_version() const { return _version; }
     uint8_t get_IHL() const { return _ihl; }
     uint8_t get_type_of_service() const { return _tos; }
+    // The ECN field (see Ecn); setting it leaves DSCP as it was. Like TTL,
+    // the header checksum covers it, so compute_checksum() comes after.
+    Ecn get_ecn() const { return static_cast<Ecn>(_tos & ECN_MASK); }
+    void set_ecn(Ecn ecn) { _tos = static_cast<uint8_t>((_tos & ~ECN_MASK) | static_cast<uint8_t>(ecn)); }
+    static constexpr uint8_t ECN_MASK = 0x03;
     uint16_t get_total_length() const { return _total_length; }
     uint16_t get_identification() const { return _identification; }
     uint8_t get_ip_flags() const { return _flags; }

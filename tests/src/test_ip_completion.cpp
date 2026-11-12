@@ -347,6 +347,25 @@ TEST(IpCompletion, AnUnknownProtocolIsForwardedUnchanged)
     expect_relayed_unchanged(s, ip_frame(PEER_IP, BEHIND_US, 64, 253, Bytes::from_hex("deadbeefcafe")), "protocol 253");
 }
 
+// RFC 3168 section 5: a router that is not itself congested passes the ECN
+// field on as it found it - a CE mark made upstream must reach the
+// receiver, and an ECT codepoint must stay markable downstream. The
+// forwarding path copies the header byte for byte, TOS included.
+TEST(IpCompletion, ForwardingKeepsTheTosByteAndItsEcnField)
+{
+    Stack s = make_router();
+    Bytes frame = ip_frame(PEER_IP, BEHIND_US, 64, 253, Bytes::from_hex("deadbeef"));
+    frame[ETH + 1] = 0xBB; // DSCP 46 with CE
+    frame[ETH + 10] = 0;
+    frame[ETH + 11] = 0;
+    uint16_t checksum = internet_checksum(frame.slice(ETH, 20));
+    frame[ETH + 10] = static_cast<byte_t>(checksum >> 8);
+    frame[ETH + 11] = static_cast<byte_t>(checksum & 0xff);
+    expect_relayed_unchanged(s, frame, "a CE-marked packet");
+    Bytes out = ip_packet_to(s.second->outbound_frames(), BEHIND_US);
+    ASSERT_EQ(out[1], 0xBB);
+}
+
 TEST(IpCompletion, ATcpSegmentWithUnmodelledOptionsIsForwardedUnchanged)
 {
     Stack s = make_router();

@@ -146,3 +146,26 @@ TEST(Ip, AHeaderWithOptionsVerifiesAndRoundTrips)
     ASSERT_TRUE(parsed.verify_checksum()) << "a correct checksum over a 24-byte header must verify";
     ASSERT_TRUE(parsed.to_bytes() == header) << "serializing must reproduce the options, or IHL and the bytes disagree";
 }
+
+// RFC 3168 section 5: the ECN field is the low two bits of the old TOS
+// octet, under the six DSCP bits. Reading or writing it must leave DSCP
+// alone.
+TEST(Ip, TheEcnFieldIsTheLowTwoBitsOfTheTosOctet)
+{
+    Ip ip(4, 5, 0xB8, 20, 0x1234, 0, 0, 64, ISOLATED_PROTOCOL, 0, IPv4Address("10.0.0.1").get_address(),
+          IPv4Address("10.0.0.2").get_address());
+    ASSERT_TRUE(ip.get_ecn() == Ecn::NOT_ECT);
+    ip.set_ecn(Ecn::ECT_0);
+    ip.compute_checksum();
+    Bytes wire = ip.to_bytes();
+    ASSERT_EQ(wire[1], 0xBA) << "DSCP 46 (EF) kept, ECT(0) = 10 in the low bits";
+    wire[1] = 0xBB; // a router marks it CE
+    wire[10] = 0;
+    wire[11] = 0;
+    uint16_t checksum = internet_checksum(wire.slice(0, 20));
+    wire[10] = static_cast<byte_t>(checksum >> 8);
+    wire[11] = static_cast<byte_t>(checksum & 0xff);
+    Ip parsed(wire);
+    ASSERT_TRUE(parsed.get_ecn() == Ecn::CE);
+    ASSERT_EQ(parsed.get_type_of_service(), 0xBB);
+}
