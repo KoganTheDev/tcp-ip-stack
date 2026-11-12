@@ -63,10 +63,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang-tidy cmake ninja-build
       - name: Configure (writes build/debug/compile_commands.json)
         run: cmake --preset debug
-      - name: Run clang-tidy over the stack and epoll-server
+      - name: Run clang-tidy over the stack, epoll-server and loadgen
         run: |
           run-clang-tidy -p build/debug -j"$(nproc)" -quiet \
-            '^(?!.*/tests/).*/(src|epoll-server/src)/[^/]*\.cpp$'
+            '^(?!.*/tests/).*/(src|epoll-server/src|tools/loadgen)/[^/]*\.cpp$'
 
   # A second, independent analyzer. cppcheck reasons about values across
   # statements differently from clang's checks and has caught things in

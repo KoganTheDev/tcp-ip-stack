@@ -547,6 +547,49 @@ default seccomp profile the `personality()` syscall is blocked, so run it with:
 docker run --security-opt seccomp=unconfined ...
 ```
 
+### Load testing
+
+`tools/loadgen` (built as `build/<preset>/loadgen`) is an epoll-driven echo client over the
+kernel's sockets: C connections at a target rate (`--rate`) and concurrency, payloads of
+`--size` bytes verified byte for byte, `--rounds` round trips per connection, N threads, or
+`--duration S` for a sustained run. It prints connections/s, verified throughput, connect and
+round-trip latency (p50/p90/p99/p99.9/max, log buckets about 3% wide) and errors by type
+(refused, timeout, reset, early EOF, echo mismatch), as text or `--json`, and exits nonzero on
+any failure. Unprivileged, against the kernel build of the server on loopback:
+
+```sh
+make -C epoll-server KERNEL=1 && ./epoll-server/epoll-server-kernel --port 18080 &
+./build/debug/loadgen --port 18080 --connections 200 --concurrency 100 --size 4096 --rounds 5 --threads 2
+```
+
+Against the real stack, `sudo scripts/loadtest_netns.sh` runs epoll-server on a veth pair
+with loadgen in the peer namespace (a burst, a sustained run, and one under `tc netem` loss and
+delay) and writes JSON reports; the nightly workflow runs it and uploads them.
+
+### Soak test
+
+`tests/src/test_soak.cpp` keeps a `ustack::Stack` EchoServer and a client stack alive for two
+virtual hours over a lossy, reordering, corrupting link while clients churn (echoes,
+half-closes, resets, abandoned and idle connections, connects to a dead host, UDP to a closed
+port, unanswered DNS), then stops and requires the resources back at baseline: both
+connection tables, the timer heap, accept queues, UDP/resolver/ARP state and the server's
+connection list empty, no growth between the first and last third of the run in table sizes,
+reorder buffers or heap. It reads those private tables through `tests/include/sim/stack_probe.h`,
+which needs no change to the stack. Event-driven time makes it about 45 s of real time.
+`make soak` runs it (`SOAK_SEED`, `SOAK_MINUTES` vary it; ctest label `soak`), the nightly
+workflow runs it with a rotating seed, and a two-minute `SoakSmoke` version is part of `make test`.
+
+### Mutation testing
+
+`make mutation` rebuilds the unit tests with clang and [Mull](https://mull.readthedocs.io)'s
+plugin on `tcp_connection`, `send_scoreboard`, `reorder_buffer`, `ip` and `dns`, then runs the
+suite once per mutant (a flipped comparison, `+` turned into `-`, ...). A surviving mutant is
+a behaviour no test pins down. It needs `clang++-19` and the `mull-19` package from Mull's apt
+repository (the plugin must match the compiler's LLVM exactly). It is slow, so it runs
+nightly, publishes the mutation score in the job summary and uploads the report; there is no
+threshold. The job and target were written from Mull's documentation and could not be run
+where they were written, so the first nightly is also their first test.
+
 ### Verified against a real kernel
 
 Unit tests are necessary but not sufficient here, and this project has a concrete

@@ -1,0 +1,9 @@
+# Mull's configuration (https://mull.readthedocs.io), read by mull-runner from
+# the directory it is run in. Which files are mutated at all is decided at
+# compile time (CMakeLists.txt, TCPIP_MULL_PLUGIN); this narrows what is
+# reported, and keeps mutants out of anything pulled in from headers.
+includePaths:
+  - '.*/src/(tcp_connection|send_scoreboard|reorder_buffer|ip|dns)\.cpp$'
+excludePaths:
+  - '.*/tests/.*'
+  - '^/usr/.*'

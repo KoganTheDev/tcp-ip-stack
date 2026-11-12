@@ -64,6 +64,22 @@ add_library(tcpip STATIC ${STACK_SOURCES})
 target_include_directories(tcpip PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(tcpip PUBLIC project_options)
 
+# Mutation testing with Mull (`make mutation`, the `mutation` preset). Mull is an
+# LLVM pass plugin matched to one clang version; it embeds every mutant in the
+# object it compiles, so only the files being mutation-tested get it - the
+# tests and the rest of the stack are compiled normally, which keeps the
+# binary small and the run short. mull.yml says which of these the report is
+# about. -grecord-command-line is what lets mull-runner find each object's
+# compile command; it only works when files are compiled one per command,
+# which CMake does.
+set(TCPIP_MULL_PLUGIN "" CACHE FILEPATH "Path to Mull's clang plugin (/usr/lib/mull-ir-frontend-N); empty = no mutation build")
+if(TCPIP_MULL_PLUGIN)
+    foreach(mutated tcp_connection send_scoreboard reorder_buffer ip dns)
+        set_property(SOURCE ${PROJECT_SOURCE_DIR}/src/${mutated}.cpp APPEND PROPERTY COMPILE_OPTIONS
+            -fpass-plugin=${TCPIP_MULL_PLUGIN} -g -grecord-command-line)
+    endforeach()
+endif()
+
 if(TCPIP_BUILD_TESTS OR TCPIP_BUILD_APPS)
 # --- The testable part of epoll-server --------------------------------------
 # Named explicitly rather than globbed: the rest of that program (server.cpp,

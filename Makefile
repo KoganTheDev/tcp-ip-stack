@@ -21,6 +21,8 @@
 #                     of them (default 200), sharded over SIM_JOBS processes
 #   make soak       - the two-virtual-hour churn test (tests/src/test_soak.cpp):
 #                     tables, timers and heap must stay flat; about a minute
+#   make mutation  - Mull mutation testing of five stack files against the unit
+#                     tests (clang, and Mull's plugin installed; slow, nightly)
 #   make asan       - full rebuild, then run the suite under ASan + UBSan
 #   make tsan       - full rebuild, then run the suite under ThreadSanitizer
 #   make strict     - build everything with -Wextra -Werror, then run the suite
@@ -102,6 +104,35 @@ SOAK_SEED ?= 1
 
 soak: all
 	SOAK=1 SOAK_VIRTUAL_MINUTES=$(SOAK_MINUTES) SOAK_SEED=$(SOAK_SEED) ./build/debug/run_tests --gtest_filter='Soak.*'
+
+# Mutation testing with Mull (https://mull.readthedocs.io): the plugin makes
+# clang embed mutants (a flipped comparison, a + turned into a -) in the files
+# named in CMakeLists.txt (tcp_connection, send_scoreboard, reorder_buffer, ip,
+# dns), and mull-runner runs the unit tests once per mutant. A mutant the tests
+# still pass on survived: a behaviour no test pins down. The score is the share
+# killed. There is deliberately no threshold - it is a map of where the tests
+# are thin, not a gate - so survivors are not an error.
+#
+# Needs clang++-$(MULL_VERSION) and Mull's matching package (mull-$(MULL_VERSION)
+# from the Mull apt repository; its plugin must be built for exactly that LLVM).
+# Always a from-scratch build, for the same reason as the sanitizers: objects
+# compiled without the plugin have no mutants in them. The simulator's property
+# tests are left out (each mutant would pay for 200 seeds) and the report
+# lands in build/mutation/mull-report. MULL_RUNNER_ARGS adds mull-runner flags.
+MULL_VERSION ?= 19
+MULL_PLUGIN ?= /usr/lib/mull-ir-frontend-$(MULL_VERSION)
+MULL_RUNNER ?= $(shell command -v mull-runner-$(MULL_VERSION) || echo mull-runner)
+MULL_WORKERS ?= $(shell nproc 2>/dev/null || echo 1)
+MULL_RUNNER_ARGS ?=
+
+mutation:
+	rm -rf build/mutation
+	$(CMAKE) --preset mutation -DCMAKE_CXX_COMPILER=clang++-$(MULL_VERSION) -DTCPIP_MULL_PLUGIN=$(MULL_PLUGIN)
+	$(CMAKE) --build --preset mutation --target run_tests
+	mkdir -p build/mutation/mull-report
+	$(MULL_RUNNER) ./build/mutation/run_tests --reporters IDE --reporters Elements \
+	    --report-dir build/mutation/mull-report --workers $(MULL_WORKERS) --allow-surviving \
+	    $(MULL_RUNNER_ARGS) --gtest_filter='-*SimTransfer*:Soak.*' | tee build/mutation/mull-report/mull.log
 
 # Configure a preset the first time it is used, and again whenever the presets
 # file changes (re-running `cmake --preset` re-applies its cache variables).
@@ -272,4 +303,4 @@ clean:
 	rm -rf build bin tests/bin
 	rm -f run_tests tcpipstack
 
-.PHONY: all run_tests test sim soak asan tsan strict coverage fuzz fuzz-seeds bench clean
+.PHONY: all run_tests test sim soak mutation asan tsan strict coverage fuzz fuzz-seeds bench clean

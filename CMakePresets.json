@@ -87,6 +87,17 @@
       }
     },
     {
+      "name": "mutation",
+      "inherits": "base",
+      "displayName": "Mutation testing (clang + Mull)",
+      "description": "Debug build with clang, unoptimised so mutants are not folded away; Mull's plugin is added to the files under test when TCPIP_MULL_PLUGIN is set (`make mutation` does). No compiler launcher: a compiler cache and a pass plugin do not mix.",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_CXX_COMPILER_LAUNCHER": "",
+        "TCPIP_BUILD_APPS": "OFF"
+      }
+    },
+    {
       "name": "bench",
       "inherits": "base",
       "displayName": "Benchmarks (Release, -O2 -g)",
@@ -132,6 +143,10 @@
     {
       "name": "bench",
       "configurePreset": "bench"
+    },
+    {
+      "name": "mutation",
+      "configurePreset": "mutation"
     }
   ],
   "testPresets": [

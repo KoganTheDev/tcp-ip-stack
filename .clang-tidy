@@ -1,6 +1,6 @@
 # Static analysis for tcp-ip-stack. Run with:
 #   run-clang-tidy -p <dir containing compile_commands.json> \
-#       '^(?!.*/tests/).*/(src|epoll-server/src)/[^/]*\.cpp$'
+#       '^(?!.*/tests/).*/(src|epoll-server/src|tools/loadgen)/[^/]*\.cpp$'
 #
 # The compile database must have exactly one entry per file. Appending
 # epoll-server's build to the root one with `bear --append` also records its

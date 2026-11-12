@@ -82,6 +82,59 @@ jobs:
           echo "soak seed: $SOAK_SEED"
           make soak
 
+  # Mutation testing with Mull on five stack files (tcp_connection,
+  # send_scoreboard, reorder_buffer, ip, dns): each mutant is one small
+  # change to the code, and the unit tests are run against it. A survivor is a
+  # behaviour nothing pins down. The score goes in the job summary and the full
+  # report is uploaded; there is no threshold, so this job reports and does not
+  # gate. Mull's plugin has to match the compiler's LLVM exactly, hence clang-19
+  # (from the distribution) with mull-19 (from Mull's apt repository). If the
+  # repository or the version moves, this is the job that breaks - and it is
+  # separate so that it breaks alone.
+  mutation:
+    name: mutation testing (Mull)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: mutation
+          extra-packages: clang-19
+
+      - name: Install Mull
+        run: |
+          curl -1sLf 'https://dl.cloudsmith.io/public/mull-project/mull-stable/setup.deb.sh' | sudo -E bash
+          sudo apt-get install -y mull-19
+          mull-runner-19 --version || mull-runner --version
+
+      - name: Build with the plugin and run Mull
+        run: make mutation MULL_VERSION=19
+
+      - name: Publish the score
+        if: always()
+        run: |
+          {
+            echo "## Mutation testing (Mull, 5 files, no threshold)"
+            echo
+            if grep -q "Mutation score" build/mutation/mull-report/mull.log 2>/dev/null; then
+              grep -E "Mutation score|Survived mutants|Killed mutants|Total mutants|Surviving mutants" \
+                build/mutation/mull-report/mull.log | sed 's/^/    /'
+            else
+              echo "No score was produced - see the job log."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-report-nightly
+          path: build/mutation/mull-report/
+          if-no-files-found: ignore
+          retention-days: 30
+
   # The same harnesses as the per-push fuzz job in ci.yml, run long: ten
   # harnesses at 180 s is thirty minutes of fuzzing. Long enough to get past
   # what a twenty-second run reaches (a bug three branches deep in the TCP
