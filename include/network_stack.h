@@ -9,6 +9,7 @@
 #include <string>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <random>
 
 #include "tun_wrapper.h"
@@ -31,6 +32,10 @@
 #include "udp_socket.h"
 #include "icmp.h"
 #include "syn_cookie.h"
+#include "ipv6.h"
+#include "icmpv6.h"
+#include "neighbour_cache.h"
+#include "ipv6_autoconfig.h"
 
 // Ties Ethernet/Arp/Ip/Tcp/Udp/Icmp together over a PacketChannel - a TAP
 // device or an AF_PACKET socket, indistinguishable from here - into something
@@ -337,11 +342,11 @@ public:
     // back untouched by the peer, which is how a reply is matched to the
     // request that caused it; the payload comes back verbatim too, which is
     // what lets a ping measure a round trip without any state at this end.
-    void send_echo_request(const IPv4Address& destination, uint16_t identifier, uint16_t sequence,
+    void send_echo_request(const IpAddress& destination, uint16_t identifier, uint16_t sequence,
                            const Bytes& payload = Bytes());
 
     // Notified when an Echo Reply arrives: source, identifier, sequence, payload.
-    using EchoReplyFn = std::function<void(const IPv4Address&, uint16_t, uint16_t, const Bytes&)>;
+    using EchoReplyFn = std::function<void(const IpAddress&, uint16_t, uint16_t, const Bytes&)>;
     void set_echo_reply_callback(EchoReplyFn callback) { _on_echo_reply = std::move(callback); }
 
     // Installs a permanent IP->MAC mapping that never ages out and is never
@@ -354,6 +359,79 @@ public:
     // request/reply exchange first, which makes anything built on top of
     // address resolution deterministic.
     void add_static_arp_entry(const IPv4Address& ip, const MacAddress& mac);
+
+    // ---- IPv6 -------------------------------------------------------------
+    //
+    // Dual stack: everything above IP (TCP, UDP, echo, connect()/listen()/
+    // bind_udp()) takes either family through IpAddress, and a listening port
+    // accepts both unless listen() says otherwise. IPv6 runs on the first
+    // interface only, and is off until one of the two calls below turns it on,
+    // so a stack that never asks for it puts not one IPv6 frame on the wire.
+    //
+    // Scope, deliberately narrower than v4's:
+    //  - no forwarding: a v6 packet for another host is dropped, whatever
+    //    set_forwarding() says. Forwarding stays IPv4-only.
+    //  - no fragmentation in either direction. Sending never fragments (RFC
+    //    8200 5 makes it the source's job, and PMTUD is how TCP avoids it); a
+    //    received packet carrying a Fragment header is dropped, not
+    //    reassembled. Real v6 traffic is rarely fragmented, and a v6 reassembler
+    //    is a second copy of the bounded-memory problem IpReassembler solves.
+    //  - no Redirects (ignored, so a forged one cannot move a route), no MLD
+    //    reports (multicast group membership is local filtering only), no
+    //    DHCPv6, no privacy addresses.
+
+    // Turns IPv6 on with stateless autoconfiguration (RFC 4862): forms the
+    // link-local address from the MAC (modified EUI-64), runs DAD on it,
+    // solicits a router, and turns every /64 an RA offers with the A flag into
+    // a global address after DAD. Idempotent.
+    void enable_ipv6();
+    // A static address, usable at once. No DAD is run for it, the same as
+    // `ip addr add ... nodad`: whoever configures an address by hand is taken
+    // to know it is theirs. Its prefix becomes an on-link route. Turns IPv6 on
+    // without autoconfiguration if enable_ipv6() was not called. Returns false
+    // if MAX_IPV6_ADDRESSES are already configured.
+    bool add_ipv6_address(const IPv6Address& address, uint8_t prefix_length = 64);
+    bool ipv6_enabled() const { return _v6.enabled; }
+    // The addresses this host may use and answers for (DAD passed, or static).
+    const std::vector<Ipv6ConfiguredAddress>& ipv6_addresses() const { return _v6.addresses; }
+    // Null unless enable_ipv6() was called.
+    const Ipv6Autoconfig* ipv6_autoconfig() const { return _v6.autoconfig.get(); }
+    // Null until IPv6 is on.
+    const NeighbourCache* neighbour_cache() const { return _v6.neighbours.get(); }
+
+    // A v6 on-link prefix (RFC 4861 6.3.4), from an RA's L flag or a static
+    // address. Off-link destinations go to the default routers below.
+    static constexpr uint64_t NO_EXPIRY = UINT64_MAX;
+    struct Ipv6Route
+    {
+        IPv6Address prefix;
+        uint8_t prefix_length = 0;
+        uint64_t expires_ms = NO_EXPIRY; // on the stack's clock
+    };
+    struct Ipv6Router
+    {
+        IPv6Address address; // link-local, as RAs come from
+        uint64_t expires_ms = NO_EXPIRY;
+    };
+    const std::vector<Ipv6Route>& ipv6_on_link_prefixes() const { return _v6.on_link; }
+    const std::vector<Ipv6Router>& ipv6_default_routers() const { return _v6.routers; }
+    // Packets waiting on neighbour resolution, across all neighbours.
+    size_t ipv6_pending_packets() const { return _v6.pending_total; }
+
+    // Bounds on everything an unauthenticated NDP message can make this host
+    // hold (RFC 3756 4.3: every table fed from the link is something an
+    // on-link attacker can try to exhaust). Each refuses new entries once
+    // full; existing ones age out on their advertised lifetimes.
+    // NeighbourCache::MAX_ENTRIES and Ipv6Autoconfig::MAX_ADDRESSES bound those
+    // two components the same way.
+    static constexpr size_t MAX_IPV6_ADDRESSES = 16;
+    static constexpr size_t MAX_IPV6_ON_LINK_PREFIXES = 16;
+    static constexpr size_t MAX_IPV6_DEFAULT_ROUTERS = 4;
+    static constexpr size_t MAX_IPV6_PENDING_PER_NEIGHBOUR = 16;
+    static constexpr size_t MAX_IPV6_PENDING_TOTAL = 256;
+    // RFC 8200 5: every v6 link carries at least this, and a path MTU report
+    // below it is not believed (RFC 8201 4).
+    static constexpr uint16_t IPV6_MINIMUM_MTU = 1280;
 
     // Reads and processes frames waiting on the channel, then reaps any
     // connection that finished closing.
@@ -473,7 +551,13 @@ private:
     // the first fragment's header plus the first 8 payload bytes as they
     // arrived - and is what an ICMP error about it quotes (RFC 792).
     void _dispatch_transport(const Ip& ip, const Bytes& received);
-    void _handle_tcp(const Ip& ip, const Tcp& tcp);
+    // Family-neutral from here up: the caller has verified the transport
+    // checksum over its own pseudo-header (RFC 793 / RFC 8200 8.1).
+    void _handle_tcp(const IpAddress& source, const IpAddress& destination, const Tcp& tcp, Ecn ecn);
+    // Hands a datagram to the socket bound to its port. False when nothing
+    // is bound there, so the caller answers with its own family's Port
+    // Unreachable.
+    bool _deliver_udp(const IpAddress& source, const Udp& udp);
     void _handle_udp(const Ip& ip, const Udp& udp, const Bytes& received);
     void _handle_icmp(const Ip& ip, const Icmp& icmp);
     void _reap_closed_connections();
@@ -511,11 +595,11 @@ private:
     // cannot leak.
     void _track_half_open(TcpConnection& connection, uint16_t local_port);
     // Answers a SYN with a stateless SYN-ACK whose ISN is a SYN cookie.
-    void _send_syn_cookie(const Ip& ip, const Tcp& tcp);
+    void _send_syn_cookie(const IpAddress& source, const IpAddress& destination, const Tcp& tcp);
     // For an ACK matching no connection: if it carries a valid cookie for a
     // listening port that sent cookies recently, creates the connection
     // (established) and returns true. False means: not a cookie ACK.
-    bool _try_complete_cookie_handshake(const Ip& ip, const Tcp& tcp);
+    bool _try_complete_cookie_handshake(const IpAddress& source, const IpAddress& destination, const Tcp& tcp, Ecn ecn);
 
     // dont_fragment sets the DF bit, which is what asks the network to report
     // a too-small link rather than silently splitting the packet. That report
@@ -525,12 +609,20 @@ private:
     // `ecn` goes in the TOS octet's ECN field (RFC 3168); DSCP is 0.
     void _send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol, const Bytes& payload, bool dont_fragment = false,
                          Ecn ecn = Ecn::NOT_ECT);
-    void _send_tcp_segment(const IPv4Address& dest_ip, const Tcp& header, const Bytes& payload, Ecn ecn = Ecn::NOT_ECT);
+    // local_v6 pins the source of a v6 segment - a connection's own address;
+    // without it one is chosen for the destination.
+    void _send_tcp_segment(const IpAddress& destination, const Tcp& header, const Bytes& payload,
+                           Ecn ecn = Ecn::NOT_ECT, const std::optional<IPv6Address>& local_v6 = std::nullopt);
     // RFC 793 SS3.4's reset-generation rule for a segment that doesn't match
     // any existing connection and isn't a SYN to a listening port: no
     // TcpConnection exists to answer through, so this builds and sends the
     // RST directly.
-    void _send_rst(const Ip& ip, const Tcp& tcp);
+    void _send_rst(const IpAddress& source, const IpAddress& destination, const Tcp& tcp);
+    // The MSS this host advertises to a peer of this family: the link MTU less
+    // 40 bytes of headers for IPv4, 60 for IPv6.
+    uint16_t _local_mss_for(const IpAddress& peer) const;
+    // A new connection's send function, bound to its peer.
+    TcpConnection::SendSegmentEcnFn _segment_sender(const IpAddress& peer, const IpAddress& local);
     // Sends a UDP datagram if the peer's MAC is already known, otherwise
     // queues it and kicks off ARP resolution (see _pending_outbound_datagrams)
     // - the UDP-side counterpart to connect()'s resolve-and-queue.
@@ -808,6 +900,67 @@ private:
     static constexpr int MS_PER_SECOND = 1000;
     int _icmp_error_tokens_scaled;
     EchoReplyFn _on_echo_reply;
+
+    // ---- IPv6 internals (network_stack_ipv6.cpp) ---------------------------
+    struct Ipv6State
+    {
+        bool enabled = false;
+        std::unique_ptr<NeighbourCache> neighbours;
+        std::unique_ptr<Ipv6Autoconfig> autoconfig;
+        std::vector<Ipv6ConfiguredAddress> addresses;
+        std::vector<Ipv6Route> on_link;
+        std::vector<Ipv6Router> routers;
+        // Whole IPv6 packets, built and checksummed, waiting for their next
+        // hop's MAC - keyed by that next hop, released by its advertisement
+        // and dropped if resolution gives up. The v6 counterpart of the ARP
+        // pending maps, holding packets rather than recipes for them because
+        // nothing in a v6 packet depends on the MAC it is sent to.
+        std::unordered_map<IPv6Address, std::deque<Bytes>> pending;
+        size_t pending_total = 0;
+    };
+    Ipv6State _v6;
+
+    void _ensure_ipv6();
+    TcpConnection* _open_ipv6_connection(const IPv6Address& remote_ip, uint16_t remote_port, uint16_t local_port);
+    void _handle_ipv6(size_t ingress, const Bytes& packet, const MacAddress& link_destination);
+    void _handle_icmpv6(const Ipv6& ip);
+    void _handle_neighbour_solicitation(const Ipv6& ip, const Icmpv6& message);
+    void _handle_neighbour_advertisement(const Ipv6& ip, const Icmpv6& message);
+    void _handle_router_advertisement(const Ipv6& ip, const Icmpv6& message);
+    void _handle_icmpv6_error(const Icmpv6& message);
+    // A host's multicast memberships: all-nodes and the solicited-node group
+    // of every address it has or is testing (RFC 4861 7.2.1, RFC 4862 5.4.2).
+    bool _ipv6_group_joined(const IPv6Address& group) const;
+    bool _is_our_ipv6(const IPv6Address& address) const;
+    // RFC 6724, cut down: link-local for link-scope destinations, otherwise a
+    // global address if there is one. Empty when nothing usable is configured.
+    std::optional<IPv6Address> _ipv6_source_for(const IPv6Address& destination) const;
+    // Link-local or longest on-link prefix, then the first default router.
+    // False: no route.
+    bool _ipv6_route_for(const IPv6Address& destination, IPv6Address& out_next_hop) const;
+    // Builds the IPv6 header and sends - or queues, if the next hop is not
+    // resolved yet. Never fragments: a packet larger than the link MTU is
+    // dropped.
+    void _send_ipv6_packet(const IPv6Address& source, const IPv6Address& destination, uint8_t next_header,
+                           const Bytes& payload, uint8_t hop_limit = 64, uint8_t traffic_class = 0);
+    void _send_icmpv6(const IPv6Address& source, const IPv6Address& destination, uint8_t type, uint8_t code,
+                      const Bytes& body, uint8_t hop_limit = 64);
+    void _send_ipv6_datagram(const IPv6Address& destination, const Udp& header, const Bytes& payload);
+    void _send_ipv6_echo_request(const IPv6Address& destination, uint16_t identifier, uint16_t sequence,
+                                 const Bytes& payload);
+    void _send_neighbour_solicitation(const IPv6Address& target, const MacAddress& unicast_to);
+    void _send_dad_probe(const IPv6Address& target);
+    void _send_router_solicitation();
+    void _transmit_ipv6(const MacAddress& destination_mac, const Bytes& packet);
+    void _flush_ipv6_pending(const IPv6Address& neighbour);
+    // RFC 4443 2.4: an error about `packet` (the invoking packet as received,
+    // quoted up to the 1280-byte minimum MTU), subject to the same rules and
+    // the same token bucket as ICMPv4's errors.
+    void _send_icmpv6_error(const Ipv6& about, const Bytes& packet, bool link_layer_group, uint8_t type, uint8_t code,
+                            uint32_t parameter);
+    void _ipv6_on_time_passed(uint32_t elapsed_ms);
+    void _fold_ipv6_timers(NextTimer& next) const;
+
     AcceptReadyFn _on_accept_ready;
     std::unordered_map<uint16_t, size_t> _listening_ports; // port -> backlog
     // Per listening port, the connections waiting for accept(), by id. Ids,

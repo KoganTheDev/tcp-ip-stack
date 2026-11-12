@@ -1476,13 +1476,13 @@ TEST(NetworkStack, EchoRequestIsSentAndItsReplyReported)
     // the peer echoes identifier, sequence and payload back untouched
     struct Reply
     {
-        IPv4Address source;
+        IpAddress source;
         uint16_t id;
         uint16_t seq;
         Bytes payload;
     };
     std::vector<Reply> replies;
-    stack->set_echo_reply_callback([&replies](const IPv4Address& src, uint16_t id, uint16_t seq, const Bytes& payload)
+    stack->set_echo_reply_callback([&replies](const IpAddress& src, uint16_t id, uint16_t seq, const Bytes& payload)
                                    { replies.push_back({src, id, seq, payload}); });
 
     Icmp reply(IcmpType::ICMP_ECHO_REPLY, ICMP_CODE_NONE, 0, (0x1234u << 16) | 7u, Bytes::from_hex("cafe"));

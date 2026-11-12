@@ -455,9 +455,9 @@ TcpConnection* NetworkStack::accept(uint16_t port)
 
 TcpConnection* NetworkStack::connect(const IpAddress& remote_ip, uint16_t remote_port, uint16_t local_port)
 {
-    if (!remote_ip.is_v4())
+    if (remote_ip.is_v6() && !this->_v6.enabled)
     {
-        LOG_WARNING("NetworkStack: connect() to " << remote_ip.to_string() << " - no IPv6 path");
+        LOG_WARNING("NetworkStack: connect() to " << remote_ip.to_string() << " - IPv6 is not enabled");
         return nullptr;
     }
     if (local_port != 0)
@@ -498,14 +498,17 @@ TcpConnection* NetworkStack::connect(const IpAddress& remote_ip, uint16_t remote
 TcpConnection* NetworkStack::_open_connection(const IpAddress& remote_address, uint16_t remote_port,
                                               uint16_t local_port)
 {
+    if (remote_address.is_v6())
+    {
+        return this->_open_ipv6_connection(remote_address.v6(), remote_port, local_port);
+    }
     const IPv4Address& remote_ip = remote_address.v4();
     ConnectionKey key{remote_ip, remote_port, local_port};
 
     auto connection = std::make_unique<TcpConnection>(
         local_port, remote_ip, remote_port,
         this->_next_isn(this->_primary().config.ip, local_port, remote_ip, remote_port),
-        [this, remote_ip](const Tcp& header, const Bytes& payload, Ecn ecn)
-        { this->_send_tcp_segment(remote_ip, header, payload, ecn); }, this->_primary().config.local_mss());
+        this->_segment_sender(remote_ip, this->_primary().config.ip), this->_primary().config.local_mss());
     connection->set_ecn_mode(this->_tcp_ecn);
 
     TcpConnection* connection_ptr = connection.get();
@@ -1002,6 +1005,8 @@ void NetworkStack::on_time_passed(uint32_t elapsed_ms)
         this->_dns_resolver->on_time_passed(elapsed_ms);
     }
 
+    this->_ipv6_on_time_passed(elapsed_ms);
+
     for (size_t index = 0; index < this->_interfaces.size(); index++)
     {
         Interface& interface = *this->_interfaces[index];
@@ -1116,6 +1121,7 @@ NextTimer NetworkStack::ms_until_next_timer() const
         fold_next_timer(next, this->_dns_resolver->ms_until_next_timer());
     }
     fold_next_timer(next, this->_reassembler.ms_until_next_timer());
+    this->_fold_ipv6_timers(next);
     for (const auto& interface : this->_interfaces)
     {
         fold_next_timer(next, interface->arp_table.ms_until_next_timer());
@@ -1215,6 +1221,10 @@ void NetworkStack::_handle_frame(size_t ingress, const Bytes& frame)
             {
                 this->_handle_arp(ingress, *arp);
             }
+        }
+        else if (ethernet.get_ethernet_protocol() == EtherType::IPv6)
+        {
+            this->_handle_ipv6(ingress, frame.slice(ETHERNET_HEADER_SIZE), ethernet.get_dest());
         }
         else if (ethernet.get_ethernet_protocol() == EtherType::IPv4)
         {
@@ -1527,7 +1537,28 @@ void NetworkStack::_dispatch_transport(const Ip& ip, const Bytes& received)
     {
         if (const Tcp* tcp = dynamic_cast<const Tcp*>(&ip.get_next_layer()))
         {
-            this->_handle_tcp(ip, *tcp);
+            IPv4Address src_ip(ip.get_src_address());
+            // Verify over the exact wire bytes, never a re-serialization: this
+            // stack's TCP codec only round-trips the MSS/window-scale options it
+            // models, so to_bytes() on a real peer's SYN (which also carries
+            // SACK-permitted and timestamp options) would emit a different,
+            // shorter option set and fail the checksum on a segment that was
+            // actually valid.
+            // Same rule as the UDP path: the destination comes from the IP
+            // header. TCP is safe either way, because a segment only reaches
+            // here if it was addressed to this stack's own address - but
+            // relying on that means the two paths look identical and only one
+            // of them is correct, which is how the UDP one stayed wrong.
+            IPv4Address dest_ip(ip.get_dest_address());
+            if (transport_checksum(src_ip, dest_ip, IpProtocol::TCP, tcp->get_received_bytes()) != 0)
+            {
+                // corrupted segment - dropped silently, same as a real kernel
+                // stack; no RST, since we can't trust the header enough to
+                // safely answer it
+                LOG_WARNING("NetworkStack: dropping a TCP segment with a bad checksum from " << src_ip.to_string());
+                return;
+            }
+            this->_handle_tcp(src_ip, dest_ip, *tcp, ip.get_ecn());
         }
     }
     else if (protocol == IpProtocol::UDP)
@@ -1543,37 +1574,25 @@ void NetworkStack::_dispatch_transport(const Ip& ip, const Bytes& received)
     }
 }
 
-void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
+void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destination, const Tcp& tcp, Ecn ecn)
 {
-    IPv4Address src_ip(ip.get_src_address());
-
-    // Verify over the exact wire bytes, never a re-serialization: this stack's
-    // TCP codec only round-trips the MSS/window-scale options it models, so
-    // to_bytes() on a real peer's SYN (which also carries SACK-permitted and
-    // timestamp options) would emit a different, shorter option set and fail
-    // the checksum on a segment that was actually valid.
-    // Same rule as the UDP path: the destination comes from the IP header. TCP
-    // is safe either way, because a segment only reaches here if it was
-    // addressed to this stack's own address - but relying on that means the two
-    // paths look identical and only one of them is correct, which is how the
-    // UDP one stayed wrong.
-    IPv4Address dest_ip(ip.get_dest_address());
-    const Bytes& segment_bytes = tcp.get_received_bytes();
-    if (transport_checksum(src_ip, dest_ip, IpProtocol::TCP, segment_bytes) != 0)
-    {
-        // corrupted segment - dropped silently, same as a real kernel stack;
-        // no RST, since we can't trust the header enough to safely answer it
-        LOG_WARNING("NetworkStack: dropping a TCP segment with a bad checksum from " << src_ip.to_string());
-        return;
-    }
-
-    ConnectionKey key{src_ip, tcp.get_src_port(), tcp.get_dest_port()};
+    ConnectionKey key{source, tcp.get_src_port(), tcp.get_dest_port()};
 
     auto connection_it = this->_connections.find(key);
     if (connection_it != this->_connections.end())
     {
         TcpState state_before = connection_it->second->get_state();
-        connection_it->second->on_segment(tcp, ip.get_ecn());
+        // RFC 4861 7.3.1's upper-layer confirmation: an ACK for data this
+        // side sent and had not seen acknowledged proves the path to the peer
+        // works, which spares the neighbour cache a probe.
+        bool acks_new_data =
+            tcp.get_ack() && connection_it->second->has_sent_unacknowledged(tcp.get_acknowledgement_number() - 1);
+        connection_it->second->on_segment(tcp, ecn);
+        IPv6Address next_hop;
+        if (acks_new_data && source.is_v6() && this->_v6.neighbours && this->_ipv6_route_for(source.v6(), next_hop))
+        {
+            this->_v6.neighbours->confirm_reachability(next_hop);
+        }
 
         // Only a passive open belongs in the accept queue. An active open can
         // pass through SYN_RECEIVED too, by way of a simultaneous open, and it
@@ -1649,7 +1668,7 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
                 LOG_WARNING("NetworkStack: port " << key.local_port << " has " << half_open
                                                   << " half-open connections, none of them stale - answering with a "
                                                      "SYN cookie. This is most likely a SYN flood.");
-                this->_send_syn_cookie(ip, tcp);
+                this->_send_syn_cookie(source, destination, tcp);
                 return;
             }
         }
@@ -1657,7 +1676,7 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
 
     if (!is_new_connection_request)
     {
-        if (this->_try_complete_cookie_handshake(ip, tcp))
+        if (this->_try_complete_cookie_handshake(source, destination, tcp, ecn))
         {
             return;
         }
@@ -1669,19 +1688,21 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
             // (that's how two stacks could RST each other forever).
             LOG_DEBUG("NetworkStack: sending RST to " << key.remote_ip.to_string() << ":" << key.remote_port
                                                       << " (no matching connection, not a SYN to a listening port)");
-            this->_send_rst(ip, tcp);
+            this->_send_rst(source, destination, tcp);
         }
         return;
     }
 
-    IPv4Address remote_ip = src_ip;
+    const IpAddress& remote_ip = source;
     LOG_DEBUG("NetworkStack: accepting new connection from " << remote_ip.to_string() << ":" << key.remote_port
                                                              << " on port " << key.local_port);
-    auto connection = std::make_unique<TcpConnection>(
-        key.local_port, remote_ip, key.remote_port,
-        this->_next_isn(this->_primary().config.ip, key.local_port, remote_ip, key.remote_port),
-        [this, remote_ip](const Tcp& header, const Bytes& payload, Ecn ecn)
-        { this->_send_tcp_segment(remote_ip, header, payload, ecn); }, this->_primary().config.local_mss());
+    // The local address in the ISN tuple: the primary interface's for v4, as
+    // it has always been, and the address the SYN was sent to for v6.
+    const IpAddress local_ip = source.is_v4() ? IpAddress(this->_primary().config.ip) : destination;
+    auto connection =
+        std::make_unique<TcpConnection>(key.local_port, remote_ip, key.remote_port,
+                                        this->_next_isn(local_ip, key.local_port, remote_ip, key.remote_port),
+                                        this->_segment_sender(remote_ip, local_ip), this->_local_mss_for(remote_ip));
     connection->set_ecn_mode(this->_tcp_ecn);
 
     try
@@ -1706,10 +1727,10 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
     this->_register_connection(key, std::move(connection));
 }
 
-void NetworkStack::_send_syn_cookie(const Ip& ip, const Tcp& tcp)
+void NetworkStack::_send_syn_cookie(const IpAddress& source, const IpAddress& destination, const Tcp& tcp)
 {
-    IPv4Address local_ip(ip.get_dest_address());
-    IPv4Address remote_ip(ip.get_src_address());
+    const IpAddress& local_ip = destination;
+    const IpAddress& remote_ip = source;
     uint16_t local_port = tcp.get_dest_port();
     uint16_t peer_mss = tcp.has_mss_option() ? tcp.get_mss_option() : 536;
 
@@ -1722,11 +1743,13 @@ void NetworkStack::_send_syn_cookie(const Ip& ip, const Tcp& tcp)
     // options this side will know nothing about. The window is unscaled.
     Tcp syn_ack(local_port, tcp.get_src_port(), cookie, tcp.get_sequence_number() + 1, 5, 0x12 /* SYN|ACK */,
                 static_cast<uint16_t>(std::min<uint32_t>(TcpConnection::RECEIVE_BUFFER_CAPACITY, 0xFFFF)), 0, 0);
-    syn_ack.set_mss_option(this->_primary().config.local_mss());
-    this->_send_tcp_segment(remote_ip, syn_ack, Bytes());
+    syn_ack.set_mss_option(this->_local_mss_for(remote_ip));
+    this->_send_tcp_segment(remote_ip, syn_ack, Bytes(), Ecn::NOT_ECT,
+                            local_ip.is_v6() ? std::optional<IPv6Address>(local_ip.v6()) : std::nullopt);
 }
 
-bool NetworkStack::_try_complete_cookie_handshake(const Ip& ip, const Tcp& tcp)
+bool NetworkStack::_try_complete_cookie_handshake(const IpAddress& source, const IpAddress& destination, const Tcp& tcp,
+                                                  Ecn ecn)
 {
     if (!tcp.get_ack() || tcp.get_syn() || tcp.get_rst())
     {
@@ -1744,8 +1767,8 @@ bool NetworkStack::_try_complete_cookie_handshake(const Ip& ip, const Tcp& tcp)
         return false; // no cookie this port sent could still be valid
     }
 
-    IPv4Address local_ip(ip.get_dest_address());
-    IPv4Address remote_ip(ip.get_src_address());
+    const IpAddress& local_ip = destination;
+    const IpAddress& remote_ip = source;
     uint32_t peer_isn = tcp.get_sequence_number() - 1;
     uint32_t cookie = tcp.get_acknowledgement_number() - 1;
     uint16_t mss =
@@ -1787,10 +1810,9 @@ bool NetworkStack::_try_complete_cookie_handshake(const Ip& ip, const Tcp& tcp)
     ConnectionKey key{remote_ip, tcp.get_src_port(), local_port};
     LOG_DEBUG("NetworkStack: completing a connection from " << remote_ip.to_string() << ":" << key.remote_port
                                                             << " by SYN cookie (MSS " << mss << ")");
-    auto connection = std::make_unique<TcpConnection>(
-        local_port, remote_ip, key.remote_port, cookie,
-        [this, remote_ip](const Tcp& header, const Bytes& payload, Ecn ecn)
-        { this->_send_tcp_segment(remote_ip, header, payload, ecn); }, this->_primary().config.local_mss());
+    auto connection =
+        std::make_unique<TcpConnection>(local_port, remote_ip, key.remote_port, cookie,
+                                        this->_segment_sender(remote_ip, local_ip), this->_local_mss_for(remote_ip));
     connection->accept_cookie_handshake(peer_isn, mss);
 
     TcpConnection* connection_ptr = connection.get();
@@ -1803,7 +1825,7 @@ bool NetworkStack::_try_complete_cookie_handshake(const Ip& ip, const Tcp& tcp)
 
     // The completing ACK may carry data (or its window), so it is processed
     // like any segment of an established connection.
-    connection_ptr->on_segment(tcp, ip.get_ecn());
+    connection_ptr->on_segment(tcp, ecn);
     return true;
 }
 
@@ -1864,16 +1886,24 @@ void NetworkStack::_handle_udp(const Ip& ip, const Udp& udp, const Bytes& receiv
         return;
     }
 
+    if (!this->_deliver_udp(src_ip, udp))
+    {
+        this->_send_icmp_port_unreachable(ip, received);
+    }
+}
+
+bool NetworkStack::_deliver_udp(const IpAddress& source, const Udp& udp)
+{
     auto socket_it = this->_udp_sockets.find(udp.get_dest_port());
     if (socket_it == this->_udp_sockets.end())
     {
         LOG_DEBUG("NetworkStack: dropping a UDP datagram to port "
                   << udp.get_dest_port() << " - nothing is bound there, sending ICMP Port Unreachable");
-        this->_send_icmp_port_unreachable(ip, received);
-        return;
+        return false;
     }
 
-    socket_it->second->on_datagram(src_ip, udp);
+    socket_it->second->on_datagram(source, udp);
+    return true;
 }
 
 void NetworkStack::_handle_icmp(const Ip& ip, const Icmp& icmp)
@@ -1970,9 +2000,15 @@ bool NetworkStack::_may_send_icmp_error()
     return true;
 }
 
-void NetworkStack::send_echo_request(const IPv4Address& destination, uint16_t identifier, uint16_t sequence,
+void NetworkStack::send_echo_request(const IpAddress& address, uint16_t identifier, uint16_t sequence,
                                      const Bytes& payload)
 {
+    if (address.is_v6())
+    {
+        this->_send_ipv6_echo_request(address.v6(), identifier, sequence, payload);
+        return;
+    }
+    const IPv4Address& destination = address.v4();
     // Identifier and sequence share the rest-of-header field, identifier first.
     // The peer echoes the whole thing back untouched, which is what lets a
     // reply be matched to its request with no state held here.
@@ -2552,7 +2588,8 @@ void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol,
     }
 }
 
-void NetworkStack::_send_tcp_segment(const IPv4Address& dest_ip, const Tcp& header, const Bytes& payload, Ecn ecn)
+void NetworkStack::_send_tcp_segment(const IpAddress& destination, const Tcp& header, const Bytes& payload, Ecn ecn,
+                                     const std::optional<IPv6Address>& local_v6)
 {
     // Tcp can't be copied (it inherits ProtocolLayer, which owns a
     // unique_ptr and declares a destructor, blocking both copy and move) -
@@ -2595,6 +2632,27 @@ void NetworkStack::_send_tcp_segment(const IPv4Address& dest_ip, const Tcp& head
         segment /= std::make_unique<Raw>(payload);
     }
 
+    if (destination.is_v6())
+    {
+        // A connection keeps the address it was opened on; only a reply with
+        // no connection behind it (a RST) picks one by RFC 6724's rules.
+        std::optional<IPv6Address> source = local_v6 ? local_v6 : this->_ipv6_source_for(destination.v6());
+        if (!source)
+        {
+            LOG_DEBUG("NetworkStack: no IPv6 source address for " << destination.to_string()
+                                                                  << " - dropping a segment");
+            return;
+        }
+        // RFC 8200 8.1: the v6 pseudo-header - both 128-bit addresses, a
+        // 32-bit length, and next header 6.
+        segment.set_checksum(ipv6_transport_checksum(*source, destination.v6(), IPV6_NEXT_TCP, segment.to_bytes()));
+        // ECN rides in the low two bits of the Traffic Class (RFC 3168 5).
+        this->_send_ipv6_packet(*source, destination.v6(), IPV6_NEXT_TCP, segment.to_bytes(), 64,
+                                static_cast<uint8_t>(ecn));
+        return;
+    }
+    const IPv4Address& dest_ip = destination.v4();
+
     uint16_t checksum =
         transport_checksum(this->_source_address_for(dest_ip), dest_ip, IpProtocol::TCP, segment.to_bytes());
     segment.set_checksum(checksum);
@@ -2621,9 +2679,9 @@ void NetworkStack::_send_tcp_segment(const IPv4Address& dest_ip, const Tcp& head
     this->_send_ip_packet(dest_ip, IpProtocol::TCP, segment.to_bytes(), true, ecn);
 }
 
-void NetworkStack::_send_rst(const Ip& ip, const Tcp& tcp)
+void NetworkStack::_send_rst(const IpAddress& source, const IpAddress& destination, const Tcp& tcp)
 {
-    IPv4Address remote_ip(ip.get_src_address());
+    const IpAddress& remote_ip = source;
 
     // RFC 793 SS3.4: a reset's sequencing depends on whether the segment
     // being answered carried an ACK.
@@ -2659,14 +2717,39 @@ void NetworkStack::_send_rst(const Ip& ip, const Tcp& tcp)
     }
 
     Tcp rst(tcp.get_dest_port(), tcp.get_src_port(), seq, ack, 5, flags, 0, 0, 0);
-    this->_send_tcp_segment(remote_ip, rst, Bytes());
+    this->_send_tcp_segment(remote_ip, rst, Bytes(), Ecn::NOT_ECT,
+                            destination.is_v6() ? std::optional<IPv6Address>(destination.v6()) : std::nullopt);
+}
+
+uint16_t NetworkStack::_local_mss_for(const IpAddress& peer) const
+{
+    if (peer.is_v4())
+    {
+        return this->_primary().config.local_mss();
+    }
+    // The v6 header is 40 bytes to v4's 20, so the same link carries 20 bytes
+    // less TCP payload per segment.
+    return static_cast<uint16_t>(this->_primary().config.mtu - Ipv6::HEADER_SIZE - 20);
+}
+
+TcpConnection::SendSegmentEcnFn NetworkStack::_segment_sender(const IpAddress& peer, const IpAddress& local)
+{
+    std::optional<IPv6Address> local_v6;
+    if (local.is_v6())
+    {
+        local_v6 = local.v6();
+    }
+    return [this, peer, local_v6](const Tcp& header, const Bytes& payload, Ecn ecn)
+    {
+        this->_send_tcp_segment(peer, header, payload, ecn, local_v6);
+    };
 }
 
 void NetworkStack::_send_or_queue_udp(const IpAddress& destination, const Udp& header, const Bytes& payload)
 {
-    if (!destination.is_v4())
+    if (destination.is_v6())
     {
-        LOG_DEBUG("NetworkStack: dropping a UDP datagram to " << destination.to_string() << " - no IPv6 path");
+        this->_send_ipv6_datagram(destination.v6(), header, payload);
         return;
     }
     const IPv4Address& dest_ip = destination.v4();
