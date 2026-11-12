@@ -120,6 +120,15 @@ void NeighbourCache::on_advertisement(const IPv6Address& address, const MacAddre
     bool address_differs = !(entry.mac == mac) && !(mac == MacAddress());
     bool had_address = entry.state != NeighbourState::INCOMPLETE;
 
+    // RFC 4861 7.2.5: an advertisement with no Target Link-Layer Address
+    // cannot complete a resolution - there is nothing to resolve to.
+    if (!had_address && mac == MacAddress())
+    {
+        LOG_DEBUG("NeighbourCache: discarding an advertisement for " << address.to_string()
+                                                                     << " with no link-layer address");
+        return;
+    }
+
     if (address_differs && had_address && !override_cache)
     {
         // A conflicting advertisement without the Override flag. The cached

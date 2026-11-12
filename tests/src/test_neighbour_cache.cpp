@@ -327,3 +327,19 @@ TEST(NeighbourCache, TheNextTimerIsTheEarliestEntryAndAStaleEntryHasNone)
     h.cache.on_advertisement(NEIGHBOUR, NEIGHBOUR_MAC, false, true); // -> STALE
     ASSERT_TRUE(!h.cache.ms_until_next_timer().has_value()) << "STALE has no timer by design, so nothing is armed";
 }
+
+TEST(NeighbourCache, AnAdvertisementWithoutATargetAddressCannotCompleteResolution)
+{
+    // RFC 4861 7.2.5: an INCOMPLETE entry and an NA with no Target Link-Layer
+    // Address option - discard it. Accepting it would "resolve" the neighbour
+    // to the all-zero MAC and release every queued packet to it.
+    CacheHarness h;
+    MacAddress mac;
+    h.cache.lookup(NEIGHBOUR, mac);
+
+    h.cache.on_advertisement(NEIGHBOUR, MacAddress(), true, true);
+
+    ASSERT_TRUE(h.cache.state_of(NEIGHBOUR) == NeighbourState::INCOMPLETE) << "still resolving";
+    ASSERT_TRUE(!h.cache.contains(NEIGHBOUR)) << "with no usable address";
+    ASSERT_TRUE(!h.cache.lookup(NEIGHBOUR, mac)) << "so nothing may be sent to it";
+}

@@ -540,6 +540,8 @@ void NetworkStack::_handle_neighbour_advertisement(const Ipv6& ip, const Icmpv6&
     }
 
     MacAddress target_mac = link_layer_option(message, NDP_OPTION_TARGET_LINK_LAYER, Icmpv6::NEIGHBOUR_OPTIONS_OFFSET);
+    // RFC 4861 7.2.5: NeighbourCache discards one without TLLA for an entry
+    // still INCOMPLETE, and the flush below then finds nothing usable.
     this->_v6.neighbours->on_advertisement(target, target_mac, message.get_solicited_flag(),
                                            message.get_override_flag());
     this->_flush_ipv6_pending(target);

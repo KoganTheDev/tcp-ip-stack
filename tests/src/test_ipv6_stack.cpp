@@ -682,3 +682,22 @@ TEST(Ipv6Checksum, AgreesWithTheRunningKernel)
     const IPv6Address loopback("::1");
     EXPECT_EQ(ipv6_transport_checksum(loopback, loopback, IPV6_NEXT_ICMPV6, reply), 0) << reply.to_hex();
 }
+
+// The stack half of RFC 4861 7.2.5: an NA without TLLA for a neighbour still
+// being resolved leaves the queued packets queued.
+TEST(Ipv6Stack, AnAdvertisementWithoutTargetLinkLayerAddressReleasesNothing)
+{
+    Host host;
+    host.stack->add_ipv6_address(LOCAL);
+    host.stack->bind_udp(5000)->send_to(PEER, 9, Bytes::from_hex("abcd"));
+    ASSERT_EQ(host.stack->ipv6_pending_packets(), 1u);
+    host.channel->clear_outbound();
+
+    Bytes body = Icmpv6::build_neighbour_advertisement(PEER, PEER_MAC, false, true, true);
+    body.resize(Icmpv6::NEIGHBOUR_OPTIONS_OFFSET); // drop the TLLA option
+    host.deliver(icmpv6_packet(PEER, LOCAL, ICMPV6_NEIGHBOUR_ADVERTISEMENT, body));
+
+    EXPECT_TRUE(host.channel->outbound_frames().empty()) << "nothing goes to a zero MAC";
+    EXPECT_EQ(host.stack->ipv6_pending_packets(), 1u);
+    EXPECT_EQ(host.stack->neighbour_cache()->state_of(PEER), NeighbourState::INCOMPLETE);
+}
