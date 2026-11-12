@@ -419,6 +419,50 @@ int main(int argc, char** argv)
                  + target.get_address().to_hex() + "01ff"));
         save("icmpv6", "echo_request", echo);
         save("icmpv6", "runt", hex("8700"));
+
+        // --- stack, over IPv6: frames to fd00::1 (static) from fd00::2 and
+        // a link-local router; the harness repairs checksums.
+        const IPv6Address local6("fd00::1");
+        const IPv6Address peer6("fd00::2");
+        const IPv6Address router6("fe80::1");
+        const MacAddress local_mac("02:00:00:00:00:01");
+        const MacAddress peer_mac("02:00:00:00:00:02");
+        auto frame6 = [&](const MacAddress& to, const IPv6Address& from, const IPv6Address& dest, uint8_t next,
+                          const Bytes& payload, uint8_t hop_limit)
+        {
+            Ipv6 packet(0, 0, static_cast<uint16_t>(payload.size()), next, hop_limit, from, dest, payload);
+            Bytes frame = to.get_address();
+            frame |= peer_mac.get_address();
+            frame |= hex("86dd");
+            frame |= packet.to_bytes();
+            return frame;
+        };
+        Bytes solicitation = Icmpv6(135, 0, Icmpv6::build_neighbour_solicitation(local6, peer_mac, true)).to_bytes();
+        Bytes ns = frame6(local6.solicited_node_multicast().multicast_mac(), peer6, local6.solicited_node_multicast(),
+                          58, solicitation, 255);
+        Bytes ping6 = frame6(local_mac, peer6, local6, 58, Icmpv6(128, 0, hex("00010001cafe")).to_bytes(), 64);
+        Bytes syn6 = frame6(local_mac, peer6, local6, 6,
+                            hex("9c400050000003e80000000050020400"
+                                "00000000"),
+                            64);
+        Bytes udp6 = frame6(local_mac, peer6, local6, 17, udp_datagram(4000, 53, hex("0102")), 64);
+        Bytes ra = hex("86000000"
+                       "40000708"
+                       "00000000"
+                       "00000000"
+                       "0101020000000001"
+                       "0304"
+                       "40c0"
+                       "00278d00"
+                       "00093a80"
+                       "00000000"
+                       "20010db800010002"
+                       "0000000000000000");
+        Bytes ra6 = frame6(IPv6Address::all_nodes_multicast().multicast_mac(), router6,
+                           IPv6Address::all_nodes_multicast(), 58, ra, 255);
+        save("stack", "ipv6_ns_then_ping", stack_item(ns, 0x00) | stack_item(ping6, 0x02));
+        save("stack", "ipv6_syn_and_udp", stack_item(ns, 0x00) | stack_item(syn6, 0x01) | stack_item(udp6, 0x01));
+        save("stack", "ipv6_router_advertisement", stack_item(ra6, 0x3f) | stack_item(ping6, 0x3f));
     }
     return 0;
 }

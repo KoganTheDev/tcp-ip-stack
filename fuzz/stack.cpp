@@ -58,8 +58,42 @@ namespace
 
     // Recomputes the IPv4 header checksum and, for an unfragmented TCP, UDP or
     // ICMP datagram that is internally consistent, the transport checksum.
+    // IPv6: the transport checksum over the RFC 8200 8.1 pseudo-header, for a
+    // packet whose fixed header names TCP, UDP or ICMPv6 directly. A packet
+    // with extension headers keeps its bytes - the codec's chain walk is what
+    // it is there to exercise.
+    void repair_ipv6_checksums(Bytes& f)
+    {
+        if (f.size() < 14 + Ipv6::HEADER_SIZE)
+            return;
+        size_t length = (static_cast<size_t>(f[18]) << 8) | f[19];
+        uint8_t next = f[20];
+        size_t at = 14 + Ipv6::HEADER_SIZE;
+        if (at + length > f.size())
+            return;
+        size_t checksum_at;
+        if (next == IPV6_NEXT_TCP && length >= 20)
+            checksum_at = 16;
+        else if (next == IPV6_NEXT_UDP && length >= 8)
+            checksum_at = 6;
+        else if (next == IPV6_NEXT_ICMPV6 && length >= 4)
+            checksum_at = 2;
+        else
+            return;
+        Bytes segment = f.slice(at, length);
+        put16(segment, checksum_at, 0);
+        uint16_t sum =
+            ipv6_transport_checksum(IPv6Address(f.slice(22, 16)), IPv6Address(f.slice(38, 16)), next, segment);
+        put16(f, at + checksum_at, sum);
+    }
+
     void repair_checksums(Bytes& f)
     {
+        if (f.size() >= 14 && f[12] == 0x86 && f[13] == 0xdd)
+        {
+            repair_ipv6_checksums(f);
+            return;
+        }
         if (f.size() < 14 + 20 || f[12] != 0x08 || f[13] != 0x00)
             return;
         size_t ihl = static_cast<size_t>(f[14] & 0x0f) * 4;
@@ -109,6 +143,13 @@ namespace
             channel = owned.get();
             stack = std::make_unique<NetworkStack>(std::move(owned), LOCAL_MAC, LOCAL_IP);
             stack->add_static_arp_entry(PEER_IP, PEER_MAC);
+            // Dual stack: a static v6 address, so v6 TCP/UDP/echo reach the
+            // transports at once, and SLAAC running, so NS/NA/RA reach the
+            // neighbour cache and the autoconfiguration state machine. The
+            // listener is port-wide, so it answers v6 SYNs too.
+            stack->add_ipv6_address(IPv6Address("fd00::1"));
+            stack->enable_ipv6();
+            stack->bind_udp(53);
             stack->listen(LOCAL_PORT);
             handshake();
         }
