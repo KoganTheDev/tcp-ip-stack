@@ -128,13 +128,20 @@ sudo ../scripts/veth_test.sh
 
 ## Load testing
 
-`load_test.py` drives N concurrent connections against a running server and asserts
-every echo matches exactly - run it in the same privileged container as the server,
-once it's up and `tap0` has an IP:
+`tools/loadgen` (built as `build/<preset>/loadgen`) drives connections against a running
+server and checks every echo byte for byte; a wrong echo, a dropped connection or data
+crossing between connections is a failure, not just a hang. It uses the kernel's sockets, so
+the same client works against either build of this server - unprivileged against the kernel
+build on 127.0.0.1:
 
 ```sh
-python3 load_test.py [connection_count] [payload_size]   # defaults: 30, 256
+make -C epoll-server KERNEL=1 && ./epoll-server/epoll-server-kernel --port 18080 &
+cmake --build --preset debug --target loadgen
+./build/debug/loadgen --port 18080 --connections 200 --size 4096 --rounds 5 --threads 2
 ```
+
+and against the real stack over a veth pair with `scripts/loadtest_netns.sh` (root). See
+the top-level README, "Load testing".
 
 This is what caught a real bug: under a burst of connections, a connection's
 handshake-completing ACK and its first data segment could land in the same

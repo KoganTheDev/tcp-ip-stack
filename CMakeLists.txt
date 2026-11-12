@@ -102,6 +102,13 @@ file(GLOB HTTP_GET_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/http-get/src/
 add_executable(http-get ${HTTP_GET_SOURCES})
 target_compile_options(http-get PRIVATE -Wextra)
 target_link_libraries(http-get PRIVATE tcpip)
+
+# The load generator: kernel sockets only, so it links nothing from the stack.
+# It is the client for epoll-server whichever stack that runs on (see
+# scripts/loadtest_netns.sh); -Wextra matches the other applications.
+add_executable(loadgen tools/loadgen/loadgen.cpp)
+target_compile_options(loadgen PRIVATE -Wextra)
+target_link_libraries(loadgen PRIVATE project_options)
 endif()
 
 if(TCPIP_BUILD_TESTS)
