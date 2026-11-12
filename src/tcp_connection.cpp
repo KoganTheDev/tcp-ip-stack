@@ -361,7 +361,9 @@ void TcpConnection::_send_challenge_ack()
     {
         return;
     }
+    _sending_challenge_ack = true;
     _send_pure_ack(); // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+    _sending_challenge_ack = false;
 }
 
 void TcpConnection::_send_reset(uint32_t seq)

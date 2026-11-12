@@ -611,8 +611,18 @@ TEST(Ipv6Stack, PortUnreachableDuringTheHandshakeRefusesTheConnection)
     Bytes body;
     body.append_int<uint32_t>(0);
     body |= quote_of_syn(isn);
+    // The connection is reaped once CLOSED, so its reason is read as it closes.
+    TcpCloseReason reason = TcpCloseReason::NONE;
+    connection->add_state_changed_callback(
+        [&reason, connection](TcpState state)
+        {
+            if (state == TcpState::CLOSED)
+                reason = connection->close_reason();
+        });
+    uint64_t id = connection->get_id();
     host.deliver(icmpv6_packet(PEER, LOCAL, ICMPV6_DESTINATION_UNREACHABLE, body, 64, 4));
-    EXPECT_EQ(connection->close_reason(), TcpCloseReason::REFUSED);
+    EXPECT_EQ(reason, TcpCloseReason::REFUSED);
+    EXPECT_EQ(host.stack->find_connection(id), nullptr) << "and reaped";
 }
 
 // A segment with nowhere to go draws a RST from the address it was sent to.
@@ -934,6 +944,10 @@ TEST(Ipv6Stack, NeighbourCacheHoldsUnderAMixedSpoofedFlood)
             break;
         case 1:
             host.deliver(tcp_segment(spoofed, LOCAL, 1000, 80, static_cast<uint32_t>(i), 0, 0x02, 1440));
+            // Out of window for the SYN_RECEIVED connection that SYN made:
+            // RFC 9293 3.10.7.4 has it answered with an ACK - from a
+            // connection whose peer nothing has verified.
+            host.deliver(tcp_segment(spoofed, LOCAL, 1000, 80, static_cast<uint32_t>(i) + 500000, 1, 0x10));
             break;
         default:
             host.deliver(icmpv6_packet(spoofed, LOCAL.solicited_node_multicast(), ICMPV6_NEIGHBOUR_SOLICITATION,
@@ -971,6 +985,15 @@ TEST(Ipv6Stack, NeighbourCacheHoldsUnderAMixedSpoofedFlood)
         ASSERT_LE(host.stack->ipv6_pending_packets(), NetworkStack::MAX_IPV6_PENDING_TOTAL);
     }
 
+    size_t promoted = 0;
+    for (size_t i = 0; i < sources; i++)
+    {
+        const IPv6Address spoofed = numbered("2001:db8::a:0:0", i);
+        if (host.stack->neighbour_cache()->tracks(spoofed)
+            && host.stack->neighbour_cache()->origin_of(spoofed) == NeighbourOrigin::HOST)
+            promoted++;
+    }
+    EXPECT_EQ(promoted, 0u) << "no spoofed source, SYN_RECEIVED peers included, became a HOST entry";
     EXPECT_TRUE(host.stack->neighbour_cache()->contains(ROUTER_LL)) << "the router mapping survives";
     EXPECT_TRUE(host.stack->find_connection(connection_id) != nullptr);
     EXPECT_TRUE(host.stack->neighbour_cache()->contains(PEER)) << "the live connection's neighbour survives";

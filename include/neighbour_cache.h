@@ -91,10 +91,12 @@ public:
     // because a STALE entry becoming DELAY is triggered by exactly this: the
     // act of sending to it.
     //
-    // `origin` says who wants it (see NeighbourOrigin). A lookup never fails
-    // for lack of room: resolutions in flight have a quota per origin, and a
-    // full quota gives up its own oldest INCOMPLETE entry - which has nothing
-    // resolved to lose - so reply traffic cannot crowd out this host's own.
+    // `origin` says who wants it (see NeighbourOrigin). A HOST lookup never
+    // fails for lack of room: resolutions in flight have a quota per origin,
+    // and a full quota gives up its own oldest INCOMPLETE entry - which has
+    // nothing resolved to lose - so reply traffic cannot crowd out this
+    // host's own. A REPLY lookup is refused when the cache is full and holds
+    // no REPLY entry to displace.
     bool lookup(const IPv6Address& address, MacAddress& out_mac, NeighbourOrigin origin = NeighbourOrigin::HOST);
 
     // Addresses a full cache must not evict while it holds anything else:
@@ -162,9 +164,11 @@ public:
     // Probes sent to a previously-known neighbour before it is declared gone.
     static constexpr int MAX_UNICAST_SOLICIT = 3;
     // Bounded because entries are created by traffic from the link. A full
-    // cache evicts, least recently used first: a REPLY entry, then a HOST
-    // entry that is neither a router nor a live connection's neighbour, and
-    // one of those only when nothing else is left.
+    // cache evicts, least recently used first: a REPLY entry, then - for a
+    // HOST lookup only - a HOST entry that is neither a router nor a live
+    // connection's neighbour, and one of those only when nothing else is
+    // left. A REPLY lookup or unsolicited learning finding no REPLY victim is
+    // refused.
     static constexpr size_t MAX_ENTRIES = 512;
     // Resolutions in flight per origin (Linux's unres_qlen idea, split so a
     // reply flood has its own budget). A full quota evicts its own oldest.
@@ -185,8 +189,10 @@ private:
         uint64_t last_used_ms = 0; // LRU order, and the STALE GC's idle time
     };
 
-    // Frees one slot of a non-empty cache, in the order MAX_ENTRIES describes.
-    void _evict();
+    // Frees one slot in the order MAX_ENTRIES describes; false if nothing may
+    // go. For a REPLY resolution or unsolicited learning only a REPLY entry
+    // may, so those are refused rather than displace this host's entries.
+    bool _evict(NeighbourOrigin for_origin);
     // A full per-origin quota of INCOMPLETE entries gives up its oldest.
     void _make_incomplete_room(NeighbourOrigin origin);
     uint64_t _clock_ms = 0;

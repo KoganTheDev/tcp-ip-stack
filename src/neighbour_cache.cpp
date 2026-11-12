@@ -71,9 +71,12 @@ bool NeighbourCache::lookup(const IPv6Address& address, MacAddress& out_mac, Nei
         // Never refused: room comes from this origin's own resolutions in
         // flight, else from the eviction order (see MAX_ENTRIES).
         this->_make_incomplete_room(origin);
-        if (this->_entries.size() >= MAX_ENTRIES)
+        if (this->_entries.size() >= MAX_ENTRIES && !this->_evict(origin))
         {
-            this->_evict();
+            // Only a REPLY lookup gets here: it may displace REPLY entries
+            // alone, and there are none to spare. The packet is dropped.
+            LOG_DEBUG("NeighbourCache: full, refusing a reply resolution of " << address.to_string());
+            return false;
         }
 
         Entry entry;
@@ -187,9 +190,9 @@ void NeighbourCache::on_solicitation_from(const IPv6Address& address, const MacA
     {
         // Learned from the link, unasked: a REPLY entry, which a full cache
         // evicts first.
-        if (this->_entries.size() >= MAX_ENTRIES)
+        if (this->_entries.size() >= MAX_ENTRIES && !this->_evict(NeighbourOrigin::REPLY))
         {
-            this->_evict();
+            return; // no REPLY entry to displace: not learned
         }
         Entry entry;
         entry.mac = mac;
@@ -337,7 +340,7 @@ NextTimer NeighbourCache::ms_until_next_timer() const
     return next;
 }
 
-void NeighbourCache::_evict()
+bool NeighbourCache::_evict(NeighbourOrigin for_origin)
 {
     const std::unordered_set<IPv6Address> in_use = this->_in_use ? this->_in_use() : std::unordered_set<IPv6Address>();
     auto pick = [this](auto&& eligible)
@@ -357,20 +360,23 @@ void NeighbourCache::_evict()
     // connection's neighbour - and only then anything at all.
     auto victim = pick([&in_use](const IPv6Address& address, const Entry& e)
                        { return e.origin == NeighbourOrigin::REPLY && in_use.count(address) == 0; });
-    if (victim == this->_entries.end())
+    // The other tiers are for this host's own resolutions only: a REPLY
+    // lookup or unsolicited learning never displaces a HOST entry.
+    if (victim == this->_entries.end() && for_origin == NeighbourOrigin::HOST)
     {
         victim = pick([&in_use](const IPv6Address& address, const Entry&) { return in_use.count(address) == 0; });
     }
-    if (victim == this->_entries.end())
+    if (victim == this->_entries.end() && for_origin == NeighbourOrigin::HOST)
     {
         victim = pick([](const IPv6Address&, const Entry&) { return true; });
     }
     if (victim == this->_entries.end())
     {
-        return;
+        return false;
     }
     LOG_DEBUG("NeighbourCache: full, evicting " << victim->first.to_string());
     this->_entries.erase(victim);
+    return true;
 }
 
 void NeighbourCache::_make_incomplete_room(NeighbourOrigin origin)

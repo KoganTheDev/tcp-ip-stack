@@ -451,6 +451,22 @@ public:
     // keep active opens out of the accept queue.
     bool is_active_open() const { return _active_open; }
 
+    // Whether the segment being sent right now is this host's own traffic to
+    // a peer it has reason to trust - an active open, or a passive one that
+    // completed a valid handshake - as opposed to an answer to something
+    // anyone could have sent: anything from SYN_RECEIVED (a spoofed SYN puts
+    // a connection there) and every challenge ACK. NetworkStack uses it to
+    // tell the IPv6 neighbour cache who wants the resolution.
+    bool sending_to_verified_peer() const
+    {
+        if (_sending_challenge_ack)
+        {
+            return false;
+        }
+        return _active_open
+               || (_state != TcpState::LISTEN && _state != TcpState::SYN_RECEIVED && _state != TcpState::CLOSED);
+    }
+
     // RFC 5961 challenge ACKs are replies to segments anyone can forge, so
     // section 7 asks for them to be throttled. The budget is the stack's, not
     // one connection's, so the decision is delegated: the gate is asked before
@@ -962,6 +978,7 @@ private:
     // rather than a walk over every buffered chunk on every header build.
     size_t _receive_queued_bytes;
     bool _active_open = false; // see is_active_open()
+    bool _sending_challenge_ack = false; // see sending_to_verified_peer()
     ChallengeAckGateFn _challenge_ack_gate;
     Stats _stats;
     TcpCloseReason _close_reason = TcpCloseReason::NONE;

@@ -456,3 +456,25 @@ TEST(NeighbourCache, AFullCacheNeverGivesUpAResolvedEntryInUseForANewResolution)
     }
     EXPECT_TRUE(h.cache.contains(NEIGHBOUR));
 }
+
+TEST(NeighbourCache, ReplyTrafficCannotDisplaceThisHostsEntries)
+{
+    CacheHarness h;
+    MacAddress mac;
+    for (size_t i = 0; i < NeighbourCache::MAX_ENTRIES; i++)
+    {
+        const IPv6Address mine("2001:db8:4::" + std::to_string(i + 1));
+        h.cache.lookup(mine, mac, NeighbourOrigin::HOST);
+        h.cache.on_advertisement(mine, NEIGHBOUR_MAC, true, true);
+    }
+    ASSERT_EQ(h.cache.size(), NeighbourCache::MAX_ENTRIES);
+
+    h.cache.on_solicitation_from(spoofed(1), OTHER_MAC);
+    EXPECT_FALSE(h.cache.tracks(spoofed(1))) << "unsolicited learning finds no REPLY victim: refused";
+    EXPECT_FALSE(h.cache.lookup(spoofed(2), mac, NeighbourOrigin::REPLY));
+    EXPECT_FALSE(h.cache.tracks(spoofed(2))) << "a REPLY resolution likewise";
+    EXPECT_TRUE(h.cache.contains(IPv6Address("2001:db8:4::1"))) << "and nothing of this host's went";
+
+    h.cache.lookup(IPv6Address("2001:db8:5::1"), mac, NeighbourOrigin::HOST);
+    EXPECT_TRUE(h.cache.tracks(IPv6Address("2001:db8:5::1"))) << "while a HOST lookup still gets its slot";
+}
