@@ -17,7 +17,10 @@ namespace
 NetemChannel& SimNetwork::add_link(const LinkParams& a_to_b, const LinkParams& b_to_a)
 {
     _links.push_back(std::make_unique<NetemChannel>(_clock, _engine, a_to_b, b_to_a));
-    _links.back()->set_capture(&_delivered, &_transmitted);
+    if (_capture)
+    {
+        _links.back()->set_capture(&_delivered, &_transmitted);
+    }
     return *_links.back();
 }
 

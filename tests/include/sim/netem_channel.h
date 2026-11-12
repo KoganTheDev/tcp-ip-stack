@@ -134,6 +134,15 @@ public:
     using DropFilter = std::function<bool(const Bytes& frame)>;
     void set_drop_filter(Side from, DropFilter filter) { _directions[from].drop_filter = std::move(filter); }
 
+    // Frames the random loss and corruption leave alone: called with every
+    // frame written from `from`, and a frame for which it returns true is
+    // neither lost nor corrupted by the link's `loss` / `corrupt` (delay, jitter,
+    // reordering and duplication still apply). For a test whose model needs a
+    // class of frames to be reliable - the soak test protects TCP RSTs, which
+    // are never retransmitted, so a lost one leaves the peer's connection open
+    // for good, which is TCP and not a leak. Unset (the default) exempts nothing.
+    void set_loss_exempt(Side from, DropFilter filter) { _directions[from].loss_exempt = std::move(filter); }
+
     // Nothing in flight in either direction.
     bool idle() const { return _directions[0].in_flight.empty() && _directions[1].in_flight.empty(); }
     // Some frame is ready to be read right now, at either end.
@@ -166,11 +175,13 @@ private:
         // enforce queue_limit.
         std::deque<uint64_t> waiting_starts_us;
         DropFilter drop_filter;
+        DropFilter loss_exempt;
     };
 
     void _transmit(Side from, const Bytes& frame);
     // Sets CE on an ECN-capable IPv4 frame; false if it is not one.
     static bool _mark_ce(Bytes& frame);
+    static bool _exempt(const Direction& direction, const Bytes& frame);
     void _enqueue_copy(Direction& direction, Bytes frame, uint64_t wire_done_us);
     Bytes _receive(Side at);
     bool _due(const Direction& direction) const;

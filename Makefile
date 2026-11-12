@@ -19,6 +19,8 @@
 #                     nonzero if any test fails)
 #   make sim        - only the simulator's seeded property tests, SIM_SEEDS
 #                     of them (default 200), sharded over SIM_JOBS processes
+#   make soak       - the two-virtual-hour churn test (tests/src/test_soak.cpp):
+#                     tables, timers and heap must stay flat; about a minute
 #   make asan       - full rebuild, then run the suite under ASan + UBSan
 #   make tsan       - full rebuild, then run the suite under ThreadSanitizer
 #   make strict     - build everything with -Wextra -Werror, then run the suite
@@ -87,6 +89,19 @@ sim: all
 	    echo "sim: details in build/debug/sim-shard-*.log, captures in build/debug/sim-pcaps/"; \
 	fi; \
 	exit $$status
+
+# The soak test: one server and one client stack kept alive for SOAK_MINUTES of
+# virtual time (default 120) under lossy, churning traffic, asserting that the
+# connection tables, timer heap, UDP/DNS/ARP state and the heap come back down.
+# Virtual time is event-driven, so two hours take about a minute. Not part of
+# `make test`, where a two-minute version (SoakSmoke) runs instead; the test
+# skips itself unless SOAK is set, which this target does. SOAK_SEED reruns a
+# different (reproducible) scenario.
+SOAK_MINUTES ?= 120
+SOAK_SEED ?= 1
+
+soak: all
+	SOAK=1 SOAK_VIRTUAL_MINUTES=$(SOAK_MINUTES) SOAK_SEED=$(SOAK_SEED) ./build/debug/run_tests --gtest_filter='Soak.*'
 
 # Configure a preset the first time it is used, and again whenever the presets
 # file changes (re-running `cmake --preset` re-applies its cache variables).
@@ -257,4 +272,4 @@ clean:
 	rm -rf build bin tests/bin
 	rm -f run_tests tcpipstack
 
-.PHONY: all run_tests test sim asan tsan strict coverage fuzz fuzz-seeds bench clean
+.PHONY: all run_tests test sim soak asan tsan strict coverage fuzz fuzz-seeds bench clean

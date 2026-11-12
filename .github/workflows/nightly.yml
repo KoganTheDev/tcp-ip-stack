@@ -57,6 +57,31 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # Two virtual hours of churn against a long-lived server and client, in the
+  # simulator (no privilege, about a minute of real time): connection tables,
+  # the timer heap, UDP/DNS/ARP state and the heap itself must stay flat and come
+  # back to baseline when the traffic stops (tests/src/test_soak.cpp). The seed
+  # changes every night so the scenario is not the same one forever; the test
+  # prints it, and a failure reproduces locally with
+  #     SOAK_SEED=<seed> make soak
+  soak:
+    name: soak (2 virtual hours)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: debug-g++
+
+      - name: Run the soak test
+        env:
+          SOAK_SEED: ${{ github.run_number }}
+        run: |
+          echo "soak seed: $SOAK_SEED"
+          make soak
+
   # The same harnesses as the per-push fuzz job in ci.yml, run long: ten
   # harnesses at 180 s is thirty minutes of fuzzing. Long enough to get past
   # what a twenty-second run reaches (a bug three branches deep in the TCP

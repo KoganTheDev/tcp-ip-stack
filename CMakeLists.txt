@@ -169,20 +169,31 @@ target_compile_definitions(run_tests PRIVATE
 # Each test writes JUnit-style XML into build/<preset>/test-results/, which CI
 # uploads when a job fails.
 #
-# Two labels. `unit` is everything fast and fixed. `sim` is the simulator's
+# Three labels. `unit` is everything fast and fixed. `sim` is the simulator's
 # seeded property tests (suites named *SimTransfer*), whose count is set by
 # SIM_SEEDS when the binary lists its tests - so it is a separate label that the
 # per-push unit runs (ctest -L unit, the test presets) leave out, and that
-# `make sim` runs on its own. Splitting by TEST_FILTER needs CMake 3.22; older
-# CMake registers everything as `unit`, which is only slower.
+# `make sim` runs on its own. `soak` is the two-virtual-hour churn test
+# (suite Soak, tests/src/test_soak.cpp), about a minute of real time; it is
+# registered with SOAK=1 so ctest actually runs it (run directly it skips
+# itself without that variable), and `make soak` does the same. Its two-minute
+# sibling SoakSmoke is an ordinary `unit` test. Splitting by TEST_FILTER needs
+# CMake 3.22; older CMake registers everything as `unit`, which is only slower
+# (and runs the soak test's skip).
 include(GoogleTest)
 set(SIM_TEST_PATTERN "*SimTransfer*")
+set(SOAK_TEST_PATTERN "Soak.*")
 if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.22)
     gtest_discover_tests(run_tests
         DISCOVERY_MODE PRE_TEST
-        TEST_FILTER "-${SIM_TEST_PATTERN}"
+        TEST_FILTER "-${SIM_TEST_PATTERN}:${SOAK_TEST_PATTERN}"
         XML_OUTPUT_DIR ${CMAKE_BINARY_DIR}/test-results
         PROPERTIES LABELS unit)
+    gtest_discover_tests(run_tests
+        DISCOVERY_MODE PRE_TEST
+        TEST_FILTER "${SOAK_TEST_PATTERN}"
+        XML_OUTPUT_DIR ${CMAKE_BINARY_DIR}/test-results
+        PROPERTIES LABELS soak ENVIRONMENT SOAK=1)
     gtest_discover_tests(run_tests
         DISCOVERY_MODE PRE_TEST
         TEST_FILTER "${SIM_TEST_PATTERN}"

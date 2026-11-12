@@ -119,7 +119,7 @@ void NetemChannel::_transmit(Side from, const Bytes& frame)
     }
 
     // Lost after serialization: a frame lost in transit still used the wire.
-    if (_random.chance(params.loss))
+    if (!_exempt(direction, frame) && _random.chance(params.loss))
     {
         direction.stats.lost++;
         return;
@@ -180,10 +180,15 @@ bool NetemChannel::_mark_ce(Bytes& frame)
     return true;
 }
 
+bool NetemChannel::_exempt(const Direction& direction, const Bytes& frame)
+{
+    return direction.loss_exempt && direction.loss_exempt(frame);
+}
+
 void NetemChannel::_enqueue_copy(Direction& direction, Bytes frame, uint64_t wire_done_us)
 {
     const LinkParams& params = direction.params;
-    if (!frame.empty() && _random.chance(params.corrupt))
+    if (!frame.empty() && !_exempt(direction, frame) && _random.chance(params.corrupt))
     {
         uint64_t bit = _random.below(frame.size() * 8);
         frame[bit / 8] = static_cast<byte_t>(frame[bit / 8] ^ (1u << (bit % 8)));

@@ -62,7 +62,13 @@ public:
     uint64_t now_ms() const { return _clock.now_ms(); }
     std::mt19937_64& engine() { return _engine; }
 
-    // A new link, recorded in this network's captures.
+    // Whether links added from now on are recorded in the captures below (on by
+    // default). A run of simulated hours would otherwise keep every frame it
+    // ever carried - gigabytes - which is also what would drown a heap-growth
+    // check; call this before add_link().
+    void set_capture_enabled(bool enabled) { _capture = enabled; }
+
+    // A new link, recorded in this network's captures unless switched off.
     NetemChannel& add_link(const LinkParams& a_to_b, const LinkParams& b_to_a);
 
     // A new stack, driven by step() from now on. Returned by reference; the
@@ -138,4 +144,5 @@ private:
     uint32_t _step_ms = 1;
     uint32_t _idle_step_ms = 0;
     bool _event_driven = true;
+    bool _capture = true;
 };
