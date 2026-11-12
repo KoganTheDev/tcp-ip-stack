@@ -129,8 +129,13 @@ public:
     static constexpr int MAX_MULTICAST_SOLICIT = 3;
     // Probes sent to a previously-known neighbour before it is declared gone.
     static constexpr int MAX_UNICAST_SOLICIT = 3;
-    // Bounded because entries are created by traffic from the link.
+    // Bounded because entries are created by traffic from the link. When
+    // full, a lookup() evicts (LRU, unreferenced entries first) rather than
+    // refuse; unsolicited learning may only evict unreferenced entries.
     static constexpr size_t MAX_ENTRIES = 512;
+    // An unused STALE entry is dropped after this long (Linux's
+    // gc_stale_time), so spoofed entries do not sit in the cache forever.
+    static constexpr int GC_STALE_TIME_MS = 60000;
 
 private:
     struct Entry
@@ -139,7 +144,16 @@ private:
         NeighbourState state = NeighbourState::INCOMPLETE;
         int timer_ms = 0;      // meaning depends on the state
         int probes_sent = 0;
+        // Eviction order: entries this host looked up are referenced, and a
+        // full cache gives up the least recently used unreferenced one first.
+        bool referenced = false;
+        uint64_t last_used_ms = 0;
     };
+
+    // Frees one slot; false if nothing may go. Unsolicited learning may only
+    // displace unreferenced entries; a lookup always gets its slot.
+    bool _evict(bool host_initiated);
+    uint64_t _clock_ms = 0;
 
     void _enter_state(const IPv6Address& address, Entry& entry, NeighbourState state);
 

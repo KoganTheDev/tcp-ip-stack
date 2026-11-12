@@ -209,18 +209,19 @@ TEST(NeighbourCache, ConfirmationEventuallyAgesBackToStaleButTheMappingSurvives)
 
 TEST(NeighbourCache, AStaleEntryDoesNotDecayOnItsOwn)
 {
-    // STALE has no timer by design. What moves it on is *sending* to it, not
-    // the passage of time - which is precisely the difference from an ARP entry
-    // counting down to eviction.
+    // STALE has no state timer by design. What moves it on is *sending* to
+    // it, not the passage of time - which is precisely the difference from an
+    // ARP entry counting down to eviction. (An unused STALE entry is garbage
+    // collected eventually - see GC_STALE_TIME_MS - but never re-probed.)
     CacheHarness h;
     resolve_to_reachable(h);
     h.advance(NeighbourCache::REACHABLE_TIME_MS + 1000); // -> STALE
     h.sent.clear();
 
-    h.advance(NeighbourCache::REACHABLE_TIME_MS * 10);
+    h.advance(NeighbourCache::GC_STALE_TIME_MS - 2000);
 
     ASSERT_TRUE(h.cache.state_of(NEIGHBOUR) == NeighbourState::STALE)
-        << "a STALE entry sits indefinitely rather than expiring";
+        << "a STALE entry sits unchanged rather than decaying";
     ASSERT_TRUE(h.cache.contains(NEIGHBOUR)) << "and is still there";
     ASSERT_TRUE(h.sent.empty()) << "having triggered nothing, because nothing was sent to it";
 }
@@ -325,7 +326,8 @@ TEST(NeighbourCache, TheNextTimerIsTheEarliestEntryAndAStaleEntryHasNone)
         << "and the deadline counts down as time passes";
 
     h.cache.on_advertisement(NEIGHBOUR, NEIGHBOUR_MAC, false, true); // -> STALE
-    ASSERT_TRUE(!h.cache.ms_until_next_timer().has_value()) << "STALE has no timer by design, so nothing is armed";
+    ASSERT_TRUE(h.cache.ms_until_next_timer() == NextTimer(NeighbourCache::GC_STALE_TIME_MS))
+        << "STALE has no state timer, only its garbage-collection deadline";
 }
 
 TEST(NeighbourCache, AnAdvertisementWithoutATargetAddressCannotCompleteResolution)
@@ -342,4 +344,54 @@ TEST(NeighbourCache, AnAdvertisementWithoutATargetAddressCannotCompleteResolutio
     ASSERT_TRUE(h.cache.state_of(NEIGHBOUR) == NeighbourState::INCOMPLETE) << "still resolving";
     ASSERT_TRUE(!h.cache.contains(NEIGHBOUR)) << "with no usable address";
     ASSERT_TRUE(!h.cache.lookup(NEIGHBOUR, mac)) << "so nothing may be sent to it";
+}
+
+namespace
+{
+    IPv6Address spoofed(size_t i)
+    {
+        return IPv6Address("2001:db8:bad::" + std::to_string(i + 1));
+    }
+
+    void flood(CacheHarness& h, size_t count)
+    {
+        for (size_t i = 0; i < count; i++)
+            h.cache.on_solicitation_from(spoofed(i), OTHER_MAC);
+    }
+}
+
+// Security review: a flood of spoofed solicitations used to fill the cache
+// for good, after which every resolution this host needed was refused.
+TEST(NeighbourCache, AFullCacheNeverRefusesAResolutionThisHostStarts)
+{
+    CacheHarness h;
+    flood(h, NeighbourCache::MAX_ENTRIES + 100);
+    ASSERT_EQ(h.cache.size(), NeighbourCache::MAX_ENTRIES);
+    h.sent.clear();
+
+    MacAddress mac;
+    ASSERT_FALSE(h.cache.lookup(NEIGHBOUR, mac));
+    EXPECT_TRUE(h.cache.tracks(NEIGHBOUR)) << "an unused flood entry is evicted to make room";
+    EXPECT_EQ(h.sent.size(), 1u) << "and the solicitation goes out";
+    EXPECT_LE(h.cache.size(), NeighbourCache::MAX_ENTRIES);
+}
+
+TEST(NeighbourCache, AnUnsolicitedFloodCannotEvictAnEntryInUse)
+{
+    CacheHarness h;
+    resolve_to_reachable(h);
+    flood(h, NeighbourCache::MAX_ENTRIES * 3);
+    EXPECT_TRUE(h.cache.contains(NEIGHBOUR)) << "only entries nobody has used are fair game for the link";
+    EXPECT_LE(h.cache.size(), NeighbourCache::MAX_ENTRIES);
+}
+
+TEST(NeighbourCache, AnUnusedStaleEntryIsCollected)
+{
+    CacheHarness h;
+    h.cache.on_solicitation_from(NEIGHBOUR, NEIGHBOUR_MAC);
+    h.advance(NeighbourCache::GC_STALE_TIME_MS - 250);
+    ASSERT_TRUE(h.cache.tracks(NEIGHBOUR));
+    h.advance(500);
+    EXPECT_FALSE(h.cache.tracks(NEIGHBOUR)) << "like Linux's gc_stale_time";
+    EXPECT_TRUE(h.sent.empty()) << "collected, not probed";
 }

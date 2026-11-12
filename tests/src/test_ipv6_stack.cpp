@@ -405,6 +405,12 @@ TEST(Ipv6Stack, NeighbourCacheIsBoundedAgainstASolicitationFlood)
                      LOCAL.solicited_node_multicast().multicast_mac());
     }
     EXPECT_EQ(host.stack->neighbour_cache()->size(), NeighbourCache::MAX_ENTRIES);
+
+    // The flood does not stop this host resolving a neighbour it needs.
+    host.channel->clear_outbound();
+    host.stack->bind_udp(5000)->send_to(IPv6Address("2001:db8::1:77"), 9, Bytes::from_hex("01"));
+    EXPECT_EQ(icmpv6_of(ipv6_frames(host.channel->outbound_frames()), ICMPV6_NEIGHBOUR_SOLICITATION).size(), 1u);
+    EXPECT_EQ(host.stack->ipv6_pending_packets(), 1u);
 }
 
 TEST(Ipv6Stack, PendingPacketsAreBoundedPerNeighbourAndOverall)

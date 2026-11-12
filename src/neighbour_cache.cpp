@@ -52,8 +52,10 @@ void NeighbourCache::_enter_state(const IPv6Address& address, Entry& entry, Neig
         // STALE entry is not decaying towards anything - it sits indefinitely
         // and is used freely. What moves it on is *sending* to it, not the
         // passage of time, which is the whole difference from an ARP entry
-        // counting down to eviction.
+        // counting down to eviction. (Unused for GC_STALE_TIME_MS, it is
+        // garbage collected - see on_time_passed() - but never re-probed.)
         entry.timer_ms = 0;
+        entry.last_used_ms = this->_clock_ms; // the GC idle time starts now
         break;
     }
 }
@@ -64,15 +66,19 @@ bool NeighbourCache::lookup(const IPv6Address& address, MacAddress& out_mac)
 
     if (it == this->_entries.end())
     {
+        // This host wants the neighbour, so a full cache makes room rather
+        // than refuse: a link flooding it with spoofed entries must not be
+        // able to stop resolution of the router or a peer.
         if (this->_entries.size() >= MAX_ENTRIES)
         {
-            LOG_WARNING("NeighbourCache: full, refusing to resolve " << address.to_string());
-            return false;
+            this->_evict(true);
         }
 
         Entry entry;
         this->_enter_state(address, entry, NeighbourState::INCOMPLETE);
         entry.probes_sent = 1;
+        entry.referenced = true;
+        entry.last_used_ms = this->_clock_ms;
         this->_entries[address] = entry;
 
         // Multicast, because there is no link-layer address to unicast to yet -
@@ -85,6 +91,8 @@ bool NeighbourCache::lookup(const IPv6Address& address, MacAddress& out_mac)
     }
 
     Entry& entry = it->second;
+    entry.referenced = true;
+    entry.last_used_ms = this->_clock_ms;
     if (entry.state == NeighbourState::INCOMPLETE)
     {
         return false; // resolution already in flight; nowhere to send yet
@@ -172,12 +180,15 @@ void NeighbourCache::on_solicitation_from(const IPv6Address& address, const MacA
     auto it = this->_entries.find(address);
     if (it == this->_entries.end())
     {
-        if (this->_entries.size() >= MAX_ENTRIES)
+        // Learned from the link, unasked: it may only displace another entry
+        // nobody here has used.
+        if (this->_entries.size() >= MAX_ENTRIES && !this->_evict(false))
         {
             return;
         }
         Entry entry;
         entry.mac = mac;
+        entry.last_used_ms = this->_clock_ms;
         this->_enter_state(address, entry, NeighbourState::STALE);
         this->_entries[address] = entry;
         return;
@@ -211,6 +222,7 @@ void NeighbourCache::confirm_reachability(const IPv6Address& address)
 void NeighbourCache::on_time_passed(uint32_t elapsed_ms)
 {
     std::vector<IPv6Address> to_remove;
+    this->_clock_ms += elapsed_ms;
 
     for (auto& pair : this->_entries)
     {
@@ -219,7 +231,12 @@ void NeighbourCache::on_time_passed(uint32_t elapsed_ms)
 
         if (entry.state == NeighbourState::STALE)
         {
-            continue; // no timer by design - see _enter_state
+            // Only the GC deadline: unused for GC_STALE_TIME_MS, it goes.
+            if (this->_clock_ms - entry.last_used_ms >= static_cast<uint64_t>(GC_STALE_TIME_MS))
+            {
+                to_remove.push_back(address);
+            }
+            continue;
         }
 
         entry.timer_ms -= static_cast<int>(elapsed_ms);
@@ -297,10 +314,53 @@ NextTimer NeighbourCache::ms_until_next_timer() const
     NextTimer next;
     for (const auto& pair : this->_entries)
     {
-        if (pair.second.state != NeighbourState::STALE)
+        if (pair.second.state == NeighbourState::STALE)
+        {
+            uint64_t idle = this->_clock_ms - pair.second.last_used_ms;
+            fold_next_timer(next, idle >= static_cast<uint64_t>(GC_STALE_TIME_MS)
+                                      ? 0
+                                      : static_cast<int64_t>(GC_STALE_TIME_MS - idle));
+        }
+        else
         {
             fold_next_timer(next, pair.second.timer_ms);
         }
     }
     return next;
+}
+
+bool NeighbourCache::_evict(bool host_initiated)
+{
+    // Least recently used, in order of how little losing it costs: an entry
+    // nobody here ever used (what a flood creates), then - only for a
+    // resolution this host started - a STALE one, then anything.
+    auto pick = [this](auto&& eligible)
+    {
+        auto victim = this->_entries.end();
+        for (auto it = this->_entries.begin(); it != this->_entries.end(); ++it)
+        {
+            if (eligible(it->second)
+                && (victim == this->_entries.end() || it->second.last_used_ms < victim->second.last_used_ms))
+            {
+                victim = it;
+            }
+        }
+        return victim;
+    };
+    auto victim = pick([](const Entry& e) { return !e.referenced; });
+    if (victim == this->_entries.end() && host_initiated)
+    {
+        victim = pick([](const Entry& e) { return e.state == NeighbourState::STALE; });
+    }
+    if (victim == this->_entries.end() && host_initiated)
+    {
+        victim = pick([](const Entry&) { return true; });
+    }
+    if (victim == this->_entries.end())
+    {
+        return false;
+    }
+    LOG_DEBUG("NeighbourCache: full, evicting " << victim->first.to_string());
+    this->_entries.erase(victim);
+    return true;
 }

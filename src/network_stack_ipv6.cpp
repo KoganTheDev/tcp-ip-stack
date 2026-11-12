@@ -501,12 +501,21 @@ void NetworkStack::_handle_neighbour_solicitation(const Ipv6& ip, const Icmpv6& 
         return;
     }
 
-    // Learned as STALE (RFC 4861 7.2.3), which is also what lets the answer
-    // below go straight out unicast.
+    // Learned as STALE (RFC 4861 7.2.3) - unreferenced, so a flood of these
+    // can only displace each other, never an entry this host uses.
     if (!is_zero(source_mac))
     {
         this->_v6.neighbours->on_solicitation_from(source, source_mac);
         this->_flush_ipv6_pending(source);
+        // Answered straight to the SLLA (RFC 4861 7.2.4), not through a cache
+        // lookup: a reply is not a resolution this host wants, and going
+        // through lookup() would let every spoofed solicitor claim a slot.
+        Icmpv6 message(ICMPV6_NEIGHBOUR_ADVERTISEMENT, 0, advertisement);
+        message.compute_checksum(target, source);
+        Ipv6 header(0, 0, static_cast<uint16_t>(message.to_bytes().size()), IPV6_NEXT_ICMPV6,
+                    Icmpv6::NDP_REQUIRED_HOP_LIMIT, target, source, message.to_bytes());
+        this->_transmit_ipv6(source_mac, header.to_bytes());
+        return;
     }
     this->_send_icmpv6(target, source, ICMPV6_NEIGHBOUR_ADVERTISEMENT, 0, advertisement,
                        Icmpv6::NDP_REQUIRED_HOP_LIMIT);
