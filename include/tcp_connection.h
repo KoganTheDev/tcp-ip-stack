@@ -428,6 +428,8 @@ public:
         uint64_t retransmit_timeouts = 0;    // RTO expiries that resent something
         uint64_t recoveries = 0;             // entries into fast recovery
         uint64_t rack_losses = 0;            // segments RACK (RFC 8985) marked lost
+        uint64_t loss_probes = 0;            // tail loss probes sent (RFC 8985 7.3)
+        uint64_t loss_probe_repairs = 0;     // losses a probe repaired by itself (7.4.2)
     };
     const Stats& stats() const { return _stats; }
     // Scoreboard entries the sender has examined, for cost tests.
@@ -569,6 +571,52 @@ private:
     // When the reordering timer fires (RFC 8985 6.2 step 5), or 0.
     uint64_t _rack_reo_deadline_ms = 0;
     void _on_rack_reo_timer();
+
+    // --- Tail Loss Probe (RFC 8985 section 7), with SACK only ---
+    //
+    // A loss at the tail of a flight draws no duplicate acks - nothing was
+    // sent after it - so only the RTO used to notice. Instead, when an ack is
+    // overdue (PTO = 2 * SRTT, plus the worst-case delayed ack when a single
+    // segment is out), one probe goes out: new data if there is some, else
+    // the last segment again. Its SACK or ack gives RACK and recovery the
+    // feedback the tail could not.
+    //
+    // When the probe is due, or 0. Armed instead of the RTO in the sense of
+    // RFC 8985 8: never later than it, and the RTO is restarted after the
+    // probe, so it stays the last resort.
+    uint64_t _tlp_deadline_ms = 0;
+    // TLP.end_seq / TLP.is_retrans (7.1): a probe is outstanding until an
+    // ack reaches end_seq.
+    bool _tlp_outstanding = false;
+    uint32_t _tlp_end_seq = 0;
+    bool _tlp_is_retrans = false;
+    // RFC 8985 7.3 condition 2: a fresh RTT sample since the last probe (or
+    // the start of the connection) - without one there is no SRTT to time a
+    // probe by, and probes must not keep the estimator from adapting.
+    bool _rtt_sampled_since_probe = false;
+    // Set while the probe's own new data goes out, which must not re-arm
+    // the PTO.
+    bool _sending_probe = false;
+    // RFC 8985 7.2's conditions: SACK in use, data in flight, not in fast
+    // or RTO recovery, nothing SACKed, no probe outstanding.
+    bool _tlp_allowed() const;
+    // TLP_calc_PTO() and arming (7.2), or disarming if not allowed.
+    void _schedule_loss_probe();
+    // TLP_send_probe() (7.3).
+    void _send_loss_probe();
+    // TLP_process_ack() (7.4.2); `pure_dup_ack` is a duplicate ack without
+    // SACK blocks - the sign, without D-SACK, that both copies arrived.
+    void _tlp_process_ack(uint32_t ack, bool pure_dup_ack);
+    // TLP_init() (7.1): on entering fast or RTO recovery.
+    void _tlp_reset()
+    {
+        _tlp_outstanding = false;
+        _tlp_deadline_ms = 0;
+    }
+    // RFC 8985 7.2's TLP.max_ack_delay: the longest a peer may hold an ack
+    // (RFC 1122 4.2.3.2 allows 500 ms; 200 ms is what Linux and this stack
+    // use).
+    static constexpr uint64_t TLP_MAX_ACK_DELAY_MS = 200;
     // RFC 793 SS3.3's sequence-number acceptability test, done with unsigned
     // wraparound arithmetic (seq - _recv_next) so it's correct across a
     // sequence-number wraparound the same way real TCP's modular arithmetic

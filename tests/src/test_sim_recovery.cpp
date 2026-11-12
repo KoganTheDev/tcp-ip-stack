@@ -232,3 +232,19 @@ TEST_F(SimRecovery, ALostRetransmissionIsRepairedWithoutATimeout)
     ASSERT_EQ(r.stats.retransmit_timeouts, 0u) << r.describe();
     ASSERT_EQ(r.spurious, 0u) << r.describe();
 }
+
+// The last two full segments of the transfer lost (400000 bytes are 276
+// segments of 1448 and one of 352, which Nagle holds behind them). Nothing
+// that is sent follows them to draw duplicate acks, so only a timeout used to
+// notice. A tail loss probe (RFC 8985 section 7) notices sooner: here it is
+// the held 352 bytes, whose SACK tells RACK the two before it are lost.
+TEST_F(SimRecovery, ATailLossIsRepairedWithoutATimeout)
+{
+    constexpr size_t SIZE = 400000;
+    constexpr int SEGMENTS = static_cast<int>((SIZE + 1447) / 1448);
+    Result r = transfer(1, wire(), SIZE, [](int index, int transmission)
+                        { return transmission == 1 && (index == SEGMENTS - 2 || index == SEGMENTS - 1); });
+    report("tail loss (last 2 full segments)", r);
+    ASSERT_TRUE(r.completed && r.intact) << r.describe();
+    ASSERT_EQ(r.stats.retransmit_timeouts, 0u) << r.describe();
+}

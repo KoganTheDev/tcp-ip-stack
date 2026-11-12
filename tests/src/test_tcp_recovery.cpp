@@ -524,3 +524,89 @@ TEST(TcpRecovery, RackCostPerAckIsBoundedByWhatTheAckChanges)
     ASSERT_LE(worst_excess, 2u) << "an ack cost RACK " << worst_excess << " visits beyond what it changed, with "
                                 << segments << " segments in flight";
 }
+
+// --- RFC 8985 section 7: Tail Loss Probe ---
+
+namespace
+{
+    // An established SACK connection with an RTT sample of 20 ms, so SRTT is
+    // known (RttEstimator floors it at 100 ms: PTO = 2 * SRTT = 200 ms).
+    Peer make_measured_peer()
+    {
+        Peer peer = make_peer(/*sack=*/true);
+        send_segments(peer, 1);
+        peer.connection->on_time_passed(20);
+        peer.ack(peer.seg(1));
+        peer.base = peer.seg(1);
+        peer.sent.clear();
+        return peer;
+    }
+}
+
+// The last two segments of a flight are lost. Nothing above them can draw a
+// duplicate ack, so before TLP the only way out was the RTO. The probe
+// (2 * SRTT after the last send) resends the last segment; its SACK tells
+// RACK the one before it is lost, and recovery repairs it - no timeout.
+TEST(TcpRecovery, TailLossIsRepairedByALossProbeWithoutATimeout)
+{
+    Peer peer = make_measured_peer();
+    send_segments(peer, 5);
+    peer.connection->on_time_passed(20);
+    peer.ack(peer.seg(3)); // 0..2 arrive, 3 and 4 are lost
+    uint64_t deadline = peer.connection->next_deadline_ms();
+    ASSERT_LE(deadline, peer.connection->now_ms() + 200) << "a probe timeout of 2 * SRTT, not the RTO";
+    peer.connection->on_time_passed(static_cast<uint32_t>(deadline - peer.connection->now_ms()));
+    ASSERT_EQ(peer.count_sent(peer.seg(4)), 2u) << "the probe resends the last segment";
+    ASSERT_EQ(peer.connection->stats().loss_probes, 1u);
+
+    peer.connection->on_time_passed(20);
+    peer.ack(peer.seg(3), sack_of(peer, {4}));
+    ASSERT_EQ(peer.count_sent(peer.seg(3)), 2u) << "RACK finds 3 lost from the probe's SACK";
+    peer.ack(peer.seg(5));
+    ASSERT_EQ(peer.connection->stats().retransmit_timeouts, 0u);
+}
+
+// With data still waiting (the congestion window held it back), the probe
+// is new data rather than a retransmission (RFC 8985 7.3).
+TEST(TcpRecovery, ALossProbeSendsNewDataWhenThereIsSome)
+{
+    Peer peer = make_measured_peer();
+    send_segments(peer, 30); // the window (about 11 segments) sends part of it
+    size_t sent_before = peer.sent.size();
+    uint32_t next_new = peer.sent.back().seq + MSS;
+    peer.connection->on_time_passed(
+        static_cast<uint32_t>(peer.connection->next_deadline_ms() - peer.connection->now_ms()));
+    ASSERT_EQ(peer.sent.size(), sent_before + 1) << "one probe";
+    ASSERT_EQ(peer.sent.back().seq, next_new) << "the probe is the next new segment";
+    ASSERT_EQ(peer.connection->stats().retransmitted_segments, 0u);
+}
+
+// RFC 8985 7.4.2: only the last segment was lost, so the probe repaired it
+// and its ack looks like any cumulative ack. Once an ack moves past the
+// probe the loss is known, and the window is reduced as for a fast
+// recovery. Had the original arrived, a duplicate ack without SACK would
+// have said so, and the window would be left alone.
+TEST(TcpRecovery, ALossRepairedByTheProbeStillReducesTheWindow)
+{
+    uint32_t cwnd_after[2] = {0, 0};
+    for (bool original_arrived : {false, true})
+    {
+        Peer peer = make_measured_peer();
+        send_segments(peer, 4);
+        peer.connection->on_time_passed(20);
+        peer.ack(peer.seg(3)); // 3 lost (or late)
+        peer.connection->on_time_passed(
+            static_cast<uint32_t>(peer.connection->next_deadline_ms() - peer.connection->now_ms()));
+        ASSERT_EQ(peer.count_sent(peer.seg(3)), 2u) << "precondition: the probe resent segment 3";
+        peer.connection->on_time_passed(20);
+        peer.ack(peer.seg(4)); // the probe (or the original) arrived
+        if (original_arrived)
+            peer.ack(peer.seg(4)); // and the other copy drew a duplicate ack
+        send_segments(peer, 1);
+        peer.connection->on_time_passed(20);
+        peer.ack(peer.seg(5));
+        ASSERT_EQ(peer.connection->stats().loss_probe_repairs, original_arrived ? 0u : 1u);
+        cwnd_after[original_arrived ? 1 : 0] = peer.connection->get_congestion_window();
+    }
+    ASSERT_LT(cwnd_after[0], cwnd_after[1]) << "only the repaired loss reduces cwnd";
+}

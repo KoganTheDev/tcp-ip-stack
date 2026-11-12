@@ -308,6 +308,10 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
     entry.retransmitted = false;
     entry.sacked = false;
     _in_flight.push(std::move(entry));
+    if (!payload.empty() && !_sending_probe)
+    {
+        _schedule_loss_probe(); // RFC 8985 7.2: after transmitting new data
+    }
 }
 
 void TcpConnection::_send_challenge_ack()
@@ -759,6 +763,7 @@ void TcpConnection::_take_rtt_sample(uint32_t rtt_ms)
         _have_rack_min_rtt = true;
     }
     _rtt.on_sample(rtt_ms);
+    _rtt_sampled_since_probe = true;
     LOG_DEBUG("TcpConnection[" << _id << "] rtt sample " << rtt_ms << " ms -> srtt " << _rtt.srtt_ms() << " rttvar "
                                << _rtt.rttvar_ms() << " rto " << _rtt.rto_ms());
 }
@@ -848,6 +853,111 @@ bool TcpConnection::_may_start_recovery(uint32_t ack) const
     return !_recovery_point_valid || seq_at_or_before(_recovery_point, ack);
 }
 
+bool TcpConnection::_tlp_allowed() const
+{
+    bool synchronized = _state != TcpState::LISTEN && _state != TcpState::SYN_SENT && _state != TcpState::SYN_RECEIVED
+                        && _state != TcpState::CLOSED && _state != TcpState::TIME_WAIT;
+    return synchronized && _sack_permitted && !_in_flight.empty() && !_in_recovery && !_rto_recovery
+           && _in_flight.sacked_segments() == 0 && !_tlp_outstanding && _rtt_sampled_since_probe;
+}
+
+void TcpConnection::_schedule_loss_probe()
+{
+    if (!_tlp_allowed())
+    {
+        _tlp_deadline_ms = 0;
+        return;
+    }
+    // TLP_calc_PTO(): 2 * SRTT, plus the peer's worst-case delayed ack when
+    // one segment is all there is to ack; never later than the RTO.
+    uint64_t pto = 2 * static_cast<uint64_t>(_rtt.srtt_ms());
+    if (_in_flight.size() == 1)
+    {
+        pto += TLP_MAX_ACK_DELAY_MS;
+    }
+    const SentSegment& oldest = _in_flight.front(); // nothing is SACKed, so the front's timer is the RTO
+    uint64_t rto_at = oldest.retransmit_deadline_ms != 0
+                          ? oldest.retransmit_deadline_ms
+                          : _now_ms + static_cast<uint64_t>(oldest.retransmit_ms_remaining);
+    _tlp_deadline_ms = std::min(_now_ms + pto, rto_at);
+}
+
+void TcpConnection::_send_loss_probe()
+{
+    // TLP_send_probe(): new data if there is some and the peer's window
+    // takes it - whatever cwnd says; FlightSize may exceed it by this one
+    // segment - else the highest segment sent, again.
+    _stats.loss_probes += 1;
+    _tlp_is_retrans = false;
+    bool sent_new = false;
+    if (!_send_queue.empty())
+    {
+        uint32_t snd_una = _in_flight.snd_una_or(_send_next);
+        if ((_send_next - snd_una) + _send_queue.front().size() <= _peer_window)
+        {
+            Bytes chunk = std::move(_send_queue.front());
+            _send_queue.pop_front();
+            _send_queued_bytes -= chunk.size();
+            _sending_probe = true;
+            _send_chunk(chunk);
+            _sending_probe = false;
+            sent_new = true;
+        }
+    }
+    if (!sent_new)
+    {
+        SentSegment* last = _in_flight.highest_unsacked();
+        if (last == nullptr)
+        {
+            return;
+        }
+        _retransmit(*last, /*rescue=*/true); // not a NextSeg() retransmission: HighRxt stays
+        _tlp_is_retrans = true;
+    }
+    LOG_DEBUG("TcpConnection[" << _id << "] tail loss probe (" << (sent_new ? "new data" : "retransmission")
+                               << "), end_seq " << _send_next);
+    _tlp_outstanding = true;
+    _tlp_end_seq = _send_next;
+    _rtt_sampled_since_probe = false;
+    // RFC 8985 7.3: re-arm the RTO, not the PTO, so the RTO stays the last
+    // resort if the probe fails too.
+    if (SentSegment* oldest = _in_flight.oldest_unsacked())
+    {
+        oldest->retransmit_deadline_ms = _now_ms + static_cast<uint64_t>(_rtt.rto_ms());
+    }
+}
+
+void TcpConnection::_tlp_process_ack(uint32_t ack, bool pure_dup_ack)
+{
+    // RFC 8985 7.4.2, without D-SACK (which this stack does not parse).
+    if (!_tlp_outstanding || !seq_at_or_before(_tlp_end_seq, ack))
+    {
+        return;
+    }
+    if (!_tlp_is_retrans)
+    {
+        _tlp_outstanding = false; // a probe of new data was delivered
+    }
+    else if (seq_before(_tlp_end_seq, ack))
+    {
+        // Every ack for the original and the probe has had its chance to
+        // arrive, and none said both copies made it: the probe repaired a
+        // loss, which the window must answer as a fast recovery would.
+        _tlp_outstanding = false;
+        _stats.loss_probe_repairs += 1;
+        if (!_in_recovery && !_rto_recovery)
+        {
+            uint32_t flight_size = _send_next - _in_flight.snd_una_or(_send_next);
+            _congestion->on_recovery_start(flight_size, _now_ms);
+            _congestion->on_recovery_end();
+        }
+    }
+    else if (pure_dup_ack)
+    {
+        _tlp_outstanding = false; // both copies arrived: there was no loss
+    }
+}
+
 void TcpConnection::_retransmit(SentSegment& segment, bool rescue)
 {
     _transmit(segment.flags, segment.seq, segment.payload);
@@ -881,6 +991,7 @@ void TcpConnection::_enter_recovery(uint32_t delivered)
     }
     uint32_t cwnd_before = _congestion->window();
     _in_recovery = true;
+    _tlp_reset();
     _recovery_point = _send_next; // RFC 6582 "recover", RFC 6675 RecoveryPoint
     _recovery_point_valid = true;
     _stats.recoveries += 1;
@@ -1092,6 +1203,11 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     // signal itself. Counted too, so a peer that shrinks its window as it
     // buffers out-of-order data cannot keep fast retransmit from firing.
     is_duplicate_ack = is_duplicate_ack || (!_in_flight.empty() && ack == snd_una && sack_advanced);
+    // TLP's "DupAck without any SACK option" (RFC 8985 7.4.2): the copy that
+    // arrived second drew it, possibly with nothing left outstanding, which
+    // RFC 5681's definition above would not count.
+    _tlp_process_ack(ack, ack == snd_una && !carries_data && !segment.get_syn() && !segment.get_fin()
+                              && _peer_window == previous_peer_window && segment.get_sack_blocks().empty());
 
     if (is_duplicate_ack)
     {
@@ -1211,6 +1327,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     {
         _rto_recovery = false; // everything outstanding at the timeout is acknowledged
     }
+    _schedule_loss_probe(); // RFC 8985 7.2: on an ack that acknowledges new data
 
     // RFC 8985 6.2 step 5 on an ack that moved SND.UNA: a partial ack in
     // recovery acts on what it marks through NextSeg() below; outside
@@ -1850,6 +1967,10 @@ uint64_t TcpConnection::next_deadline_ms() const
     {
         deadline = std::min(deadline, _rack_reo_deadline_ms);
     }
+    if (_tlp_deadline_ms != 0 && _tlp_allowed())
+    {
+        deadline = std::min(deadline, _tlp_deadline_ms);
+    }
     for (const SentSegment& entry : _in_flight)
     {
         if (!entry.sacked)
@@ -1935,6 +2056,14 @@ void TcpConnection::_run_timers()
             return;
         }
     }
+    if (_tlp_deadline_ms != 0 && _now_ms >= _tlp_deadline_ms)
+    {
+        _tlp_deadline_ms = 0;
+        if (_tlp_allowed())
+        {
+            _send_loss_probe();
+        }
+    }
 
     // Simplified go-back-one: only one segment is resent per timeout, not every
     // unacked one (real go-back-N). With SACK that is the oldest segment the
@@ -1989,6 +2118,7 @@ void TcpConnection::_run_timers()
         _rto_recovery = true;
     }
     _rack_reo_deadline_ms = 0;
+    _tlp_reset();
 
     // Karn's second half - the part that is easy to miss and matters as much
     // as ignoring the ambiguous sample. Having lost a segment, the estimator
