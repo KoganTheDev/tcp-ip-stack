@@ -75,6 +75,27 @@ simultaneous close rather than folding it into `FIN_WAIT_2`. On top of that:
   the ssthresh the Reno or CUBIC policy chose. Without SACK it is NewReno (RFC 6582):
   a partial ack resends the next hole and stays in recovery. Three losses in one flight
   cost three retransmissions and no timeout (`SimRecovery` in the test suite)
+- **RACK-TLP** (RFC 8985) alongside it when SACK is negotiated. RACK detects loss by
+  *time*: once a segment sent later has been delivered and a reordering window
+  (min_RTT/4, or 0 in recovery) has passed, an earlier one is lost - a retransmission
+  included, which RFC 6675's counting cannot see, so a lost retransmission no longer
+  waits for the RTO. Candidates sit in a transmit-time list, so an ack costs what it
+  changes rather than a walk of the flight however the peer shapes its SACK blocks, and
+  a reordering timer catches what no ack would. A **Tail Loss Probe** handles the loss
+  nothing follows: when an ack is overdue (2*SRTT, never later than the RTO) one probe
+  goes out - new data, or the last segment again - so its SACK can tell RACK what is
+  missing, and a loss the probe repaired by itself still reduces cwnd. In `SimRecovery`
+  a lost retransmission now completes in 230 ms instead of 490 (no RTO), a lost tail in
+  430 ms instead of 930, and 5% random loss over five seeds takes 2 RTOs instead of 12
+- **ECN** (RFC 3168): negotiated on the SYNs, ECT(0) on new data only (never on SYNs,
+  pure acks, retransmissions or probes), CE echoed as ECE until the sender's CWR, and
+  ECE answered like a loss - the congestion-control policy's ssthresh - at most once per
+  window, so an ECE flood earns one reduction per round trip. `NetworkStack::set_tcp_ecn()`
+  takes Linux's `tcp_ecn` modes: 0 off, 1 ask and accept, 2 accept only - the default,
+  as on Linux, since asking can meet middleboxes that drop ECN-setup SYNs. A simulated
+  link that marks instead of dropping carries a transfer with no retransmissions while
+  the window still comes down. Forwarding leaves the TOS byte, ECN field included, as it
+  found it
 - **Keepalive** (RFC 1122 4.2.3.6), off by default as the RFC requires, probing one byte
   *behind* SND.NXT because that is the only segment that compels a reply without moving
   the stream
@@ -287,10 +308,14 @@ limit by a peer.
 
 These are documented decisions, not gaps that were missed:
 
-- **No PRR without SACK, and no RACK/TLP, D-SACK or F-RTO.** Without SACK, recovery is
-  NewReno's window inflation; there is no SACK-less pipe estimate for PRR to work from.
-  Loss is detected by duplicate counts (DupThresh 3) rather than by time (RFC 8985), a
-  lost retransmission still costs a timeout, and a spurious timeout is not undone.
+- **No PRR or RACK-TLP without SACK, and no D-SACK or F-RTO.** Without SACK, recovery
+  is NewReno's window inflation and loss is detected by duplicate counts alone; there is
+  no SACK-less pipe estimate for PRR to work from. Without D-SACK, RACK's reordering
+  window stays at min_RTT/4 (RFC 8985's reo_wnd_mult never grows), TLP judges a repaired
+  loss without the D-SACK case, and a spurious retransmission or timeout is not undone.
+- **ECN is RFC 3168's, not AccECN or L4S.** One reduction per marked window, no
+  per-mark feedback (RFC 9768) and no DCTCP-style proportional response; a sender with a
+  one-segment window does not also reset its retransmit timer on ECE (6.1.2).
 - **No ECMP.** A route is keyed by destination and prefix, so two routes to one prefix by
   different interfaces cannot coexist. Equal-cost multipath needs a per-flow hash to keep
   a connection's packets on one path, which is a different project.
