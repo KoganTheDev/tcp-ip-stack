@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "ipv6_address.h"
@@ -46,6 +47,25 @@ enum class NeighbourState
     PROBE,
 };
 
+// Why an entry exists, which decides what a full cache gives up first.
+//
+// The cache is fed from the link, so an attacker who can spoof on-link
+// sources can make it create entries: every echo request, SYN or solicitation
+// it sends draws a reply, and a reply needs resolution. Entries created that
+// way are worth little - nobody here asked to talk to those addresses - and
+// the eviction and quota rules below make them compete only with each other.
+enum class NeighbourOrigin
+{
+    // This host's own traffic: a connect(), a UDP send, data on a connection,
+    // the default router.
+    HOST,
+    // An answer to inbound traffic from an unverified source - an echo reply,
+    // a SYN-ACK to a new peer, an ICMP error - or a mapping learned unasked
+    // from a solicitation or an RA. Promoted to HOST when this host later
+    // sends its own traffic there or a connection confirms it.
+    REPLY,
+};
+
 // The RFC 4861 neighbour cache: NDP's answer to the ARP table.
 //
 // Pure state and timers with no I/O, the same shape as ArpTable and
@@ -70,7 +90,18 @@ public:
     // true with the MAC otherwise, and may start a probe as a side effect,
     // because a STALE entry becoming DELAY is triggered by exactly this: the
     // act of sending to it.
-    bool lookup(const IPv6Address& address, MacAddress& out_mac);
+    //
+    // `origin` says who wants it (see NeighbourOrigin). A lookup never fails
+    // for lack of room: resolutions in flight have a quota per origin, and a
+    // full quota gives up its own oldest INCOMPLETE entry - which has nothing
+    // resolved to lose - so reply traffic cannot crowd out this host's own.
+    bool lookup(const IPv6Address& address, MacAddress& out_mac, NeighbourOrigin origin = NeighbourOrigin::HOST);
+
+    // Addresses a full cache must not evict while it holds anything else:
+    // the default routers and the neighbours live connections use. The owner
+    // knows those; the cache asks only when it has to evict.
+    using InUseFn = std::function<std::unordered_set<IPv6Address>()>;
+    void set_in_use_callback(InUseFn in_use) { _in_use = std::move(in_use); }
 
     // A neighbour advertisement, or any other message carrying a link-layer
     // address, arrived.
@@ -114,6 +145,7 @@ public:
     // "has a usable link-layer address".
     bool tracks(const IPv6Address& address) const { return _entries.count(address) != 0; }
     NeighbourState state_of(const IPv6Address& address) const;
+    NeighbourOrigin origin_of(const IPv6Address& address) const;
     size_t size() const { return _entries.size(); }
 
     // How long a positive confirmation is trusted before an entry falls back to
@@ -129,15 +161,15 @@ public:
     static constexpr int MAX_MULTICAST_SOLICIT = 3;
     // Probes sent to a previously-known neighbour before it is declared gone.
     static constexpr int MAX_UNICAST_SOLICIT = 3;
-    // Bounded because entries are created by traffic from the link. When
-    // full, a lookup() evicts the least recently used unused resolved entry,
-    // else an INCOMPLETE one, and never a resolved entry in use; unsolicited
-    // learning may only evict unused resolved entries.
+    // Bounded because entries are created by traffic from the link. A full
+    // cache evicts, least recently used first: a REPLY entry, then a HOST
+    // entry that is neither a router nor a live connection's neighbour, and
+    // one of those only when nothing else is left.
     static constexpr size_t MAX_ENTRIES = 512;
-    // Resolutions in flight at once. Beyond it lookup() refuses (the caller
-    // drops the packet) instead of evicting: lookups include replies to
-    // whatever source address a packet claimed.
-    static constexpr size_t MAX_INCOMPLETE = 64;
+    // Resolutions in flight per origin (Linux's unres_qlen idea, split so a
+    // reply flood has its own budget). A full quota evicts its own oldest.
+    static constexpr size_t HOST_INCOMPLETE_MAX = 64;
+    static constexpr size_t REPLY_INCOMPLETE_MAX = 64;
     // An unused STALE entry is dropped after this long (Linux's
     // gc_stale_time), so spoofed entries do not sit in the cache forever.
     static constexpr int GC_STALE_TIME_MS = 60000;
@@ -149,17 +181,16 @@ private:
         NeighbourState state = NeighbourState::INCOMPLETE;
         int timer_ms = 0;      // meaning depends on the state
         int probes_sent = 0;
-        // Set when this host looks the entry up after it resolved: an entry in
-        // use, which eviction never takes.
-        bool referenced = false;
-        uint64_t last_used_ms = 0;
+        NeighbourOrigin origin = NeighbourOrigin::HOST;
+        uint64_t last_used_ms = 0; // LRU order, and the STALE GC's idle time
     };
 
-    // Frees one slot; false if nothing may go. Unsolicited learning may only
-    // displace unused resolved entries; a lookup may also displace an
-    // INCOMPLETE one.
-    bool _evict(bool host_initiated);
+    // Frees one slot of a non-empty cache, in the order MAX_ENTRIES describes.
+    void _evict();
+    // A full per-origin quota of INCOMPLETE entries gives up its oldest.
+    void _make_incomplete_room(NeighbourOrigin origin);
     uint64_t _clock_ms = 0;
+    InUseFn _in_use;
 
     void _enter_state(const IPv6Address& address, Entry& entry, NeighbourState state);
 

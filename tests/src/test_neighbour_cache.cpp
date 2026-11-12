@@ -396,15 +396,46 @@ TEST(NeighbourCache, AnUnusedStaleEntryIsCollected)
     EXPECT_TRUE(h.sent.empty()) << "collected, not probed";
 }
 
-TEST(NeighbourCache, ResolutionsInFlightAreCappedAndTheExcessRefused)
+TEST(NeighbourCache, EachOriginHasItsOwnQuotaOfResolutionsInFlight)
 {
     CacheHarness h;
     MacAddress mac;
-    for (size_t i = 0; i < NeighbourCache::MAX_INCOMPLETE + 20; i++)
-        h.cache.lookup(spoofed(i), mac);
-    EXPECT_EQ(h.cache.size(), NeighbourCache::MAX_INCOMPLETE);
-    EXPECT_FALSE(h.cache.tracks(spoofed(NeighbourCache::MAX_INCOMPLETE))) << "refused, not evicting";
-    EXPECT_EQ(h.sent.size(), NeighbourCache::MAX_INCOMPLETE) << "no solicitation for a refused one";
+    const IPv6Address mine("2001:db8:1::1");
+    h.cache.lookup(mine, mac, NeighbourOrigin::HOST);
+    for (size_t i = 0; i < NeighbourCache::REPLY_INCOMPLETE_MAX * 4; i++)
+        h.cache.lookup(spoofed(i), mac, NeighbourOrigin::REPLY);
+    EXPECT_EQ(h.cache.size(), NeighbourCache::REPLY_INCOMPLETE_MAX + 1) << "replies compete only with replies";
+    EXPECT_TRUE(h.cache.tracks(mine)) << "this host's own resolution is untouched";
+    EXPECT_TRUE(h.cache.tracks(spoofed(NeighbourCache::REPLY_INCOMPLETE_MAX * 4 - 1))) << "the newest is kept";
+    EXPECT_FALSE(h.cache.tracks(spoofed(0))) << "the oldest made room";
+
+    for (size_t i = 0; i < NeighbourCache::HOST_INCOMPLETE_MAX + 5; i++)
+        h.cache.lookup(IPv6Address("2001:db8:2::" + std::to_string(i + 1)), mac, NeighbourOrigin::HOST);
+    EXPECT_TRUE(h.cache.tracks(IPv6Address("2001:db8:2::" + std::to_string(NeighbourCache::HOST_INCOMPLETE_MAX + 5))))
+        << "a host lookup is never refused";
+}
+
+TEST(NeighbourCache, AReplyEntryIsPromotedWhenThisHostUsesIt)
+{
+    CacheHarness h;
+    h.cache.on_solicitation_from(NEIGHBOUR, NEIGHBOUR_MAC);
+    ASSERT_EQ(h.cache.origin_of(NEIGHBOUR), NeighbourOrigin::REPLY);
+    MacAddress mac;
+    h.cache.lookup(NEIGHBOUR, mac, NeighbourOrigin::REPLY);
+    EXPECT_EQ(h.cache.origin_of(NEIGHBOUR), NeighbourOrigin::REPLY) << "answering it is not using it";
+    h.cache.lookup(NEIGHBOUR, mac, NeighbourOrigin::HOST);
+    EXPECT_EQ(h.cache.origin_of(NEIGHBOUR), NeighbourOrigin::HOST);
+}
+
+TEST(NeighbourCache, AFullCacheKeepsEntriesItIsToldAreInUse)
+{
+    CacheHarness h;
+    h.cache.set_in_use_callback([] { return std::unordered_set<IPv6Address>{NEIGHBOUR}; });
+    h.cache.on_solicitation_from(NEIGHBOUR, NEIGHBOUR_MAC); // a REPLY entry, but the router's
+    MacAddress mac;
+    for (size_t i = 0; i < NeighbourCache::MAX_ENTRIES * 3; i++)
+        h.cache.lookup(IPv6Address("2001:db8:3::" + std::to_string(i + 1)), mac, NeighbourOrigin::HOST);
+    EXPECT_TRUE(h.cache.contains(NEIGHBOUR));
 }
 
 TEST(NeighbourCache, AFullCacheNeverGivesUpAResolvedEntryInUseForANewResolution)

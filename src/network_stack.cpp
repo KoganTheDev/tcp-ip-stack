@@ -2651,9 +2651,14 @@ void NetworkStack::_send_tcp_segment(const IpAddress& destination, const Tcp& he
         // RFC 8200 8.1: the v6 pseudo-header - both 128-bit addresses, a
         // 32-bit length, and next header 6.
         segment.set_checksum(ipv6_transport_checksum(*source, destination.v6(), IPV6_NEXT_TCP, segment.to_bytes()));
+        // A SYN-ACK or a RST answers a peer nothing here has verified yet (a
+        // spoofed SYN draws both), so its resolution is a REPLY; everything
+        // else a connection sends is this host's own traffic.
+        NeighbourOrigin origin =
+            (header.get_syn() && header.get_ack()) || header.get_rst() ? NeighbourOrigin::REPLY : NeighbourOrigin::HOST;
         // ECN rides in the low two bits of the Traffic Class (RFC 3168 5).
         this->_send_ipv6_packet(*source, destination.v6(), IPV6_NEXT_TCP, segment.to_bytes(), 64,
-                                static_cast<uint8_t>(ecn));
+                                static_cast<uint8_t>(ecn), origin);
         return;
     }
     const IPv4Address& dest_ip = destination.v4();

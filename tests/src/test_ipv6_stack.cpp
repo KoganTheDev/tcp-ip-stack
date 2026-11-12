@@ -865,3 +865,123 @@ TEST(Ipv6Stack, APingFloodFromSpoofedSourcesCannotEvictAResolvedNeighbour)
     ASSERT_EQ(sent.size(), 1u) << "and traffic to it goes straight out";
     EXPECT_TRUE(sent[0].destination_mac == PEER_MAC);
 }
+
+namespace
+{
+    Bytes tcp_segment(const IPv6Address& from, const IPv6Address& to, uint16_t sport, uint16_t dport, uint32_t seq,
+                      uint32_t ack, uint8_t flags, uint16_t mss = 0)
+    {
+        Tcp tcp(sport, dport, seq, ack, mss != 0 ? 6 : 5, flags, 65535, 0, 0);
+        if (mss != 0)
+            tcp.set_mss_option(mss);
+        Bytes segment = tcp.to_bytes();
+        uint16_t checksum = ipv6_transport_checksum(from, to, IPV6_NEXT_TCP, segment);
+        segment[16] = static_cast<byte_t>(checksum >> 8);
+        segment[17] = static_cast<byte_t>(checksum & 0xff);
+        return ipv6_packet(from, to, IPV6_NEXT_TCP, segment);
+    }
+
+    IPv6Address numbered(const char* prefix, size_t i)
+    {
+        Bytes address = IPv6Address(prefix).get_address();
+        address[13] = static_cast<byte_t>(i >> 16);
+        address[14] = static_cast<byte_t>(i >> 8);
+        address[15] = static_cast<byte_t>(i);
+        return IPv6Address(address);
+    }
+}
+
+// Every neighbour-cache attack the security review raised, at once: pings,
+// SYNs and solicitations from more spoofed on-link sources than the cache
+// holds, interleaved with this host resolving new peers of its own. The
+// router's mapping and a live connection's neighbour must survive, every
+// resolution this host starts during the flood must complete, and memory
+// must stay bounded.
+TEST(Ipv6Stack, NeighbourCacheHoldsUnderAMixedSpoofedFlood)
+{
+    Host host;
+    host.stack->add_ipv6_address(LOCAL);
+    host.stack->listen(80);
+
+    // A default router, learned from an RA (with its SLLA).
+    host.deliver(icmpv6_packet(ROUTER_LL, IPv6Address::all_nodes_multicast(), ICMPV6_ROUTER_ADVERTISEMENT,
+                               router_advertisement_body(1800, ROUTER_MAC)),
+                 IPv6Address::all_nodes_multicast().multicast_mac(), ROUTER_MAC);
+    ASSERT_EQ(host.stack->ipv6_default_routers().size(), 1u);
+
+    // A live connection to PEER.
+    TcpConnection* connection = host.stack->connect(PEER, 443);
+    ASSERT_NE(connection, nullptr);
+    uint64_t connection_id = connection->get_id();
+    host.advertise_peer();
+    Tcp syn(ipv6_frames(host.channel->outbound_frames()).back().ip->get_upper_layer_payload());
+    host.deliver(tcp_segment(PEER, LOCAL, 443, syn.get_src_port(), 9000, syn.get_sequence_number() + 1, 0x12, 1440));
+    ASSERT_EQ(connection->get_state(), TcpState::ESTABLISHED);
+
+    const size_t sources = NeighbourCache::MAX_ENTRIES * 3;
+    size_t resolutions_started = 0;
+    size_t resolutions_completed = 0;
+    UdpSocket* socket = host.stack->bind_udp(5000);
+    for (size_t i = 0; i < sources; i++)
+    {
+        const IPv6Address spoofed = numbered("2001:db8::a:0:0", i);
+        Bytes echo;
+        echo.append_int<uint32_t>(static_cast<uint32_t>(i));
+        switch (i % 3)
+        {
+        case 0:
+            host.deliver(icmpv6_packet(spoofed, LOCAL, ICMPV6_ECHO_REQUEST, echo, 64));
+            break;
+        case 1:
+            host.deliver(tcp_segment(spoofed, LOCAL, 1000, 80, static_cast<uint32_t>(i), 0, 0x02, 1440));
+            break;
+        default:
+            host.deliver(icmpv6_packet(spoofed, LOCAL.solicited_node_multicast(), ICMPV6_NEIGHBOUR_SOLICITATION,
+                                       Icmpv6::build_neighbour_solicitation(LOCAL, PEER_MAC, true)),
+                         LOCAL.solicited_node_multicast().multicast_mac());
+            break;
+        }
+
+        // Every 97 packets this host starts resolving a new peer of its own,
+        // and the peer answers a few flood packets later.
+        if (i % 97 == 0)
+        {
+            const IPv6Address wanted = numbered("2001:db8::b:0:0", i);
+            const MacAddress wanted_mac("02:00:00:00:77:01");
+            socket->send_to(wanted, 9, Bytes::from_hex("aa"));
+            resolutions_started++;
+            for (size_t j = 0; j < 5; j++)
+            {
+                const IPv6Address more = numbered("2001:db8::c:0:0", i * 8 + j);
+                host.deliver(icmpv6_packet(more, LOCAL, ICMPV6_ECHO_REQUEST, echo, 64));
+            }
+            host.channel->clear_outbound();
+            host.deliver(icmpv6_packet(wanted, LOCAL, ICMPV6_NEIGHBOUR_ADVERTISEMENT,
+                                       Icmpv6::build_neighbour_advertisement(wanted, wanted_mac, false, true, true)),
+                         MAC_A, wanted_mac);
+            for (const V6Frame& frame : ipv6_frames(host.channel->outbound_frames()))
+                if (frame.destination_mac == wanted_mac && frame.ip->get_destination() == wanted)
+                    resolutions_completed++;
+        }
+        if (i % 50 == 0)
+            host.stack->on_time_passed(250);
+        host.channel->clear_outbound();
+
+        ASSERT_LE(host.stack->neighbour_cache()->size(), NeighbourCache::MAX_ENTRIES) << "bounded, at " << i;
+        ASSERT_LE(host.stack->ipv6_pending_packets(), NetworkStack::MAX_IPV6_PENDING_TOTAL);
+    }
+
+    EXPECT_TRUE(host.stack->neighbour_cache()->contains(ROUTER_LL)) << "the router mapping survives";
+    EXPECT_TRUE(host.stack->find_connection(connection_id) != nullptr);
+    EXPECT_TRUE(host.stack->neighbour_cache()->contains(PEER)) << "the live connection's neighbour survives";
+    EXPECT_EQ(resolutions_completed, resolutions_started) << "every resolution this host started completed";
+
+    // And both still carry traffic straight away.
+    host.channel->clear_outbound();
+    connection->send(Bytes::from_hex("01"));
+    socket->send_to(IPv6Address("2001:db8:99::1"), 9, Bytes::from_hex("02")); // off-link: via the router
+    std::vector<V6Frame> sent = ipv6_frames(host.channel->outbound_frames());
+    ASSERT_EQ(sent.size(), 2u);
+    EXPECT_TRUE(sent[0].destination_mac == PEER_MAC);
+    EXPECT_TRUE(sent[1].destination_mac == ROUTER_MAC);
+}

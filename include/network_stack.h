@@ -955,11 +955,17 @@ private:
     bool _ipv6_route_for(const IPv6Address& destination, IPv6Address& out_next_hop) const;
     // Builds the IPv6 header and sends - or queues, if the next hop is not
     // resolved yet. Never fragments: a packet larger than the link MTU is
-    // dropped.
+    // dropped. `origin` tells the neighbour cache whether this is the host's
+    // own traffic or an answer to an unverified source (see NeighbourOrigin).
     void _send_ipv6_packet(const IPv6Address& source, const IPv6Address& destination, uint8_t next_header,
-                           const Bytes& payload, uint8_t hop_limit = 64, uint8_t traffic_class = 0);
+                           const Bytes& payload, uint8_t hop_limit = 64, uint8_t traffic_class = 0,
+                           NeighbourOrigin origin = NeighbourOrigin::HOST);
     void _send_icmpv6(const IPv6Address& source, const IPv6Address& destination, uint8_t type, uint8_t code,
-                      const Bytes& body, uint8_t hop_limit = 64);
+                      const Bytes& body, uint8_t hop_limit = 64, NeighbourOrigin origin = NeighbourOrigin::HOST);
+    // The neighbours a full cache must keep: the default routers, and the
+    // next hops of live connections (any but a half-open passive one, which a
+    // spoofed SYN can create).
+    std::unordered_set<IPv6Address> _ipv6_neighbours_in_use() const;
     void _send_ipv6_datagram(const IPv6Address& destination, const Udp& header, const Bytes& payload);
     void _send_ipv6_echo_request(const IPv6Address& destination, uint16_t identifier, uint16_t sequence,
                                  const Bytes& payload);

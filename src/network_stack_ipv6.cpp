@@ -116,6 +116,31 @@ void NetworkStack::_ensure_ipv6()
     this->_v6.neighbours =
         std::make_unique<NeighbourCache>([this](const IPv6Address& target, const MacAddress& unicast_to)
                                          { this->_send_neighbour_solicitation(target, unicast_to); });
+    this->_v6.neighbours->set_in_use_callback([this]() { return this->_ipv6_neighbours_in_use(); });
+}
+
+std::unordered_set<IPv6Address> NetworkStack::_ipv6_neighbours_in_use() const
+{
+    std::unordered_set<IPv6Address> in_use;
+    for (const Ipv6Router& router : this->_v6.routers)
+    {
+        in_use.insert(router.address);
+    }
+    for (const auto& entry : this->_connections_by_id)
+    {
+        const IpAddress& peer = entry.second.key.remote_ip;
+        TcpState state = entry.second.connection->get_state();
+        if (!peer.is_v6() || state == TcpState::SYN_RECEIVED || state == TcpState::CLOSED)
+        {
+            continue;
+        }
+        IPv6Address next_hop;
+        if (this->_ipv6_route_for(peer.v6(), next_hop))
+        {
+            in_use.insert(next_hop);
+        }
+    }
+    return in_use;
 }
 
 void NetworkStack::enable_ipv6()
@@ -435,7 +460,7 @@ void NetworkStack::_handle_icmpv6(const Ipv6& ip)
         {
             return;
         }
-        this->_send_icmpv6(destination, source, ICMPV6_ECHO_REPLY, 0, message.get_body());
+        this->_send_icmpv6(destination, source, ICMPV6_ECHO_REPLY, 0, message.get_body(), 64, NeighbourOrigin::REPLY);
         return;
     }
     case ICMPV6_ECHO_REPLY:
@@ -525,8 +550,8 @@ void NetworkStack::_handle_neighbour_solicitation(const Ipv6& ip, const Icmpv6& 
         return;
     }
 
-    // Learned as STALE (RFC 4861 7.2.3) - unreferenced, so a flood of these
-    // can only displace each other, never an entry this host uses.
+    // Learned as STALE (RFC 4861 7.2.3), with REPLY origin, so a flood of
+    // these competes only with itself for room.
     if (!is_zero(source_mac))
     {
         this->_v6.neighbours->on_solicitation_from(source, source_mac);
@@ -541,8 +566,8 @@ void NetworkStack::_handle_neighbour_solicitation(const Ipv6& ip, const Icmpv6& 
         this->_transmit_ipv6(source_mac, header.to_bytes());
         return;
     }
-    this->_send_icmpv6(target, source, ICMPV6_NEIGHBOUR_ADVERTISEMENT, 0, advertisement,
-                       Icmpv6::NDP_REQUIRED_HOP_LIMIT);
+    this->_send_icmpv6(target, source, ICMPV6_NEIGHBOUR_ADVERTISEMENT, 0, advertisement, Icmpv6::NDP_REQUIRED_HOP_LIMIT,
+                       NeighbourOrigin::REPLY);
 }
 
 void NetworkStack::_handle_neighbour_advertisement(const Ipv6& ip, const Icmpv6& message)
@@ -733,7 +758,8 @@ void NetworkStack::_transmit_ipv6(const MacAddress& destination_mac, const Bytes
 }
 
 void NetworkStack::_send_ipv6_packet(const IPv6Address& source, const IPv6Address& destination, uint8_t next_header,
-                                     const Bytes& payload, uint8_t hop_limit, uint8_t traffic_class)
+                                     const Bytes& payload, uint8_t hop_limit, uint8_t traffic_class,
+                                     NeighbourOrigin origin)
 {
     if (!this->_v6.enabled)
     {
@@ -769,7 +795,7 @@ void NetworkStack::_send_ipv6_packet(const IPv6Address& source, const IPv6Addres
     }
 
     MacAddress mac;
-    if (this->_v6.neighbours->lookup(next_hop, mac))
+    if (this->_v6.neighbours->lookup(next_hop, mac, origin))
     {
         this->_transmit_ipv6(mac, packet);
         return;
@@ -805,7 +831,8 @@ void NetworkStack::_flush_ipv6_pending(const IPv6Address& neighbour)
         return;
     }
     MacAddress mac;
-    if (!this->_v6.neighbours->lookup(neighbour, mac))
+    // REPLY: releasing what waited is not this host choosing to talk to it.
+    if (!this->_v6.neighbours->lookup(neighbour, mac, NeighbourOrigin::REPLY))
     {
         return;
     }
@@ -819,11 +846,11 @@ void NetworkStack::_flush_ipv6_pending(const IPv6Address& neighbour)
 }
 
 void NetworkStack::_send_icmpv6(const IPv6Address& source, const IPv6Address& destination, uint8_t type, uint8_t code,
-                                const Bytes& body, uint8_t hop_limit)
+                                const Bytes& body, uint8_t hop_limit, NeighbourOrigin origin)
 {
     Icmpv6 message(type, code, body);
     message.compute_checksum(source, destination);
-    this->_send_ipv6_packet(source, destination, IPV6_NEXT_ICMPV6, message.to_bytes(), hop_limit);
+    this->_send_ipv6_packet(source, destination, IPV6_NEXT_ICMPV6, message.to_bytes(), hop_limit, 0, origin);
 }
 
 void NetworkStack::_send_ipv6_datagram(const IPv6Address& destination, const Udp& header, const Bytes& payload)
@@ -956,7 +983,7 @@ void NetworkStack::_send_icmpv6_error(const Ipv6& about, const Bytes& packet, bo
     Bytes body;
     body.append_int<uint32_t>(parameter);
     body |= packet.slice(0, std::min(packet.size(), ICMPV6_ERROR_MAX_QUOTE));
-    this->_send_icmpv6(about.get_destination(), source, type, code, body);
+    this->_send_icmpv6(about.get_destination(), source, type, code, body, 64, NeighbourOrigin::REPLY);
 }
 
 // ---- timers ----------------------------------------------------------------
