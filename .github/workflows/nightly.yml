@@ -112,3 +112,49 @@ jobs:
             build/fuzz/*.log
           if-no-files-found: ignore
           retention-days: 30
+
+  # The real epoll-server on this repo's stack over a veth pair, driven by the
+  # kernel's TCP through tools/loadgen: a burst of concurrent connections, a
+  # sustained minute of churn, and a lossy/delayed run (tc netem). The client is
+  # an independent implementation, so an echo that comes back wrong, a reset or a
+  # stall is a bug in our stack and fails the job. The logic is in
+  # scripts/loadtest_netns.sh (it needs root, so it is not part of any local
+  # test run); the JSON reports are uploaded whatever the outcome.
+  loadtest:
+    name: load test (veth, real stack)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: loadtest
+
+      - uses: ./.github/actions/netns-tools
+
+      # sch_netem is in linux-modules-extra on Ubuntu's cloud kernels; without
+      # it the script skips the lossy phase with a warning instead of failing.
+      - name: Install the netem kernel module if the image lacks it
+        run: |
+          sudo modprobe sch_netem 2>/dev/null \
+            || { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe sch_netem; } \
+            || echo "::warning::sch_netem unavailable; the netem phase will be skipped"
+
+      - name: Build the server on our stack, and loadgen
+        run: |
+          make -C epoll-server -j"$(nproc)"
+          cmake --preset release
+          cmake --build --preset release --target loadgen
+
+      - name: Run the load test
+        run: sudo env OUT_DIR="$PWD/loadtest-results" scripts/loadtest_netns.sh
+
+      - name: Upload the JSON reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loadtest-nightly
+          path: loadtest-results/
+          if-no-files-found: ignore
+          retention-days: 30
