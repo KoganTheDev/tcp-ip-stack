@@ -1,4 +1,5 @@
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
 
@@ -8,6 +9,7 @@
 #include <cstring>
 #include <exception>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -933,6 +935,20 @@ namespace ustack
                 list.erase(std::remove(list.begin(), list.end(), fd), list.end());
             }
             _epoll_fds.erase(fd);
+            {
+                // Kernel fds it watched: the driver stops waking for them
+                // unless another epoll still wants them.
+                std::vector<int> external;
+                for (const auto& entry : socket->epoll->external)
+                {
+                    external.push_back(entry.first);
+                }
+                socket->epoll->external.clear();
+                for (int kernel_fd : external)
+                {
+                    static_cast<void>(_sync_external(kernel_fd));
+                }
+            }
             break;
         case Kind::UDP:
             if (socket->udp != nullptr)
@@ -1392,11 +1408,129 @@ namespace ustack
         return count;
     }
 
+    uint32_t Stack::_poll_external(int fd, uint32_t interest)
+    {
+        // The poll(2) and epoll event bits are the same numbers on Linux.
+        constexpr uint32_t WATCHED = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
+        pollfd entry{fd, static_cast<short>(interest & (EPOLLIN | EPOLLOUT | EPOLLRDHUP)), 0};
+        if (::poll(&entry, 1, 0) <= 0 || (entry.revents & POLLNVAL) != 0)
+        {
+            return 0; // nothing ready, or closed without a DEL
+        }
+        return static_cast<uint32_t>(entry.revents) & WATCHED;
+    }
+
+    int Stack::_collect_external(const EpollInstance& epoll, struct epoll_event* events, int maxevents) const
+    {
+        int count = 0;
+        for (const auto& entry : epoll.external)
+        {
+            if (count >= maxevents)
+            {
+                break;
+            }
+            uint32_t revents = _poll_external(entry.first, entry.second.events);
+            if (revents != 0)
+            {
+                events[count].events = revents;
+                events[count].data = entry.second.data;
+                count++;
+            }
+        }
+        return count;
+    }
+
+    int Stack::_sync_external(int fd)
+    {
+        uint32_t wanted = 0;
+        for (int epfd : _epoll_fds)
+        {
+            const auto& external = _sockets[static_cast<size_t>(epfd)]->epoll->external;
+            auto it = external.find(fd);
+            if (it != external.end())
+            {
+                wanted |= it->second.events;
+            }
+        }
+        return _driver->watch_fd(fd, wanted & (EPOLLIN | EPOLLOUT | EPOLLRDHUP));
+    }
+
+    int Stack::epoll_ctl_external(int epfd, int op, int fd, struct epoll_event* event)
+    {
+        CallScope scope(*this);
+        Socket* owner = _get(epfd);
+        if (owner == nullptr)
+        {
+            return fail(EBADF);
+        }
+        if (owner->kind != Kind::EPOLL || fd < 0)
+        {
+            return fail(EINVAL);
+        }
+        if (op != EPOLL_CTL_DEL && event == nullptr)
+        {
+            return fail(EFAULT);
+        }
+        auto& external = owner->epoll->external;
+        auto it = external.find(fd);
+        switch (op)
+        {
+        case EPOLL_CTL_ADD:
+        case EPOLL_CTL_MOD:
+        {
+            if ((event->events & (EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE)) != 0)
+            {
+                return fail(EINVAL);
+            }
+            if (op == EPOLL_CTL_ADD ? it != external.end() : it == external.end())
+            {
+                return fail(op == EPOLL_CTL_ADD ? EEXIST : ENOENT);
+            }
+            std::optional<struct epoll_event> previous;
+            if (it != external.end())
+            {
+                previous = it->second;
+            }
+            external[fd] = *event;
+            if (int error = _sync_external(fd); error != 0)
+            {
+                if (previous.has_value())
+                {
+                    external[fd] = *previous;
+                }
+                else
+                {
+                    external.erase(fd);
+                }
+                return fail(error);
+            }
+            return 0;
+        }
+        case EPOLL_CTL_DEL:
+            if (it == external.end())
+            {
+                return fail(ENOENT);
+            }
+            external.erase(it);
+            static_cast<void>(_sync_external(fd));
+            return 0;
+        default:
+            return fail(EINVAL);
+        }
+    }
+
     bool Stack::_any_ready() const
     {
         for (int epfd : _epoll_fds)
         {
             const EpollInstance& epoll = *_sockets[static_cast<size_t>(epfd)]->epoll;
+            for (const auto& entry : epoll.external)
+            {
+                if (_poll_external(entry.first, entry.second.events) != 0)
+                {
+                    return true;
+                }
+            }
             for (int fd : epoll.ready)
             {
                 if ((_poll(fd) & epoll.items.at(fd).event.events) != 0)
@@ -1534,6 +1668,7 @@ namespace ustack
         for (;;)
         {
             int count = _collect(*owner->epoll, events, maxevents);
+            count += _collect_external(*owner->epoll, events + count, maxevents - count);
             if (count > 0 || timeout == 0)
             {
                 return count;

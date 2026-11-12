@@ -69,6 +69,13 @@ namespace ustack
         // --- epoll ---
         int epoll_create1(int flags) { return ::epoll_create1(flags); }
         int epoll_ctl(int epfd, int op, int fd, struct epoll_event* event) { return ::epoll_ctl(epfd, op, fd, event); }
+        // A kernel epoll watches kernel fds natively, so this is epoll_ctl().
+        // ustack::Stack needs a separate method because its own fds are not
+        // the kernel's; here there is only one kind.
+        int epoll_ctl_external(int epfd, int op, int fd, struct epoll_event* event)
+        {
+            return ::epoll_ctl(epfd, op, fd, event);
+        }
         int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout)
         {
             return ::epoll_wait(epfd, events, maxevents, timeout);

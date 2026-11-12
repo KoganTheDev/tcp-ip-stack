@@ -390,6 +390,10 @@ namespace
         int getsockname(int fd, sockaddr* a, socklen_t* l) { return _real.getsockname(fd, a, l); }
         int epoll_create1(int f) { return _real.epoll_create1(f); }
         int epoll_ctl(int ep, int op, int fd, epoll_event* e) { return _real.epoll_ctl(ep, op, fd, e); }
+        int epoll_ctl_external(int ep, int op, int fd, epoll_event* e)
+        {
+            return _real.epoll_ctl_external(ep, op, fd, e);
+        }
         int epoll_wait(int ep, epoll_event* e, int n, int t) { return _real.epoll_wait(ep, e, n, t); }
 
     private:
@@ -477,4 +481,31 @@ TEST_F(AcceptPauseTest, ConnectionCapPausesAcceptingUntilAConnectionCloses)
                           return got.size() >= 2;
                       }));
     EXPECT_EQ(got, "in");
+}
+
+// The CompletionQueue's eventfd is registered with the stack's epoll, so while
+// work is in the pool the reactor sleeps in epoll_wait() until it completes
+// instead of waking every millisecond to look. A worker that takes 150 ms is
+// answered within a handful of step() calls, not ~150.
+TEST(EchoServerWakeup, ReactorSleepsUntilPoolWorkCompletes)
+{
+    KernelHarness harness;
+    EchoServer<ustack::KernelStack> server(harness.server_stack(), 1);
+    uint16_t port = server.listen_on(0);
+    Client<ustack::KernelStack> client(harness.client_stack(), KernelHarness::server_address(port));
+    ASSERT_TRUE(until(server, [&] { return client.connected(); }));
+
+    server.set_work_delay(std::chrono::milliseconds(150));
+    ASSERT_EQ(client.send("slow"), 4);
+    int steps = 0;
+    std::string got;
+    auto start = std::chrono::steady_clock::now();
+    while (got.empty() && std::chrono::steady_clock::now() - start < std::chrono::seconds(5))
+    {
+        server.step(1000);
+        steps++;
+        got += client.read_available();
+    }
+    EXPECT_EQ(got, "slow");
+    EXPECT_LE(steps, 6) << "the reactor woke " << steps << " times while one request was in the pool";
 }

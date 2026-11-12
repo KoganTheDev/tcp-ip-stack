@@ -431,7 +431,10 @@ callbacks from the stack, with level-triggered, `EPOLLET` and `EPOLLONESHOT` sem
 It is non-blocking only (`socket()` requires `SOCK_NONBLOCK`), because the thread that
 would block is the one that drives the stack; `epoll_wait()` is what runs it, through a
 driver that waits on the channel fds and a timerfd, or on the simulator's virtual time in
-tests. `pollable_fd()` lets it nest inside an application's own kernel epoll.
+tests. `pollable_fd()` lets it nest inside an application's own kernel epoll. The other
+direction is `epoll_ctl_external()`: a kernel fd the application owns (an eventfd, say) is
+added to a ustack epoll and the wait sleeps in the driver's kernel epoll until it is ready
+(level-triggered; the simulator's driver refuses with `ENOTSUP`).
 
 [`include/ustack/kernel_stack.h`](include/ustack/kernel_stack.h) is `ustack::KernelStack`:
 the same method names and signatures, each forwarding to the real `::socket`,

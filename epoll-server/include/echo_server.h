@@ -12,6 +12,7 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -34,12 +35,15 @@
 // response and pushes a closure onto the CompletionQueue; the reactor runs
 // that closure, and so does the send(). Workers never see a socket.
 //
-// One consequence: the CompletionQueue's eventfd is a KERNEL fd, and a
-// ustack epoll cannot watch one (its fds are its own), so the reactor does
-// not wait on it. It drains the queue every pass instead, and while any
-// connection has work in the pool it waits at most 1 ms, so a finished
-// response is sent at most a millisecond late. With nothing in the pool the
-// loop sleeps for the caller's whole timeout, so an idle server costs nothing.
+// The CompletionQueue's eventfd is a KERNEL fd. It is registered with the
+// stack's epoll through epoll_ctl_external() (a plain epoll_ctl on a
+// KernelStack), so the reactor sleeps in epoll_wait() until a socket event, a
+// timer or a finished piece of pool work wakes it: an idle server, or one
+// waiting on slow workers, costs nothing. A stack whose driver cannot watch
+// kernel fds (the simulator's, which has no kernel epoll) refuses with
+// ENOTSUP; the reactor then falls back to waiting at most 1 ms while any
+// connection has work in the pool, so a finished response is sent at most a
+// millisecond late.
 //
 // BACKPRESSURE. While a connection's chunk is in the pool, or its response is
 // not fully written, the connection is "busy" and is NOT read from: its
@@ -71,12 +75,28 @@ public:
     static constexpr size_t DEFAULT_MAX_CONNECTIONS = 1024;
     static constexpr int ACCEPT_RETRY_MS = 1000;
 
+    // Makes every piece of pool work take at least this long, as real
+    // per-connection processing would. Mostly for tests of the reactor's
+    // sleeping.
+    void set_work_delay(std::chrono::milliseconds delay) { this->_work_delay = delay; }
+
     EchoServer(StackT& stack, size_t worker_count)
         : _stack(stack), _epfd(stack.epoll_create1(0)), _thread_pool(worker_count)
     {
         if (this->_epfd < 0)
         {
             throw EXCEPTION(SystemException, std::string("epoll_create1 failed: ") + errno_text(errno));
+        }
+        epoll_event event{};
+        event.events = EPOLLIN;
+        event.data.u64 = COMPLETION_ID;
+        this->_completion_watched =
+            stack.epoll_ctl_external(this->_epfd, EPOLL_CTL_ADD, this->_completion_queue.get_fd(), &event) == 0;
+        if (!this->_completion_watched && errno != ENOTSUP)
+        {
+            std::string why = errno_text(errno);
+            static_cast<void>(stack.close(this->_epfd));
+            throw EXCEPTION(SystemException, "cannot watch the completion queue: " + why);
         }
     }
 
@@ -88,6 +108,12 @@ public:
     ~EchoServer()
     {
         this->_thread_pool.shutdown();
+        if (this->_completion_watched)
+        {
+            // Before the queue's fd is closed, or the driver keeps a stale entry.
+            static_cast<void>(
+                this->_stack.epoll_ctl_external(this->_epfd, EPOLL_CTL_DEL, this->_completion_queue.get_fd(), nullptr));
+        }
         this->_completion_queue.drain_and_run();
         for (auto& entry : this->_conns)
         {
@@ -148,7 +174,7 @@ public:
         this->_completion_queue.drain_and_run();
 
         int wait = timeout_ms;
-        if (this->_busy_count > 0)
+        if (this->_busy_count > 0 && !this->_completion_watched)
         {
             wait = timeout_ms < 0 ? 1 : std::min(timeout_ms, 1);
         }
@@ -288,6 +314,10 @@ private:
 
     void _handle_event(uint64_t id, uint32_t events)
     {
+        if (id == COMPLETION_ID)
+        {
+            return; // the wake-up is all it is for; step() drains the queue
+        }
         if (this->_listeners.count(id) > 0)
         {
             this->_accept_all(id);
@@ -462,6 +492,10 @@ private:
         bool accepted = this->_thread_pool.submit(
             [this, id, data = std::string(buffer, static_cast<size_t>(n))]()
             {
+                if (this->_work_delay.count() > 0)
+                {
+                    std::this_thread::sleep_for(this->_work_delay);
+                }
                 std::string response = data;
                 // The completion MUST be pushed whatever happened above: it is
                 // what clears `busy`. Failing to push wedges the connection.
@@ -615,6 +649,10 @@ private:
     std::unordered_map<uint64_t, Conn> _conns;
     uint64_t _next_id = 1;
     int _busy_count = 0;
+    // Event id of the completion queue's eventfd; connection and listener ids count up from 1.
+    static constexpr uint64_t COMPLETION_ID = 0;
+    bool _completion_watched = false;
+    std::chrono::milliseconds _work_delay{0};
 
     int _shutdown_deadline_ms = DEFAULT_SHUTDOWN_DEADLINE_MS;
     size_t _max_connections = DEFAULT_MAX_CONNECTIONS;

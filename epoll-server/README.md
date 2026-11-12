@@ -27,9 +27,10 @@ touches it. A worker gets a copy of the bytes the reactor read, computes the res
 `CompletionQueue`; the reactor runs the closure, and so does the `send()`. Workers never
 see a socket.
 
-A ustack epoll cannot watch the completion queue's eventfd (its fds are its own, not the
-kernel's), so the reactor drains the queue every pass and waits at most 1 ms while any
-connection has work in the pool. An idle server sleeps for the whole timeout.
+The completion queue's eventfd is registered with the stack's epoll through
+`epoll_ctl_external()`, so the reactor sleeps until a socket, a timer or finished pool
+work wakes it. Only the simulator's driver (no kernel epoll) refuses; the reactor then
+waits at most 1 ms while any connection has work in the pool.
 
 Connections are keyed by a server-assigned id, not the fd (the kernel reuses fd numbers
 at once). While a connection's chunk is in the pool or its response is not fully

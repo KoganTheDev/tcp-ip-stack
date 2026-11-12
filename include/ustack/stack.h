@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <deque>
 #include <list>
@@ -86,6 +87,13 @@ namespace ustack
         // A kernel fd that is readable while the stack has frames to read or a
         // timer due, or -1 if this driver has none.
         virtual int wake_fd() const { return -1; }
+        // Makes wait() also return when the application's kernel fd is ready
+        // for any of `events` (EPOLLIN, EPOLLOUT, EPOLLRDHUP); 0 stops
+        // watching it. Called again with a new mask when the interest changes.
+        // Returns 0 or an errno value. Level-triggered, and the Stack asks the
+        // fd itself (poll(2)) what is ready, so the driver only has to wake
+        // up. A driver with no kernel behind it cannot, hence the default.
+        virtual int watch_fd(int /*fd*/, uint32_t /*events*/) { return ENOTSUP; }
     };
 
     // The production driver: a kernel epoll over the stack's channel fds and
@@ -108,10 +116,13 @@ namespace ustack
         void stack_changed(NetworkStack& stack) override;
         // The internal epoll fd, which is readable when any of its members is.
         int wake_fd() const override { return _epoll_fd; }
+        int watch_fd(int fd, uint32_t events) override;
 
     private:
         int _epoll_fd = -1;
         int _timer_fd = -1;
+        // Application fds added by watch_fd(), so MOD or ADD is known.
+        std::unordered_set<int> _watched;
         // The monotonic time last reported to the stack.
         uint64_t _reported_ms = 0;
         // The stack-clock moment the timerfd is armed for, so an unchanged
@@ -199,6 +210,19 @@ namespace ustack
         // the simulator's driver a timeout advances virtual time.
         int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout);
 
+        // Like epoll_ctl(), but `fd` is a KERNEL fd the application owns (an
+        // eventfd, a pipe, a timerfd ...) rather than one of this Stack's. A
+        // separate method because the two number spaces overlap: fd 5 here and
+        // fd 5 in the kernel are different things. The event is reported by
+        // epoll_wait() on `epfd` next to the stack's own, with the data you
+        // gave; the wait sleeps in the driver's kernel epoll, so the fd waking
+        // ends it at once. Level-triggered only (EPOLLET and EPOLLONESHOT are
+        // EINVAL); EPOLLIN, EPOLLOUT, EPOLLRDHUP, and EPOLLERR/EPOLLHUP always.
+        // Remove it (EPOLL_CTL_DEL) before closing the kernel fd. Fails with
+        // ENOTSUP on a driver that has no kernel epoll - the simulator's.
+        // ustack::KernelStack has the same method, as plain ::epoll_ctl.
+        int epoll_ctl_external(int epfd, int op, int fd, struct epoll_event* event);
+
         // --- running inside someone else's event loop ---
         // A kernel fd, readable while any of this Stack's epoll instances has
         // something to report or the stack has frames or a timer due. Add it
@@ -233,6 +257,9 @@ namespace ustack
         struct EpollInstance
         {
             std::map<int, EpollItem> items;
+            // Kernel fds added by epoll_ctl_external(): checked with poll(2)
+            // whenever the epoll is asked, so they need no ready list.
+            std::map<int, struct epoll_event> external;
             std::list<int> ready;
         };
 
@@ -315,6 +342,10 @@ namespace ustack
         bool _any_ready() const;
         void _enqueue(EpollInstance& epoll, int fd, EpollItem& item);
         void _remove_watch(int epfd, int fd);
+        // Tells the driver the union of what every epoll wants of a kernel fd.
+        int _sync_external(int fd);
+        static uint32_t _poll_external(int fd, uint32_t interest);
+        int _collect_external(const EpollInstance& epoll, struct epoll_event* events, int maxevents) const;
         // ep_send_events: report what is ready, re-queue level-triggered items.
         int _collect(EpollInstance& epoll, struct epoll_event* events, int maxevents);
         // After every public call: re-arm the driver's timer and set or clear

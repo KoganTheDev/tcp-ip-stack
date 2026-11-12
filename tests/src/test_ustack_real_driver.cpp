@@ -2,6 +2,7 @@
 
 #include <netinet/in.h>
 #include <poll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -10,6 +11,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include "network_stack.h"
 #include "packet_channel.h"
@@ -156,4 +158,71 @@ TEST_F(UstackRealDriver, WaitTimesOutOnTheMonotonicClock)
     auto waited = std::chrono::steady_clock::now() - start;
     EXPECT_GE(waited, std::chrono::milliseconds(45));
     EXPECT_LT(waited, std::chrono::milliseconds(2000));
+}
+
+// A kernel fd the application owns (a worker pool's eventfd) watched by a
+// ustack epoll: epoll_wait() sleeps in the driver's kernel epoll and wakes
+// when the fd does, with no polling interval.
+TEST_F(UstackRealDriver, ExternalEventfdWakesAUstackEpollWait)
+{
+    int efd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    ASSERT_GE(efd, 0);
+    int ep = client->epoll_create1(0);
+    epoll_event event{};
+    event.events = EPOLLIN;
+    event.data.u64 = 0xfeedULL;
+    ASSERT_EQ(client->epoll_ctl_external(ep, EPOLL_CTL_ADD, efd, &event), 0) << std::strerror(errno);
+
+    std::thread writer(
+        [efd]
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            uint64_t one = 1;
+            ssize_t ignored = ::write(efd, &one, sizeof(one));
+            (void)ignored;
+        });
+    epoll_event got{};
+    auto start = std::chrono::steady_clock::now();
+    int ready = client->epoll_wait(ep, &got, 1, 5000);
+    auto waited = std::chrono::steady_clock::now() - start;
+    writer.join();
+
+    ASSERT_EQ(ready, 1);
+    EXPECT_EQ(got.data.u64, 0xfeedULL);
+    EXPECT_NE(got.events & EPOLLIN, 0u);
+    EXPECT_GE(waited, std::chrono::milliseconds(100));
+    EXPECT_LT(waited, std::chrono::milliseconds(2000));
+
+    // Level-triggered: reported again until drained.
+    EXPECT_EQ(client->epoll_wait(ep, &got, 1, 0), 1);
+    uint64_t value = 0;
+    ASSERT_EQ(::read(efd, &value, sizeof(value)), static_cast<ssize_t>(sizeof(value)));
+    EXPECT_EQ(client->epoll_wait(ep, &got, 1, 0), 0);
+
+    // DEL: a later write is no longer reported.
+    ASSERT_EQ(client->epoll_ctl_external(ep, EPOLL_CTL_DEL, efd, nullptr), 0);
+    value = 1;
+    ASSERT_EQ(::write(efd, &value, sizeof(value)), static_cast<ssize_t>(sizeof(value)));
+    EXPECT_EQ(client->epoll_wait(ep, &got, 1, 20), 0);
+    ::close(efd);
+}
+
+TEST_F(UstackRealDriver, ExternalFdMixesWithStackSocketsAndRejectsBadRequests)
+{
+    int efd = ::eventfd(1, EFD_NONBLOCK | EFD_CLOEXEC);
+    ASSERT_GE(efd, 0);
+    int ep = client->epoll_create1(0);
+    epoll_event event{};
+    event.events = EPOLLIN;
+    ASSERT_EQ(client->epoll_ctl_external(ep, EPOLL_CTL_ADD, efd, &event), 0);
+    EXPECT_EQ(client->epoll_ctl_external(ep, EPOLL_CTL_ADD, efd, &event), -1);
+    EXPECT_EQ(errno, EEXIST);
+    EXPECT_EQ(client->epoll_ctl_external(ep, EPOLL_CTL_DEL, 9999, nullptr), -1);
+    EXPECT_EQ(errno, ENOENT);
+    event.events = EPOLLIN | EPOLLET;
+    EXPECT_EQ(client->epoll_ctl_external(ep, EPOLL_CTL_MOD, efd, &event), -1);
+    EXPECT_EQ(errno, EINVAL);
+    // Closing the ustack epoll leaves no watch behind in the driver.
+    ASSERT_EQ(client->close(ep), 0);
+    ::close(efd);
 }

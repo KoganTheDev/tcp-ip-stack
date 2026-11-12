@@ -2,6 +2,8 @@
 #include <sys/timerfd.h>
 #include <unistd.h>
 
+#include <poll.h>
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -118,6 +120,29 @@ namespace ustack
             }
         }
         run_pending(stack);
+    }
+
+    int RealDriver::watch_fd(int fd, uint32_t events)
+    {
+        if (events == 0)
+        {
+            if (_watched.erase(fd) > 0)
+            {
+                // Already gone if the application closed the fd; nothing to undo.
+                ::epoll_ctl(_epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+            }
+            return 0;
+        }
+        epoll_event event{};
+        event.events = events; // level-triggered, like the channel fds
+        event.data.fd = fd;
+        int op = _watched.count(fd) > 0 ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
+        if (::epoll_ctl(_epoll_fd, op, fd, &event) < 0)
+        {
+            return errno;
+        }
+        _watched.insert(fd);
+        return 0;
     }
 
     void RealDriver::stack_changed(NetworkStack& stack)
