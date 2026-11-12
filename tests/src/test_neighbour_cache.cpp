@@ -395,3 +395,33 @@ TEST(NeighbourCache, AnUnusedStaleEntryIsCollected)
     EXPECT_FALSE(h.cache.tracks(NEIGHBOUR)) << "like Linux's gc_stale_time";
     EXPECT_TRUE(h.sent.empty()) << "collected, not probed";
 }
+
+TEST(NeighbourCache, ResolutionsInFlightAreCappedAndTheExcessRefused)
+{
+    CacheHarness h;
+    MacAddress mac;
+    for (size_t i = 0; i < NeighbourCache::MAX_INCOMPLETE + 20; i++)
+        h.cache.lookup(spoofed(i), mac);
+    EXPECT_EQ(h.cache.size(), NeighbourCache::MAX_INCOMPLETE);
+    EXPECT_FALSE(h.cache.tracks(spoofed(NeighbourCache::MAX_INCOMPLETE))) << "refused, not evicting";
+    EXPECT_EQ(h.sent.size(), NeighbourCache::MAX_INCOMPLETE) << "no solicitation for a refused one";
+}
+
+TEST(NeighbourCache, AFullCacheNeverGivesUpAResolvedEntryInUseForANewResolution)
+{
+    CacheHarness h;
+    resolve_to_reachable(h);
+    MacAddress mac;
+    ASSERT_TRUE(h.cache.lookup(NEIGHBOUR, mac)); // in use
+    flood(h, NeighbourCache::MAX_ENTRIES);
+    for (size_t i = 0; i < 2000; i++)
+    {
+        h.cache.lookup(IPv6Address("2001:db8:c0::" + std::to_string(i + 1)), mac);
+        if (i % 50 == 0)
+        {
+            h.advance(NeighbourCache::RETRANS_TIMER_MS * 4); // let resolutions give up
+            h.cache.confirm_reachability(NEIGHBOUR);          // still in use: its traffic is acked
+        }
+    }
+    EXPECT_TRUE(h.cache.contains(NEIGHBOUR));
+}

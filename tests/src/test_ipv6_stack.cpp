@@ -823,3 +823,45 @@ TEST(Ipv6Stack, PacketsWithV4MappedAddressesAreDropped)
     EXPECT_TRUE(host.channel->outbound_frames().empty()) << "no SYN-ACK to a v4-mapped source";
     EXPECT_FALSE(host.stack->has_pending_accept(80));
 }
+
+// Security review: replies to spoofed sources go through lookup() too, so a
+// ping flood from made-up on-link addresses must not be able to push a
+// resolved, in-use mapping - the router's, say - out of a full cache.
+TEST(Ipv6Stack, APingFloodFromSpoofedSourcesCannotEvictAResolvedNeighbour)
+{
+    Host host;
+    host.stack->add_ipv6_address(LOCAL);
+    UdpSocket* socket = host.stack->bind_udp(5000);
+    socket->send_to(PEER, 9, Bytes::from_hex("01"));
+    host.advertise_peer(); // PEER resolved, and used
+    host.stack->on_time_passed(NeighbourCache::REACHABLE_TIME_MS + 1000);
+    ASSERT_EQ(host.stack->neighbour_cache()->state_of(PEER), NeighbourState::STALE);
+
+    // Fill the rest of the cache with unsolicited entries, then ping-flood.
+    for (int i = 0; i < 600; i++)
+    {
+        Bytes source = IPv6Address("2001:db8::1:0").get_address();
+        source[14] = static_cast<byte_t>(i >> 8);
+        source[15] = static_cast<byte_t>(i);
+        host.deliver(icmpv6_packet(IPv6Address(source), LOCAL.solicited_node_multicast(), ICMPV6_NEIGHBOUR_SOLICITATION,
+                                   Icmpv6::build_neighbour_solicitation(LOCAL, PEER_MAC, true)),
+                     LOCAL.solicited_node_multicast().multicast_mac());
+    }
+    for (int i = 0; i < 2000; i++)
+    {
+        Bytes source = IPv6Address("2001:db8::2:0").get_address();
+        source[14] = static_cast<byte_t>(i >> 8);
+        source[15] = static_cast<byte_t>(i);
+        Bytes echo;
+        echo.append_int<uint32_t>(static_cast<uint32_t>(i));
+        host.deliver(icmpv6_packet(IPv6Address(source), LOCAL, ICMPV6_ECHO_REQUEST, echo, 64));
+    }
+    EXPECT_TRUE(host.stack->neighbour_cache()->contains(PEER)) << "the resolved mapping survives the flood";
+    EXPECT_LE(host.stack->neighbour_cache()->size(), NeighbourCache::MAX_ENTRIES);
+
+    host.channel->clear_outbound();
+    socket->send_to(PEER, 9, Bytes::from_hex("02"));
+    std::vector<V6Frame> sent = ipv6_frames(host.channel->outbound_frames());
+    ASSERT_EQ(sent.size(), 1u) << "and traffic to it goes straight out";
+    EXPECT_TRUE(sent[0].destination_mac == PEER_MAC);
+}

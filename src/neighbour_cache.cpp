@@ -1,5 +1,7 @@
 #include "neighbour_cache.h"
 
+#include <algorithm>
+
 #include "logger.h"
 
 namespace
@@ -66,18 +68,30 @@ bool NeighbourCache::lookup(const IPv6Address& address, MacAddress& out_mac)
 
     if (it == this->_entries.end())
     {
-        // This host wants the neighbour, so a full cache makes room rather
-        // than refuse: a link flooding it with spoofed entries must not be
-        // able to stop resolution of the router or a peer.
-        if (this->_entries.size() >= MAX_ENTRIES)
+        // Resolutions in flight are capped on their own (Linux's unres_qlen /
+        // gc_thresh idea): a lookup may be a reply to a spoofed source, so a
+        // flood of those must run into this cap and be refused - the packet
+        // dropped - rather than displace anything resolved.
+        auto incomplete =
+            static_cast<size_t>(std::count_if(this->_entries.begin(), this->_entries.end(), [](const auto& pair)
+                                              { return pair.second.state == NeighbourState::INCOMPLETE; }));
+        if (incomplete >= MAX_INCOMPLETE)
         {
-            this->_evict(true);
+            LOG_DEBUG("NeighbourCache: " << incomplete << " resolutions in flight, refusing " << address.to_string());
+            return false;
+        }
+        // When full, room is made from unused entries only (see _evict): a
+        // link flooding the cache must not stop resolution of the router or
+        // a peer, and nor may it push out a mapping in use.
+        if (this->_entries.size() >= MAX_ENTRIES && !this->_evict(true))
+        {
+            LOG_WARNING("NeighbourCache: full of neighbours in use, refusing " << address.to_string());
+            return false;
         }
 
         Entry entry;
         this->_enter_state(address, entry, NeighbourState::INCOMPLETE);
         entry.probes_sent = 1;
-        entry.referenced = true;
         entry.last_used_ms = this->_clock_ms;
         this->_entries[address] = entry;
 
@@ -91,7 +105,9 @@ bool NeighbourCache::lookup(const IPv6Address& address, MacAddress& out_mac)
     }
 
     Entry& entry = it->second;
-    entry.referenced = true;
+    // Valuable only once resolved: an INCOMPLETE entry may be nothing but a
+    // reply to a spoofed source.
+    entry.referenced = entry.state != NeighbourState::INCOMPLETE;
     entry.last_used_ms = this->_clock_ms;
     if (entry.state == NeighbourState::INCOMPLETE)
     {
@@ -331,9 +347,11 @@ NextTimer NeighbourCache::ms_until_next_timer() const
 
 bool NeighbourCache::_evict(bool host_initiated)
 {
-    // Least recently used, in order of how little losing it costs: an entry
-    // nobody here ever used (what a flood creates), then - only for a
-    // resolution this host started - a STALE one, then anything.
+    // Least recently used among what costs least to lose: a resolved entry
+    // nobody here ever used (what a flood of unsolicited messages creates),
+    // then - only for a resolution this host started - one still INCOMPLETE.
+    // A resolved mapping in use (the router's, a peer's) is never a victim,
+    // whatever its state.
     auto pick = [this](auto&& eligible)
     {
         auto victim = this->_entries.end();
@@ -347,14 +365,10 @@ bool NeighbourCache::_evict(bool host_initiated)
         }
         return victim;
     };
-    auto victim = pick([](const Entry& e) { return !e.referenced; });
+    auto victim = pick([](const Entry& e) { return !e.referenced && e.state != NeighbourState::INCOMPLETE; });
     if (victim == this->_entries.end() && host_initiated)
     {
-        victim = pick([](const Entry& e) { return e.state == NeighbourState::STALE; });
-    }
-    if (victim == this->_entries.end() && host_initiated)
-    {
-        victim = pick([](const Entry&) { return true; });
+        victim = pick([](const Entry& e) { return e.state == NeighbourState::INCOMPLETE; });
     }
     if (victim == this->_entries.end())
     {

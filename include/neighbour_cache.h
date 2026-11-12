@@ -130,9 +130,14 @@ public:
     // Probes sent to a previously-known neighbour before it is declared gone.
     static constexpr int MAX_UNICAST_SOLICIT = 3;
     // Bounded because entries are created by traffic from the link. When
-    // full, a lookup() evicts (LRU, unreferenced entries first) rather than
-    // refuse; unsolicited learning may only evict unreferenced entries.
+    // full, a lookup() evicts the least recently used unused resolved entry,
+    // else an INCOMPLETE one, and never a resolved entry in use; unsolicited
+    // learning may only evict unused resolved entries.
     static constexpr size_t MAX_ENTRIES = 512;
+    // Resolutions in flight at once. Beyond it lookup() refuses (the caller
+    // drops the packet) instead of evicting: lookups include replies to
+    // whatever source address a packet claimed.
+    static constexpr size_t MAX_INCOMPLETE = 64;
     // An unused STALE entry is dropped after this long (Linux's
     // gc_stale_time), so spoofed entries do not sit in the cache forever.
     static constexpr int GC_STALE_TIME_MS = 60000;
@@ -144,14 +149,15 @@ private:
         NeighbourState state = NeighbourState::INCOMPLETE;
         int timer_ms = 0;      // meaning depends on the state
         int probes_sent = 0;
-        // Eviction order: entries this host looked up are referenced, and a
-        // full cache gives up the least recently used unreferenced one first.
+        // Set when this host looks the entry up after it resolved: an entry in
+        // use, which eviction never takes.
         bool referenced = false;
         uint64_t last_used_ms = 0;
     };
 
     // Frees one slot; false if nothing may go. Unsolicited learning may only
-    // displace unreferenced entries; a lookup always gets its slot.
+    // displace unused resolved entries; a lookup may also displace an
+    // INCOMPLETE one.
     bool _evict(bool host_initiated);
     uint64_t _clock_ms = 0;
 
