@@ -36,6 +36,9 @@ public:
     // for its v4 form is a bug, not something to paper over with 0.0.0.0.
     const IPv4Address& v4() const { return std::get<IPv4Address>(_address); }
     const IPv6Address& v6() const { return std::get<IPv6Address>(_address); }
+    // Non-throwing access, nullptr on the other family.
+    const IPv4Address* as_v4() const noexcept { return std::get_if<IPv4Address>(&_address); }
+    const IPv6Address* as_v6() const noexcept { return std::get_if<IPv6Address>(&_address); }
 
     // 4 or 16 bytes, network order.
     const Bytes& bytes() const { return is_v4() ? v4().get_address() : v6().get_address(); }

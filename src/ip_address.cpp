@@ -2,12 +2,16 @@
 
 bool IpAddress::operator==(const IpAddress& other) const noexcept
 {
-    if (this->is_v4() != other.is_v4())
+    // get_if, not get: neither may throw in a noexcept comparison.
+    const auto* mine_v4 = std::get_if<IPv4Address>(&this->_address);
+    const auto* theirs_v4 = std::get_if<IPv4Address>(&other._address);
+    if (mine_v4 != nullptr || theirs_v4 != nullptr)
     {
-        return false;
+        return mine_v4 != nullptr && theirs_v4 != nullptr && *mine_v4 == *theirs_v4;
     }
-    return this->is_v4() ? std::get<IPv4Address>(this->_address) == std::get<IPv4Address>(other._address)
-                         : std::get<IPv6Address>(this->_address) == std::get<IPv6Address>(other._address);
+    const auto* mine_v6 = std::get_if<IPv6Address>(&this->_address);
+    const auto* theirs_v6 = std::get_if<IPv6Address>(&other._address);
+    return mine_v6 != nullptr && theirs_v6 != nullptr && *mine_v6 == *theirs_v6;
 }
 
 IPv6Address IpAddress::v4_mapped(const IPv4Address& address)
@@ -45,5 +49,10 @@ std::size_t std::hash<IpAddress>::operator()(const IpAddress& address) const noe
 {
     // The family is folded in so a v4 address and a v6 one that happens to
     // share its hash land apart; equality already tells them apart.
-    return address.is_v4() ? std::hash<IPv4Address>{}(address.v4()) : ~std::hash<IPv6Address>{}(address.v6());
+    if (const auto* v4 = address.as_v4())
+    {
+        return std::hash<IPv4Address>{}(*v4);
+    }
+    const auto* v6 = address.as_v6();
+    return v6 != nullptr ? ~std::hash<IPv6Address>{}(*v6) : 0;
 }
