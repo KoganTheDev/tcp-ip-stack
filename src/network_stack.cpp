@@ -496,8 +496,9 @@ TcpConnection* NetworkStack::_open_connection(const IPv4Address& remote_ip, uint
 
     auto connection = std::make_unique<TcpConnection>(
         local_port, remote_ip, remote_port, this->_next_isn(local_port, remote_ip, remote_port),
-        [this, remote_ip](const Tcp& header, const Bytes& payload)
-        { this->_send_tcp_segment(remote_ip, header, payload); }, this->_primary().config.local_mss());
+        [this, remote_ip](const Tcp& header, const Bytes& payload, Ecn ecn)
+        { this->_send_tcp_segment(remote_ip, header, payload, ecn); }, this->_primary().config.local_mss());
+    connection->set_ecn_mode(this->_tcp_ecn);
 
     TcpConnection* connection_ptr = connection.get();
     this->_register_connection(key, std::move(connection));
@@ -1539,7 +1540,7 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
     if (connection_it != this->_connections.end())
     {
         TcpState state_before = connection_it->second->get_state();
-        connection_it->second->on_segment(tcp);
+        connection_it->second->on_segment(tcp, ip.get_ecn());
 
         // Only a passive open belongs in the accept queue. An active open can
         // pass through SYN_RECEIVED too, by way of a simultaneous open, and it
@@ -1645,15 +1646,17 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
                                                              << " on port " << key.local_port);
     auto connection = std::make_unique<TcpConnection>(
         key.local_port, remote_ip, key.remote_port, this->_next_isn(key.local_port, remote_ip, key.remote_port),
-        [this, remote_ip](const Tcp& header, const Bytes& payload)
-        { this->_send_tcp_segment(remote_ip, header, payload); }, this->_primary().config.local_mss());
+        [this, remote_ip](const Tcp& header, const Bytes& payload, Ecn ecn)
+        { this->_send_tcp_segment(remote_ip, header, payload, ecn); }, this->_primary().config.local_mss());
+    connection->set_ecn_mode(this->_tcp_ecn);
 
     try
     {
         connection->accept_incoming_syn(
             tcp.get_sequence_number(), tcp.has_mss_option() ? tcp.get_mss_option() : 0, tcp.has_window_scale_option(),
             tcp.has_window_scale_option() ? tcp.get_window_scale_option() : 0, tcp.has_timestamp_option(),
-            tcp.has_timestamp_option() ? tcp.get_timestamp_value() : 0, tcp.has_sack_permitted_option());
+            tcp.has_timestamp_option() ? tcp.get_timestamp_value() : 0, tcp.has_sack_permitted_option(),
+            tcp.get_ece() && tcp.get_cwr()); // RFC 3168 6.1.1's ECN-setup SYN
     }
     catch (const FatalChannelError&)
     {
@@ -1751,8 +1754,9 @@ bool NetworkStack::_try_complete_cookie_handshake(const Ip& ip, const Tcp& tcp)
     LOG_DEBUG("NetworkStack: completing a connection from " << remote_ip.to_string() << ":" << key.remote_port
                                                             << " by SYN cookie (MSS " << mss << ")");
     auto connection = std::make_unique<TcpConnection>(
-        local_port, remote_ip, key.remote_port, cookie, [this, remote_ip](const Tcp& header, const Bytes& payload)
-        { this->_send_tcp_segment(remote_ip, header, payload); }, this->_primary().config.local_mss());
+        local_port, remote_ip, key.remote_port, cookie,
+        [this, remote_ip](const Tcp& header, const Bytes& payload, Ecn ecn)
+        { this->_send_tcp_segment(remote_ip, header, payload, ecn); }, this->_primary().config.local_mss());
     connection->accept_cookie_handshake(peer_isn, mss);
 
     TcpConnection* connection_ptr = connection.get();
@@ -1765,7 +1769,7 @@ bool NetworkStack::_try_complete_cookie_handshake(const Ip& ip, const Tcp& tcp)
 
     // The completing ACK may carry data (or its window), so it is processed
     // like any segment of an established connection.
-    connection_ptr->on_segment(tcp);
+    connection_ptr->on_segment(tcp, ip.get_ecn());
     return true;
 }
 
@@ -2427,7 +2431,7 @@ IPv4Address NetworkStack::_source_address_for(const IPv4Address& dest_ip) const
 }
 
 void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol, const Bytes& payload,
-                                   bool dont_fragment)
+                                   bool dont_fragment, Ecn ecn)
 {
     // The IP header keeps naming the final destination; the frame goes to
     // whoever will carry it onward, out of the link the route names.
@@ -2450,7 +2454,7 @@ void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol,
     {
         // fits one frame - the common case (TCP is MSS-capped, so only an
         // oversized UDP send ever needs the fragmentation path below)
-        auto ip = std::make_unique<Ip>(4, 5, 0, static_cast<uint16_t>(20 + payload.size()), 0,
+        auto ip = std::make_unique<Ip>(4, 5, static_cast<uint8_t>(ecn), static_cast<uint16_t>(20 + payload.size()), 0,
                                        dont_fragment ? IP_FLAG_DONT_FRAGMENT : 0, 0, 64, protocol, 0,
                                        interface.config.ip.get_address(), dest_ip.get_address());
         *ip /= std::make_unique<Raw>(payload);
@@ -2504,7 +2508,7 @@ void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol,
     }
 }
 
-void NetworkStack::_send_tcp_segment(const IPv4Address& dest_ip, const Tcp& header, const Bytes& payload)
+void NetworkStack::_send_tcp_segment(const IPv4Address& dest_ip, const Tcp& header, const Bytes& payload, Ecn ecn)
 {
     // Tcp can't be copied (it inherits ProtocolLayer, which owns a
     // unique_ptr and declares a destructor, blocking both copy and move) -
@@ -2570,7 +2574,7 @@ void NetworkStack::_send_tcp_segment(const IPv4Address& dest_ip, const Tcp& head
         }
     }
 
-    this->_send_ip_packet(dest_ip, IpProtocol::TCP, segment.to_bytes(), true);
+    this->_send_ip_packet(dest_ip, IpProtocol::TCP, segment.to_bytes(), true, ecn);
 }
 
 void NetworkStack::_send_rst(const Ip& ip, const Tcp& tcp)

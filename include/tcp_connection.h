@@ -8,6 +8,7 @@
 
 #include "bytes.h"
 #include "congestion_control.h"
+#include "ip.h"
 #include "network_addresses.h"
 #include "reorder_buffer.h"
 #include "rtt_estimator.h"
@@ -41,6 +42,15 @@ enum class TcpCloseReason
     TIMED_OUT,   // retransmissions, the user timeout, or keepalive probes gave up
     UNREACHABLE, // no route, or ARP for the next hop never answered
     ABORTED,     // abort() was called locally, or an internal error dropped it
+};
+
+// Explicit Congestion Notification (RFC 3168), per connection, with the
+// values and meaning of Linux's net.ipv4.tcp_ecn.
+enum class TcpEcnMode
+{
+    OFF = 0,     // never: SYNs ask for nothing, ECN-setup SYNs are answered without it
+    ON = 1,      // ask for it on our SYNs, and accept it when asked
+    PASSIVE = 2, // accept it when a peer's SYN asks, never ask (the default)
 };
 
 // A single TCP connection's state machine (RFC 793/5681/7323, still
@@ -80,6 +90,10 @@ public:
     // already blocks the implicit copy constructor. A by-value std::function
     // parameter would need one of those to invoke its stored target.
     using SendSegmentFn = std::function<void(const Tcp& segment, const Bytes& payload)>;
+    // The same, also told the ECN codepoint the segment's IP header is to
+    // carry (RFC 3168): ECT(0) on new data once ECN is negotiated, Not-ECT
+    // on everything else.
+    using SendSegmentEcnFn = std::function<void(const Tcp& segment, const Bytes& payload, Ecn ecn)>;
     // Notification that readable data has arrived. It deliberately carries no
     // data: the bytes stay in this connection's receive queue until the
     // application takes them with read(). That is what makes the advertised
@@ -100,10 +114,21 @@ public:
     TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port, uint32_t initial_seq,
                   SendSegmentFn send_segment, uint16_t local_mss = DEFAULT_LOCAL_MSS,
                   CongestionControlAlgorithm algorithm = CongestionControlAlgorithm::CUBIC);
+    TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port, uint32_t initial_seq,
+                  SendSegmentEcnFn send_segment, uint16_t local_mss = DEFAULT_LOCAL_MSS,
+                  CongestionControlAlgorithm algorithm = CongestionControlAlgorithm::CUBIC);
 
     // Feeds in a segment already verified (checksum, IP addresses, ports) to
-    // belong to this connection.
-    void on_segment(const Tcp& segment);
+    // belong to this connection. `ecn` is the ECN field of the IP header it
+    // came in (RFC 3168): CE on an acceptable data segment is echoed back.
+    void on_segment(const Tcp& segment, Ecn ecn = Ecn::NOT_ECT);
+
+    // Whether to ask for, or accept, ECN (see TcpEcnMode). Read when the SYN
+    // is sent or answered, so it is set before initiate_connect() or
+    // accept_incoming_syn(). Defaults to PASSIVE, as Linux does.
+    void set_ecn_mode(TcpEcnMode mode) { _ecn_mode = mode; }
+    // Both SYNs agreed to ECN (RFC 3168 6.1.1).
+    bool ecn_negotiated() const { return _ecn_negotiated; }
 
     // Drives every timer on the connection. The caller reports how much real
     // time has passed since it last called, in milliseconds.
@@ -390,7 +415,7 @@ public:
     // negotiation can keep calling this with just peer_isn.
     void accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss = 0, bool peer_supports_window_scaling = false,
                              uint8_t peer_window_scale = 0, bool peer_supports_timestamps = false,
-                             uint32_t peer_timestamp = 0, bool peer_permits_sack = false);
+                             uint32_t peer_timestamp = 0, bool peer_permits_sack = false, bool peer_ecn_setup = false);
 
     // Called by NetworkStack immediately after constructing this object for an
     // ACK that carried a valid SYN cookie (see syn_cookie.h): the handshake is
@@ -430,6 +455,7 @@ public:
         uint64_t rack_losses = 0;            // segments RACK (RFC 8985) marked lost
         uint64_t loss_probes = 0;            // tail loss probes sent (RFC 8985 7.3)
         uint64_t loss_probe_repairs = 0;     // losses a probe repaired by itself (7.4.2)
+        uint64_t ecn_reductions = 0;         // cwnd reductions for an ECN-Echo (RFC 3168 6.1.2)
     };
     const Stats& stats() const { return _stats; }
     // Scoreboard entries the sender has examined, for cost tests.
@@ -455,7 +481,9 @@ private:
     // negotiated, every non-RST segment carries TSopt; a retransmitted SYN
     // offers what the first one did). Tracks nothing: the callers that put
     // data in flight do that themselves.
-    void _transmit(uint8_t flags, uint32_t seq, const Bytes& payload);
+    // `ecn` is the IP codepoint; ECE and CWR are added here as RFC 3168 has
+    // them: the setup flags on a SYN, ECE on an ack while a CE is owed.
+    void _transmit(uint8_t flags, uint32_t seq, const Bytes& payload, Ecn ecn = Ecn::NOT_ECT);
     // The options for a segment with these flags and this much payload: the
     // SYN's negotiation options, or a timestamp and whatever SACK blocks fit.
     void _add_options(Tcp& header, uint8_t flags, size_t payload_size) const;
@@ -617,6 +645,26 @@ private:
     // (RFC 1122 4.2.3.2 allows 500 ms; 200 ms is what Linux and this stack
     // use).
     static constexpr uint64_t TLP_MAX_ACK_DELAY_MS = 200;
+
+    // --- ECN (RFC 3168 section 6.1) ---
+    TcpEcnMode _ecn_mode = TcpEcnMode::PASSIVE;
+    bool _ecn_negotiated = false;
+    // Receiver (6.1.3): a CE-marked data segment arrived, so every ack
+    // carries ECE until a segment with CWR says the sender reacted.
+    bool _ece_pending = false;
+    // Sender (6.1.2): the window was reduced, so the next new data segment
+    // carries CWR.
+    bool _cwr_pending = false;
+    // At most one reduction per window of data (6.1.2): no ECE-driven
+    // reduction until the ack reaches what was sent at the last reduction,
+    // for loss or for ECE alike.
+    uint32_t _cwr_point = 0;
+    bool _cwr_point_valid = false;
+    // Records a window reduction (loss or ECE) for the two rules above.
+    void _note_window_reduced();
+    // The sender's half: an ack with ECE. Returns true if the window was
+    // reduced, in which case this ack must not grow it.
+    bool _on_ecn_echo(const Tcp& segment, uint32_t ack);
     // RFC 793 SS3.3's sequence-number acceptability test, done with unsigned
     // wraparound arithmetic (seq - _recv_next) so it's correct across a
     // sequence-number wraparound the same way real TCP's modular arithmetic
@@ -882,7 +930,7 @@ private:
     // `rescue` marks RFC 6675's rule-4 retransmission, which leaves HighRxt.
     void _retransmit(SentSegment& segment, bool rescue = false);
 
-    SendSegmentFn _send_segment;
+    SendSegmentEcnFn _send_segment;
     DataReadyFn _on_data_ready;
     std::vector<StateChangedFn> _on_state_changed;
     // In-order data that has been acknowledged to the peer but not yet read by

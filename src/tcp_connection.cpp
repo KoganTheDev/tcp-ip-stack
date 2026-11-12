@@ -52,6 +52,15 @@ namespace
 TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port,
                              uint32_t initial_seq, SendSegmentFn send_segment, uint16_t local_mss,
                              CongestionControlAlgorithm algorithm)
+    : TcpConnection(local_port, remote_ip, remote_port, initial_seq,
+                    SendSegmentEcnFn([send = std::move(send_segment)](const Tcp& segment, const Bytes& payload, Ecn)
+                                     { send(segment, payload); }),
+                    local_mss, algorithm)
+{}
+
+TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port,
+                             uint32_t initial_seq, SendSegmentEcnFn send_segment, uint16_t local_mss,
+                             CongestionControlAlgorithm algorithm)
     : _id(g_next_connection_id.fetch_add(1)), _local_port(local_port), _remote_ip(remote_ip), _remote_port(remote_port),
       _state(TcpState::LISTEN), _iss(initial_seq), _send_next(initial_seq), _send_max(initial_seq), _recv_next(0),
       // Kept in declaration order. Members are initialised in the order they
@@ -164,8 +173,28 @@ bool TcpConnection::_seq_in_receive_window(uint32_t seq) const
     return (seq - _recv_next) < window;
 }
 
-void TcpConnection::_transmit(uint8_t flags, uint32_t seq, const Bytes& payload)
+void TcpConnection::_transmit(uint8_t flags, uint32_t seq, const Bytes& payload, Ecn ecn)
 {
+    constexpr uint8_t FLAG_ECE = 0x40;
+    constexpr uint8_t FLAG_CWR = 0x80;
+    if (flags & FLAG_SYN)
+    {
+        // RFC 3168 6.1.1: an ECN-setup SYN carries ECE and CWR; an
+        // ECN-setup SYN-ACK only ECE (so a peer that merely reflects the
+        // reserved bits is not taken for ECN-capable).
+        if ((flags & FLAG_ACK) == 0 && _ecn_mode == TcpEcnMode::ON)
+        {
+            flags |= FLAG_ECE | FLAG_CWR;
+        }
+        else if ((flags & FLAG_ACK) != 0 && _ecn_negotiated)
+        {
+            flags |= FLAG_ECE;
+        }
+    }
+    else if (_ecn_negotiated && _ece_pending && (flags & FLAG_ACK) != 0)
+    {
+        flags |= FLAG_ECE; // 6.1.3: echoed on every ack until CWR arrives
+    }
     uint32_t available = _advertised_window();
     // RFC 7323: if window scaling wasn't negotiated, this side must
     // advertise its window unscaled too - the peer has no way to know our
@@ -179,7 +208,7 @@ void TcpConnection::_transmit(uint8_t flags, uint32_t seq, const Bytes& payload)
 
     Tcp header(_local_port, _remote_port, seq, _recv_next, 5, flags, static_cast<uint16_t>(window_value), 0, 0);
     _add_options(header, flags, payload.size());
-    _send_segment(header, payload);
+    _send_segment(header, payload, ecn);
     if (flags & FLAG_ACK)
     {
         _last_ack_sent = _recv_next;
@@ -274,7 +303,17 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
 {
     uint32_t seq = _send_next;
     uint8_t full_flags = include_ack ? (flags | FLAG_ACK) : flags;
-    _transmit(full_flags, seq, payload);
+    // RFC 3168 6.1.2: new data is ECT(0), and the first new data after a
+    // window reduction carries CWR. Neither is kept in the scoreboard's
+    // flags: a retransmission carries neither (6.1.5, 6.1.2).
+    bool new_data = !payload.empty() && (flags & FLAG_SYN) == 0 && _ecn_negotiated;
+    uint8_t wire_flags = full_flags;
+    if (new_data && _cwr_pending)
+    {
+        wire_flags |= 0x80; // CWR
+        _cwr_pending = false;
+    }
+    _transmit(wire_flags, seq, payload, new_data ? Ecn::ECT_0 : Ecn::NOT_ECT);
     if (!payload.empty())
     {
         _last_data_sent_ms = _now_ms;
@@ -329,7 +368,7 @@ void TcpConnection::_send_reset(uint32_t seq)
 {
     // <SEQ=seq><CTL=RST>: no ACK, nothing tracked - a reset is never
     // acknowledged or retransmitted
-    _send_segment(Tcp(_local_port, _remote_port, seq, 0, 5, FLAG_RST, 0, 0, 0), Bytes());
+    _send_segment(Tcp(_local_port, _remote_port, seq, 0, 5, FLAG_RST, 0, 0, 0), Bytes(), Ecn::NOT_ECT);
 }
 
 void TcpConnection::_take_peer_syn_options(const Tcp& segment)
@@ -392,10 +431,13 @@ void TcpConnection::_schedule_or_send_ack()
 
 void TcpConnection::accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss, bool peer_supports_window_scaling,
                                         uint8_t peer_window_scale, bool peer_supports_timestamps,
-                                        uint32_t peer_timestamp, bool peer_permits_sack)
+                                        uint32_t peer_timestamp, bool peer_permits_sack, bool peer_ecn_setup)
 {
     EntryScope scope(*this);
     _sack_permitted = peer_permits_sack;
+    // RFC 3168 6.1.1: an ECN-setup SYN may be answered with an ECN-setup
+    // SYN-ACK; in any mode but OFF this one is.
+    _ecn_negotiated = peer_ecn_setup && _ecn_mode != TcpEcnMode::OFF;
     _set_recv_next(peer_isn + 1); // the SYN itself consumes one sequence number
     _peer_mss = peer_mss != 0 ? std::max(peer_mss, MIN_PEER_MSS) : DEFAULT_PEER_MSS;
     _effective_mss = std::min(_local_mss, _peer_mss);
@@ -950,12 +992,49 @@ void TcpConnection::_tlp_process_ack(uint32_t ack, bool pure_dup_ack)
             uint32_t flight_size = _send_next - _in_flight.snd_una_or(_send_next);
             _congestion->on_recovery_start(flight_size, _now_ms);
             _congestion->on_recovery_end();
+            _note_window_reduced();
         }
     }
     else if (pure_dup_ack)
     {
         _tlp_outstanding = false; // both copies arrived: there was no loss
     }
+}
+
+void TcpConnection::_note_window_reduced()
+{
+    if (!_ecn_negotiated)
+    {
+        return;
+    }
+    _cwr_pending = true;
+    _cwr_point = _send_next;
+    _cwr_point_valid = true;
+}
+
+bool TcpConnection::_on_ecn_echo(const Tcp& segment, uint32_t ack)
+{
+    // RFC 3168 6.1.2: ECE is congestion, answered as a loss would be (the
+    // policy's ssthresh, cwnd down to it) but at most once per window of
+    // data, and not while a loss recovery is already reducing it. O(1) per
+    // ack, so a peer setting ECE on everything costs nothing beyond the one
+    // reduction per round trip it is entitled to.
+    if (!_ecn_negotiated || !segment.get_ece() || segment.get_syn() || _in_recovery || _rto_recovery)
+    {
+        return false;
+    }
+    if (_cwr_point_valid && !seq_at_or_before(_cwr_point, ack))
+    {
+        return false;
+    }
+    uint32_t flight_size = _send_next - _in_flight.snd_una_or(_send_next);
+    uint32_t cwnd_before = _congestion->window();
+    _congestion->on_recovery_start(flight_size, _now_ms);
+    _congestion->on_recovery_end();
+    _note_window_reduced();
+    _stats.ecn_reductions += 1;
+    LOG_DEBUG("TcpConnection[" << _id << "] ECN-Echo: cwnd " << cwnd_before << " -> " << _congestion->window());
+    return true;
 }
 
 void TcpConnection::_retransmit(SentSegment& segment, bool rescue)
@@ -992,6 +1071,7 @@ void TcpConnection::_enter_recovery(uint32_t delivered)
     uint32_t cwnd_before = _congestion->window();
     _in_recovery = true;
     _tlp_reset();
+    _note_window_reduced();
     _recovery_point = _send_next; // RFC 6582 "recover", RFC 6675 RecoveryPoint
     _recovery_point_valid = true;
     _stats.recoveries += 1;
@@ -1187,6 +1267,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     _set_peer_window(static_cast<uint32_t>(segment.get_window()) << peer_shift);
 
     uint32_t snd_una = _in_flight.snd_una_or(_send_next);
+    bool ecn_reduced = _on_ecn_echo(segment, ack);
 
     // RFC 5681 2's definition of a duplicate ack, all five conditions: data
     // outstanding, SND.UNA not moved, no payload, no SYN/FIN, and the window
@@ -1395,7 +1476,10 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         // yet". There is no second copy of the estimator behind the interface:
         // RFC 6298's is right here and there is no reason for two.
         uint32_t srtt_ms = _rtt.srtt_ms();
-        _congestion->on_ack(bytes_acked, _bytes_in_flight(), srtt_ms, _now_ms);
+        if (!ecn_reduced) // RFC 3168 6.1.2: an ECE ack does not grow the window
+        {
+            _congestion->on_ack(bytes_acked, _bytes_in_flight(), srtt_ms, _now_ms);
+        }
     }
 
     if (fin_acked)
@@ -1487,7 +1571,7 @@ void TcpConnection::_handle_fin(uint32_t fin_seq)
     }
 }
 
-void TcpConnection::on_segment(const Tcp& segment)
+void TcpConnection::on_segment(const Tcp& segment, Ecn ecn)
 {
     EntryScope scope(*this);
     // Anything at all from the peer means the connection is not idle - even a
@@ -1583,6 +1667,9 @@ void TcpConnection::on_segment(const Tcp& segment)
         }
 
         _in_flight.clear(); // our SYN is now acked
+        // RFC 3168 6.1.1: our ECN-setup SYN answered by an ECN-setup SYN-ACK
+        // (ECE without CWR - both set is a peer reflecting our own bits).
+        _ecn_negotiated = _ecn_mode == TcpEcnMode::ON && segment.get_ece() && !segment.get_cwr();
         _set_peer_window(segment.get_window()); // a SYN-ACK's window is never scaled (RFC 7323 2.2)
         // The MSS is only now negotiated, and the window is denominated in
         // it, so this is where congestion control actually starts.
@@ -1753,6 +1840,23 @@ void TcpConnection::on_segment(const Tcp& segment)
     // PAWS drop every genuine segment after it.
     _update_ts_recent(segment);
 
+    // RFC 3168 6.1.3, the receiver: CWR ends the echo; CE on data (already
+    // known to be in the window - 6.1.5 asks that out-of-window CE be
+    // ignored) starts it, and the ack goes out at once rather than delayed.
+    bool ce_marked_data = false;
+    if (_ecn_negotiated)
+    {
+        if (segment.get_cwr())
+        {
+            _ece_pending = false;
+        }
+        if (ecn == Ecn::CE && payload_size > 0)
+        {
+            _ece_pending = true;
+            ce_marked_data = true;
+        }
+    }
+
     _handle_ack(segment);
 
     // Resolved before the state check because the FIN handling at the bottom
@@ -1783,7 +1887,7 @@ void TcpConnection::on_segment(const Tcp& segment)
                 // drain any buffered segments the gap-filler just unblocked
                 _drain_reorder_buffer();
 
-                if (fills_gap)
+                if (fills_gap || ce_marked_data)
                 {
                     _send_pure_ack();
                 }
@@ -2119,6 +2223,7 @@ void TcpConnection::_run_timers()
     }
     _rack_reo_deadline_ms = 0;
     _tlp_reset();
+    _note_window_reduced();
 
     // Karn's second half - the part that is easy to miss and matters as much
     // as ignoring the ambiguous sample. Having lost a segment, the estimator

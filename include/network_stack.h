@@ -160,6 +160,15 @@ public:
     void set_forwarding(bool enabled) { _forwarding_enabled = enabled; }
     bool forwarding() const { return _forwarding_enabled; }
 
+    // ECN for TCP (RFC 3168), like Linux's net.ipv4.tcp_ecn: OFF (0), ON (1,
+    // ask on connect() and accept when asked) or PASSIVE (2, accept only).
+    // PASSIVE is the default, and Linux's, for the reason Linux chose it:
+    // answering a peer that asks costs nothing, while asking can meet a
+    // middlebox that drops ECN-setup SYNs. Applies to connections opened or
+    // accepted after the call.
+    void set_tcp_ecn(TcpEcnMode mode) { _tcp_ecn = mode; }
+    TcpEcnMode tcp_ecn() const { return _tcp_ecn; }
+
     // Routes beyond the two derived from the interface. Use this for a route
     // to a network reachable through some router other than the default.
     //
@@ -512,9 +521,10 @@ private:
     // is the only way a sender can learn the path MTU, so TCP sets it; UDP does
     // not, because this stack fragments oversized datagrams itself and there is
     // no per-connection state to adjust in response.
-    void _send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol, const Bytes& payload,
-                         bool dont_fragment = false);
-    void _send_tcp_segment(const IPv4Address& dest_ip, const Tcp& header, const Bytes& payload);
+    // `ecn` goes in the TOS octet's ECN field (RFC 3168); DSCP is 0.
+    void _send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol, const Bytes& payload, bool dont_fragment = false,
+                         Ecn ecn = Ecn::NOT_ECT);
+    void _send_tcp_segment(const IPv4Address& dest_ip, const Tcp& header, const Bytes& payload, Ecn ecn = Ecn::NOT_ECT);
     // RFC 793 SS3.4's reset-generation rule for a segment that doesn't match
     // any existing connection and isn't a SYN to a listening port: no
     // TcpConnection exists to answer through, so this builds and sends the
@@ -629,6 +639,7 @@ private:
     // hole rather than a feature. Linux makes the same choice with
     // net.ipv4.ip_forward.
     bool _forwarding_enabled = false;
+    TcpEcnMode _tcp_ecn = TcpEcnMode::PASSIVE;
     // False until the constructor has finished: configure_interface() does
     // not announce the address it is given at construction.
     bool _constructed = false;
