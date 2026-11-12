@@ -50,7 +50,16 @@
 // from connect(). A connection's error is reported once - by SO_ERROR, or by
 // the next send()/recv() - and then cleared, as sk_err is.
 //
-// What is not here: IPv6, blocking mode, MSG_PEEK and every other flag but
+// Both families: AF_INET with sockaddr_in, and AF_INET6 with sockaddr_in6.
+// An AF_INET6 socket is dual-stack, as on Linux with net.ipv6.bindv6only=0:
+// IPv4 peers appear as v4-mapped addresses (::ffff:a.b.c.d, RFC 3493 3.7),
+// and a v4-mapped address given to connect()/sendto() reaches the peer over
+// IPv4. IPPROTO_IPV6/IPV6_V6ONLY (set before bind) makes it IPv6 only. One
+// difference from Linux: a port is held by one socket whatever its family,
+// so a V6ONLY listener and an AF_INET listener cannot share a port - a
+// dual-stack socket is the way to serve both.
+//
+// What is not here: blocking mode, MSG_PEEK and every other flag but
 // MSG_DONTWAIT/MSG_NOSIGNAL (accepted, and meaningless here), connect() on a
 // UDP socket, nesting one ustack epoll inside another, fcntl(), poll()/select().
 //
@@ -146,12 +155,13 @@ namespace ustack
         Stack& operator=(Stack&&) = delete;
 
         // --- sockets ---
-        // domain AF_INET; type SOCK_STREAM or SOCK_DGRAM, OR'd with
+        // domain AF_INET or AF_INET6; type SOCK_STREAM or SOCK_DGRAM, OR'd with
         // SOCK_NONBLOCK (required, see above) and optionally SOCK_CLOEXEC
         // (accepted, meaningless); protocol 0 or the type's own.
         // NOT a kernel fd - see the top of this file.
         int socket(int domain, int type, int protocol);
-        // sin_addr INADDR_ANY or the interface's address; sin_port 0 picks a
+        // sin_addr INADDR_ANY or the interface's address (sin6_addr ::, one of
+        // the interface's IPv6 addresses, or a v4-mapped one of those); sin_port 0 picks a
         // free ephemeral port. EADDRINUSE if this Stack already has the port
         // bound. SO_REUSEADDR is accepted but changes nothing: with no
         // TIME_WAIT sockets holding ports here, there is nothing for it to
@@ -281,7 +291,10 @@ namespace ustack
             // local_port was reserved by bind() (or an autobind) on this
             // Stack, rather than picked by NetworkStack::connect().
             bool port_reserved = false;
-            IPv4Address bound_ip; // what bind() named: INADDR_ANY or the interface's
+            int family = AF_INET;
+            bool v6only = false; // IPV6_V6ONLY; Linux's default is off
+            IpAddress bound_ip;  // what bind() named: the wildcard or the interface's
+            IpAddress local_ip;  // a connection's own end, for getsockname()
             int so_error = 0;
 
             // Options, kept here as well as applied, because they are set
@@ -357,7 +370,14 @@ namespace ustack
         int _bind_port(int fd, Socket& socket, uint16_t port);
         void _on_connection_state(uint64_t connection_id, TcpState state);
         int _take_error(Socket& socket);
-        int _fill_address(const IpAddress& ip, uint16_t port, struct sockaddr* addr, socklen_t* addrlen) const;
+        // As the socket's family: a v4 address on an AF_INET6 socket is given
+        // in its v4-mapped form.
+        static int _fill_address(int family, const IpAddress& ip, uint16_t port, struct sockaddr* addr,
+                                 socklen_t* addrlen);
+        // The socket's sockaddr, validated: 0 or an errno. On an AF_INET6
+        // socket a v4-mapped address comes back as the IPv4 address it maps.
+        static int _parse_address(const Socket& socket, const struct sockaddr* addr, socklen_t addrlen, IpAddress& ip,
+                                  uint16_t& port);
 
         std::unique_ptr<NetworkStack> _owned_stack;
         NetworkStack& _stack;

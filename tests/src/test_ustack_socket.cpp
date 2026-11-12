@@ -168,7 +168,7 @@ TEST_F(UstackSocket, ErrorsMatchLinux)
 {
     EXPECT_EQ(client->socket(AF_INET, SOCK_STREAM, 0), -1) << "blocking sockets are unsupported";
     EXPECT_EQ(errno, EINVAL);
-    EXPECT_EQ(client->socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0), -1);
+    EXPECT_EQ(client->socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0), -1) << "AF_INET and AF_INET6 only";
     EXPECT_EQ(errno, EAFNOSUPPORT);
 
     char byte = 0;

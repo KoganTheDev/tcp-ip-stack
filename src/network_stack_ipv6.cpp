@@ -278,6 +278,7 @@ TcpConnection* NetworkStack::_open_ipv6_connection(const IPv6Address& remote_ip,
         local_port, remote_ip, remote_port, this->_next_isn(local_ip, local_port, remote_ip, remote_port),
         this->_segment_sender(remote_ip, local_ip), this->_local_mss_for(remote_ip));
     connection->set_ecn_mode(this->_tcp_ecn);
+    connection->set_local_ip(local_ip);
     TcpConnection* connection_ptr = connection.get();
     this->_register_connection(key, std::move(connection));
 

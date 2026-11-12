@@ -200,7 +200,16 @@ public:
     // of one packet each. A bound is also what makes SYN cookies meaningful -
     // cookies are the fallback for when this limit is hit, not a replacement
     // for having one.
-    void listen(uint16_t port, size_t backlog = DEFAULT_LISTEN_BACKLOG);
+    //
+    // family picks which SYNs the port answers: both (the default, and what
+    // an AF_INET6 socket without IPV6_V6ONLY means), or one family only.
+    enum class ListenFamily
+    {
+        ANY,
+        IPV4_ONLY,
+        IPV6_ONLY,
+    };
+    void listen(uint16_t port, size_t backlog = DEFAULT_LISTEN_BACKLOG, ListenFamily family = ListenFamily::ANY);
 
     static constexpr size_t DEFAULT_LISTEN_BACKLOG = 128;
 
@@ -962,7 +971,16 @@ private:
     void _fold_ipv6_timers(NextTimer& next) const;
 
     AcceptReadyFn _on_accept_ready;
-    std::unordered_map<uint16_t, size_t> _listening_ports; // port -> backlog
+    struct Listener
+    {
+        size_t backlog = 0;
+        ListenFamily family = ListenFamily::ANY;
+        bool accepts(const IpAddress& peer) const
+        {
+            return family == ListenFamily::ANY || (family == ListenFamily::IPV4_ONLY) == peer.is_v4();
+        }
+    };
+    std::unordered_map<uint16_t, Listener> _listening_ports;
     // Per listening port, the connections waiting for accept(), by id. Ids,
     // not four-tuples: an entry can outlive its connection (reset and reaped
     // before accept()), and a tuple left behind could name a different, later

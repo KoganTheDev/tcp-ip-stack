@@ -29,6 +29,7 @@ namespace ustack
         constexpr size_t CONGESTION_NAME_MAX = 16;
         // IPv4 and UDP headers: what a datagram adds to its payload.
         constexpr size_t IP_UDP_HEADER_BYTES = 28;
+        constexpr size_t IPV6_UDP_HEADER_BYTES = 48;
 
         int fail(int error)
         {
@@ -80,28 +81,6 @@ namespace ustack
             in_addr address{};
             std::memcpy(&address.s_addr, ip.get_address().data(), 4);
             return address;
-        }
-
-        // Validates a caller's sockaddr as AF_INET; 0 or an errno.
-        int parse_address(const struct sockaddr* addr, socklen_t addrlen, IPv4Address& ip, uint16_t& port)
-        {
-            if (addr == nullptr)
-            {
-                return EFAULT;
-            }
-            if (addrlen < static_cast<socklen_t>(sizeof(sockaddr_in)))
-            {
-                return EINVAL;
-            }
-            sockaddr_in in{};
-            std::memcpy(&in, addr, sizeof(in));
-            if (in.sin_family != AF_INET)
-            {
-                return EAFNOSUPPORT;
-            }
-            ip = to_ip(in.sin_addr);
-            port = ntohs(in.sin_port);
-            return 0;
         }
 
         int read_int_option(const void* optval, socklen_t optlen, int& value)
@@ -294,6 +273,7 @@ namespace ustack
         socket.dead = false;
         socket.local_port = connection.get_local_port();
         socket.peer_ip = connection.get_remote_ip();
+        socket.local_ip = connection.get_local_ip();
         socket.peer_port = connection.get_remote_port();
         _fd_by_connection[id] = fd;
         _apply_options(socket, connection);
@@ -445,6 +425,12 @@ namespace ustack
                         return;
                     }
                     Socket& receiver = *stack->_get(fd);
+                    // The port is shared by both families below this layer;
+                    // the socket's family decides what it may see.
+                    if (source.is_v6() ? receiver.family != AF_INET6 : receiver.v6only)
+                    {
+                        return;
+                    }
                     if (receiver.received.size() >= UDP_RECEIVE_QUEUE_LIMIT)
                     {
                         return; // a full receive buffer drops, as SO_RCVBUF does
@@ -463,7 +449,7 @@ namespace ustack
     int Stack::socket(int domain, int type, int protocol)
     {
         CallScope scope(*this);
-        if (domain != AF_INET)
+        if (domain != AF_INET && domain != AF_INET6)
         {
             return fail(EAFNOSUPPORT);
         }
@@ -473,6 +459,8 @@ namespace ustack
         }
         int base_type = type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
         auto socket = std::make_unique<Socket>();
+        socket->family = domain;
+        socket->bound_ip = domain == AF_INET6 ? IpAddress(IPv6Address()) : IpAddress(IPv4Address());
         if (base_type == SOCK_STREAM)
         {
             if (protocol != 0 && protocol != IPPROTO_TCP)
@@ -508,13 +496,22 @@ namespace ustack
         {
             return fail(ENOTSOCK);
         }
-        IPv4Address ip;
+        IpAddress ip;
         uint16_t port = 0;
-        if (int error = parse_address(addr, addrlen, ip, port); error != 0)
+        if (int error = _parse_address(*socket, addr, addrlen, ip, port); error != 0)
         {
             return fail(error);
         }
-        if (!(ip == IPv4Address()) && !(ip == _stack.interface_config().ip))
+        if (ip.is_v4() && socket->v6only && socket->family == AF_INET6)
+        {
+            return fail(EINVAL); // a v4-mapped address on an IPv6-only socket
+        }
+        bool local = ip.is_v4() ? ip.v4() == IPv4Address() || ip.v4() == _stack.interface_config().ip
+                                : ip.v6().is_unspecified()
+                                      || std::any_of(_stack.ipv6_addresses().begin(), _stack.ipv6_addresses().end(),
+                                                     [&ip](const Ipv6ConfiguredAddress& configured)
+                                                     { return configured.address == ip.v6(); });
+        if (!local)
         {
             return fail(EADDRNOTAVAIL);
         }
@@ -558,7 +555,12 @@ namespace ustack
             }
         }
         backlog = std::clamp(backlog, 1, MAX_BACKLOG);
-        _stack.listen(socket->local_port, static_cast<size_t>(backlog));
+        NetworkStack::ListenFamily family = NetworkStack::ListenFamily::IPV4_ONLY;
+        if (socket->family == AF_INET6)
+        {
+            family = socket->v6only ? NetworkStack::ListenFamily::IPV6_ONLY : NetworkStack::ListenFamily::ANY;
+        }
+        _stack.listen(socket->local_port, static_cast<size_t>(backlog), family);
         socket->listening = true;
         _listener_by_port[socket->local_port] = fd;
         return 0;
@@ -601,19 +603,22 @@ namespace ustack
 
         auto socket = std::make_unique<Socket>();
         socket->kind = Kind::TCP;
+        socket->family = listener->family;
+        socket->v6only = listener->v6only;
         socket->keepalive = listener->keepalive;
         socket->nodelay = listener->nodelay;
         socket->reuseaddr = listener->reuseaddr;
         socket->linger = listener->linger;
         socket->user_timeout_ms = listener->user_timeout_ms;
         socket->congestion = listener->congestion;
+        int listener_family = listener->family;
         // listener may move: _new_fd can grow the table, but it holds
         // unique_ptrs, so the Socket objects themselves stay put.
         int new_fd = _new_fd(std::move(socket));
         _attach(new_fd, *connection);
         if (addr != nullptr)
         {
-            _fill_address(connection->get_remote_ip(), connection->get_remote_port(), addr, addrlen);
+            _fill_address(listener_family, connection->get_remote_ip(), connection->get_remote_port(), addr, addrlen);
         }
         return new_fd;
     }
@@ -634,11 +639,15 @@ namespace ustack
         {
             return fail(EOPNOTSUPP); // a UDP default peer is not supported - see stack.h
         }
-        IPv4Address ip;
+        IpAddress ip;
         uint16_t port = 0;
-        if (int error = parse_address(addr, addrlen, ip, port); error != 0)
+        if (int error = _parse_address(*socket, addr, addrlen, ip, port); error != 0)
         {
             return fail(error);
+        }
+        if ((ip.is_v4() && socket->v6only) || (ip.is_v6() && !_stack.ipv6_enabled()))
+        {
+            return fail(ENETUNREACH);
         }
         if (socket->listening)
         {
@@ -726,13 +735,17 @@ namespace ustack
             {
                 return fail(EDESTADDRREQ);
             }
-            IPv4Address ip;
+            IpAddress ip;
             uint16_t port = 0;
-            if (int error = parse_address(dest_addr, addrlen, ip, port); error != 0)
+            if (int error = _parse_address(*socket, dest_addr, addrlen, ip, port); error != 0)
             {
                 return fail(error);
             }
-            if (len + IP_UDP_HEADER_BYTES > _stack.interface_config().mtu)
+            if ((ip.is_v4() && socket->v6only) || (ip.is_v6() && !_stack.ipv6_enabled()))
+            {
+                return fail(ENETUNREACH);
+            }
+            if (len + (ip.is_v4() ? IP_UDP_HEADER_BYTES : IPV6_UDP_HEADER_BYTES) > _stack.interface_config().mtu)
             {
                 return fail(EMSGSIZE);
             }
@@ -830,7 +843,7 @@ namespace ustack
             std::copy(datagram.payload.begin(), datagram.payload.begin() + static_cast<std::ptrdiff_t>(copied), out);
             if (src_addr != nullptr)
             {
-                _fill_address(datagram.source, datagram.source_port, src_addr, addrlen);
+                _fill_address(socket->family, datagram.source, datagram.source_port, src_addr, addrlen);
             }
             return static_cast<ssize_t>(copied);
         }
@@ -1050,6 +1063,23 @@ namespace ustack
                 return fail(ENOPROTOOPT);
             }
         }
+        if (level == IPPROTO_IPV6)
+        {
+            if (socket->family != AF_INET6 || optname != IPV6_V6ONLY)
+            {
+                return fail(ENOPROTOOPT);
+            }
+            if (int error = read_int_option(optval, optlen, value); error != 0)
+            {
+                return fail(error);
+            }
+            if (socket->local_port != 0)
+            {
+                return fail(EINVAL); // as Linux: fixed once the socket is bound
+            }
+            socket->v6only = value != 0;
+            return 0;
+        }
         if (level != IPPROTO_TCP || socket->kind != Kind::TCP)
         {
             return fail(ENOPROTOOPT);
@@ -1161,6 +1191,15 @@ namespace ustack
             }
             return error != 0 ? fail(error) : 0;
         }
+        if (level == IPPROTO_IPV6)
+        {
+            if (socket->family != AF_INET6 || optname != IPV6_V6ONLY)
+            {
+                return fail(ENOPROTOOPT);
+            }
+            error = write_int_option(optval, optlen, socket->v6only ? 1 : 0);
+            return error != 0 ? fail(error) : 0;
+        }
         if (level != IPPROTO_TCP || socket->kind != Kind::TCP)
         {
             return fail(ENOPROTOOPT);
@@ -1188,21 +1227,79 @@ namespace ustack
         return error != 0 ? fail(error) : 0;
     }
 
-    int Stack::_fill_address(const IpAddress& ip, uint16_t port, struct sockaddr* addr, socklen_t* addrlen) const
+    int Stack::_fill_address(int family, const IpAddress& ip, uint16_t port, struct sockaddr* addr, socklen_t* addrlen)
     {
         if (addr == nullptr || addrlen == nullptr)
         {
             return EFAULT;
         }
+        // Truncated to the caller's buffer, with the real size reported, as
+        // the kernel does.
+        auto copy_out = [addr, addrlen](const void* address, size_t size)
+        {
+            size_t length = std::min(static_cast<size_t>(*addrlen), size);
+            std::memcpy(addr, address, length);
+            *addrlen = static_cast<socklen_t>(size);
+        };
+        if (family == AF_INET6)
+        {
+            sockaddr_in6 in6{};
+            in6.sin6_family = AF_INET6;
+            in6.sin6_port = htons(port);
+            const IPv6Address address = ip.is_v6() ? ip.v6() : IpAddress::v4_mapped(ip.v4());
+            std::memcpy(&in6.sin6_addr, address.get_address().data(), IPv6Address::SIZE);
+            copy_out(&in6, sizeof(in6));
+            return 0;
+        }
         sockaddr_in in{};
         in.sin_family = AF_INET;
         in.sin_port = htons(port);
-        in.sin_addr = from_ip(ip.v4());
-        // Truncated to the caller's buffer, with the real size reported, as
-        // the kernel does.
-        size_t length = std::min(static_cast<size_t>(*addrlen), sizeof(in));
-        std::memcpy(addr, &in, length);
-        *addrlen = sizeof(in);
+        if (ip.is_v4())
+        {
+            in.sin_addr = from_ip(ip.v4());
+        }
+        copy_out(&in, sizeof(in));
+        return 0;
+    }
+
+    int Stack::_parse_address(const Socket& socket, const struct sockaddr* addr, socklen_t addrlen, IpAddress& ip,
+                              uint16_t& port)
+    {
+        if (addr == nullptr)
+        {
+            return EFAULT;
+        }
+        if (socket.family == AF_INET)
+        {
+            if (addrlen < static_cast<socklen_t>(sizeof(sockaddr_in)))
+            {
+                return EINVAL;
+            }
+            sockaddr_in in{};
+            std::memcpy(&in, addr, sizeof(in));
+            if (in.sin_family != AF_INET)
+            {
+                return EAFNOSUPPORT;
+            }
+            ip = to_ip(in.sin_addr);
+            port = ntohs(in.sin_port);
+            return 0;
+        }
+        if (addrlen < static_cast<socklen_t>(sizeof(sockaddr_in6)))
+        {
+            return EINVAL;
+        }
+        sockaddr_in6 in6{};
+        std::memcpy(&in6, addr, sizeof(in6));
+        if (in6.sin6_family != AF_INET6)
+        {
+            return EAFNOSUPPORT;
+        }
+        Bytes bytes(static_cast<unsigned int>(IPv6Address::SIZE));
+        std::memcpy(bytes.data(), &in6.sin6_addr, IPv6Address::SIZE);
+        IPv6Address address(bytes);
+        ip = IpAddress::is_v4_mapped(address) ? IpAddress(IpAddress::unmap(address)) : IpAddress(address);
+        port = ntohs(in6.sin6_port);
         return 0;
     }
 
@@ -1218,8 +1315,8 @@ namespace ustack
         {
             return fail(ENOTSOCK);
         }
-        IPv4Address ip = socket->connection_id != 0 ? _stack.interface_config().ip : socket->bound_ip;
-        if (int error = _fill_address(ip, socket->local_port, addr, addrlen); error != 0)
+        const IpAddress& ip = socket->connection_id != 0 ? socket->local_ip : socket->bound_ip;
+        if (int error = _fill_address(socket->family, ip, socket->local_port, addr, addrlen); error != 0)
         {
             return fail(error);
         }
@@ -1243,7 +1340,7 @@ namespace ustack
         {
             return fail(ENOTCONN);
         }
-        if (int error = _fill_address(socket->peer_ip, socket->peer_port, addr, addrlen); error != 0)
+        if (int error = _fill_address(socket->family, socket->peer_ip, socket->peer_port, addr, addrlen); error != 0)
         {
             return fail(error);
         }

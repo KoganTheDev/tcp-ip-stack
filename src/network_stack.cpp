@@ -346,9 +346,9 @@ int NetworkStack::get_fd() const
     return this->_primary().channel->get_fd();
 }
 
-void NetworkStack::listen(uint16_t port, size_t backlog)
+void NetworkStack::listen(uint16_t port, size_t backlog, ListenFamily family)
 {
-    this->_listening_ports[port] = backlog;
+    this->_listening_ports[port] = Listener{backlog, family};
 }
 
 void NetworkStack::unlisten(uint16_t port)
@@ -510,6 +510,7 @@ TcpConnection* NetworkStack::_open_connection(const IpAddress& remote_address, u
         this->_next_isn(this->_primary().config.ip, local_port, remote_ip, remote_port),
         this->_segment_sender(remote_ip, this->_primary().config.ip), this->_primary().config.local_mss());
     connection->set_ecn_mode(this->_tcp_ecn);
+    connection->set_local_ip(this->_primary().config.ip);
 
     TcpConnection* connection_ptr = connection.get();
     this->_register_connection(key, std::move(connection));
@@ -1616,7 +1617,8 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
     }
 
     auto listening_it = this->_listening_ports.find(tcp.get_dest_port());
-    bool is_new_connection_request = tcp.get_syn() && listening_it != this->_listening_ports.end();
+    bool is_new_connection_request =
+        tcp.get_syn() && listening_it != this->_listening_ports.end() && listening_it->second.accepts(source);
 
     if (is_new_connection_request)
     {
@@ -1626,11 +1628,11 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
         // connection that was only ever refused because we were briefly behind.
         auto pending_it = this->_pending_accepts.find(tcp.get_dest_port());
         size_t queued = pending_it == this->_pending_accepts.end() ? 0 : pending_it->second.size();
-        if (queued >= listening_it->second)
+        if (queued >= listening_it->second.backlog)
         {
             LOG_WARNING("NetworkStack: dropping a SYN for port "
                         << tcp.get_dest_port() << " - the accept queue is full (" << queued << "/"
-                        << listening_it->second
+                        << listening_it->second.backlog
                         << "). The application is not accepting fast enough, or this is a SYN flood.");
             return;
         }
@@ -1704,6 +1706,7 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
                                         this->_next_isn(local_ip, key.local_port, remote_ip, key.remote_port),
                                         this->_segment_sender(remote_ip, local_ip), this->_local_mss_for(remote_ip));
     connection->set_ecn_mode(this->_tcp_ecn);
+    connection->set_local_ip(destination);
 
     try
     {
@@ -1757,7 +1760,7 @@ bool NetworkStack::_try_complete_cookie_handshake(const IpAddress& source, const
     }
     uint16_t local_port = tcp.get_dest_port();
     auto listening_it = this->_listening_ports.find(local_port);
-    if (listening_it == this->_listening_ports.end())
+    if (listening_it == this->_listening_ports.end() || !listening_it->second.accepts(source))
     {
         return false;
     }
@@ -1800,7 +1803,7 @@ bool NetworkStack::_try_complete_cookie_handshake(const IpAddress& source, const
     // overflow, so the client's retransmission can succeed later.
     auto pending_it = this->_pending_accepts.find(local_port);
     size_t queued = pending_it == this->_pending_accepts.end() ? 0 : pending_it->second.size();
-    if (queued >= listening_it->second)
+    if (queued >= listening_it->second.backlog)
     {
         LOG_WARNING("NetworkStack: a valid SYN cookie for port " << local_port
                                                                  << " arrived with the accept queue full - dropped");
@@ -1814,6 +1817,7 @@ bool NetworkStack::_try_complete_cookie_handshake(const IpAddress& source, const
         std::make_unique<TcpConnection>(local_port, remote_ip, key.remote_port, cookie,
                                         this->_segment_sender(remote_ip, local_ip), this->_local_mss_for(remote_ip));
     connection->accept_cookie_handshake(peer_isn, mss);
+    connection->set_local_ip(local_ip);
 
     TcpConnection* connection_ptr = connection.get();
     this->_register_connection(key, std::move(connection));

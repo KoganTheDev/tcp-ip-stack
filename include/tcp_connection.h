@@ -311,6 +311,11 @@ public:
     // The connection's own end and the peer's, for getsockname()/getpeername().
     uint16_t get_local_port() const { return _local_port; }
     const IpAddress& get_remote_ip() const { return _remote_ip; }
+    // This end's address, which NetworkStack records when it creates the
+    // connection (a dual-stack host has several, and a socket's getsockname()
+    // must name the one the peer is talking to). Not used by TCP itself.
+    void set_local_ip(const IpAddress& address) { _local_ip = address; }
+    const IpAddress& get_local_ip() const { return _local_ip; }
     uint16_t get_remote_port() const { return _remote_port; }
 
     // TCP_NODELAY: turns Nagle's algorithm off, so a small segment goes out at
@@ -690,6 +695,7 @@ private:
     uint64_t _id;
     uint16_t _local_port;
     IpAddress _remote_ip;
+    IpAddress _local_ip;
     uint16_t _remote_port;
 
     TcpState _state;
