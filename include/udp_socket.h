@@ -4,7 +4,7 @@
 #include <functional>
 
 #include "bytes.h"
-#include "network_addresses.h"
+#include "ip_address.h"
 #include "udp.h"
 
 // One bound UDP port. Unlike TcpConnection, there's no state machine and no
@@ -25,19 +25,19 @@ public:
     // dest_ip is included because, unlike TcpConnection, a single socket can
     // send to a different peer on every call - there's no one "the" remote
     // address to bind send_datagram to ahead of time.
-    using SendDatagramFn = std::function<void(const IPv4Address& dest_ip, const Udp& header, const Bytes& payload)>;
-    using DatagramReceivedFn = std::function<void(const IPv4Address& src_ip, uint16_t src_port, const Bytes& data)>;
+    using SendDatagramFn = std::function<void(const IpAddress& dest_ip, const Udp& header, const Bytes& payload)>;
+    using DatagramReceivedFn = std::function<void(const IpAddress& src_ip, uint16_t src_port, const Bytes& data)>;
 
     UdpSocket(uint16_t local_port, SendDatagramFn send_datagram);
 
     // Feeds in a datagram already verified (checksum, addressed to this
     // port) - src_ip is passed separately since Udp itself (like Tcp) has no
     // notion of IP addresses.
-    void on_datagram(const IPv4Address& src_ip, const Udp& segment);
+    void on_datagram(const IpAddress& src_ip, const Udp& segment);
 
     // Fire-and-forget: builds and sends one datagram to dest_ip:dest_port.
     // No queueing, no retry, no acknowledgment - exactly UDP's contract.
-    void send_to(const IPv4Address& dest_ip, uint16_t dest_port, const Bytes& data);
+    void send_to(const IpAddress& dest_ip, uint16_t dest_port, const Bytes& data);
 
     void set_datagram_received_callback(DatagramReceivedFn callback);
 

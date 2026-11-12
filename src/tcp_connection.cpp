@@ -49,7 +49,7 @@ namespace
     std::atomic<uint64_t> g_next_connection_id{1};
 }
 
-TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port,
+TcpConnection::TcpConnection(uint16_t local_port, const IpAddress& remote_ip, uint16_t remote_port,
                              uint32_t initial_seq, SendSegmentFn send_segment, uint16_t local_mss,
                              CongestionControlAlgorithm algorithm)
     : TcpConnection(local_port, remote_ip, remote_port, initial_seq,
@@ -58,7 +58,7 @@ TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, 
                     local_mss, algorithm)
 {}
 
-TcpConnection::TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port,
+TcpConnection::TcpConnection(uint16_t local_port, const IpAddress& remote_ip, uint16_t remote_port,
                              uint32_t initial_seq, SendSegmentEcnFn send_segment, uint16_t local_mss,
                              CongestionControlAlgorithm algorithm)
     : _id(g_next_connection_id.fetch_add(1)), _local_port(local_port), _remote_ip(remote_ip), _remote_port(remote_port),

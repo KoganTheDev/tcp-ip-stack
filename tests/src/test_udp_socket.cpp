@@ -9,7 +9,7 @@ namespace
 {
     struct SentDatagram
     {
-        IPv4Address dest_ip;
+        IpAddress dest_ip;
         uint16_t src_port;
         uint16_t dest_port;
         Bytes payload;
@@ -17,7 +17,7 @@ namespace
 
     struct ReceivedDatagram
     {
-        IPv4Address src_ip;
+        IpAddress src_ip;
         uint16_t src_port;
         Bytes data;
     };
@@ -38,8 +38,8 @@ namespace
 TEST(UdpSocket, IncomingDatagramReachesRegisteredCallback)
 {
     std::vector<ReceivedDatagram> received;
-    UdpSocket socket(8080, [](const IPv4Address&, const Udp&, const Bytes&) {});
-    socket.set_datagram_received_callback([&received](const IPv4Address& src_ip, uint16_t src_port, const Bytes& data)
+    UdpSocket socket(8080, [](const IpAddress&, const Udp&, const Bytes&) {});
+    socket.set_datagram_received_callback([&received](const IpAddress& src_ip, uint16_t src_port, const Bytes& data)
                                           { received.push_back({src_ip, src_port, data}); });
 
     Bytes payload = Bytes::from_hex("68656c6c6f"); // "hello"
@@ -58,7 +58,7 @@ TEST(UdpSocket, IncomingDatagramReachesRegisteredCallback)
 // call pending drops what it can't buffer.
 TEST(UdpSocket, DatagramWithNoRegisteredCallbackIsDroppedWithoutCrashing)
 {
-    UdpSocket socket(8080, [](const IPv4Address&, const Udp&, const Bytes&) {});
+    UdpSocket socket(8080, [](const IpAddress&, const Udp&, const Bytes&) {});
 
     Bytes payload = Bytes::from_hex("68656c6c6f");
     socket.on_datagram(IPv4Address("10.0.0.1"), *make_incoming_datagram(payload));
@@ -68,7 +68,7 @@ TEST(UdpSocket, DatagramWithNoRegisteredCallbackIsDroppedWithoutCrashing)
 TEST(UdpSocket, SendToInvokesSendCallbackWithCorrectHeaderAndPayload)
 {
     std::vector<SentDatagram> sent;
-    UdpSocket socket(8080, [&sent](const IPv4Address& dest_ip, const Udp& header, const Bytes& payload)
+    UdpSocket socket(8080, [&sent](const IpAddress& dest_ip, const Udp& header, const Bytes& payload)
                      { sent.push_back({dest_ip, header.get_src_port(), header.get_dest_port(), payload}); });
 
     Bytes payload = Bytes::from_hex("6f6b"); // "ok"
@@ -91,9 +91,9 @@ TEST(UdpSocket, SocketCanSendToAndReceiveFromMultipleDifferentPeers)
 {
     std::vector<SentDatagram> sent;
     std::vector<ReceivedDatagram> received;
-    UdpSocket socket(8080, [&sent](const IPv4Address& dest_ip, const Udp& header, const Bytes& payload)
+    UdpSocket socket(8080, [&sent](const IpAddress& dest_ip, const Udp& header, const Bytes& payload)
                      { sent.push_back({dest_ip, header.get_src_port(), header.get_dest_port(), payload}); });
-    socket.set_datagram_received_callback([&received](const IPv4Address& src_ip, uint16_t src_port, const Bytes& data)
+    socket.set_datagram_received_callback([&received](const IpAddress& src_ip, uint16_t src_port, const Bytes& data)
                                           { received.push_back({src_ip, src_port, data}); });
 
     socket.send_to(IPv4Address("10.0.0.2"), 9000, Bytes::from_hex("01"));

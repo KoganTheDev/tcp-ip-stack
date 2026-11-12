@@ -9,7 +9,7 @@
 #include "bytes.h"
 #include "congestion_control.h"
 #include "ip.h"
-#include "network_addresses.h"
+#include "ip_address.h"
 #include "reorder_buffer.h"
 #include "rtt_estimator.h"
 #include "send_scoreboard.h"
@@ -111,10 +111,10 @@ public:
     // for the same reason Linux does: it is what the peers on the other end of
     // these connections are almost certainly running, and a stack whose default
     // loses to its own peers is not a useful default.
-    TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port, uint32_t initial_seq,
+    TcpConnection(uint16_t local_port, const IpAddress& remote_ip, uint16_t remote_port, uint32_t initial_seq,
                   SendSegmentFn send_segment, uint16_t local_mss = DEFAULT_LOCAL_MSS,
                   CongestionControlAlgorithm algorithm = CongestionControlAlgorithm::CUBIC);
-    TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port, uint32_t initial_seq,
+    TcpConnection(uint16_t local_port, const IpAddress& remote_ip, uint16_t remote_port, uint32_t initial_seq,
                   SendSegmentEcnFn send_segment, uint16_t local_mss = DEFAULT_LOCAL_MSS,
                   CongestionControlAlgorithm algorithm = CongestionControlAlgorithm::CUBIC);
 
@@ -310,7 +310,7 @@ public:
 
     // The connection's own end and the peer's, for getsockname()/getpeername().
     uint16_t get_local_port() const { return _local_port; }
-    const IPv4Address& get_remote_ip() const { return _remote_ip; }
+    const IpAddress& get_remote_ip() const { return _remote_ip; }
     uint16_t get_remote_port() const { return _remote_port; }
 
     // TCP_NODELAY: turns Nagle's algorithm off, so a small segment goes out at
@@ -689,7 +689,7 @@ private:
 
     uint64_t _id;
     uint16_t _local_port;
-    IPv4Address _remote_ip;
+    IpAddress _remote_ip;
     uint16_t _remote_port;
 
     TcpState _state;

@@ -437,7 +437,7 @@ namespace ustack
             _udp_ports.insert(port);
             std::shared_ptr<Stack*> self = _self;
             socket.udp->set_datagram_received_callback(
-                [self, fd](const IPv4Address& source, uint16_t source_port, const Bytes& data)
+                [self, fd](const IpAddress& source, uint16_t source_port, const Bytes& data)
                 {
                     Stack* stack = *self;
                     if (stack == nullptr)
@@ -1188,7 +1188,7 @@ namespace ustack
         return error != 0 ? fail(error) : 0;
     }
 
-    int Stack::_fill_address(const IPv4Address& ip, uint16_t port, struct sockaddr* addr, socklen_t* addrlen) const
+    int Stack::_fill_address(const IpAddress& ip, uint16_t port, struct sockaddr* addr, socklen_t* addrlen) const
     {
         if (addr == nullptr || addrlen == nullptr)
         {
@@ -1197,7 +1197,7 @@ namespace ustack
         sockaddr_in in{};
         in.sin_family = AF_INET;
         in.sin_port = htons(port);
-        in.sin_addr = from_ip(ip);
+        in.sin_addr = from_ip(ip.v4());
         // Truncated to the caller's buffer, with the real size reported, as
         // the kernel does.
         size_t length = std::min(static_cast<size_t>(*addrlen), sizeof(in));

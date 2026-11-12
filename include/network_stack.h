@@ -21,6 +21,7 @@
 #include "dhcp_client.h"
 #include "dns_resolver.h"
 #include "network_addresses.h"
+#include "ip_address.h"
 #include "ethernet.h"
 #include "arp.h"
 #include "ip.h"
@@ -294,7 +295,7 @@ public:
     // ARP replies arrive via poll(). The returned pointer has the same
     // whole-lifetime ownership as accept()'s. Returns nullptr if every
     // ephemeral port is already connected to this same remote ip:port.
-    TcpConnection* connect(const IPv4Address& remote_ip, uint16_t remote_port, uint16_t local_port = 0);
+    TcpConnection* connect(const IpAddress& remote_ip, uint16_t remote_port, uint16_t local_port = 0);
 
     // Looks a connection up by the stable id from TcpConnection::get_id(),
     // or nullptr if it's since been reaped. This is the safe way to hold
@@ -429,7 +430,7 @@ public:
 private:
     struct ConnectionKey
     {
-        IPv4Address remote_ip;
+        IpAddress remote_ip;
         uint16_t remote_port{};
         uint16_t local_port{};
         bool operator==(const ConnectionKey& other) const;
@@ -533,7 +534,7 @@ private:
     // Sends a UDP datagram if the peer's MAC is already known, otherwise
     // queues it and kicks off ARP resolution (see _pending_outbound_datagrams)
     // - the UDP-side counterpart to connect()'s resolve-and-queue.
-    void _send_or_queue_udp(const IPv4Address& dest_ip, const Udp& header, const Bytes& payload);
+    void _send_or_queue_udp(const IpAddress& destination, const Udp& header, const Bytes& payload);
     void _send_udp_datagram(const IPv4Address& dest_ip, const Udp& header, const Bytes& payload);
     // Flushes every datagram queued for ip once its MAC has just been learned.
     void _flush_pending_outbound_datagrams(size_t index, const IPv4Address& ip);
@@ -662,7 +663,7 @@ private:
     void _ensure_arp_resolution(size_t interface_index, const IPv4Address& ip);
     void _fail_pending_outbound_connects(size_t interface_index, const IPv4Address& ip);
     // connect()'s second half, once the local port is settled.
-    TcpConnection* _open_connection(const IPv4Address& remote_ip, uint16_t remote_port, uint16_t local_port);
+    TcpConnection* _open_connection(const IpAddress& remote_address, uint16_t remote_port, uint16_t local_port);
 
     // A UDP datagram whose send had to wait on ARP resolution - enough to
     // rebuild it once the peer's MAC is known. Keyed (in Interface, below) by
@@ -774,7 +775,8 @@ private:
     // Set by set_secret_seed(): M comes from _now_ms, not the wall clock.
     bool _isn_on_virtual_clock = false;
     // The ISN for a new connection, from whichever clock is in use.
-    uint32_t _next_isn(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port) const;
+    uint32_t _next_isn(const IpAddress& local_ip, uint16_t local_port, const IpAddress& remote_ip,
+                       uint16_t remote_port) const;
     bool _challenge_ack_window_open = false; // false until the first challenge ACK draws a limit
     uint64_t _challenge_ack_window_start_ms = 0;
     uint64_t _challenge_ack_window_limit = 0;

@@ -2,7 +2,6 @@
 
 #include <random>
 
-#include "interface_config.h"
 #include "isn_generator.h"
 
 constexpr uint16_t SynCookies::MSS_TABLE[8];
@@ -29,22 +28,30 @@ namespace
     }
 }
 
-uint32_t SynCookies::_mac(const IPv4Address& local_ip, uint16_t local_port, const IPv4Address& remote_ip,
+uint32_t SynCookies::_mac(const IpAddress& local_ip, uint16_t local_port, const IpAddress& remote_ip,
                           uint16_t remote_port, uint32_t peer_isn, uint64_t slot, uint32_t mss_index) const
 {
-    // Big-endian, so the value does not depend on the host's byte order.
-    uint8_t message[28];
-    put32(message + 0, ipv4_to_uint32(local_ip));
-    put32(message + 4, ipv4_to_uint32(remote_ip));
-    put32(message + 8, (static_cast<uint32_t>(local_port) << 16) | remote_port);
-    put32(message + 12, peer_isn);
-    put32(message + 16, static_cast<uint32_t>(slot >> 32));
-    put32(message + 20, static_cast<uint32_t>(slot));
-    put32(message + 24, mss_index);
-    return static_cast<uint32_t>(siphash_2_4(message, sizeof(message), _key_low, _key_high)) & 0x00FFFFFFu;
+    // Both addresses, then the fixed 20 bytes below: 28 bytes for IPv4 (the
+    // layout this always had), 52 for IPv6.
+    uint8_t message[2 * IPv6Address::SIZE + 20];
+    size_t length = 0;
+    for (const IpAddress* address : {&local_ip, &remote_ip})
+    {
+        for (byte_t b : address->bytes())
+        {
+            message[length++] = b;
+        }
+    }
+    put32(message + length, (static_cast<uint32_t>(local_port) << 16) | remote_port);
+    put32(message + length + 4, peer_isn);
+    put32(message + length + 8, static_cast<uint32_t>(slot >> 32));
+    put32(message + length + 12, static_cast<uint32_t>(slot));
+    put32(message + length + 16, mss_index);
+    length += 20;
+    return static_cast<uint32_t>(siphash_2_4(message, length, _key_low, _key_high)) & 0x00FFFFFFu;
 }
 
-uint32_t SynCookies::make(const IPv4Address& local_ip, uint16_t local_port, const IPv4Address& remote_ip,
+uint32_t SynCookies::make(const IpAddress& local_ip, uint16_t local_port, const IpAddress& remote_ip,
                           uint16_t remote_port, uint32_t peer_isn, uint16_t peer_mss, uint64_t now_ms) const
 {
     // the largest table entry not above what the peer said it can take
@@ -61,7 +68,7 @@ uint32_t SynCookies::make(const IPv4Address& local_ip, uint16_t local_port, cons
            | _mac(local_ip, local_port, remote_ip, remote_port, peer_isn, slot, index);
 }
 
-uint16_t SynCookies::check(const IPv4Address& local_ip, uint16_t local_port, const IPv4Address& remote_ip,
+uint16_t SynCookies::check(const IpAddress& local_ip, uint16_t local_port, const IpAddress& remote_ip,
                            uint16_t remote_port, uint32_t peer_isn, uint32_t cookie, uint64_t now_ms) const
 {
     uint32_t slot_bits = cookie >> 27;

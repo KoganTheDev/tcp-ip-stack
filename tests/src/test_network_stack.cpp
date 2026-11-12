@@ -430,7 +430,7 @@ TEST(NetworkStack, UdpToBoundPortReachesTheSocket)
 
     std::vector<Bytes> received;
     UdpSocket* socket = stack->bind_udp(8080);
-    socket->set_datagram_received_callback([&received](const IPv4Address&, uint16_t, const Bytes& data)
+    socket->set_datagram_received_callback([&received](const IpAddress&, uint16_t, const Bytes& data)
                                            { received.push_back(data); });
 
     Bytes payload = Bytes::from_hex("68656c6c6f"); // "hello"
@@ -771,7 +771,7 @@ TEST(NetworkStack, PaddedShortUdpDatagramStillReachesTheSocket)
 
     std::vector<Bytes> received;
     UdpSocket* socket = stack->bind_udp(8080);
-    socket->set_datagram_received_callback([&received](const IPv4Address&, uint16_t, const Bytes& data)
+    socket->set_datagram_received_callback([&received](const IpAddress&, uint16_t, const Bytes& data)
                                            { received.push_back(data); });
 
     Bytes payload = Bytes::from_hex("68656c6c6f"); // "hello" - 5 bytes, well under the minimum
@@ -1066,7 +1066,7 @@ TEST(NetworkStack, BroadcastIsSentWithoutResolutionAndAcceptedInbound)
     // inbound: a broadcast datagram is not addressed to our IP, and must be
     // accepted anyway or a host could never be reached before it has an address
     std::vector<Bytes> received;
-    socket->set_datagram_received_callback([&received](const IPv4Address&, uint16_t, const Bytes& data)
+    socket->set_datagram_received_callback([&received](const IpAddress&, uint16_t, const Bytes& data)
                                            { received.push_back(data); });
 
     Bytes frame = build_udp(67, 68, Bytes::from_hex("beef"));
@@ -1165,7 +1165,7 @@ TEST(NetworkStack, FragmentedUdpDatagramIsReassembledAndDelivered)
 
     std::vector<Bytes> received;
     UdpSocket* socket = stack->bind_udp(9000);
-    socket->set_datagram_received_callback([&received](const IPv4Address&, uint16_t, const Bytes& data)
+    socket->set_datagram_received_callback([&received](const IpAddress&, uint16_t, const Bytes& data)
                                            { received.push_back(data); });
 
     // a 24-byte UDP payload, so the whole datagram is 8 + 24 = 32 bytes, split
@@ -1607,8 +1607,7 @@ TEST(NetworkStack, ADirectedBroadcastWithARealChecksumIsAccepted)
 
     bool received = false;
     UdpSocket* socket = stack->bind_udp(9999);
-    socket->set_datagram_received_callback([&received](const IPv4Address&, uint16_t, const Bytes&)
-                                           { received = true; });
+    socket->set_datagram_received_callback([&received](const IpAddress&, uint16_t, const Bytes&) { received = true; });
 
     channel->push_inbound(build_checksummed_udp_to(IPv4Address("10.0.0.255"), MacAddress::BROADCAST, 5000, 9999,
                                                    Bytes::from_hex("cafe")));
@@ -1627,8 +1626,7 @@ TEST(NetworkStack, AUnicastDatagramWithARealChecksumStillVerifies)
 
     bool received = false;
     UdpSocket* socket = stack->bind_udp(9999);
-    socket->set_datagram_received_callback([&received](const IPv4Address&, uint16_t, const Bytes&)
-                                           { received = true; });
+    socket->set_datagram_received_callback([&received](const IpAddress&, uint16_t, const Bytes&) { received = true; });
 
     channel->push_inbound(build_checksummed_udp_to(LOCAL_IP, LOCAL_MAC, 5000, 9999, Bytes::from_hex("cafe")));
     stack->poll();
@@ -1644,8 +1642,7 @@ TEST(NetworkStack, ACorruptedChecksumIsStillRejected)
 
     bool received = false;
     UdpSocket* socket = stack->bind_udp(9999);
-    socket->set_datagram_received_callback([&received](const IPv4Address&, uint16_t, const Bytes&)
-                                           { received = true; });
+    socket->set_datagram_received_callback([&received](const IpAddress&, uint16_t, const Bytes&) { received = true; });
 
     Bytes frame = build_checksummed_udp_to(LOCAL_IP, LOCAL_MAC, 5000, 9999, Bytes::from_hex("cafe"));
     frame[frame.size() - 3] = static_cast<byte_t>(frame[frame.size() - 3] ^ 0xff);

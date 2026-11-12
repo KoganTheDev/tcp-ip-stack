@@ -127,7 +127,7 @@ bool NetworkStack::ConnectionKey::operator==(const ConnectionKey& other) const
 
 size_t NetworkStack::ConnectionKeyHash::operator()(const ConnectionKey& key) const
 {
-    size_t h1 = std::hash<IPv4Address>{}(key.remote_ip);
+    size_t h1 = std::hash<IpAddress>{}(key.remote_ip);
     size_t h2 = std::hash<uint16_t>{}(key.remote_port);
     size_t h3 = std::hash<uint16_t>{}(key.local_port);
     return h1 ^ (h2 << 1) ^ (h3 << 2);
@@ -229,9 +229,9 @@ void NetworkStack::set_secret_seed(uint64_t seed)
     this->_isn_on_virtual_clock = true;
 }
 
-uint32_t NetworkStack::_next_isn(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port) const
+uint32_t NetworkStack::_next_isn(const IpAddress& local_ip, uint16_t local_port, const IpAddress& remote_ip,
+                                 uint16_t remote_port) const
 {
-    const IPv4Address& local_ip = this->_primary().config.ip;
     if (this->_isn_on_virtual_clock)
     {
         return this->_isn_generator.generate_at(local_ip, local_port, remote_ip, remote_port, this->_now_ms * 1000);
@@ -453,8 +453,13 @@ TcpConnection* NetworkStack::accept(uint16_t port)
     return nullptr;
 }
 
-TcpConnection* NetworkStack::connect(const IPv4Address& remote_ip, uint16_t remote_port, uint16_t local_port)
+TcpConnection* NetworkStack::connect(const IpAddress& remote_ip, uint16_t remote_port, uint16_t local_port)
 {
+    if (!remote_ip.is_v4())
+    {
+        LOG_WARNING("NetworkStack: connect() to " << remote_ip.to_string() << " - no IPv6 path");
+        return nullptr;
+    }
     if (local_port != 0)
     {
         // A port the caller chose (a socket bound before connect()): used as
@@ -490,12 +495,15 @@ TcpConnection* NetworkStack::connect(const IPv4Address& remote_ip, uint16_t remo
     return this->_open_connection(remote_ip, remote_port, ephemeral_port);
 }
 
-TcpConnection* NetworkStack::_open_connection(const IPv4Address& remote_ip, uint16_t remote_port, uint16_t local_port)
+TcpConnection* NetworkStack::_open_connection(const IpAddress& remote_address, uint16_t remote_port,
+                                              uint16_t local_port)
 {
+    const IPv4Address& remote_ip = remote_address.v4();
     ConnectionKey key{remote_ip, remote_port, local_port};
 
     auto connection = std::make_unique<TcpConnection>(
-        local_port, remote_ip, remote_port, this->_next_isn(local_port, remote_ip, remote_port),
+        local_port, remote_ip, remote_port,
+        this->_next_isn(this->_primary().config.ip, local_port, remote_ip, remote_port),
         [this, remote_ip](const Tcp& header, const Bytes& payload, Ecn ecn)
         { this->_send_tcp_segment(remote_ip, header, payload, ecn); }, this->_primary().config.local_mss());
     connection->set_ecn_mode(this->_tcp_ecn);
@@ -554,11 +562,11 @@ DnsResolver& NetworkStack::_ensure_dns_resolver()
             UdpSocket* socket = this->_bind_udp_socket(source_port);
             this->_resolver_ports.insert(source_port);
             socket->set_datagram_received_callback(
-                [this, source_port](const IPv4Address& src, uint16_t src_port, const Bytes& data)
+                [this, source_port](const IpAddress& src, uint16_t src_port, const Bytes& data)
                 {
-                    if (this->_dns_resolver)
+                    if (this->_dns_resolver && src.is_v4()) // the resolver queries IPv4 servers only
                     {
-                        this->_dns_resolver->on_datagram(src, src_port, source_port, data);
+                        this->_dns_resolver->on_datagram(src.v4(), src_port, source_port, data);
                     }
                 });
             socket->send_to(server, DnsResolver::SERVER_PORT, payload);
@@ -613,9 +621,9 @@ DhcpClient* NetworkStack::start_dhcp()
                                         limited_broadcast_address(), DhcpClient::SERVER_PORT));
 
     socket->set_datagram_received_callback(
-        [this](const IPv4Address&, uint16_t src_port, const Bytes& data)
+        [this](const IpAddress& source, uint16_t src_port, const Bytes& data)
         {
-            if (src_port != DhcpClient::SERVER_PORT)
+            if (src_port != DhcpClient::SERVER_PORT || !source.is_v4())
             {
                 return;
             }
@@ -680,7 +688,7 @@ UdpSocket* NetworkStack::_bind_udp_socket(uint16_t port)
     }
 
     auto socket =
-        std::make_unique<UdpSocket>(port, [this](const IPv4Address& dest_ip, const Udp& header, const Bytes& payload)
+        std::make_unique<UdpSocket>(port, [this](const IpAddress& dest_ip, const Udp& header, const Bytes& payload)
                                     { this->_send_or_queue_udp(dest_ip, header, payload); });
 
     UdpSocket* socket_ptr = socket.get();
@@ -1666,11 +1674,12 @@ void NetworkStack::_handle_tcp(const Ip& ip, const Tcp& tcp)
         return;
     }
 
-    IPv4Address remote_ip = key.remote_ip;
+    IPv4Address remote_ip = src_ip;
     LOG_DEBUG("NetworkStack: accepting new connection from " << remote_ip.to_string() << ":" << key.remote_port
                                                              << " on port " << key.local_port);
     auto connection = std::make_unique<TcpConnection>(
-        key.local_port, remote_ip, key.remote_port, this->_next_isn(key.local_port, remote_ip, key.remote_port),
+        key.local_port, remote_ip, key.remote_port,
+        this->_next_isn(this->_primary().config.ip, key.local_port, remote_ip, key.remote_port),
         [this, remote_ip](const Tcp& header, const Bytes& payload, Ecn ecn)
         { this->_send_tcp_segment(remote_ip, header, payload, ecn); }, this->_primary().config.local_mss());
     connection->set_ecn_mode(this->_tcp_ecn);
@@ -2653,8 +2662,14 @@ void NetworkStack::_send_rst(const Ip& ip, const Tcp& tcp)
     this->_send_tcp_segment(remote_ip, rst, Bytes());
 }
 
-void NetworkStack::_send_or_queue_udp(const IPv4Address& dest_ip, const Udp& header, const Bytes& payload)
+void NetworkStack::_send_or_queue_udp(const IpAddress& destination, const Udp& header, const Bytes& payload)
 {
+    if (!destination.is_v4())
+    {
+        LOG_DEBUG("NetworkStack: dropping a UDP datagram to " << destination.to_string() << " - no IPv6 path");
+        return;
+    }
+    const IPv4Address& dest_ip = destination.v4();
     // Broadcast needs no resolution at all - it has a fixed destination MAC and
     // no neighbour to ask. Sending it straight out is what lets a stack with no
     // address of its own talk at all, which address-configuration protocols

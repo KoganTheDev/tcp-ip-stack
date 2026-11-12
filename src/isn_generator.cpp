@@ -4,7 +4,6 @@
 #include <cstring>
 #include <random>
 
-#include "interface_config.h" // ipv4_to_uint32
 
 namespace
 {
@@ -98,33 +97,30 @@ IsnGenerator::IsnGenerator()
 
 IsnGenerator::IsnGenerator(uint64_t key_low, uint64_t key_high) : _key_low(key_low), _key_high(key_high) {}
 
-uint32_t IsnGenerator::offset_for(const IPv4Address& local_ip, uint16_t local_port, const IPv4Address& remote_ip,
+uint32_t IsnGenerator::offset_for(const IpAddress& local_ip, uint16_t local_port, const IpAddress& remote_ip,
                                   uint16_t remote_port) const
 {
-    // The 4-tuple, serialised big-endian so the value does not depend on the
-    // host's byte order - two machines in a test fleet disagreeing about ISNs
-    // for the same connection would be a memorable afternoon.
-    uint8_t tuple[12];
-    uint32_t local = ipv4_to_uint32(local_ip);
-    uint32_t remote = ipv4_to_uint32(remote_ip);
+    // local address, remote address, local port, remote port, all network
+    // order: 12 bytes for IPv4 (the layout this always had, so a seeded
+    // stack's v4 ISNs did not move when v6 arrived), 36 for IPv6.
+    uint8_t tuple[2 * IPv6Address::SIZE + 4];
+    size_t length = 0;
+    for (const IpAddress* address : {&local_ip, &remote_ip})
+    {
+        for (byte_t b : address->bytes())
+        {
+            tuple[length++] = b;
+        }
+    }
+    tuple[length++] = static_cast<uint8_t>(local_port >> 8);
+    tuple[length++] = static_cast<uint8_t>(local_port);
+    tuple[length++] = static_cast<uint8_t>(remote_port >> 8);
+    tuple[length++] = static_cast<uint8_t>(remote_port);
 
-    tuple[0] = static_cast<uint8_t>(local >> 24);
-    tuple[1] = static_cast<uint8_t>(local >> 16);
-    tuple[2] = static_cast<uint8_t>(local >> 8);
-    tuple[3] = static_cast<uint8_t>(local);
-    tuple[4] = static_cast<uint8_t>(remote >> 24);
-    tuple[5] = static_cast<uint8_t>(remote >> 16);
-    tuple[6] = static_cast<uint8_t>(remote >> 8);
-    tuple[7] = static_cast<uint8_t>(remote);
-    tuple[8] = static_cast<uint8_t>(local_port >> 8);
-    tuple[9] = static_cast<uint8_t>(local_port);
-    tuple[10] = static_cast<uint8_t>(remote_port >> 8);
-    tuple[11] = static_cast<uint8_t>(remote_port);
-
-    return static_cast<uint32_t>(siphash_2_4(tuple, sizeof(tuple), _key_low, _key_high));
+    return static_cast<uint32_t>(siphash_2_4(tuple, length, _key_low, _key_high));
 }
 
-uint32_t IsnGenerator::generate(const IPv4Address& local_ip, uint16_t local_port, const IPv4Address& remote_ip,
+uint32_t IsnGenerator::generate(const IpAddress& local_ip, uint16_t local_port, const IpAddress& remote_ip,
                                 uint16_t remote_port) const
 {
     // RFC 6528's M: a timer incrementing every 4 microseconds, so sequence
@@ -143,7 +139,7 @@ uint32_t IsnGenerator::generate(const IPv4Address& local_ip, uint16_t local_port
     return generate_at(local_ip, local_port, remote_ip, remote_port, static_cast<uint64_t>(microseconds));
 }
 
-uint32_t IsnGenerator::generate_at(const IPv4Address& local_ip, uint16_t local_port, const IPv4Address& remote_ip,
+uint32_t IsnGenerator::generate_at(const IpAddress& local_ip, uint16_t local_port, const IpAddress& remote_ip,
                                    uint16_t remote_port, uint64_t clock_us) const
 {
     auto clock_term = static_cast<uint32_t>(clock_us / 4);

@@ -238,7 +238,7 @@ namespace ustack
     private:
         struct Datagram
         {
-            IPv4Address source;
+            IpAddress source;
             uint16_t source_port{};
             Bytes payload;
         };
@@ -302,7 +302,7 @@ namespace ustack
             bool dead = false;
             bool shut_rd = false;
             bool shut_wr = false;
-            IPv4Address peer_ip;
+            IpAddress peer_ip;
             uint16_t peer_port = 0;
 
             // UDP
@@ -357,7 +357,7 @@ namespace ustack
         int _bind_port(int fd, Socket& socket, uint16_t port);
         void _on_connection_state(uint64_t connection_id, TcpState state);
         int _take_error(Socket& socket);
-        int _fill_address(const IPv4Address& ip, uint16_t port, struct sockaddr* addr, socklen_t* addrlen) const;
+        int _fill_address(const IpAddress& ip, uint16_t port, struct sockaddr* addr, socklen_t* addrlen) const;
 
         std::unique_ptr<NetworkStack> _owned_stack;
         NetworkStack& _stack;
