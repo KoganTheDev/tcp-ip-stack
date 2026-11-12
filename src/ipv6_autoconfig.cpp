@@ -252,6 +252,20 @@ void Ipv6Autoconfig::on_time_passed(uint32_t elapsed_ms)
     }
 }
 
+NextTimer Ipv6Autoconfig::ms_until_next_timer() const
+{
+    NextTimer next;
+    for (const Tentative& tentative : this->_tentative)
+    {
+        fold_next_timer(next, tentative.timer_ms);
+    }
+    if (!this->_router_found && this->_router_solicitations_sent > 0)
+    {
+        fold_next_timer(next, this->_router_solicitation_timer_ms);
+    }
+    return next;
+}
+
 Ipv6AddressState Ipv6Autoconfig::state_of(const IPv6Address& address) const
 {
     for (const Tentative& tentative : this->_tentative)

@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "ipv6_address.h"
+#include "next_timer.h"
 #include "network_addresses.h"
 
 // RFC 4861 neighbour cache states.
@@ -100,6 +101,11 @@ public:
     void confirm_reachability(const IPv6Address& address);
 
     void on_time_passed(uint32_t elapsed_ms);
+
+    // Until the earliest entry needs a state change or a solicitation, or
+    // nullopt if none does. STALE entries have no timer by design and do not
+    // count. A scan, bounded by MAX_ENTRIES.
+    NextTimer ms_until_next_timer() const;
 
     // Observation, mostly for tests and diagnostics.
     bool contains(const IPv6Address& address) const;

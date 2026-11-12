@@ -312,3 +312,21 @@ TEST(Ipv6Autoconfig, TheAddressListIsBounded)
         << "a router advertising many prefixes must not grow this without bound, got "
                + std::to_string(h.autoconf.addresses().size());
 }
+
+TEST(Ipv6Autoconfig, TheNextTimerFollowsDadAndRouterSolicitationAndEndsWithBoth)
+{
+    AutoconfHarness h;
+    ASSERT_TRUE(!h.autoconf.ms_until_next_timer().has_value()) << "nothing is armed before start()";
+
+    h.autoconf.start();
+    ASSERT_TRUE(h.autoconf.ms_until_next_timer() == NextTimer(Ipv6Autoconfig::RETRANS_TIMER_MS))
+        << "DAD on the link-local address is the nearest deadline";
+
+    h.advance(Ipv6Autoconfig::RETRANS_TIMER_MS);
+    ASSERT_TRUE(h.autoconf.ms_until_next_timer() ==
+                NextTimer(Ipv6Autoconfig::ROUTER_SOLICITATION_INTERVAL_MS - Ipv6Autoconfig::RETRANS_TIMER_MS))
+        << "with DAD finished, the router solicitation retry is what remains";
+
+    h.advance(Ipv6Autoconfig::ROUTER_SOLICITATION_INTERVAL_MS * Ipv6Autoconfig::MAX_ROUTER_SOLICITATIONS);
+    ASSERT_TRUE(!h.autoconf.ms_until_next_timer().has_value()) << "once solicitation gives up, no timer is armed";
+}

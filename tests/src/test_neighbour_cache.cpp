@@ -309,3 +309,21 @@ TEST(NeighbourCache, TheCacheIsBounded)
     ASSERT_TRUE(h.cache.size() <= NeighbourCache::MAX_ENTRIES)
         << "the cache must not grow without bound, got " + std::to_string(h.cache.size());
 }
+
+TEST(NeighbourCache, TheNextTimerIsTheEarliestEntryAndAStaleEntryHasNone)
+{
+    CacheHarness h;
+    ASSERT_TRUE(!h.cache.ms_until_next_timer().has_value()) << "an empty cache has no timer armed";
+
+    MacAddress mac;
+    h.cache.lookup(NEIGHBOUR, mac); // INCOMPLETE: waiting out a solicitation
+    ASSERT_TRUE(h.cache.ms_until_next_timer() == NextTimer(NeighbourCache::RETRANS_TIMER_MS))
+        << "a resolution in flight is due one retransmit interval from now";
+
+    h.advance(400);
+    ASSERT_TRUE(h.cache.ms_until_next_timer() == NextTimer(NeighbourCache::RETRANS_TIMER_MS - 400))
+        << "and the deadline counts down as time passes";
+
+    h.cache.on_advertisement(NEIGHBOUR, NEIGHBOUR_MAC, false, true); // -> STALE
+    ASSERT_TRUE(!h.cache.ms_until_next_timer().has_value()) << "STALE has no timer by design, so nothing is armed";
+}

@@ -7,6 +7,7 @@
 #include "icmpv6.h"
 #include "ipv6_address.h"
 #include "network_addresses.h"
+#include "next_timer.h"
 
 enum class Ipv6AddressState
 {
@@ -99,6 +100,10 @@ public:
     void on_duplicate_probe(const IPv6Address& target);
 
     void on_time_passed(uint32_t elapsed_ms);
+
+    // Until the next DAD probe, DAD completion or router solicitation is due,
+    // or nullopt if none is pending.
+    NextTimer ms_until_next_timer() const;
 
     const std::vector<Ipv6ConfiguredAddress>& addresses() const { return _addresses; }
     Ipv6AddressState state_of(const IPv6Address& address) const;

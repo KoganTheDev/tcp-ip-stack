@@ -282,3 +282,16 @@ NeighbourState NeighbourCache::state_of(const IPv6Address& address) const
     auto it = this->_entries.find(address);
     return it == this->_entries.end() ? NeighbourState::INCOMPLETE : it->second.state;
 }
+
+NextTimer NeighbourCache::ms_until_next_timer() const
+{
+    NextTimer next;
+    for (const auto& pair : this->_entries)
+    {
+        if (pair.second.state != NeighbourState::STALE)
+        {
+            fold_next_timer(next, pair.second.timer_ms);
+        }
+    }
+    return next;
+}
