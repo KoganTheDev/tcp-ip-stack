@@ -9,8 +9,8 @@ if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     message(FATAL_ERROR "TCPIP_BUILD_FUZZERS needs clang (libFuzzer); use the fuzz preset")
 endif()
 
-set(FUZZ_PARSERS ethernet ipv4 tcp udp icmp arp dhcp dns)
-set(FUZZ_HARNESSES ${FUZZ_PARSERS} ip_reassembler stack)
+set(FUZZ_PARSERS ethernet ipv4 tcp udp icmp arp dhcp dns ipv6)
+set(FUZZ_HARNESSES ${FUZZ_PARSERS} icmpv6 ip_reassembler stack)
 
 foreach(name IN LISTS FUZZ_HARNESSES)
     set(sources ${PROJECT_SOURCE_DIR}/fuzz/${name}.cpp)

@@ -260,7 +260,7 @@ coverage: $(COVERAGE_DIR)/build.ninja
 # summary lines are shown; the full output of a crashing run is kept in
 # build/fuzz/<harness>.log.
 FUZZ_SECONDS ?= 30
-FUZZ_HARNESSES = ethernet ipv4 tcp udp icmp arp dhcp dns ip_reassembler stack
+FUZZ_HARNESSES = ethernet ipv4 tcp udp icmp arp dhcp dns ipv6 icmpv6 ip_reassembler stack
 
 fuzz: build/fuzz/build.ninja
 	$(CMAKE) --build --preset fuzz

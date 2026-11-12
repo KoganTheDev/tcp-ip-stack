@@ -245,6 +245,8 @@ reports rather than relays.
 **IPv6, and NDP as ARP redesigned.** `IPv6Address` with RFC 5952 canonical formatting,
 the fixed 40-byte header with a bounded extension-header walk, ICMPv6 with the v6
 pseudo-header checksum, the full RFC 4861 neighbour cache, and DAD plus SLAAC.
+These are standalone codecs and state machines, tested and fuzzed, but not yet wired into
+`NetworkStack`: the stack's data path is still IPv4-only.
 
 The reason this is worth having next to the v4 code rather than instead of it is that the
 two can be read against each other. `ArpTable` is a map with a TTL: an entry is present or

@@ -20,6 +20,8 @@
 #include "dhcp.h"
 #include "dns.h"
 #include "ethernet.h"
+#include "icmpv6.h"
+#include "ipv6.h"
 #include "sim/tcp_frame.h"
 #include "utils.h"
 
@@ -357,5 +359,66 @@ int main(int argc, char** argv)
         save("stack", "fragments", stack_item(frag, 0x00) | stack_item(last, 0x1f));
     }
     save("stack", "idle_then_close", stack_item(Bytes(), 0x7f) | stack_item(data, 0x7f));
+    // IPv6 header and extension chain, and ICMPv6 / NDP. The shapes are the ones
+    // tests/src/test_ipv6.cpp and test_icmpv6.cpp treat as interesting: a chain
+    // that ends cleanly, one that never ends, a fragment header, an extension
+    // header claiming more than the packet holds, and NDP options with a zero
+    // length (which would spin a naive walker forever).
+    {
+        const IPv6Address src("2001:db8::1");
+        const IPv6Address dst("2001:db8::2");
+        const std::string v6_head = "60000000"; // version 6, class and flow label zero
+        const std::string addrs = src.get_address().to_hex() + dst.get_address().to_hex();
+
+        Bytes udp_payload = udp_datagram(1234, 53, Bytes::from_hex("aabbccdd"));
+        Ipv6 plain(0, 0, static_cast<uint16_t>(udp_payload.size()), 17, 64, src, dst, udp_payload);
+        save("ipv6", "udp", plain.to_bytes());
+        Bytes echo = Icmpv6(128, 0, Bytes::from_hex("0001000200112233")).to_bytes();
+        Ipv6 ping(0xab, 0x12345, static_cast<uint16_t>(echo.size()), 58, 255, src, dst, echo);
+        save("ipv6", "icmpv6_echo", ping.to_bytes());
+        save("ipv6", "hop_by_hop_then_udp", hex(v6_head + "0010" + "00" + "40" + addrs + "1100010000000000" + "cafe"));
+        save("ipv6", "fragment_header", hex(v6_head + "000a" + "2c" + "40" + addrs + "1100000100000001" + "1234"));
+        save("ipv6", "no_next_header", hex(v6_head + "0008" + "3b" + "40" + addrs + "3b00000000000000"));
+        save("ipv6", "extension_claims_too_much", hex(v6_head + "0008" + "00" + "40" + addrs + "11ff000000000000"));
+        save("ipv6", "self_referential_chain", hex(v6_head + "0008" + "00" + "40" + addrs + "0000000000000000"));
+        save("ipv6", "payload_length_too_long", hex(v6_head + "00ff" + "11" + "40" + addrs + "aabb"));
+        save("ipv6", "version_4",
+             hex("45000000000000000000000000000000000000000000000000000000000000000000000000000000"));
+        save("ipv6", "runt", hex("6000000000"));
+
+        const IPv6Address target("fe80::1");
+        const MacAddress mac("02:00:00:00:00:01");
+        save("icmpv6", "neighbour_solicitation",
+             Icmpv6(135, 0, Icmpv6::build_neighbour_solicitation(target, mac, true)).to_bytes());
+        save("icmpv6", "neighbour_solicitation_no_option",
+             Icmpv6(135, 0, Icmpv6::build_neighbour_solicitation(target, mac, false)).to_bytes());
+        save("icmpv6", "neighbour_advertisement",
+             Icmpv6(136, 0, Icmpv6::build_neighbour_advertisement(target, mac, true, true, true)).to_bytes());
+        save("icmpv6", "router_solicitation", Icmpv6(133, 0, Icmpv6::build_router_solicitation(mac)).to_bytes());
+        save("icmpv6", "router_advertisement_prefix",
+             hex("86000000"
+                 "40c00708"
+                 "00000000"
+                 "00000000" // hop limit, flags, lifetime, reachable, retrans
+                 "0304"
+                 "40c0"
+                 "00278d00"
+                 "00093a80"
+                 "00000000"
+                 "20010db800010002"
+                 "0000000000000000"));
+        save("icmpv6", "router_advertisement_zero_length_option",
+             hex("86000000"
+                 "40000708"
+                 "00000000"
+                 "00000000"
+                 "0100"));
+        save("icmpv6", "option_longer_than_message",
+             hex("87000000"
+                 "00000000"
+                 + target.get_address().to_hex() + "01ff"));
+        save("icmpv6", "echo_request", echo);
+        save("icmpv6", "runt", hex("8700"));
+    }
     return 0;
 }
