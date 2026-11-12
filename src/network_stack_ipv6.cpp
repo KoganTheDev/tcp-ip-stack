@@ -399,7 +399,7 @@ void NetworkStack::_handle_ipv6(size_t ingress, const Bytes& packet, const MacAd
             return;
         }
         Udp udp(payload);
-        if (!this->_deliver_udp(source, udp))
+        if (!this->_deliver_udp(source, destination, udp))
         {
             this->_send_icmpv6_error(ip, packet, link_layer_group, ICMPV6_DESTINATION_UNREACHABLE,
                                      ICMPV6_CODE_PORT_UNREACHABLE, 0);

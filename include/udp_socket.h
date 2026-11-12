@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 
 #include "bytes.h"
 #include "ip_address.h"
@@ -34,6 +35,12 @@ public:
     // port) - src_ip is passed separately since Udp itself (like Tcp) has no
     // notion of IP addresses.
     void on_datagram(const IpAddress& src_ip, const Udp& segment);
+    // As above, for a datagram sent to dest_ip; false (and not delivered)
+    // when the socket is bound to a different address.
+    bool on_datagram(const IpAddress& src_ip, const IpAddress& dest_ip, const Udp& segment);
+    // Restricts the socket to datagrams sent to this address (a bind() to a
+    // specific address); nullopt is the wildcard.
+    void set_bound_address(const std::optional<IpAddress>& address) { _bound_address = address; }
 
     // Fire-and-forget: builds and sends one datagram to dest_ip:dest_port.
     // No queueing, no retry, no acknowledgment - exactly UDP's contract.
@@ -47,4 +54,5 @@ private:
     uint16_t _local_port;
     SendDatagramFn _send_datagram;
     DatagramReceivedFn _on_datagram_received;
+    std::optional<IpAddress> _bound_address;
 };

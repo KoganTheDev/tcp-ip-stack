@@ -24,6 +24,16 @@ void UdpSocket::on_datagram(const IpAddress& src_ip, const Udp& segment)
     _on_datagram_received(src_ip, segment.get_src_port(), payload);
 }
 
+bool UdpSocket::on_datagram(const IpAddress& src_ip, const IpAddress& dest_ip, const Udp& segment)
+{
+    if (_bound_address && *_bound_address != dest_ip)
+    {
+        return false;
+    }
+    on_datagram(src_ip, segment);
+    return true;
+}
+
 void UdpSocket::send_to(const IpAddress& dest_ip, uint16_t dest_port, const Bytes& data)
 {
     // checksum left at 0 here - like TcpConnection's _build_header(), the

@@ -187,3 +187,48 @@ TEST_F(UstackIpv6, UdpSendtoAndRecvfromUseSockaddrIn6)
         3000));
     EXPECT_EQ(text_of(from).substr(0, 16), "::ffff:10.0.0.1/");
 }
+
+// Security review: a socket bound to one address must not answer for the
+// host's others. Linux matches a listener and a UDP socket on the bound
+// address as well as the port.
+TEST_F(UstackIpv6, AListenerBoundToOneAddressIgnoresSynsToAnother)
+{
+    server_net->add_ipv6_address(IPv6Address("fd00::3"));
+    int listener = server->socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    sockaddr_in6 bound = address6("fd00::2", SERVER_PORT);
+    ASSERT_EQ(server->bind(listener, as_sockaddr6(bound), sizeof(bound)), 0);
+    ASSERT_EQ(server->listen(listener, 8), 0);
+
+    int fd = client->socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    sockaddr_in6 other = address6("fd00::3", SERVER_PORT);
+    ASSERT_EQ(client->connect(fd, as_sockaddr6(other), sizeof(other)), -1);
+    ASSERT_TRUE(net.run_until([&] { return so_error(*client, fd) != 0; }, 3000))
+        << "a SYN to fd00::3 is not the fd00::2 listener's";
+    EXPECT_EQ(server->accept4(listener, nullptr, nullptr, SOCK_NONBLOCK), -1);
+
+    int good = client->socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    ASSERT_EQ(client->connect(good, as_sockaddr6(bound), sizeof(bound)), -1);
+    EXPECT_TRUE(net.run_until([&] { return server->accept4(listener, nullptr, nullptr, SOCK_NONBLOCK) >= 0; }, 3000));
+}
+
+TEST_F(UstackIpv6, AUdpSocketBoundToOneAddressIgnoresDatagramsToAnother)
+{
+    server_net->add_ipv6_address(IPv6Address("fd00::3"));
+    int server_fd = server->socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    sockaddr_in6 bound = address6("fd00::2", 9000);
+    ASSERT_EQ(server->bind(server_fd, as_sockaddr6(bound), sizeof(bound)), 0);
+    int client_fd = client->socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    sockaddr_in6 other = address6("fd00::3", 9000);
+    ASSERT_EQ(client->sendto(client_fd, "no", 2, 0, as_sockaddr6(other), sizeof(other)), 2);
+    ASSERT_EQ(client->sendto(client_fd, "yes", 3, 0, as_sockaddr6(bound), sizeof(bound)), 3);
+    char buffer[8] = {};
+    ssize_t got = -1;
+    ASSERT_TRUE(net.run_until(
+        [&]
+        {
+            got = server->recvfrom(server_fd, buffer, sizeof(buffer), 0, nullptr, nullptr);
+            return got >= 0;
+        },
+        3000));
+    EXPECT_EQ(std::string(buffer, static_cast<size_t>(got)), "yes") << "the datagram to fd00::3 was not delivered";
+}

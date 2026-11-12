@@ -376,6 +376,10 @@ namespace ustack
                                  socklen_t* addrlen);
         // The socket's sockaddr, validated: 0 or an errno. On an AF_INET6
         // socket a v4-mapped address comes back as the IPv4 address it maps.
+        static bool _is_wildcard(const IpAddress& ip)
+        {
+            return ip.is_v4() ? ip.v4() == IPv4Address() : ip.v6().is_unspecified();
+        }
         static int _parse_address(const Socket& socket, const struct sockaddr* addr, socklen_t addrlen, IpAddress& ip,
                                   uint16_t& port);
 

@@ -346,9 +346,9 @@ int NetworkStack::get_fd() const
     return this->_primary().channel->get_fd();
 }
 
-void NetworkStack::listen(uint16_t port, size_t backlog, ListenFamily family)
+void NetworkStack::listen(uint16_t port, size_t backlog, ListenFamily family, const std::optional<IpAddress>& local)
 {
-    this->_listening_ports[port] = Listener{backlog, family};
+    this->_listening_ports[port] = Listener{backlog, family, local};
 }
 
 void NetworkStack::unlisten(uint16_t port)
@@ -1617,8 +1617,8 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
     }
 
     auto listening_it = this->_listening_ports.find(tcp.get_dest_port());
-    bool is_new_connection_request =
-        tcp.get_syn() && listening_it != this->_listening_ports.end() && listening_it->second.accepts(source);
+    bool is_new_connection_request = tcp.get_syn() && listening_it != this->_listening_ports.end()
+                                     && listening_it->second.accepts(source, destination);
 
     if (is_new_connection_request)
     {
@@ -1760,7 +1760,7 @@ bool NetworkStack::_try_complete_cookie_handshake(const IpAddress& source, const
     }
     uint16_t local_port = tcp.get_dest_port();
     auto listening_it = this->_listening_ports.find(local_port);
-    if (listening_it == this->_listening_ports.end() || !listening_it->second.accepts(source))
+    if (listening_it == this->_listening_ports.end() || !listening_it->second.accepts(source, destination))
     {
         return false;
     }
@@ -1890,13 +1890,13 @@ void NetworkStack::_handle_udp(const Ip& ip, const Udp& udp, const Bytes& receiv
         return;
     }
 
-    if (!this->_deliver_udp(src_ip, udp))
+    if (!this->_deliver_udp(src_ip, IPv4Address(ip.get_dest_address()), udp))
     {
         this->_send_icmp_port_unreachable(ip, received);
     }
 }
 
-bool NetworkStack::_deliver_udp(const IpAddress& source, const Udp& udp)
+bool NetworkStack::_deliver_udp(const IpAddress& source, const IpAddress& destination, const Udp& udp)
 {
     auto socket_it = this->_udp_sockets.find(udp.get_dest_port());
     if (socket_it == this->_udp_sockets.end())
@@ -1906,8 +1906,9 @@ bool NetworkStack::_deliver_udp(const IpAddress& source, const Udp& udp)
         return false;
     }
 
-    socket_it->second->on_datagram(source, udp);
-    return true;
+    // A socket bound to one address does not take datagrams sent to another;
+    // to the sender that is the same as no socket at all.
+    return socket_it->second->on_datagram(source, destination, udp);
 }
 
 void NetworkStack::_handle_icmp(const Ip& ip, const Icmp& icmp)

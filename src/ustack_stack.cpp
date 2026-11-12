@@ -531,6 +531,10 @@ namespace ustack
             return fail(error);
         }
         socket->bound_ip = std::move(ip);
+        if (socket->udp != nullptr && !_is_wildcard(socket->bound_ip))
+        {
+            socket->udp->set_bound_address(socket->bound_ip);
+        }
         return 0;
     }
 
@@ -567,7 +571,14 @@ namespace ustack
         {
             family = socket->v6only ? NetworkStack::ListenFamily::IPV6_ONLY : NetworkStack::ListenFamily::ANY;
         }
-        _stack.listen(socket->local_port, static_cast<size_t>(backlog), family);
+        std::optional<IpAddress> local;
+        if (!_is_wildcard(socket->bound_ip))
+        {
+            // Bound to one address: only SYNs to it, and its family decides.
+            local = socket->bound_ip;
+            family = local->is_v4() ? NetworkStack::ListenFamily::IPV4_ONLY : NetworkStack::ListenFamily::IPV6_ONLY;
+        }
+        _stack.listen(socket->local_port, static_cast<size_t>(backlog), family, local);
         socket->listening = true;
         _listener_by_port[socket->local_port] = fd;
         return 0;

@@ -209,7 +209,11 @@ public:
         IPV4_ONLY,
         IPV6_ONLY,
     };
-    void listen(uint16_t port, size_t backlog = DEFAULT_LISTEN_BACKLOG, ListenFamily family = ListenFamily::ANY);
+    // local, if given, is the one address the port answers on - a socket
+    // bound to a specific address - and a SYN (or SYN-cookie ACK) sent to any
+    // other of this host's addresses is treated as finding no listener.
+    void listen(uint16_t port, size_t backlog = DEFAULT_LISTEN_BACKLOG, ListenFamily family = ListenFamily::ANY,
+                const std::optional<IpAddress>& local = std::nullopt);
 
     static constexpr size_t DEFAULT_LISTEN_BACKLOG = 128;
 
@@ -568,7 +572,7 @@ private:
     // Hands a datagram to the socket bound to its port. False when nothing
     // is bound there, so the caller answers with its own family's Port
     // Unreachable.
-    bool _deliver_udp(const IpAddress& source, const Udp& udp);
+    bool _deliver_udp(const IpAddress& source, const IpAddress& destination, const Udp& udp);
     void _handle_udp(const Ip& ip, const Udp& udp, const Bytes& received);
     void _handle_icmp(const Ip& ip, const Icmp& icmp);
     void _reap_closed_connections();
@@ -977,8 +981,13 @@ private:
     {
         size_t backlog = 0;
         ListenFamily family = ListenFamily::ANY;
-        bool accepts(const IpAddress& peer) const
+        std::optional<IpAddress> local;
+        bool accepts(const IpAddress& peer, const IpAddress& destination) const
         {
+            if (local && *local != destination)
+            {
+                return false;
+            }
             // A v4-mapped v6 address is never a real peer (dropped on receive
             // too); refused here as well, as defence in depth.
             if (peer.is_v6() && IpAddress::is_v4_mapped(peer.v6()))
