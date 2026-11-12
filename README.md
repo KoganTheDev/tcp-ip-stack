@@ -244,9 +244,8 @@ reports rather than relays.
 
 **IPv6, and NDP as ARP redesigned.** `IPv6Address` with RFC 5952 canonical formatting,
 the fixed 40-byte header with a bounded extension-header walk, ICMPv6 with the v6
-pseudo-header checksum, the full RFC 4861 neighbour cache, and DAD plus SLAAC.
-These are standalone codecs and state machines, tested and fuzzed, but not yet wired into
-`NetworkStack`: the stack's data path is still IPv4-only.
+pseudo-header checksum, the full RFC 4861 neighbour cache, and DAD plus SLAAC - wired
+into `NetworkStack`, which is dual-stack (see below).
 
 The reason this is worth having next to the v4 code rather than instead of it is that the
 two can be read against each other. `ArpTable` is a map with a TTL: an entry is present or
@@ -261,8 +260,9 @@ confirmation means, and it is the biggest idea in NDP: reachability is not a tim
 something the layers above already know and were previously throwing away.
 
 Two states are easy to misread. **STALE** is not an error and not expiring - it is a
-mapping believed but unverified, used exactly as freely as REACHABLE, and it has no timer
-at all. What moves it on is *sending* to it. **DELAY** exists solely to avoid probing for
+mapping believed but unverified, used exactly as freely as REACHABLE, and it has no state
+timer (only a garbage-collection deadline if nobody uses it). What moves it on is
+*sending* to it. **DELAY** exists solely to avoid probing for
 something a TCP ack is about to prove.
 
 Three more things NDP got right that ARP could not. A solicitation goes to the target's
@@ -274,6 +274,35 @@ never forwarded, because a router would have decremented it. And **SLAAC** lets 
 come up with no server at all: it computes its own link-local address from its MAC, asks
 for a router, and forms a global address from the advertised prefix - with **DAD** going
 and checking, which is the half that makes the other half safe.
+
+**Dual stack.** TCP, UDP and echo run over either family. `IpAddress` (a tagged union
+of the two address classes, not a base of them - a v4 address and its v4-mapped form
+compare unequal) keys connections, sockets and the ISN/SYN-cookie hashes, whose v4 inputs
+are byte-for-byte what they were. IPv6 is off until `enable_ipv6()` (EUI-64 link-local,
+DAD, router solicitation, SLAAC from RAs with RFC 4862 lifetimes and the two-hour rule) or
+`add_ipv6_address()` (static, no DAD). Then:
+
+- EtherType 0x86DD is accepted for our MAC and the 33:33 MACs of joined groups (all-nodes
+  and the solicited-node group of every held or tentative address), and only for our
+  addresses and those groups.
+- TCP and UDP use the RFC 8200 8.1 pseudo-header; a zero UDP checksum is invalid. A v6
+  SYN advertises MTU - 60. Packet Too Big lowers a connection's MSS (never below 1280 -
+  60, RFC 8201) and port unreachable fails a handshake, both only for a quoted sequence
+  number in flight, as the v4 errors are (RFC 5927). ICMPv6 errors obey RFC 4443 2.4(e)
+  and share ICMPv4's token bucket.
+- Sending resolves through the neighbour cache and queues whole packets behind it, the way
+  ARP holds datagrams. On-link prefixes and default routers come from RAs, with their
+  lifetimes; static addresses add their prefix as on-link.
+- NDP is unauthenticated, so everything it feeds is bounded: the neighbour cache (512,
+  evicting by origin - entries created to answer unverified traffic go first, a router's
+  or a live connection's never - with separate quotas for resolutions in flight), the
+  pending queues, routers, prefixes, and SLAAC addresses (their own cap, apart from
+  static ones). NS, NA and RA need hop limit 255 (RFC 4861); Redirects are ignored.
+  Packets carrying v4-mapped addresses are dropped, as Linux's `ipv6_rcv` does.
+- ustack's AF_INET6 sockets take `sockaddr_in6` everywhere and are dual-stack by default,
+  as Linux with `bindv6only=0`: IPv4 peers appear as `::ffff:a.b.c.d`. `IPV6_V6ONLY`
+  (before bind) makes one IPv6-only. A socket bound to a specific address only accepts
+  SYNs and datagrams sent to it.
 
 **Routing.** A subnet mask, a default gateway, and a route table with longest-prefix
 match, each route naming the interface to send by. Every send decides whether the destination is on-link, and so resolves the
@@ -358,12 +387,19 @@ These are documented decisions, not gaps that were missed:
   per-mark feedback (RFC 9768) and no DCTCP-style proportional response; a sender with a
   one-segment window does not also reset its retransmit timer on ECE (6.1.2).
 
-- **IPv6 carries no TCP or UDP.** The addressing, the header, ICMPv6, the neighbour cache
-  and autoconfiguration are all built and tested, but `NetworkStack` is still IPv4-only on
-  the data path: `ConnectionKey`, the route table and the send path are not generalised
-  over address family. That is a deliberate stopping point rather than an oversight - the
-  design content of IPv6 is in NDP and autoconfiguration, and making TCP dual-stack is
-  mostly a mechanical widening of every call site the router work just touched.
+- **IPv6 is a host, on one link.** It runs on the first interface only, and forwarding
+  stays IPv4-only: a v6 packet for another host is dropped whatever `set_forwarding()`
+  says.
+- **No IPv6 fragmentation.** Sends never fragment (PMTUD keeps TCP inside the path MTU;
+  an oversized UDP datagram is refused with EMSGSIZE). A received packet carrying a
+  Fragment header is dropped rather than reassembled - real v6 traffic is rarely
+  fragmented, and a v6 reassembler would be a second copy of the bounded-memory problem
+  `IpReassembler` solves.
+- **No MLD, DHCPv6 or ICMPv6 Redirect.** Group membership is local filtering only, the M
+  flag is ignored, and Redirects are dropped unread.
+- **One socket per port, whatever the family.** ustack cannot have an `IPV6_V6ONLY`
+  listener and an AF_INET listener on the same port as Linux can; a dual-stack socket
+  serves both.
 - **No RFC 4941 temporary addresses.** SLAAC derives the interface identifier from the MAC,
   so a host is trackable across networks by the bottom 64 bits of its address. Privacy
   addresses are the fix and are not implemented.
