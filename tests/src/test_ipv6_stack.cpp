@@ -794,3 +794,32 @@ TEST(Ipv6Stack, AnRaCannotCutTheValidLifetimeBelowTwoHours)
     host.stack->on_time_passed((TWO_HOURS_S - 3600) * 1000 + 1000);
     EXPECT_FALSE(state_in_stack(*host.stack, SLAAC_ADDRESS).has_value()) << "but no longer than two hours";
 }
+
+// Security review: a v4-mapped address on the wire would reach a socket
+// looking like an IPv4 peer, past IPV6_V6ONLY and any v4 address check.
+// Linux's ipv6_rcv drops such packets; so does this stack.
+TEST(Ipv6Stack, PacketsWithV4MappedAddressesAreDropped)
+{
+    Host host;
+    host.stack->add_ipv6_address(LOCAL);
+    host.introduce_peer();
+    const IPv6Address mapped = IpAddress::v4_mapped(IPv4Address("10.9.9.9"));
+
+    std::vector<IpAddress> sources;
+    host.stack->bind_udp(4444)->set_datagram_received_callback([&](const IpAddress& from, uint16_t, const Bytes&)
+                                                               { sources.push_back(from); });
+    host.deliver(
+        ipv6_packet(mapped, LOCAL, IPV6_NEXT_UDP, udp_payload(mapped, LOCAL, 4000, 4444, Bytes::from_hex("01"))));
+    EXPECT_TRUE(sources.empty()) << "a v4-mapped source over IPv6";
+
+    host.stack->listen(80);
+    Tcp syn(4000, 80, 1000, 0, 5, 0x02, 1024, 0, 0);
+    Bytes segment = syn.to_bytes();
+    uint16_t checksum = ipv6_transport_checksum(mapped, LOCAL, IPV6_NEXT_TCP, segment);
+    segment[16] = static_cast<byte_t>(checksum >> 8);
+    segment[17] = static_cast<byte_t>(checksum & 0xff);
+    host.channel->clear_outbound();
+    host.deliver(ipv6_packet(mapped, LOCAL, IPV6_NEXT_TCP, segment));
+    EXPECT_TRUE(host.channel->outbound_frames().empty()) << "no SYN-ACK to a v4-mapped source";
+    EXPECT_FALSE(host.stack->has_pending_accept(80));
+}

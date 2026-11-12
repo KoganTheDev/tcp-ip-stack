@@ -343,6 +343,15 @@ void NetworkStack::_handle_ipv6(size_t ingress, const Bytes& packet, const MacAd
     {
         return; // RFC 4291 2.7: never a source
     }
+    if (IpAddress::is_v4_mapped(source) || IpAddress::is_v4_mapped(destination))
+    {
+        // As Linux's ipv6_rcv: a v4-mapped address on the wire is never
+        // legitimate (RFC 4291 2.5.5.2), and delivered it would look to an
+        // AF_INET6 socket like an IPv4 peer - past IPV6_V6ONLY and any check
+        // made on the v4 address.
+        LOG_DEBUG("NetworkStack: dropping an IPv6 packet with a v4-mapped address from " << source.to_string());
+        return;
+    }
     if (ip.has_fragment_header())
     {
         // Deliberately not reassembled (see the scope note in the header).

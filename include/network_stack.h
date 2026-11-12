@@ -979,6 +979,12 @@ private:
         ListenFamily family = ListenFamily::ANY;
         bool accepts(const IpAddress& peer) const
         {
+            // A v4-mapped v6 address is never a real peer (dropped on receive
+            // too); refused here as well, as defence in depth.
+            if (peer.is_v6() && IpAddress::is_v4_mapped(peer.v6()))
+            {
+                return false;
+            }
             return family == ListenFamily::ANY || (family == ListenFamily::IPV4_ONLY) == peer.is_v4();
         }
     };

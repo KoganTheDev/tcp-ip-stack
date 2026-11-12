@@ -431,6 +431,12 @@ namespace ustack
                     {
                         return;
                     }
+                    // Never shown as a v4 peer: the network layer drops these,
+                    // and this layer refuses them too.
+                    if (source.is_v6() && IpAddress::is_v4_mapped(source.v6()))
+                    {
+                        return;
+                    }
                     if (receiver.received.size() >= UDP_RECEIVE_QUEUE_LIMIT)
                     {
                         return; // a full receive buffer drops, as SO_RCVBUF does
