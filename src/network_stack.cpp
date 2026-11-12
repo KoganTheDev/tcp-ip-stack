@@ -284,8 +284,8 @@ void NetworkStack::configure_interface(const InterfaceConfig& config)
     // renewal says nothing new - and not from the constructor, where nothing
     // has been on the wire yet and frames sent before the caller has even set
     // the stack up would only surprise it. Not preceded by an RFC 5227
-    // probe: that is a conflict check for DHCP to make before binding and is
-    // not done here.
+    // probe: that is a conflict check for DHCP to make before binding (see
+    // DhcpClient's PROBING state) and is not done here.
     Interface& primary = this->_primary();
     primary.announcements_remaining = 0;
     if (primary.config.has_address() && !(primary.config.ip == previous_ip) && this->_constructed)
@@ -640,6 +640,10 @@ DhcpClient* NetworkStack::start_dhcp()
                 this->set_dns_servers(lease.dns_servers);
             }
         });
+
+    // RFC 5227 2.1: probe the offered address before binding it. The client
+    // schedules the probes; they go out on the primary interface.
+    this->_dhcp_client->set_probe_callback([this](const IPv4Address& ip) { this->_send_arp_probe(0, ip); });
 
     this->_dhcp_client->set_lease_lost_callback(
         [this]()
@@ -1259,6 +1263,27 @@ void NetworkStack::_handle_arp(size_t ingress, const Arp& arp)
     // snooping. Neither was ever load-bearing. RFC 5227 address-defence probes
     // still work, since a probe carries sender 0.0.0.0 but targets our IP.
     Interface& interface = *this->_interfaces.at(ingress);
+
+    // The address a DHCP ACK offered and the client is probing (RFC 5227
+    // 2.1.1) is not ours yet, so the test below would drop everything about
+    // it. A conflict is any other host using it as sender (a reply to our
+    // probe, or its own traffic), or another host probing for it too.
+    if (ingress == 0 && this->_dhcp_client)
+    {
+        if (std::optional<IPv4Address> probed = this->_dhcp_client->probed_address())
+        {
+            bool from_other_host = !(arp.get_sender_hardware_address() == interface.config.mac);
+            bool uses_it = arp.get_sender_protocol_address() == *probed;
+            bool probes_it =
+                arp.get_sender_protocol_address() == IPv4Address() && arp.get_target_protocol_address() == *probed;
+            if (from_other_host && (uses_it || probes_it))
+            {
+                this->_dhcp_client->on_address_conflict();
+                return;
+            }
+        }
+    }
+
     if (!(arp.get_target_protocol_address() == interface.config.ip))
     {
         return;
@@ -2221,6 +2246,16 @@ void NetworkStack::_send_arp_request(size_t interface_index, const IPv4Address& 
     Ethernet request(interface.config.mac, MacAddress::BROADCAST, EtherType::ARP);
     request /= std::make_unique<Arp>(interface.config.mac, interface.config.ip, target_ip);
     this->_transmit(interface, request.to_bytes());
+}
+
+void NetworkStack::_send_arp_probe(size_t interface_index, const IPv4Address& target_ip)
+{
+    Interface& interface = *this->_interfaces.at(interface_index);
+    // RFC 5227 2.1.1: sender protocol address all zeros, so no cache learns a
+    // binding for an address that is only being tested.
+    Ethernet probe(interface.config.mac, MacAddress::BROADCAST, EtherType::ARP);
+    probe /= std::make_unique<Arp>(interface.config.mac, IPv4Address(), target_ip);
+    this->_transmit(interface, probe.to_bytes());
 }
 
 void NetworkStack::_send_arp_announcement(size_t interface_index)

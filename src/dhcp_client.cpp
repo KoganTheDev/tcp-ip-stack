@@ -42,8 +42,8 @@ uint8_t DhcpLease::prefix_length() const
 
 DhcpClient::DhcpClient(const MacAddress& mac, SendFn send, uint32_t random_seed)
     : _mac(mac), _send(std::move(send)), _state(DhcpClientState::INIT), _transaction_id(random_seed),
-      _retransmit_ms_remaining(0), _retransmit_interval_ms(RETRANSMIT_BASE_MS), _seconds_elapsed_ms(0),
-      _renewal_ms_remaining(0), _rebinding_ms_remaining(0), _expiry_ms_remaining(0)
+      _rng_state(random_seed | 1U), _retransmit_ms_remaining(0), _retransmit_interval_ms(RETRANSMIT_BASE_MS),
+      _seconds_elapsed_ms(0), _renewal_ms_remaining(0), _rebinding_ms_remaining(0), _expiry_ms_remaining(0)
 {}
 
 bool DhcpClient::has_lease() const
@@ -236,6 +236,72 @@ void DhcpClient::on_datagram(const Bytes& payload)
     }
 }
 
+int DhcpClient::_jitter_ms(int low, int high)
+{
+    // xorshift32: no state beyond the word, no allocation, and never stuck at
+    // zero because the seed is forced odd.
+    _rng_state ^= _rng_state << 13;
+    _rng_state ^= _rng_state >> 17;
+    _rng_state ^= _rng_state << 5;
+    return low + static_cast<int>(_rng_state % static_cast<uint32_t>(high - low + 1));
+}
+
+std::optional<IPv4Address> DhcpClient::probed_address() const
+{
+    if (_state != DhcpClientState::PROBING)
+    {
+        return std::nullopt;
+    }
+    return _pending_lease.ip;
+}
+
+void DhcpClient::on_address_conflict()
+{
+    if (_state != DhcpClientState::PROBING)
+    {
+        return;
+    }
+    LOG_WARNING("DhcpClient: " << _pending_lease.ip.to_string() << " is in use by another host - declining it");
+
+    // RFC 2131 4.4.1: DHCPDECLINE names the address (option 50) and the
+    // server whose lease it was (option 54). Broadcast: there is no address
+    // of our own to send from yet.
+    Dhcp message;
+    message.set_op(Dhcp::OP_BOOTREQUEST);
+    message.set_transaction_id(_transaction_id);
+    message.set_client_mac(_mac);
+    message.set_message_type(DHCP_DECLINE);
+    message.set_option(DHCP_OPTION_REQUESTED_IP, _pending_lease.ip.get_address());
+    message.set_option(DHCP_OPTION_SERVER_IDENTIFIER, _pending_lease.server.get_address());
+    _send(limited_broadcast_address(), message.to_bytes());
+
+    _pending_lease = DhcpLease{};
+    _state = DhcpClientState::DECLINED;
+    _decline_ms_remaining = DECLINE_BACKOFF_MS;
+}
+
+void DhcpClient::_on_probe_time_passed(uint32_t elapsed_ms)
+{
+    _probe_elapsed_ms += elapsed_ms;
+    _probe_ms_remaining -= static_cast<int>(elapsed_ms);
+    while (_state == DhcpClientState::PROBING && _probe_ms_remaining <= 0)
+    {
+        if (_probes_sent < PROBE_NUM)
+        {
+            _probes_sent++;
+            LOG_DEBUG("DhcpClient: ARP probe " << _probes_sent << " for " << _pending_lease.ip.to_string());
+            _probe(_pending_lease.ip);
+            // After the last probe, ANNOUNCE_WAIT for an objection; between
+            // probes, a random PROBE_MIN..PROBE_MAX.
+            _probe_ms_remaining = _probes_sent < PROBE_NUM ? _jitter_ms(PROBE_MIN_MS, PROBE_MAX_MS) : ANNOUNCE_WAIT_MS;
+        }
+        else
+        {
+            _bind(std::move(_pending_lease), _pending_t1_seconds, _pending_t2_seconds, _probe_elapsed_ms);
+        }
+    }
+}
+
 void DhcpClient::_apply_ack(const Dhcp& message)
 {
     DhcpLease granted;
@@ -281,17 +347,41 @@ void DhcpClient::_apply_ack(const Dhcp& message)
         granted.server = _lease.server;
     }
 
-    int lease_ms = lease_seconds_to_ms(granted.lease_seconds);
     uint32_t t1_seconds =
         message.get_option_uint32(DHCP_OPTION_RENEWAL_TIME, granted.lease_seconds * T1_NUMERATOR / T1_DENOMINATOR);
     uint32_t t2_seconds =
         message.get_option_uint32(DHCP_OPTION_REBINDING_TIME, granted.lease_seconds * T2_NUMERATOR / T2_DENOMINATOR);
 
+    if (_state == DhcpClientState::REQUESTING && _probe)
+    {
+        // A fresh address: make sure nobody else is using it before it is
+        // configured (RFC 5227 2.1.1). Renewals skip this - the address is
+        // already ours and in use.
+        _pending_lease = std::move(granted);
+        _pending_t1_seconds = t1_seconds;
+        _pending_t2_seconds = t2_seconds;
+        _state = DhcpClientState::PROBING;
+        _probes_sent = 0;
+        _probe_elapsed_ms = 0;
+        _probe_ms_remaining = _jitter_ms(0, PROBE_WAIT_MS);
+        _retransmit_ms_remaining = 0;
+        return;
+    }
+    _bind(std::move(granted), t1_seconds, t2_seconds, 0);
+}
+
+void DhcpClient::_bind(DhcpLease granted, uint32_t t1_seconds, uint32_t t2_seconds, uint32_t probe_elapsed_ms)
+{
+    // The lease runs from the ACK, so the time spent probing is already gone.
+    auto remaining = [probe_elapsed_ms](uint32_t seconds)
+    {
+        return std::max(1, lease_seconds_to_ms(seconds) - static_cast<int>(probe_elapsed_ms));
+    };
+    _renewal_ms_remaining = remaining(t1_seconds);
+    _rebinding_ms_remaining = remaining(t2_seconds);
+    _expiry_ms_remaining = remaining(granted.lease_seconds);
     _lease = std::move(granted);
     _state = DhcpClientState::BOUND;
-    _renewal_ms_remaining = lease_seconds_to_ms(t1_seconds);
-    _rebinding_ms_remaining = lease_seconds_to_ms(t2_seconds);
-    _expiry_ms_remaining = lease_ms;
     _retransmit_ms_remaining = 0;
 
     LOG_INFO("DhcpClient: ACK - bound to " << _lease.ip.to_string() << "/" << static_cast<int>(_lease.prefix_length())
@@ -318,6 +408,21 @@ void DhcpClient::on_time_passed(uint32_t elapsed_ms)
     }
 
     _seconds_elapsed_ms += elapsed_ms;
+
+    if (_state == DhcpClientState::PROBING)
+    {
+        _on_probe_time_passed(elapsed_ms);
+        return;
+    }
+    if (_state == DhcpClientState::DECLINED)
+    {
+        _decline_ms_remaining -= static_cast<int>(elapsed_ms);
+        if (_decline_ms_remaining <= 0)
+        {
+            _restart();
+        }
+        return;
+    }
 
     if (_state == DhcpClientState::SELECTING || _state == DhcpClientState::REQUESTING)
     {
@@ -405,6 +510,12 @@ NextTimer DhcpClient::ms_until_next_timer() const
     case DhcpClientState::SELECTING:
     case DhcpClientState::REQUESTING:
         fold_next_timer(next, _retransmit_ms_remaining);
+        break;
+    case DhcpClientState::PROBING:
+        fold_next_timer(next, _probe_ms_remaining);
+        break;
+    case DhcpClientState::DECLINED:
+        fold_next_timer(next, _decline_ms_remaining);
         break;
     case DhcpClientState::BOUND:
         fold_next_timer(next, _renewal_ms_remaining);

@@ -653,6 +653,9 @@ private:
     // address (a previous holder's MAC) to replace it. Sent when an address is
     // configured, then once more ANNOUNCE_INTERVAL later.
     void _send_arp_announcement(size_t interface_index);
+    // RFC 5227 2.1.1 ARP Probe: a broadcast request for target_ip with sender
+    // protocol address 0.0.0.0, sent by DHCP before it binds an address.
+    void _send_arp_probe(size_t interface_index, const IPv4Address& target_ip);
     // Sends an ARP request for ip and registers its retry state, unless one is
     // already in flight for that ip - shared by connect() and UDP sends to a
     // peer whose MAC isn't cached yet.

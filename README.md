@@ -145,8 +145,8 @@ is bounded, and the stack only learns from ARP that targets its own address, so 
 segment cannot fill it or overwrite mappings it is using. A newly configured address
 (static, or from a DHCP bind) is announced as RFC 5227 section 2.3 describes: a broadcast
 request with sender and target IP both the address, sent twice, 2 s apart, so neighbours
-holding a stale mapping for it replace it. The RFC 5227 probe and conflict check before
-binding is not implemented.
+holding a stale mapping for it replace it. Before a DHCP bind that announcement is preceded by
+the RFC 5227 probe (below); a static address is announced without one.
 
 **Two transports.** A TAP device, or an `AF_PACKET` socket on a physical NIC, both behind
 one `PacketChannel` seam that nothing downstream can distinguish. The real-NIC path
@@ -176,6 +176,12 @@ through the full retransmit budget.
 rebinding and lease expiry. It configures the stack itself - address, mask, gateway and
 MTU arrive together and go straight into `configure_interface()`, which is why that had
 to be reconfigurable before this could exist.
+
+A fresh address is not bound at once: after the ACK the client sends three ARP probes (sender
+0.0.0.0, a random 0-1 s start, 1-2 s apart) and waits 2 s more for an objection (RFC 5227
+2.1.1). Another host replying for the address, or probing for it too, makes the client send
+DHCPDECLINE, wait 10 s (RFC 2131 3.1.5) and start discovery over; otherwise the lease binds
+and the gratuitous announcement runs. Renewals are not probed.
 
 The two round trips are not redundant, and the three timers are not one timer with
 decoration. The REQUEST is *broadcast* even though the client has already chosen a

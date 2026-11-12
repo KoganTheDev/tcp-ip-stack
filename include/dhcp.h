@@ -9,7 +9,7 @@
 #include "protocol_layer.h"
 
 // DHCP message types, option 53. The four this stack uses are the four that
-// make up a lease acquisition; DECLINE and RELEASE are decoded but never sent.
+// make up a lease acquisition; DECLINE is sent when an offered address is found in use (RFC 5227 probing); RELEASE is decoded but never sent.
 enum DhcpMessageType : uint8_t
 {
     DHCP_DISCOVER = 1,
