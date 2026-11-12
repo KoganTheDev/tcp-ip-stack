@@ -977,9 +977,15 @@ namespace ustack
                 {
                     connection->abort();
                 }
-                else if (!socket->shut_wr)
+                else
                 {
-                    connection->close();
+                    if (!socket->shut_wr)
+                    {
+                        connection->close();
+                    }
+                    // Nobody will read what the peer sends from here on, so
+                    // new data means a RST, not a buffer held until the reap.
+                    connection->abandon_receive();
                 }
             }
             if (socket->port_reserved)

@@ -235,6 +235,15 @@ public:
     // abort() below.
     void close();
 
+    // The application has closed the socket and will never read again (POSIX
+    // close(), as opposed to close() above or shutdown(SHUT_WR)). Data that
+    // then arrives beyond RCV.NXT can reach nobody, so it is answered with a
+    // RST and the connection goes to CLOSED, as Linux does (RFC 9293
+    // 3.10.7.4, RFC 1122 4.2.2.13). Retransmissions of data already received
+    // are only acknowledged. Call it together with close(), after which the
+    // connection lives on only to finish the FIN exchange.
+    void abandon_receive() { _receive_abandoned = true; }
+
     // RFC 9293 3.10.5 ABORT: drops the connection at once. In SYN_RECEIVED,
     // ESTABLISHED, FIN_WAIT_1/2 and CLOSE_WAIT a <SEQ=SND.NXT><CTL=RST> tells
     // the peer; in the other states there is nothing to tell. Queued and
@@ -988,6 +997,9 @@ private:
     // on the way in and refreshes the deadline on the way out, however the
     // call returns. Nesting (a callback re-entering the connection) is fine:
     // both halves are idempotent.
+    // The application closed the socket for good: see abandon_receive().
+    bool _receive_abandoned = false;
+
     class EntryScope
     {
     public:

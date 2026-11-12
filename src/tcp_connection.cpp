@@ -1874,6 +1874,15 @@ void TcpConnection::on_segment(const Tcp& segment, Ecn ecn)
             const Bytes& payload = payload_layer->get_data();
             uint32_t seq = segment.get_sequence_number();
 
+            if (_receive_abandoned && !seq_at_or_before(seq + payload_size, _recv_next))
+            {
+                // New data for a socket nobody can read any more (Linux's
+                // tcp_rcv_state_process does the same): tell the peer it was
+                // not delivered rather than ack and buffer it until the reap.
+                abort();
+                return;
+            }
+
             if (seq == _recv_next)
             {
                 // Something held out of order means this segment fills (part

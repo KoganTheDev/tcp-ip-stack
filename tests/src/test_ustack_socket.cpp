@@ -94,6 +94,20 @@ TEST_F(UstackSocket, CloseWithUnreadDataResetsThePeer)
         << "closing with unread data should RST, as Linux does";
 }
 
+// RFC 9293 3.10.7.4 / RFC 1122 4.2.2.13: once the application has closed and
+// can no longer read, new data from the peer is answered with a RST. Not so
+// after shutdown(SHUT_WR), which keeps reading (ShutdownWriteHalfCloses).
+TEST_F(UstackSocket, DataArrivingAfterCloseIsAnsweredWithReset)
+{
+    auto [client_fd, server_fd] = connected_pair();
+    ASSERT_EQ(server->close(server_fd), 0); // nothing unread: a plain FIN
+    net.step(50);                           // the FIN is delivered; the client is in CLOSE_WAIT
+    ASSERT_EQ(send_string(*client, client_fd, "too late"), 8);
+
+    ASSERT_TRUE(net.run_until([&] { return so_error(*client, client_fd) == ECONNRESET; }, 1000))
+        << "data after close() should be answered with a RST, as Linux does";
+}
+
 TEST_F(UstackSocket, ShutdownWriteHalfCloses)
 {
     auto [client_fd, server_fd] = connected_pair();

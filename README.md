@@ -124,7 +124,9 @@ simultaneous close rather than folding it into `FIN_WAIT_2`. On top of that:
   1337 as optional; this stack takes its side, because closing early is the hazard
   `TIME_WAIT` exists to prevent
 - `abort()` (RFC 9293 ABORT: a RST at SND.NXT, every queue flushed) alongside `close()`,
-  which is a half close - `shutdown(SHUT_WR)`, not POSIX `close()`
+  which is a half close - `shutdown(SHUT_WR)`, not POSIX `close()`. After a ustack `close()`
+  (`abandon_receive()`), new data from the peer is answered with a RST (RFC 9293 3.10.7.4),
+  as is data left unread at close time; after `shutdown(SHUT_WR)` it is still delivered
 - Data is sized so that payload plus options fits the MSS (RFC 6691); urgent data is
   delivered inline and URG is never sent (RFC 6093)
 - A frame the device drops for a passing reason (`ENOBUFS`, `EAGAIN`, a link that is
