@@ -88,12 +88,15 @@ jobs:
   # behaviour nothing pins down. The score goes in the job summary and the full
   # report is uploaded; there is no threshold, so this job reports and does not
   # gate. Mull's plugin has to match the compiler's LLVM exactly, hence clang-19
-  # (from the distribution) with mull-19 (from Mull's apt repository). If the
-  # repository or the version moves, this is the job that breaks - and it is
-  # separate so that it breaks alone.
+  # (from the distribution) with the mull-19 package built against LLVM 19.1.1.
+  # The package comes from Mull's GitHub release, pinned by version and sha256:
+  # its old apt repository (cloudsmith) started answering 402 Payment Required.
+  # ubuntu-24.04 is pinned rather than ubuntu-latest because that .deb is built
+  # for 24.04 and clang-19 is in its archive. If the version moves, this is the
+  # job that breaks - and it is separate so that it breaks alone.
   mutation:
     name: mutation testing (Mull)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v5
@@ -105,8 +108,10 @@ jobs:
 
       - name: Install Mull
         run: |
-          curl -1sLf 'https://dl.cloudsmith.io/public/mull-project/mull-stable/setup.deb.sh' | sudo -E bash
-          sudo apt-get install -y mull-19
+          deb=Mull-19-0.38.0-LLVM-19.1.1-ubuntu-amd64-24.04.deb
+          curl -fsSL -o "$deb" "https://github.com/mull-project/mull/releases/download/0.38.0/$deb"
+          echo "ee0b582a2e9fcd4861c842d1fdf9fa814b513ebf9957a3b5753b839672bf0741  $deb" | sha256sum -c -
+          sudo apt-get install -y "./$deb"
           mull-runner-19 --version || mull-runner --version
 
       - name: Build with the plugin and run Mull
