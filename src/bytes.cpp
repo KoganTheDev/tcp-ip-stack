@@ -77,7 +77,8 @@ Bytes Bytes::slice(size_t index, size_t length) const
     {
         throw EXCEPTION(BaseException, "Bytes index out of range");
     }
-    return std::vector(this->begin() + index, this->begin() + index + length);
+    const auto offset = static_cast<std::ptrdiff_t>(index);
+    return std::vector(this->begin() + offset, this->begin() + offset + static_cast<std::ptrdiff_t>(length));
 }
 
 Bytes Bytes::slice(size_t index) const

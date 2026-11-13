@@ -1,15 +1,5 @@
 #include "utils.h"
 
-void system_wrapper(const std::string& command)
-{
-    int return_value = system(command.c_str());
-    if (return_value != 0)
-    {
-        throw EXCEPTION(SystemException,
-                        "Error in command \"" + command + "\", return value " + std::to_string(return_value));
-    }
-}
-
 std::string string_replace_all(const std::string& str, const std::string& to_replace, const std::string& replace_with)
 {
     if (to_replace.empty())
@@ -74,6 +64,7 @@ std::string byte_to_decimal(uint8_t byte)
 
     const std::string digits = "0123456789";
     std::string result;
+    // NOLINTNEXTLINE(bugprone-infinite-loop): false positive: byte is reduced by byte /= 10 in the body
     while (byte > 0)
     {
         result += digits[byte % 10];
@@ -117,6 +108,7 @@ uint16_t internet_checksum(const Bytes& data)
         sum += static_cast<uint16_t>(data[i]) << 8; // odd trailing byte, low half padded with zero
     }
 
+    // NOLINTNEXTLINE(bugprone-infinite-loop): false positive: sum is folded in the body
     while (sum >> 16)
     {
         sum = (sum & 0xffff) + (sum >> 16);

@@ -1,0 +1,16 @@
+# PENDING - fails today. RFC 5961 3.2: in a synchronized state, a RST whose
+# sequence number is inside the receive window but not exactly RCV.NXT is
+# answered with a challenge ACK and otherwise ignored - a blind attacker only
+# has to land in the window to reset a connection otherwise. A RST exactly at
+# RCV.NXT still resets it, silently.
+0      listen 8080
++0     < S 0:0(0) win 65535 <mss 1460>
++0     > S. 0:0(0) ack 1 <mss 1460>
++0.005 < . 1:1(0) ack 1 win 65535
++0     accept
+
++0.010 < R 101:101(0) win 0
++0     > . 1:1(0) ack 1
++0     state ESTABLISHED
++0.010 < R 1:1(0) win 0
++0     state CLOSED

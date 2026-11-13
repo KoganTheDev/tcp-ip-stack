@@ -124,7 +124,7 @@ OpenedChannel open_channel(const ChannelOptions& options)
 
     OpenedChannel opened;
     opened.config = base_config(options);
-    opened.config.mac = resolved_mac;
+    opened.config.mac = std::move(resolved_mac);
     opened.config.mtu = raw->get_mtu();
     opened.channel = std::move(raw);
     return opened;

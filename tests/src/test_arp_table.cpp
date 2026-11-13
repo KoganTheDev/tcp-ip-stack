@@ -1,4 +1,4 @@
-#include "test.h"
+#include "test_support.h"
 #include "arp_table.h"
 #include "network_addresses.h"
 
@@ -19,35 +19,35 @@ namespace
     const MacAddress MAC_B("aa:bb:cc:dd:ee:ff");
 }
 
-TEST(ArpTableLearnAndLookup)
+TEST(ArpTable, ArpTableLearnAndLookup)
 {
     ArpTable table(TTL_MS);
-    test_assert(!table.contains(IP_A), "an unknown IP should not be present");
+    ASSERT_TRUE(!table.contains(IP_A)) << "an unknown IP should not be present";
 
     table.learn(IP_A, MAC_A);
-    test_assert(table.contains(IP_A), "a learned IP should be present");
+    ASSERT_TRUE(table.contains(IP_A)) << "a learned IP should be present";
 
     MacAddress out;
-    test_assert(table.lookup(IP_A, out), "lookup of a learned IP should succeed");
-    test_assert(out == MAC_A, "lookup should return the learned MAC");
+    ASSERT_TRUE(table.lookup(IP_A, out)) << "lookup of a learned IP should succeed";
+    ASSERT_TRUE(out == MAC_A) << "lookup should return the learned MAC";
 
-    test_assert(!table.lookup(IP_B, out), "lookup of an unknown IP should fail");
+    ASSERT_TRUE(!table.lookup(IP_B, out)) << "lookup of an unknown IP should fail";
 }
 
-TEST(ArpTableDynamicEntryExpiresAfterTtl)
+TEST(ArpTable, ArpTableDynamicEntryExpiresAfterTtl)
 {
     ArpTable table(TTL_MS);
     table.learn(IP_A, MAC_A);
 
     table.age(TEST_TICK_MS);
     table.age(TEST_TICK_MS);
-    test_assert(table.contains(IP_A), "a dynamic entry should survive until its TTL is exhausted");
+    ASSERT_TRUE(table.contains(IP_A)) << "a dynamic entry should survive until its TTL is exhausted";
 
     table.age(TEST_TICK_MS); // third tick - TTL of 3 now reached
-    test_assert(!table.contains(IP_A), "a dynamic entry should be evicted once its TTL is exhausted");
+    ASSERT_TRUE(!table.contains(IP_A)) << "a dynamic entry should be evicted once its TTL is exhausted";
 }
 
-TEST(ArpTableRefreshResetsTtl)
+TEST(ArpTable, ArpTableRefreshResetsTtl)
 {
     ArpTable table(TTL_MS);
     table.learn(IP_A, MAC_A);
@@ -58,13 +58,13 @@ TEST(ArpTableRefreshResetsTtl)
 
     table.age(TEST_TICK_MS);
     table.age(TEST_TICK_MS);
-    test_assert(table.contains(IP_A), "refresh should have reset the TTL, so the entry is still alive");
+    ASSERT_TRUE(table.contains(IP_A)) << "refresh should have reset the TTL, so the entry is still alive";
 
     table.age(TEST_TICK_MS); // now 3 ticks since refresh
-    test_assert(!table.contains(IP_A), "after a full TTL past the refresh, the entry should expire");
+    ASSERT_TRUE(!table.contains(IP_A)) << "after a full TTL past the refresh, the entry should expire";
 }
 
-TEST(ArpTableRelearningResetsTtl)
+TEST(ArpTable, ArpTableRelearningResetsTtl)
 {
     ArpTable table(TTL_MS);
     table.learn(IP_A, MAC_A);
@@ -74,14 +74,14 @@ TEST(ArpTableRelearningResetsTtl)
     table.learn(IP_A, MAC_B); // relearn (e.g. the peer's MAC changed) - resets TTL and MAC
     MacAddress out;
     table.lookup(IP_A, out);
-    test_assert(out == MAC_B, "relearning should overwrite the MAC");
+    ASSERT_TRUE(out == MAC_B) << "relearning should overwrite the MAC";
 
     table.age(TEST_TICK_MS);
     table.age(TEST_TICK_MS);
-    test_assert(table.contains(IP_A), "relearning should have reset the TTL");
+    ASSERT_TRUE(table.contains(IP_A)) << "relearning should have reset the TTL";
 }
 
-TEST(ArpTableStaticEntryNeverExpires)
+TEST(ArpTable, ArpTableStaticEntryNeverExpires)
 {
     ArpTable table(TTL_MS);
     table.add_static(IP_A, MAC_A);
@@ -90,18 +90,18 @@ TEST(ArpTableStaticEntryNeverExpires)
     {
         table.age(TEST_TICK_MS);
     }
-    test_assert(table.contains(IP_A), "a static entry must never be aged out");
+    ASSERT_TRUE(table.contains(IP_A)) << "a static entry must never be aged out";
 
     MacAddress out;
-    test_assert(table.lookup(IP_A, out) && out == MAC_A, "a static entry should still resolve after many ticks");
+    ASSERT_TRUE(table.lookup(IP_A, out) && out == MAC_A) << "a static entry should still resolve after many ticks";
 }
 
-TEST(ArpTableRemove)
+TEST(ArpTable, ArpTableRemove)
 {
     ArpTable table(TTL_MS);
     table.learn(IP_A, MAC_A);
     table.remove(IP_A);
-    test_assert(!table.contains(IP_A), "a removed entry should be gone");
+    ASSERT_TRUE(!table.contains(IP_A)) << "a removed entry should be gone";
 }
 
 // The table is filled from ARP observed on the wire, so without a bound its
@@ -109,7 +109,7 @@ TEST(ArpTableRemove)
 // new entries when full (rather than evicting) is deliberate: every eviction
 // candidate is a mapping we are plausibly using, while the refused one is a
 // stranger - and entries age out on their own, so a full table drains.
-TEST(ArpTableRefusesNewEntriesOnceFull)
+TEST(ArpTable, ArpTableRefusesNewEntriesOnceFull)
 {
     ArpTable table(60 * static_cast<int>(TEST_TICK_MS));
     const MacAddress MAC("11:22:33:44:55:66");
@@ -118,17 +118,17 @@ TEST(ArpTableRefusesNewEntriesOnceFull)
     {
         // 10.<hi>.<lo>.1 - distinct for every i within the cap
         std::string ip = "10." + std::to_string(i / 256) + "." + std::to_string(i % 256) + ".1";
-        test_assert(table.learn(IPv4Address(ip), MAC), "learning should succeed while there is room");
+        ASSERT_TRUE(table.learn(IPv4Address(ip), MAC)) << "learning should succeed while there is room";
     }
-    test_assert(table.size() == ArpTable::MAX_ENTRIES, "the table should now be exactly full");
+    ASSERT_TRUE(table.size() == ArpTable::MAX_ENTRIES) << "the table should now be exactly full";
 
-    test_assert(!table.learn(IPv4Address("172.16.0.1"), MAC), "a new mapping must be refused once the table is full");
-    test_assert(table.size() == ArpTable::MAX_ENTRIES, "a refused mapping must not grow the table");
+    ASSERT_TRUE(!table.learn(IPv4Address("172.16.0.1"), MAC)) << "a new mapping must be refused once the table is full";
+    ASSERT_TRUE(table.size() == ArpTable::MAX_ENTRIES) << "a refused mapping must not grow the table";
 
     // refreshing something already held replaces rather than adds, so it must
     // still be allowed even when full - otherwise a busy peer's mapping would
     // age out and could never be relearned
-    test_assert(table.learn(IPv4Address("10.0.0.1"), MAC),
-                "refreshing an existing mapping must still be allowed when full");
-    test_assert(table.size() == ArpTable::MAX_ENTRIES, "refreshing must not change the table's size");
+    ASSERT_TRUE(table.learn(IPv4Address("10.0.0.1"), MAC))
+        << "refreshing an existing mapping must still be allowed when full";
+    ASSERT_TRUE(table.size() == ArpTable::MAX_ENTRIES) << "refreshing must not change the table's size";
 }

@@ -1,0 +1,238 @@
+name: Nightly
+
+# The simulator's property tests at depth. Per push they run 200 seeds (a few
+# seconds, see the sim job in ci.yml); here they run 100000, which takes long
+# enough that it belongs off the push path but finds the rare interleavings
+# (a loss at exactly the wrong moment) that 200 seeds will not. Seeds are
+# fixed, so a nightly failure reproduces locally with
+#     SIM_SEED_START=<seed> SIM_SEEDS=1 make sim
+on:
+  schedule:
+    - cron: "17 3 * * *" # 03:17 UTC, off the top of the hour when runners are busiest
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: Number of seeds to run
+        required: false
+        default: "100000"
+      fuzz_seconds:
+        description: Seconds of fuzzing per harness
+        required: false
+        default: "180"
+
+# One nightly at a time; a manual run while the scheduled one is going waits.
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sim:
+    name: simulator (${{ github.event.inputs.seeds || '100000' }} seeds)
+    runs-on: ubuntu-latest
+    # The debug build does roughly 50-100 seeds per second per core; 100000
+    # seeds sharded over a 4-core runner is well under an hour.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: debug-g++
+
+      - name: Run the simulator property tests
+        env:
+          SIM_SEEDS: ${{ github.event.inputs.seeds || '100000' }}
+        run: make sim
+
+      # Every failing seed leaves a pcap of what was delivered and of what was
+      # transmitted (drops included), plus text renderings of both.
+      - name: Upload captures and logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-pcaps-nightly
+          path: |
+            build/debug/sim-pcaps/
+            build/debug/sim-shard-*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Two virtual hours of churn against a long-lived server and client, in the
+  # simulator (no privilege, about a minute of real time): connection tables,
+  # the timer heap, UDP/DNS/ARP state and the heap itself must stay flat and come
+  # back to baseline when the traffic stops (tests/src/test_soak.cpp). The seed
+  # changes every night so the scenario is not the same one forever; the test
+  # prints it, and a failure reproduces locally with
+  #     SOAK_SEED=<seed> make soak
+  soak:
+    name: soak (2 virtual hours)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: debug-g++
+
+      - name: Run the soak test
+        env:
+          SOAK_SEED: ${{ github.run_number }}
+        run: |
+          echo "soak seed: $SOAK_SEED"
+          make soak
+
+  # Mutation testing with Mull on five stack files (tcp_connection,
+  # send_scoreboard, reorder_buffer, ip, dns): each mutant is one small
+  # change to the code, and the unit tests are run against it. A survivor is a
+  # behaviour nothing pins down. The score goes in the job summary and the full
+  # report is uploaded; there is no threshold, so this job reports and does not
+  # gate. Mull's plugin has to match the compiler's LLVM exactly, hence clang-19
+  # (from the distribution) with mull-19 (from Mull's apt repository). If the
+  # repository or the version moves, this is the job that breaks - and it is
+  # separate so that it breaks alone.
+  mutation:
+    name: mutation testing (Mull)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: mutation
+          extra-packages: clang-19
+
+      - name: Install Mull
+        run: |
+          curl -1sLf 'https://dl.cloudsmith.io/public/mull-project/mull-stable/setup.deb.sh' | sudo -E bash
+          sudo apt-get install -y mull-19
+          mull-runner-19 --version || mull-runner --version
+
+      - name: Build with the plugin and run Mull
+        run: make mutation MULL_VERSION=19
+
+      - name: Publish the score
+        if: always()
+        run: |
+          {
+            echo "## Mutation testing (Mull, 5 files, no threshold)"
+            echo
+            if grep -q "Mutation score" build/mutation/mull-report/mull.log 2>/dev/null; then
+              grep -E "Mutation score|Survived mutants|Killed mutants|Total mutants|Surviving mutants" \
+                build/mutation/mull-report/mull.log | sed 's/^/    /'
+            else
+              echo "No score was produced - see the job log."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-report-nightly
+          path: build/mutation/mull-report/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # The same harnesses as the per-push fuzz job in ci.yml, run long: ten
+  # harnesses at 180 s is thirty minutes of fuzzing. Long enough to get past
+  # what a twenty-second run reaches (a bug three branches deep in the TCP
+  # option parser, a particular fragment interleaving), short enough to stay one
+  # job.
+  #
+  # The grown corpus is the point of running nightly: it is cached between runs,
+  # so each night starts from everything found before instead of from the
+  # committed seeds, and the coverage only goes up. Restore and save are
+  # separate steps so the save happens even when a harness crashed (a plain
+  # actions/cache step skips its save on failure), and the key carries the run
+  # id so every night saves a new, larger corpus; the restore key matches the
+  # newest. Per-push runs restore it read-only.
+  fuzz:
+    name: fuzz (${{ github.event.inputs.fuzz_seconds || '180' }} s per harness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: fuzz
+
+      - uses: ./.github/actions/install-libfuzzer
+
+      - name: Restore the grown corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: build/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+
+      - name: Fuzz every harness
+        env:
+          FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || '180' }}
+        run: make fuzz
+
+      - name: Save the grown corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: build/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+
+      - name: Upload reproducers and logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-nightly
+          path: |
+            build/fuzz/crashes/
+            build/fuzz/*.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # The real epoll-server on this repo's stack over a veth pair, driven by the
+  # kernel's TCP through tools/loadgen: a burst of concurrent connections, a
+  # sustained minute of churn, and a lossy/delayed run (tc netem). The client is
+  # an independent implementation, so an echo that comes back wrong, a reset or a
+  # stall is a bug in our stack and fails the job. The logic is in
+  # scripts/loadtest_netns.sh (it needs root, so it is not part of any local
+  # test run); the JSON reports are uploaded whatever the outcome.
+  loadtest:
+    name: load test (veth, real stack)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: loadtest
+
+      - uses: ./.github/actions/netns-tools
+
+      # sch_netem is in linux-modules-extra on Ubuntu's cloud kernels; without
+      # it the script skips the lossy phase with a warning instead of failing.
+      - name: Install the netem kernel module if the image lacks it
+        run: |
+          sudo modprobe sch_netem 2>/dev/null \
+            || { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe sch_netem; } \
+            || echo "::warning::sch_netem unavailable; the netem phase will be skipped"
+
+      - name: Build the server on our stack, and loadgen
+        run: |
+          make -C epoll-server -j"$(nproc)"
+          cmake --preset release
+          cmake --build --preset release --target loadgen
+
+      - name: Run the load test
+        run: sudo env OUT_DIR="$PWD/loadtest-results" scripts/loadtest_netns.sh
+
+      - name: Upload the JSON reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loadtest-nightly
+          path: loadtest-results/
+          if-no-files-found: ignore
+          retention-days: 30

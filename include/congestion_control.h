@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 
@@ -18,8 +19,9 @@
 // from what looked tidy. Reno and CUBIC agree on almost everything:
 //
 //  - slow start, verbatim, including the ssthresh boundary
-//  - the RFC 5681 fast-recovery bookkeeping (inflate the window by one MSS per
-//    duplicate ack, deflate to ssthresh when the retransmit is acked)
+//  - the fast-recovery bookkeeping: RFC 5681/6582 window inflation without
+//    SACK, RFC 6937 PRR with it (the connection computes PRR's cwnd and sets
+//    it through set_recovery_window()), and cwnd = ssthresh at the end
 //  - that a retransmit timeout is a harsher signal than three duplicate acks
 //    and collapses the window to one segment
 //
@@ -50,7 +52,25 @@ public:
     // quantity in here is denominated in. Also the reset point: a window
     // inherited from before the MSS was known would be measured in the wrong
     // unit.
-    void on_established(uint32_t mss);
+    //
+    // cwnd starts at RFC 6928's initial window (initial_window() below), or at
+    // one segment if this side's SYN or SYN-ACK had to be retransmitted more
+    // than once (RFC 6928 section 2; RFC 5681 3.1 says after any loss, but
+    // RFC 6928 asks not to fall back for a single retransmission, which the
+    // 1 s initial RTO can cause on a long path with no loss at all).
+    void on_established(uint32_t mss, uint32_t syn_retransmissions = 0);
+
+    // RFC 6928: IW = min(10*MSS, max(2*MSS, 14600)). Ten segments rather
+    // than one because a single segment never meets the peer's "ack every
+    // second segment" rule, so every connection's first round trip waited
+    // out its delayed-ack timer.
+    static uint32_t initial_window(uint32_t mss) { return std::min(10 * mss, std::max(2 * mss, 14600u)); }
+
+    // RFC 5681 4.1: nothing has been sent for longer than the RTO, so the ack
+    // clock that justified cwnd has stopped. cwnd drops to the restart window
+    // RW = min(IW, cwnd) - never raised, so the 1-segment loss window after a
+    // timeout stays what it is. ssthresh is kept.
+    void on_idle_restart();
 
     // A cumulative acknowledgement retired new data.
     //
@@ -88,6 +108,24 @@ public:
     // bookkeeping fiction.
     void on_recovery_end() { _cwnd = _ssthresh; }
 
+    // RFC 6582 section 3.2 step 3, NewReno's partial ack: an ack inside the
+    // recovery window took bytes_acked out of the network, so the inflated
+    // window shrinks by that much, then grows back by one MSS if at least one
+    // MSS was acknowledged - the retransmission that ack prompts must fit.
+    void on_partial_ack(uint32_t bytes_acked);
+
+    // Entering SACK-based recovery (RFC 6675 section 5 step 4.2, RFC 6937):
+    // the algorithm sets ssthresh from flight_size as on any congestion event,
+    // but cwnd is left alone - during recovery Proportional Rate Reduction
+    // sets it, through set_recovery_window(), and on_recovery_end() lands it
+    // on ssthresh. The ssthresh policy is the algorithm's either way: Reno
+    // halves, CUBIC multiplies by its beta.
+    void on_recovery_start(uint32_t flight_size, uint64_t now_ms) { _on_congestion_event(flight_size, now_ms); }
+
+    // RFC 6937: cwnd = pipe + sndcnt, recomputed on every ack in recovery.
+    // Floored at one segment so nothing that divides by it ever sees zero.
+    void set_recovery_window(uint32_t window) { _cwnd = std::min(std::max(window, _mss), MAX_CWND); }
+
     // Retransmit timeout: no acks got through at all, which is a much stronger
     // statement than "one segment went missing". Collapse to one segment and
     // slow-start back up.
@@ -112,6 +150,10 @@ protected:
     // congestion event and has to be cleared on a fresh connection. Reno has
     // none, which is the whole of what makes it classic.
     virtual void _on_reset() {}
+
+    // Optional hook for the restart after idle. CUBIC clears its epoch so its
+    // curve does not count the idle time as time spent growing.
+    virtual void _on_idle_restart() {}
 
     // cwnd expressed in segments, which is the unit RFC 8312's constants are
     // calibrated in. Floored at one segment so it is always safe to divide by:
@@ -205,6 +247,7 @@ protected:
     void _grow_in_congestion_avoidance(uint32_t bytes_acked, uint32_t bytes_in_flight, uint32_t srtt_ms,
                                        uint64_t now_ms) override;
     void _on_reset() override;
+    void _on_idle_restart() override { _epoch_running = false; }
 
 private:
     // RFC 8312's two parameters. C is the aggressiveness of the cubic term, in

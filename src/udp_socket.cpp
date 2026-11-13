@@ -5,7 +5,7 @@ UdpSocket::UdpSocket(uint16_t local_port, SendDatagramFn send_datagram)
     : _local_port(local_port), _send_datagram(std::move(send_datagram))
 {}
 
-void UdpSocket::on_datagram(const IPv4Address& src_ip, const Udp& segment)
+void UdpSocket::on_datagram(const IpAddress& src_ip, const Udp& segment)
 {
     if (!_on_datagram_received)
     {
@@ -24,7 +24,17 @@ void UdpSocket::on_datagram(const IPv4Address& src_ip, const Udp& segment)
     _on_datagram_received(src_ip, segment.get_src_port(), payload);
 }
 
-void UdpSocket::send_to(const IPv4Address& dest_ip, uint16_t dest_port, const Bytes& data)
+bool UdpSocket::on_datagram(const IpAddress& src_ip, const IpAddress& dest_ip, const Udp& segment)
+{
+    if (_bound_address && *_bound_address != dest_ip)
+    {
+        return false;
+    }
+    on_datagram(src_ip, segment);
+    return true;
+}
+
+void UdpSocket::send_to(const IpAddress& dest_ip, uint16_t dest_port, const Bytes& data)
 {
     // checksum left at 0 here - like TcpConnection's _build_header(), the
     // real value needs the source/destination IP this class doesn't own;

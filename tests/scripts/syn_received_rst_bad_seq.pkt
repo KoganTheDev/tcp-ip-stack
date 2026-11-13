@@ -1,0 +1,11 @@
+# PENDING - fails today. RFC 9293 3.10.7.4 (and RFC 5961 3.2): in
+# SYN-RECEIVED a RST is checked against the receive window like in any
+# synchronized state; one far outside it is dropped. The handshake must still
+# complete afterwards.
+0      listen 8080
++0     < S 0:0(0) win 65535 <mss 1460>
++0     > S. 0:0(0) ack 1 <mss 1460>
++0.005 < R 500000:500000(0) win 0
++0.005 < . 1:1(0) ack 1 win 65535
++0     accept
++0     state ESTABLISHED

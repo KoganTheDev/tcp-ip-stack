@@ -20,6 +20,7 @@ Arp::Arp(const MacAddress& sender_hardware_address, const IPv4Address& sender_pr
 
 Arp::Arp(const Bytes& bytes)
 {
+    // NOLINTNEXTLINE(clang-analyzer-optin.cplusplus.VirtualCall): intended: parses with this class's own from_bytes, which no subclass overrides
     this->from_bytes(bytes);
 }
 

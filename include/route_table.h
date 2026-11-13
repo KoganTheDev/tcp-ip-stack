@@ -29,7 +29,7 @@ public:
     struct Route
     {
         IPv4Address destination; // network address, already masked
-        uint8_t prefix_length;
+        uint8_t prefix_length{};
         // The neighbour to hand the packet to. Zero means the destination is
         // directly reachable, so resolve the destination itself - that is what
         // makes a connected network different from a gateway route.

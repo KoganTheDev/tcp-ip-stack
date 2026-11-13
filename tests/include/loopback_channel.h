@@ -26,6 +26,11 @@ public:
 
     void write(const Bytes& buffer) override
     {
+        if (this->_writes_to_fail > 0)
+        {
+            this->_writes_to_fail--;
+            throw TransientWriteError("injected transient write failure");
+        }
         if (this->_peer != nullptr)
         {
             this->_peer->_inbound.push_back(buffer);
@@ -38,7 +43,12 @@ public:
     // both channels before handing them to their NetworkStacks.
     void set_peer(LoopbackChannel* peer) { this->_peer = peer; }
 
+    // The next n writes are lost the way a full transmit queue loses them:
+    // with a TransientWriteError, and never delivered to the peer.
+    void fail_next_writes(size_t n) { this->_writes_to_fail = n; }
+
 private:
+    size_t _writes_to_fail = 0;
     std::deque<Bytes> _inbound;
     LoopbackChannel* _peer = nullptr;
 };

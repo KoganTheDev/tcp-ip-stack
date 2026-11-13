@@ -3,13 +3,16 @@
 #include <cstdint>
 #include <functional>
 #include <deque>
-#include <map>
 #include <memory>
 #include <vector>
 
 #include "bytes.h"
 #include "congestion_control.h"
-#include "network_addresses.h"
+#include "ip.h"
+#include "ip_address.h"
+#include "reorder_buffer.h"
+#include "rtt_estimator.h"
+#include "send_scoreboard.h"
 #include "tcp.h"
 
 enum class TcpState
@@ -27,6 +30,29 @@ enum class TcpState
     CLOSED,
 };
 
+// Why a connection reached CLOSED, for a socket layer that has to turn it into
+// an errno (SO_ERROR): ECONNRESET, ECONNREFUSED, ETIMEDOUT and so on. The
+// state machine itself has no use for it - CLOSED is CLOSED - which is why it
+// is a separate value read after the fact rather than a family of states.
+enum class TcpCloseReason
+{
+    NONE,        // still open, or closed cleanly (both FINs acknowledged, TIME_WAIT ran out)
+    RESET,       // the peer sent an acceptable RST
+    REFUSED,     // our SYN was answered by a RST, or by ICMP port/protocol unreachable
+    TIMED_OUT,   // retransmissions, the user timeout, or keepalive probes gave up
+    UNREACHABLE, // no route, or ARP for the next hop never answered
+    ABORTED,     // abort() was called locally, or an internal error dropped it
+};
+
+// Explicit Congestion Notification (RFC 3168), per connection, with the
+// values and meaning of Linux's net.ipv4.tcp_ecn.
+enum class TcpEcnMode
+{
+    OFF = 0,     // never: SYNs ask for nothing, ECN-setup SYNs are answered without it
+    ON = 1,      // ask for it on our SYNs, and accept it when asked
+    PASSIVE = 2, // accept it when a peer's SYN asks, never ask (the default)
+};
+
 // A single TCP connection's state machine (RFC 793/5681/7323, still
 // deliberately narrowed on a few points - see the scope notes below). Owns
 // no socket, no Ethernet/IP/ARP knowledge, and no I/O: it only decides what
@@ -35,9 +61,10 @@ enum class TcpState
 // resolves the peer's MAC, and writes bytes to the TUN device.
 //
 // Implements: the 3-way handshake, a receiver-advertised + congestion-
-// controlled sliding window (slow start, congestion avoidance, fast
-// retransmit/fast recovery on 3 duplicate ACKs, with the growth and decrease
-// policy itself pluggable - Reno or CUBIC, see congestion_control.h), out-of-order
+// controlled sliding window (slow start, congestion avoidance, loss recovery -
+// RFC 6675 SACK-based with RFC 6937 PRR when SACK is negotiated, RFC 6582
+// NewReno otherwise - with the growth and decrease policy itself pluggable -
+// Reno or CUBIC, see congestion_control.h), out-of-order
 // reassembly bounded by a fixed receive-buffer capacity, MSS and window-scale
 // option negotiation (RFC 7323's rule: scaling is used at all only if *both*
 // SYNs carried the option), RFC 7323 timestamps with PAWS, RFC 2018 selective
@@ -45,13 +72,15 @@ enum class TcpState
 // real `CLOSING` state for simultaneous close instead of folding it into
 // `FIN_WAIT_2`.
 //
-// Still deliberately out of scope (documented, not accidental):
-//  - SACK reports and honours blocks, but recovery is not full RFC 6675:
-//    there is no pipe estimate driving transmission during recovery, and no
-//    rescue retransmission. The scoreboard both would need does exist
-//  - the reorder buffer stores exact-sequence-keyed segments, not merged
-//    ranges - an incoming segment that partially overlaps one already
-//    buffered doesn't get stitched together, just kept or dropped whole
+// The pieces with state of their own live beside it: SendScoreboard (what is
+// in flight and what SACK said about it), RttEstimator (RFC 6298) and
+// ReorderBuffer (out-of-order receive data). This class coordinates them.
+//
+// With SACK, loss is also detected by time (RFC 8985 RACK), which is what
+// catches a lost retransmission without a timeout.
+//
+// Still deliberately out of scope (documented, not accidental): PRR without
+// SACK, D-SACK and F-RTO - see the README.
 class TcpConnection
 {
 public:
@@ -61,6 +90,10 @@ public:
     // already blocks the implicit copy constructor. A by-value std::function
     // parameter would need one of those to invoke its stored target.
     using SendSegmentFn = std::function<void(const Tcp& segment, const Bytes& payload)>;
+    // The same, also told the ECN codepoint the segment's IP header is to
+    // carry (RFC 3168): ECT(0) on new data once ECN is negotiated, Not-ECT
+    // on everything else.
+    using SendSegmentEcnFn = std::function<void(const Tcp& segment, const Bytes& payload, Ecn ecn)>;
     // Notification that readable data has arrived. It deliberately carries no
     // data: the bytes stay in this connection's receive queue until the
     // application takes them with read(). That is what makes the advertised
@@ -78,13 +111,24 @@ public:
     // for the same reason Linux does: it is what the peers on the other end of
     // these connections are almost certainly running, and a stack whose default
     // loses to its own peers is not a useful default.
-    TcpConnection(uint16_t local_port, const IPv4Address& remote_ip, uint16_t remote_port, uint32_t initial_seq,
+    TcpConnection(uint16_t local_port, const IpAddress& remote_ip, uint16_t remote_port, uint32_t initial_seq,
                   SendSegmentFn send_segment, uint16_t local_mss = DEFAULT_LOCAL_MSS,
+                  CongestionControlAlgorithm algorithm = CongestionControlAlgorithm::CUBIC);
+    TcpConnection(uint16_t local_port, const IpAddress& remote_ip, uint16_t remote_port, uint32_t initial_seq,
+                  SendSegmentEcnFn send_segment, uint16_t local_mss = DEFAULT_LOCAL_MSS,
                   CongestionControlAlgorithm algorithm = CongestionControlAlgorithm::CUBIC);
 
     // Feeds in a segment already verified (checksum, IP addresses, ports) to
-    // belong to this connection.
-    void on_segment(const Tcp& segment);
+    // belong to this connection. `ecn` is the ECN field of the IP header it
+    // came in (RFC 3168): CE on an acceptable data segment is echoed back.
+    void on_segment(const Tcp& segment, Ecn ecn = Ecn::NOT_ECT);
+
+    // Whether to ask for, or accept, ECN (see TcpEcnMode). Read when the SYN
+    // is sent or answered, so it is set before initiate_connect() or
+    // accept_incoming_syn(). Defaults to PASSIVE, as Linux does.
+    void set_ecn_mode(TcpEcnMode mode) { _ecn_mode = mode; }
+    // Both SYNs agreed to ECN (RFC 3168 6.1.1).
+    bool ecn_negotiated() const { return _ecn_negotiated; }
 
     // Drives every timer on the connection. The caller reports how much real
     // time has passed since it last called, in milliseconds.
@@ -109,7 +153,44 @@ public:
     // Reporting elapsed time instead means one call after that stall advances
     // everything by the full 2000 ms, and the caller is free to poll at any
     // cadence, regular or not.
+    //
+    // For a connection on its own clock (the default). One owned by a
+    // NetworkStack reads the stack's clock instead (see use_external_clock())
+    // and is driven by run_due_timers(); on such a connection elapsed_ms is
+    // ignored, because the stack has already advanced the clock it reads.
     void on_time_passed(uint32_t elapsed_ms);
+
+    // --- Deadlines ---
+    //
+    // Every timer on the connection is held as the absolute moment it is due
+    // on the connection's clock, not as a countdown. A countdown has to be
+    // decremented by every call whether or not anything is due, so whoever
+    // drives it must visit every connection on every tick: O(connections) per
+    // tick, for nothing, and a coarse tick fires everything late. A deadline
+    // can be asked for instead - next_deadline_ms() - so a stack can keep its
+    // connections in a queue ordered by deadline and visit only the ones due.
+
+    static constexpr uint64_t NO_DEADLINE = UINT64_MAX;
+    // The connection's clock: milliseconds, starting at 1 when it was made.
+    uint64_t now_ms() const;
+    // The earliest moment, on now_ms()'s clock, at which run_due_timers()
+    // has something to do, or NO_DEADLINE when no timer is armed. Driving the
+    // timers at or after it fires what is due; driving them earlier is
+    // harmless - nothing fires before its time.
+    uint64_t next_deadline_ms() const;
+    // Fires every timer that is due at now_ms(), each at most once - the same
+    // work on_time_passed() does after advancing its own clock.
+    void run_due_timers();
+    // Told whenever next_deadline_ms() may have changed: at the end of every
+    // call that can arm, re-arm or disarm a timer. NetworkStack uses it to
+    // keep its timer queue current without polling every connection.
+    using TimerChangedFn = std::function<void()>;
+    void set_timer_changed_callback(TimerChangedFn callback) { _on_timer_changed = std::move(callback); }
+    // Reads time from *clock_ms (NetworkStack's own clock) from now on,
+    // offset so that now_ms() carries on from where it is - the connection's
+    // timestamps and RTT samples are unchanged by the switch. *clock_ms must
+    // outlive the connection and never go backwards.
+    void use_external_clock(const uint64_t* clock_ms);
 
     // Application-facing API. send() before ESTABLISHED or after the peer's
     // FIN silently does nothing - there is no error channel back to the
@@ -141,8 +222,34 @@ public:
     // a segment; an off-path forgery has to guess one. Always false with
     // nothing in flight, since then no error can be about anything.
     bool has_sent_unacknowledged(uint32_t seq) const;
-    // Half-closes our side: sends a FIN and starts the shutdown sequence.
+    // Half-closes our side: a FIN goes out once everything already queued has
+    // been sent, and from then on send() accepts nothing. Receiving is not
+    // affected - read() keeps working, and data the peer sends in FIN_WAIT_1/2
+    // is still delivered - so this is RFC 9293's CLOSE, which is exactly what
+    // shutdown(SHUT_WR) means. There is deliberately no separate
+    // shutdown_write(): it would be this function under a second name.
+    //
+    // It is not POSIX close(), which also gives up the receive side (Linux
+    // answers data arriving after it with a RST). A socket layer gets that
+    // from close() plus discarding further reads, and SO_LINGER{0} from
+    // abort() below.
     void close();
+
+    // The application has closed the socket and will never read again (POSIX
+    // close(), as opposed to close() above or shutdown(SHUT_WR)). Data that
+    // then arrives beyond RCV.NXT can reach nobody, so it is answered with a
+    // RST and the connection goes to CLOSED, as Linux does (RFC 9293
+    // 3.10.7.4, RFC 1122 4.2.2.13). Retransmissions of data already received
+    // are only acknowledged. Call it together with close(), after which the
+    // connection lives on only to finish the FIN exchange.
+    void abandon_receive() { _receive_abandoned = true; }
+
+    // RFC 9293 3.10.5 ABORT: drops the connection at once. In SYN_RECEIVED,
+    // ESTABLISHED, FIN_WAIT_1/2 and CLOSE_WAIT a <SEQ=SND.NXT><CTL=RST> tells
+    // the peer; in the other states there is nothing to tell. Queued and
+    // in-flight send data, unread and out-of-order receive data are all
+    // discarded, and the connection is CLOSED on return.
+    void abort();
 
     // Turns keepalive on or off. Off is the default, and RFC 1122 4.2.3.6 is
     // unusually blunt about why: a keepalive can drop a connection that is
@@ -164,11 +271,11 @@ public:
 
     // The current retransmission timeout in milliseconds - what a freshly
     // sent segment will wait before being retransmitted. Starts at
-    // INITIAL_RTO_MS and thereafter tracks the measured round-trip time
-    // (see _update_rto_from_sample). Exposed for tests and for anyone
+    // RttEstimator::INITIAL_RTO_MS and thereafter tracks the measured
+    // round-trip time (see RttEstimator). Exposed for tests and for anyone
     // wanting to observe the estimator; nothing in the stack's own data
     // path reads it from outside.
-    int get_rto_ms() const { return _rto_ms; }
+    int get_rto_ms() const { return _rtt.rto_ms(); }
 
     // The congestion window in bytes, and which algorithm is computing it.
     // Same rationale as get_rto_ms(): observable from outside, read from
@@ -192,7 +299,46 @@ public:
     // Hard-closes without any teardown handshake - nothing has been
     // transmitted yet, so there's nothing to tear down. NetworkStack calls
     // this when an active open's ARP resolution exhausts its retries.
-    void fail() { _transition(TcpState::CLOSED); }
+    // reason says why, for close_reason(): UNREACHABLE for a failed ARP or a
+    // missing route, REFUSED for an ICMP port or protocol unreachable.
+    void fail(TcpCloseReason reason = TcpCloseReason::UNREACHABLE) { _close_as(reason); }
+
+    // Why the connection reached CLOSED; NONE while it has not, or when it
+    // closed cleanly. Kept after the transition so a socket layer can read it
+    // from a state-change callback and report it as SO_ERROR.
+    TcpCloseReason close_reason() const { return _close_reason; }
+
+    // The connection's own end and the peer's, for getsockname()/getpeername().
+    uint16_t get_local_port() const { return _local_port; }
+    const IpAddress& get_remote_ip() const { return _remote_ip; }
+    // This end's address, which NetworkStack records when it creates the
+    // connection (a dual-stack host has several, and a socket's getsockname()
+    // must name the one the peer is talking to). Not used by TCP itself.
+    void set_local_ip(const IpAddress& address) { _local_ip = address; }
+    const IpAddress& get_local_ip() const { return _local_ip; }
+    uint16_t get_remote_port() const { return _remote_port; }
+
+    // TCP_NODELAY: turns Nagle's algorithm off, so a small segment goes out at
+    // once even with earlier data unacknowledged. Off by default, as on Linux:
+    // Nagle saves a lot of tiny packets for an application that writes a byte
+    // at a time, and costs a round trip of latency for one that writes a
+    // request and waits for the answer - which is the one that sets this.
+    void set_nodelay(bool enabled) { _nodelay = enabled; }
+    bool nodelay() const { return _nodelay; }
+
+    // TCP_CONGESTION: switches the congestion control algorithm. The new one
+    // starts from its initial window, as Linux's does when the algorithm is
+    // changed on a live socket - the window is the algorithm's state, and one
+    // algorithm's window is not a meaningful starting point for another.
+    void set_congestion_control(CongestionControlAlgorithm algorithm);
+
+    // Told when send_space_available() has grown - an ack let queued data go
+    // out, freeing room. A socket layer turns it into EPOLLOUT: without it an
+    // application that filled the send buffer could only find out it may write
+    // again by trying. Fired at the end of the entry point that freed the
+    // space, never from inside send() itself, which only ever shrinks it.
+    using SendSpaceFn = std::function<void()>;
+    void set_send_space_callback(SendSpaceFn callback) { _on_send_space = std::move(callback); }
 
     // Like Linux's TCP_USER_TIMEOUT (RFC 5482): the connection is failed once
     // data it has to send - in flight or queued - has made no progress, i.e.
@@ -200,7 +346,7 @@ public:
     // with "still zero" are not progress, which is the case it exists for: a
     // peer that stops reading would otherwise hold the connection forever.
     // 0 turns it off. Defaults to DEFAULT_USER_TIMEOUT_MS.
-    void set_user_timeout(uint32_t ms) { _user_timeout_ms = ms; }
+    void set_user_timeout(uint32_t ms);
 
     // A stable identity that outlives any single TcpConnection* - safe to
     // hand across a thread boundary and look up again later via
@@ -239,6 +385,17 @@ public:
 
     // Bytes waiting to be read. The application's share of the receive buffer.
     size_t bytes_available() const { return _receive_queued_bytes; }
+    // Bytes held out of order, waiting for a gap before them to fill. They
+    // occupy the receive buffer but no longer shrink the advertised window
+    // (see _advertised_window()), so this is the way to see them.
+    size_t bytes_out_of_order() const { return _reorder_buffer.bytes(); }
+    // See ReorderBuffer::CHUNK_COALESCE_BYTES.
+    static constexpr size_t REORDER_CHUNK_COALESCE_BYTES = ReorderBuffer::CHUNK_COALESCE_BYTES;
+    // The reorder buffer's shape, for tests: how many ranges it holds, how
+    // many chunks they hold between them, and the largest chunk.
+    size_t reorder_range_count() const { return _reorder_buffer.range_count(); }
+    size_t max_reorder_chunk_bytes() const { return _reorder_buffer.max_chunk_bytes(); }
+    size_t reorder_chunk_count() const { return _reorder_buffer.chunk_count(); }
 
     // How much this connection will queue on the send side before send()
     // starts accepting less than it is offered. The application's writes are
@@ -251,13 +408,9 @@ public:
     // because it is the number an application needs to reason about how much
     // it can afford not to read.
     static constexpr uint32_t RECEIVE_BUFFER_CAPACITY = 131072; // 128 KiB
-    // How many out-of-order segments the reorder buffer may hold, whatever
-    // their size. The window bounds the bytes but not the count, and each entry
-    // costs a map node and a step of every SACK report - so a peer sending
-    // one-byte segments could otherwise pin memory and CPU far beyond what the
-    // window suggests. A 128 KiB window holds ~90 full-sized segments, so
-    // legitimate traffic never comes near this.
-    static constexpr uint32_t MAX_REORDER_SEGMENTS = 1024;
+    // How many disjoint ranges the reorder buffer may hold (see
+    // ReorderBuffer::MAX_RANGES).
+    static constexpr uint32_t MAX_REORDER_SEGMENTS = ReorderBuffer::MAX_RANGES;
     // How long outstanding data may make no progress before the connection
     // is failed (see set_user_timeout()).
     static constexpr uint32_t DEFAULT_USER_TIMEOUT_MS = 300000;
@@ -276,7 +429,7 @@ public:
     // negotiation can keep calling this with just peer_isn.
     void accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss = 0, bool peer_supports_window_scaling = false,
                              uint8_t peer_window_scale = 0, bool peer_supports_timestamps = false,
-                             uint32_t peer_timestamp = 0, bool peer_permits_sack = false);
+                             uint32_t peer_timestamp = 0, bool peer_permits_sack = false, bool peer_ecn_setup = false);
 
     // Called by NetworkStack immediately after constructing this object for an
     // ACK that carried a valid SYN cookie (see syn_cookie.h): the handshake is
@@ -292,13 +445,102 @@ public:
     // MAC is resolved (or immediately, if it already was).
     void initiate_connect();
 
+    // True for a connection opened with initiate_connect(), including one
+    // that went through SYN_RECEIVED by way of a simultaneous open - which is
+    // why the state history alone cannot answer it. NetworkStack uses it to
+    // keep active opens out of the accept queue.
+    bool is_active_open() const { return _active_open; }
+
+    // Whether the segment being sent right now is this host's own traffic to
+    // a peer it has reason to trust - an active open, or a passive one that
+    // completed a valid handshake - as opposed to an answer to something
+    // anyone could have sent: anything from SYN_RECEIVED (a spoofed SYN puts
+    // a connection there) and every challenge ACK. NetworkStack uses it to
+    // tell the IPv6 neighbour cache who wants the resolution.
+    bool sending_to_verified_peer() const
+    {
+        if (_sending_challenge_ack)
+        {
+            return false;
+        }
+        return _active_open
+               || (_state != TcpState::LISTEN && _state != TcpState::SYN_RECEIVED && _state != TcpState::CLOSED);
+    }
+
+    // RFC 5961 challenge ACKs are replies to segments anyone can forge, so
+    // section 7 asks for them to be throttled. The budget is the stack's, not
+    // one connection's, so the decision is delegated: the gate is asked before
+    // each one goes out and returns false to suppress it. Unset means always
+    // send, which is what a connection used on its own (in a test) wants.
+    using ChallengeAckGateFn = std::function<bool()>;
+    void set_challenge_ack_gate(ChallengeAckGateFn gate) { _challenge_ack_gate = std::move(gate); }
+
+    // Loss-recovery counters, for tests and measurement (Linux reports the
+    // same through TCP_INFO / nstat as TcpExtTCPLossProbes and friends).
+    struct Stats
+    {
+        uint64_t retransmitted_segments = 0; // every resend of an in-flight segment
+        uint64_t retransmit_timeouts = 0;    // RTO expiries that resent something
+        uint64_t recoveries = 0;             // entries into fast recovery
+        uint64_t rack_losses = 0;            // segments RACK (RFC 8985) marked lost
+        uint64_t loss_probes = 0;            // tail loss probes sent (RFC 8985 7.3)
+        uint64_t loss_probe_repairs = 0;     // losses a probe repaired by itself (7.4.2)
+        uint64_t ecn_reductions = 0;         // cwnd reductions for an ECN-Echo (RFC 3168 6.1.2)
+    };
+    const Stats& stats() const { return _stats; }
+    // Scoreboard entries the sender has examined, for cost tests.
+    uint64_t scoreboard_visits() const { return _in_flight.visits(); }
+    // The part of it spent by RACK.
+    uint64_t rack_visits() const { return _in_flight.rack_visits(); }
+
 private:
     void _transition(TcpState new_state);
-    Tcp _build_header(uint8_t flags, uint32_t seq) const;
+    // Records why, then moves to CLOSED. Every path to CLOSED goes through
+    // here, so close_reason() never disagrees with the transition.
+    void _close_as(TcpCloseReason reason)
+    {
+        _close_reason = reason;
+        _transition(TcpState::CLOSED);
+    }
+    // Fires the send-space callback if send_space_available() grew since it
+    // was last reported. Run at the end of every entry point (EntryScope).
+    void _report_send_space();
+    // Builds and sends one segment - the only path any non-RST segment takes,
+    // first transmission, retransmission, ack or probe alike, so what options
+    // a segment carries never depends on which code sent it (RFC 7323 3.2: once
+    // negotiated, every non-RST segment carries TSopt; a retransmitted SYN
+    // offers what the first one did). Tracks nothing: the callers that put
+    // data in flight do that themselves.
+    // `ecn` is the IP codepoint; ECE and CWR are added here as RFC 3168 has
+    // them: the setup flags on a SYN, ECE on an ack while a CE is owed.
+    void _transmit(uint8_t flags, uint32_t seq, const Bytes& payload, Ecn ecn = Ecn::NOT_ECT);
+    // The options for a segment with these flags and this much payload: the
+    // SYN's negotiation options, or a timestamp and whatever SACK blocks fit.
+    void _add_options(Tcp& header, uint8_t flags, size_t payload_size) const;
     // include_ack is false only for the very first segment of an active
     // open: every other segment this stack ever sends acks something.
     void _send_flags(uint8_t flags, const Bytes& payload = Bytes(), bool include_ack = true);
     void _send_pure_ack();
+    // The most data one segment carries: the MSS less the options every
+    // segment carries (RFC 6691 - the MSS counts payload only, so the sender
+    // makes room for its own options). Timestamps, once negotiated, are on
+    // every segment; SACK blocks come and go and are trimmed to fit instead.
+    size_t _max_segment_payload() const
+    {
+        size_t options = _timestamps_negotiated ? TIMESTAMP_OPTION_BYTES : 0;
+        return _effective_mss > options ? _effective_mss - options : 1;
+    }
+    // RFC 5961's challenge ACK - a pure ACK of where this side really is -
+    // unless the challenge-ACK gate says the stack-wide budget is spent.
+    void _send_challenge_ack();
+    // A bare <SEQ=seq><CTL=RST>, outside the retransmission machinery.
+    void _send_reset(uint32_t seq);
+    // Records what the peer's SYN (or SYN-ACK) negotiated: MSS, window scale,
+    // SACK-permitted and timestamps.
+    void _take_peer_syn_options(const Tcp& segment);
+    // Whether a SYN-ACK completing a simultaneous open carries the same
+    // options as the SYN recorded by _take_peer_syn_options().
+    bool _matches_recorded_syn_options(const Tcp& segment) const;
     // Delayed ACK (RFC 1122 4.2.3.2): rather than acking every in-order data
     // segment immediately, coalesce - send the ack when a second segment
     // arrives, when the delay timer fires, or piggybacked on any segment we
@@ -344,74 +586,136 @@ private:
     // has already delivered, and so refusing to send more - which is exactly
     // the stall SACK exists to avoid. A running total keeps it O(1) without
     // the assumption.
-    uint32_t _bytes_in_flight() const { return _unsacked_in_flight_bytes; }
+    uint32_t _bytes_in_flight() const { return _in_flight.unsacked_bytes(); }
 
-    // Applies the peer's SACK blocks to the in-flight deque. Returns true if
+    // Applies the peer's SACK blocks (if SACK is in use) to the scoreboard. Returns true if
     // anything was newly marked, which is what makes a duplicate ack
     // informative rather than merely repeated.
     bool _apply_sack_blocks(const Tcp& segment);
+    // What RACK needs from this ack (see SendScoreboard::AckContext).
+    SendScoreboard::AckContext _rack_context(const Tcp& segment) const;
 
     // Bytes occupying the receive buffer: out-of-order segments waiting for a
     // gap to fill, plus in-order data the application has not read yet. What is
     // left of RECEIVE_BUFFER_CAPACITY after subtracting this is the window.
     uint32_t _receive_buffer_occupied() const;
-    // The window this side would advertise right now.
+    // The window this side would advertise right now: the free buffer space,
+    // but never less than what keeps the last offered right edge in place.
     uint32_t _advertised_window() const;
-    // Folds one round-trip measurement into the smoothed RTT/variance pair
-    // and recomputes _rto_ms from them (RFC 6298's estimator, Jacobson &
-    // Karels' algorithm). Called only with an *unambiguous* sample - see
-    // Karn's algorithm at the call site in _handle_ack().
-    void _update_rto_from_sample(uint32_t rtt_ms);
+    // Feeds one unambiguous round-trip measurement to _rtt, logging it.
+    void _take_rtt_sample(uint32_t rtt_ms);
+
+    // --- RACK (RFC 8985 section 6), with SACK only ---
+    //
+    // The scoreboard holds the per-segment state and does the marking (see
+    // send_scoreboard.h); this side owns the clock-driven parts: RACK.min_RTT,
+    // the reordering window and the reordering timer.
+    //
+    // RACK.min_RTT (6.2 step 1): a windowed minimum of the raw RTT samples -
+    // the lowest in the last MIN_RTT_WINDOW_MS, so a move to a longer path is
+    // eventually believed. Raw because RttEstimator floors its input at its
+    // clock granularity, and a quarter of that floor would be a reordering
+    // window five times the real round trip on a short path.
+    uint32_t _rack_min_rtt_ms = 0;
+    uint64_t _rack_min_rtt_at_ms = 0;
+    bool _have_rack_min_rtt = false;
+    static constexpr uint64_t MIN_RTT_WINDOW_MS = 300000; // Linux's tcp_min_rtt_wlen
+    // RFC 8985 6.2 step 4, RACK_update_reo_wnd() with reo_wnd_mult fixed at
+    // 1: the window grows only on D-SACK, which this stack does not parse.
+    uint64_t _rack_reo_wnd_ms() const;
+    // Runs RACK_detect_loss() and arms or disarms the reordering timer.
+    // Returns how many segments it marked lost.
+    uint32_t _rack_detect_loss();
+    // When the reordering timer fires (RFC 8985 6.2 step 5), or 0.
+    uint64_t _rack_reo_deadline_ms = 0;
+    void _on_rack_reo_timer();
+
+    // --- Tail Loss Probe (RFC 8985 section 7), with SACK only ---
+    //
+    // A loss at the tail of a flight draws no duplicate acks - nothing was
+    // sent after it - so only the RTO used to notice. Instead, when an ack is
+    // overdue (PTO = 2 * SRTT, plus the worst-case delayed ack when a single
+    // segment is out), one probe goes out: new data if there is some, else
+    // the last segment again. Its SACK or ack gives RACK and recovery the
+    // feedback the tail could not.
+    //
+    // When the probe is due, or 0. Armed instead of the RTO in the sense of
+    // RFC 8985 8: never later than it, and the RTO is restarted after the
+    // probe, so it stays the last resort.
+    uint64_t _tlp_deadline_ms = 0;
+    // TLP.end_seq / TLP.is_retrans (7.1): a probe is outstanding until an
+    // ack reaches end_seq.
+    bool _tlp_outstanding = false;
+    uint32_t _tlp_end_seq = 0;
+    bool _tlp_is_retrans = false;
+    // RFC 8985 7.3 condition 2: a fresh RTT sample since the last probe (or
+    // the start of the connection) - without one there is no SRTT to time a
+    // probe by, and probes must not keep the estimator from adapting.
+    bool _rtt_sampled_since_probe = false;
+    // Set while the probe's own new data goes out, which must not re-arm
+    // the PTO.
+    bool _sending_probe = false;
+    // RFC 8985 7.2's conditions: SACK in use, data in flight, not in fast
+    // or RTO recovery, nothing SACKed, no probe outstanding.
+    bool _tlp_allowed() const;
+    // TLP_calc_PTO() and arming (7.2), or disarming if not allowed.
+    void _schedule_loss_probe();
+    // TLP_send_probe() (7.3).
+    void _send_loss_probe();
+    // TLP_process_ack() (7.4.2); `pure_dup_ack` is a duplicate ack without
+    // SACK blocks - the sign, without D-SACK, that both copies arrived.
+    void _tlp_process_ack(uint32_t ack, bool pure_dup_ack);
+    // TLP_init() (7.1): on entering fast or RTO recovery.
+    void _tlp_reset()
+    {
+        _tlp_outstanding = false;
+        _tlp_deadline_ms = 0;
+    }
+    // RFC 8985 7.2's TLP.max_ack_delay: the longest a peer may hold an ack
+    // (RFC 1122 4.2.3.2 allows 500 ms; 200 ms is what Linux and this stack
+    // use).
+    static constexpr uint64_t TLP_MAX_ACK_DELAY_MS = 200;
+
+    // --- ECN (RFC 3168 section 6.1) ---
+    TcpEcnMode _ecn_mode = TcpEcnMode::PASSIVE;
+    bool _ecn_negotiated = false;
+    // Receiver (6.1.3): a CE-marked data segment arrived, so every ack
+    // carries ECE until a segment with CWR says the sender reacted.
+    bool _ece_pending = false;
+    // Sender (6.1.2): the window was reduced, so the next new data segment
+    // carries CWR.
+    bool _cwr_pending = false;
+    // At most one reduction per window of data (6.1.2): no ECE-driven
+    // reduction until the ack reaches what was sent at the last reduction,
+    // for loss or for ECE alike.
+    uint32_t _cwr_point = 0;
+    bool _cwr_point_valid = false;
+    // Records a window reduction (loss or ECE) for the two rules above.
+    void _note_window_reduced();
+    // The sender's half: an ack with ECE. Returns true if the window was
+    // reduced, in which case this ack must not grow it.
+    bool _on_ecn_echo(const Tcp& segment, uint32_t ack);
     // RFC 793 SS3.3's sequence-number acceptability test, done with unsigned
     // wraparound arithmetic (seq - _recv_next) so it's correct across a
     // sequence-number wraparound the same way real TCP's modular arithmetic
     // is, without needing any special-case wraparound handling.
     bool _seq_in_receive_window(uint32_t seq) const;
-
-    // One segment this side sent and hasn't seen acked yet. end_seq is
-    // seq + however many sequence numbers it consumed (payload bytes, plus
-    // one each for SYN/FIN) - a cumulative ack covering end_seq clears it.
-    struct InFlightSegment
-    {
-        uint32_t seq;
-        uint32_t end_seq;
-        uint8_t flags;
-        Bytes payload;
-        int retransmit_ms_remaining;
-        int retransmit_attempts;
-        // The connection's clock when this segment first went out. Storing the
-        // absolute moment rather than an age counter keeps timekeeping O(1):
-        // on_time_passed() would otherwise have to walk the whole window on
-        // every call just to age each entry, and this window is walked often
-        // enough already. Age is _now_ms - sent_at_ms, computed only when a
-        // segment is actually acked.
-        uint64_t sent_at_ms;
-        // Named by a SACK block, so the peer holds it even though the
-        // cumulative ack has not reached it. It stays in this deque because the
-        // window cannot slide past it until everything before it is acked too -
-        // but it must not be counted as still travelling, and must never be the
-        // segment a retransmission picks.
-        bool sacked = false;
-        // Karn's algorithm: once a segment has been retransmitted, an ack for
-        // it is ambiguous - it could be acking the original or the
-        // retransmission, and those imply very different round-trip times.
-        // Such a segment never yields an RTT sample.
-        bool retransmitted;
-    };
-
-    // The oldest in-flight segment the peer has NOT reported holding - the one
-    // a retransmission should actually resend. Without SACK this is always the
-    // front of the deque; with it, the front may already be sitting in the
-    // peer's reorder buffer, and resending that is pure waste. Declared here
-    // rather than with the other helpers because it names the type above.
-    InFlightSegment* _oldest_unsacked_segment();
+    // RFC 9293 3.10.7.4's acceptability test for a segment occupying `length`
+    // sequence numbers (payload plus FIN) from seq: does it overlap the
+    // receive window at all?
+    bool _segment_acceptable(uint32_t seq, uint32_t length) const;
+    // RFC 9293 3.10.7.3's test in SYN_SENT: does this ACK cover our SYN, and
+    // nothing beyond what was sent (ISS < SEG.ACK =< SND.NXT)?
+    bool _ack_acceptable_in_syn_sent(uint32_t ack) const;
 
     uint64_t _id;
     uint16_t _local_port;
-    IPv4Address _remote_ip;
+    IpAddress _remote_ip;
+    IpAddress _local_ip;
     uint16_t _remote_port;
 
     TcpState _state;
+    uint32_t _iss;       // ISS - our initial sequence number, what our SYN carried
     uint32_t _send_next; // SND.NXT - next sequence number this side will send
     // SND.MAX (RFC 9293): one past the highest sequence number ever actually
     // put on the wire. Usually equal to SND.NXT, but a zero-window probe sends
@@ -420,72 +724,50 @@ private:
     uint32_t _send_max;
     uint32_t _recv_next; // RCV.NXT - next sequence number expected from the peer
 
-    // the sliding window: ordered oldest-first by sequence number, so the
-    // front is always SND.UNA (or _send_next if empty - nothing
-    // outstanding). A cumulative ack pops everything it covers from the
-    // front; a timeout retransmits only the front entry.
-    std::deque<InFlightSegment> _in_flight;
-    // Running total of in-flight bytes not yet named by a SACK block. Kept
-    // incrementally because the alternative - summing the deque on every ack -
-    // is the hot path of the send loop.
-    uint32_t _unsacked_in_flight_bytes;
+    // The sliding window: every segment in flight, oldest first, with what
+    // SACK has said about each (see send_scoreboard.h).
+    SendScoreboard _in_flight;
     std::deque<Bytes> _send_queue; // data waiting for window room
     // Bytes sitting in _send_queue, kept alongside it so send_space_available()
     // is a subtraction rather than a walk over every queued chunk.
     size_t _send_queued_bytes;
-    // close() called while something was still in flight or queued -
-    // deferred until both drain, instead of clobbering in-flight state
+    // close() called while data was still queued: the FIN goes out with the
+    // last queued segment (see _send_chunk()).
     bool _fin_requested;
+    // Sends the FIN, on `payload` if there is one, and moves to FIN_WAIT_1 or
+    // LAST_ACK.
+    void _send_fin(const Bytes& payload);
+    // Sends one chunk taken off the send queue, with the FIN if it is the
+    // last one after close().
+    void _send_chunk(const Bytes& chunk);
 
-    // counts down while in TIME_WAIT; reset if a duplicate FIN arrives
-    // (meaning our ack for it was likely lost)
-    int _time_wait_ms_remaining;
+    // when TIME_WAIT ends; pushed back if a duplicate FIN arrives (meaning
+    // our ack for it was likely lost)
+    uint64_t _time_wait_deadline_ms;
 
-    // --- RTT estimation / adaptive RTO (RFC 6298, Jacobson & Karels) ---
-    // A fixed retransmission timeout can only be wrong in one of two
-    // directions: too short on a slow path and it retransmits segments that
-    // were merely still in transit, adding load to a link that is already the
-    // bottleneck; too long on a fast path and every real loss costs far more
-    // idle time than it needs to. The fix is to measure the round trip and
-    // derive the timeout from it - but the *mean* RTT alone is not enough,
-    // which is the lesson of the 1988 congestion collapse: on a loaded path
-    // RTT varies wildly, and a timeout set near the mean fires constantly on
-    // ordinary jitter. So the variance is tracked alongside the mean and the
-    // timeout is set several deviations out, where ordinary jitter cannot
-    // reach it and only a real loss can.
-    //
-    // Both are held scaled by RTO_SCALE so the exponential moving averages
-    // keep fractional precision in pure integer arithmetic - the same trick
-    // the BSD implementation uses, and the reason there is no floating point
-    // anywhere in this path.
-    // Monotonic millisecond clock, summed from what on_time_passed() reports.
-    // This is what RTT is measured against and, once timestamps are
+    // Monotonic millisecond clock: summed from what on_time_passed() reports,
+    // or read from the owning stack's clock (see use_external_clock()). Every
+    // timer deadline below is a moment on it. This is what RTT is measured against and, once timestamps are
     // negotiated, the value put in TSval - a millisecond clock sits squarely
     // inside RFC 7323's required 1 ms to 1 s per tick, which a counter of
     // application timer ticks only did by luck. It starts at 1 rather than 0
     // so a zero TSecr unambiguously means "nothing to echo yet" rather than
     // "echoing the very first moment of the connection".
     uint64_t _now_ms;
-    uint32_t _srtt_scaled;  // smoothed RTT (SRTT), in ms * RTO_SCALE
-    uint32_t _rttvar_scaled; // RTT variation (RTTVAR), in ms * RTO_SCALE
-    bool _has_rtt_sample;   // false until the first measurement seeds the estimator
-    // The live timeout, in whole milliseconds. Doubled on every retransmission
-    // (Karn's second half: back off, and keep the backed-off value rather
-    // than recomputing it from an estimator no valid sample can currently
-    // update) and recomputed from SRTT/RTTVAR on the next unambiguous sample.
-    int _rto_ms;
+    // RTT estimation and the RTO it drives (RFC 6298) - see rtt_estimator.h.
+    RttEstimator _rtt;
 
     // --- zero-window persist timer ---
-    // milliseconds until the next zero-window probe, or 0 when the persist
+    // when the next zero-window probe goes out, or 0 when the persist
     // timer is disarmed. Unlike the retransmit timer this never gives up: a peer with a
     // full receive buffer is healthy, just not ready, so probing continues
     // (with exponential backoff) until the window reopens.
-    int _persist_ms_remaining;
+    uint64_t _persist_deadline_ms;
     int _persist_backoff; // shift applied to PERSIST_BASE_MS, capped at PERSIST_MAX_BACKOFF_SHIFT
 
     // --- delayed ACK ---
     bool _ack_pending;              // an in-order segment is awaiting a coalesced ack
-    int _ack_delay_ms_remaining; // countdown that forces a pending ack out on time
+    uint64_t _ack_deadline_ms;      // when a pending ack is forced out
 
     // --- keepalive (RFC 1122 4.2.3.6) ---
     //
@@ -498,13 +780,14 @@ private:
     // stating what it really expects. A wrong-looking segment is the point:
     // it is the only thing that compels a reply without moving the stream.
     bool _keepalive_enabled;
-    int _keepalive_idle_ms_remaining;   // time left before the first probe
-    int _keepalive_probe_ms_remaining;  // time left before the next probe, once probing
+    // When the next probe goes out: KEEPALIVE_IDLE_MS after the last segment
+    // heard, then KEEPALIVE_PROBE_INTERVAL_MS after each unanswered probe.
+    uint64_t _keepalive_deadline_ms;
     int _keepalive_probes_sent;         // consecutive unanswered probes
     void _send_keepalive_probe();
-    // Drives both keepalive countdowns. Called from on_time_passed() only when
-    // the pipe is empty and persist is not running - see the call site.
-    void _run_keepalive(uint32_t elapsed_ms);
+    // Sends the probe that is due, or gives up. Called from _run_timers() only
+    // when the pipe is empty and persist is not running - see the call site.
+    void _run_keepalive();
     // Rearms the idle timer and forgets any probing in progress. Called on
     // every segment received: hearing anything at all from the peer is the
     // definition of the connection not being idle.
@@ -523,14 +806,10 @@ private:
     // Reno alone it eventually resends the lot. SACK blocks name what did
     // arrive, so only the actual holes are retransmitted.
     bool _sack_permitted;
-    // Where the most recent out-of-order segment landed, so the first reported
-    // block can be the one the peer has not heard about yet.
-    uint32_t _last_out_of_order_seq;
 
     // The out-of-order ranges this side currently holds, as they would be
-    // reported to the peer. Derived from _reorder_buffer by merging adjacent
-    // entries - the buffer keys segments by exact sequence number, so what is
-    // logically one contiguous run can be several entries in it.
+    // reported to the peer. One block per _reorder_buffer range, the range that
+    // arrived last first.
     std::vector<Tcp::SackBlock> _sack_blocks_to_report() const;
 
     // --- timestamps and PAWS (RFC 7323) ---
@@ -557,6 +836,13 @@ private:
     bool _timestamps_negotiated;
     uint32_t _ts_recent;      // newest timestamp received in sequence - echoed back
     bool _have_ts_recent;
+    // Last.ACK.sent (RFC 7323 4.3): the ACK field of the last segment sent.
+    // TS.Recent only takes the TSval of a segment at or before it, which is
+    // what makes the echo the earliest unacknowledged segment's (delayed
+    // acks) and the hole-filling retransmission's (loss).
+    uint32_t _last_ack_sent = 0;
+    // RFC 7323 4.3's update: called for an acceptable segment.
+    void _update_ts_recent(const Tcp& segment);
 
     // --- MSS / window-scale negotiation (RFC 7323) ---
     uint16_t _local_mss;
@@ -570,19 +856,51 @@ private:
 
     // --- flow control ---
     uint32_t _peer_window; // SND.WND, already left-shifted by the peer's window scale if negotiated
-    // out-of-order segments, keyed by sequence number - drained into
-    // _recv_next/_deliver() as gaps fill in; bounded by
-    // RECEIVE_BUFFER_CAPACITY via _receive_buffer_occupied()
-    std::map<uint32_t, Bytes> _reorder_buffer;
-    // Total payload bytes in _reorder_buffer, kept alongside it like
-    // _receive_queued_bytes is for the receive queue. Summing the map instead
-    // was O(entries) on every segment received and every ack sent - quadratic
-    // over a buffer a peer can fill with tens of thousands of tiny segments.
-    size_t _reorder_buffered_bytes = 0;
+    // MAX.SND.WND (RFC 5961 section 5): the largest window the peer has ever
+    // advertised, scaled. Bounds how far behind SND.UNA an acceptable ACK may
+    // be. Starts at the same placeholder as _peer_window.
+    uint32_t _max_peer_window;
+    void _set_peer_window(uint32_t window)
+    {
+        _peer_window = window;
+        _max_peer_window = std::max(_max_peer_window, window);
+    }
+    // Out-of-order data (see reorder_buffer.h), positioned by unwrapped
+    // sequence number; drained into _recv_next/_deliver() as gaps fill in.
+    // Bounded by the window offered and by MAX_REORDER_SEGMENTS ranges.
+    ReorderBuffer _reorder_buffer;
+    // RCV.NXT, unwrapped: advanced in lockstep with _recv_next, so the two are
+    // equal modulo 2^32. Every buffered range lies after it and within the
+    // window, so (seq - RCV.NXT) + this is a range's unwrapped position.
+    uint64_t _recv_next_unwrapped = 0;
+    // RCV.NXT + RCV.WND as last advertised, unwrapped like the above: the
+    // right edge the window may never be pulled back from (RFC 1122
+    // 4.2.2.16). See _advertised_window().
+    uint64_t _rcv_right_edge_unwrapped = 0;
+    void _set_recv_next(uint32_t value)
+    {
+        _recv_next = value;
+        _recv_next_unwrapped = value;
+        _rcv_right_edge_unwrapped = 0; // nothing offered yet relative to this RCV.NXT
+    }
+    void _advance_recv_next(uint32_t count)
+    {
+        _recv_next += count;
+        _recv_next_unwrapped += count;
+    }
+    // Stores whatever part of an out-of-order segment is not already held.
+    void _buffer_out_of_order(uint32_t seq, const Bytes& payload);
     uint32_t _user_timeout_ms = DEFAULT_USER_TIMEOUT_MS;
     // How long outstanding data has gone without progress. Reset by any ack
     // that moves SND.UNA, and whenever nothing is outstanding.
-    uint64_t _stalled_ms = 0;
+    // Since when, while there is something outstanding: the moment it became
+    // outstanding, or the last ack that moved SND.UNA.
+    uint64_t _stall_since_ms = 0;
+    bool _stall_clock_running = false;
+    // Starts or stops the stall clock above to match whether anything is
+    // outstanding right now. Run at the end of every entry point, so it notices
+    // the change within the same millisecond it happens.
+    void _track_stall();
 
     // --- congestion control ---
     //
@@ -593,10 +911,57 @@ private:
     // sequence space, which the algorithm knows nothing about. It is told what
     // happened; it never works it out.
     std::unique_ptr<CongestionControl> _congestion;
+    // Times our SYN or SYN-ACK was retransmitted: more than one and the
+    // initial window is one segment (RFC 6928 section 2).
+    uint32_t _syn_retransmissions = 0;
+    // _now_ms when new data last went out, 0 once an idle restart has used
+    // it. See _restart_after_idle().
+    uint64_t _last_data_sent_ms = 0;
+    // RFC 5681 4.1 restart after idle: called before sending new data.
+    void _restart_after_idle();
     uint32_t _dup_ack_count;
-    bool _in_fast_recovery;
+    // In fast recovery: entered on DupThresh duplicate acks, left on the ack
+    // that covers _recovery_point, or on a timeout.
+    bool _in_recovery;
+    // SND.NXT when the last recovery started or the last timeout fired - RFC
+    // 6582's "recover", RFC 6675's RecoveryPoint. Recovery ends when the
+    // cumulative ack reaches it, and no new one starts until it has.
+    uint32_t _recovery_point = 0;
+    bool _recovery_point_valid = false;
+    bool _may_start_recovery(uint32_t ack) const;
+    // Fast retransmit: the first segment presumed lost goes out again, and
+    // the congestion control is told.
+    void _enter_recovery(uint32_t delivered);
+    // After a timeout with SACK in use: the segments presumed lost are being
+    // refilled, until the ack reaches _recovery_point (RFC 6675 5.1).
+    bool _rto_recovery = false;
+    // RescueRxt (RFC 6675 NextSeg rule 4): where the last rescue
+    // retransmission was allowed from; invalid until one is sent.
+    uint32_t _rescue_rxt = 0;
+    bool _rescue_valid = false;
+    // Whether the scoreboard's pipe, rather than the in-flight total, decides
+    // what may be sent: SACK recovery, or refilling after a timeout.
+    bool _scoreboard_drives_sending() const { return (_in_recovery && _sack_permitted) || _rto_recovery; }
+    // One ack's sending in SACK recovery: RFC 6937 PRR (with the slow start
+    // reduction bound) decides how much, RFC 6675 NextSeg() what. `delivered`
+    // is the ack's DeliveredData; `entering` forces the fast retransmission.
+    void _sack_recovery_send(uint32_t delivered, bool entering = false);
+    // RFC 6937 state: bytes delivered to the receiver and bytes sent since
+    // recovery began, and FlightSize at its start (RecoverFS).
+    uint64_t _prr_delivered = 0;
+    uint64_t _prr_out = 0;
+    uint32_t _prr_recover_fs = 0;
+    // NextSeg() and transmit, while pipe + SMSS <= window. Rules 3 and 4 only
+    // in fast recovery. Returns the bytes sent.
+    uint32_t _send_by_next_seg(uint32_t pipe, uint32_t window, bool in_recovery);
+    // Sends the next queued chunk as new data if the peer's window, Nagle and
+    // `window` allow it.
+    bool _send_one_new_segment(uint32_t pipe, uint32_t window);
+    // Resends one in-flight segment and restarts its retransmit timer.
+    // `rescue` marks RFC 6675's rule-4 retransmission, which leaves HighRxt.
+    void _retransmit(SentSegment& segment, bool rescue = false);
 
-    SendSegmentFn _send_segment;
+    SendSegmentEcnFn _send_segment;
     DataReadyFn _on_data_ready;
     std::vector<StateChangedFn> _on_state_changed;
     // In-order data that has been acknowledged to the peer but not yet read by
@@ -612,10 +977,83 @@ private:
     // Kept alongside the queue so the advertised window is an O(1) subtraction
     // rather than a walk over every buffered chunk on every header build.
     size_t _receive_queued_bytes;
+    bool _active_open = false; // see is_active_open()
+    bool _sending_challenge_ack = false; // see sending_to_verified_peer()
+    ChallengeAckGateFn _challenge_ack_gate;
+    Stats _stats;
+    TcpCloseReason _close_reason = TcpCloseReason::NONE;
+    bool _nodelay = false;
+    SendSpaceFn _on_send_space;
+    // send_space_available() as of the last _report_send_space().
+    size_t _reported_send_space = SEND_BUFFER_CAPACITY;
+
+    // --- clock and deadline bookkeeping ---
+    //
+    // _now_ms is a cache of the clock, refreshed at the start of every entry
+    // point by an EntryScope: with an external clock, *_external_clock plus
+    // _clock_offset. Caching keeps every reader of _now_ms unchanged, and the
+    // clock cannot move during a call anyway - only the caller advances it.
+    const uint64_t* _external_clock = nullptr;
+    uint64_t _clock_offset = 0;
+    TimerChangedFn _on_timer_changed;
+    // What next_deadline_ms() said last time _on_timer_changed was told.
+    uint64_t _reported_deadline_ms = NO_DEADLINE;
+    void _sync_clock()
+    {
+        if (_external_clock != nullptr)
+        {
+            _now_ms = *_external_clock + _clock_offset;
+        }
+    }
+    // Starts the oldest unSACKed segment's retransmit timer if it is not
+    // running yet - the moment a segment becomes the oldest is the moment its
+    // timer starts.
+    void _start_retransmit_timer();
+    // The connection-side half of the deadline contract: catches up the
+    // bookkeeping that is decided by state rather than by an event (the stall
+    // clock, the retransmit timer's start) and reports a changed deadline.
+    void _refresh_timer_deadline();
+    // The timer work itself, at _now_ms. Shared by on_time_passed() and
+    // run_due_timers().
+    void _run_timers();
+    // Wraps every public entry point that can touch a timer: syncs the clock
+    // on the way in and refreshes the deadline on the way out, however the
+    // call returns. Nesting (a callback re-entering the connection) is fine:
+    // both halves are idempotent.
+    // The application closed the socket for good: see abandon_receive().
+    bool _receive_abandoned = false;
+
+    class EntryScope
+    {
+    public:
+        explicit EntryScope(TcpConnection& connection) : _connection(connection) { _connection._sync_clock(); }
+        ~EntryScope()
+        {
+            _connection._refresh_timer_deadline();
+            _connection._report_send_space();
+        }
+        EntryScope(const EntryScope&) = delete;
+        EntryScope& operator=(const EntryScope&) = delete;
+        EntryScope(EntryScope&&) = delete;
+        EntryScope& operator=(EntryScope&&) = delete;
+
+    private:
+        TcpConnection& _connection;
+    };
 
     static constexpr uint16_t DEFAULT_LOCAL_MSS = 1460; // 1500 (typical Ethernet MTU) - 20 (IP) - 20 (TCP)
+    // The smallest peer MSS option honoured: Linux's TCP_MIN_SND_MSS, the
+    // CVE-2019-11479 fix. An MSS of 1 would make every byte a segment and
+    // every per-segment cost - scoreboard walks, headers, timers - a
+    // per-byte one; a smaller option is taken as 48.
+    static constexpr uint16_t MIN_PEER_MSS = 48;
     static constexpr uint16_t DEFAULT_PEER_MSS = 536; // RFC 793's fallback when a peer's SYN carries no MSS option
     static constexpr uint8_t WINDOW_SCALE_SHIFT = 1; // this stack's advertised shift
+    // Option sizes as Tcp serializes them: timestamps are two NOPs + 10
+    // bytes; SACK is two NOPs + kind + length, then 8 bytes per block.
+    static constexpr size_t TIMESTAMP_OPTION_BYTES = 12;
+    static constexpr size_t SACK_OPTION_OVERHEAD_BYTES = 4;
+    static constexpr size_t SACK_BLOCK_BYTES = 8;
     // Three, not two, and not one. One or two duplicate acks are what ordinary
     // reordering looks like - the network delivered a later segment first, and
     // the missing one is still on its way. Three in a row is the point at which
@@ -625,40 +1063,6 @@ private:
     // specifies it says it means. That is the whole point of taking elapsed
     // time from the caller rather than counting its ticks.
     //
-    // RFC 6298 rule 2.1: before any RTT has been measured there is nothing to
-    // derive a timeout from, so the first one is a fixed conservative guess -
-    // the RFC's own one second. Every segment sent after the first ack comes
-    // back uses a measured value instead.
-    static constexpr int INITIAL_RTO_MS = 1000;
-    // Fixed-point shift for _srtt_scaled/_rttvar_scaled: eighths of a
-    // millisecond.
-    static constexpr uint32_t RTO_SCALE = 8;
-    // RFC 6298's alpha = 1/8 and beta = 1/4, as right-shifts. Powers of two
-    // are not an approximation chosen for speed - the original algorithm
-    // picked them precisely so the filters need no division at all.
-    static constexpr int RTT_SMOOTHING_SHIFT = 3;  // alpha = 1/8
-    static constexpr int RTT_VARIANCE_SHIFT = 2;   // beta  = 1/4
-    // RFC 6298's K: how many deviations above the smoothed mean the timeout
-    // sits. Four is what makes ordinary jitter unable to reach it.
-    static constexpr uint32_t RTO_VARIANCE_MULTIPLIER = 4;
-    // Assumed resolution of the caller's clock, and so the smallest
-    // difference in timing this connection can actually resolve. It is the G
-    // term in RFC 6298's RTO formula: the variance floor exists because on a
-    // very steady path RTTVAR converges toward zero, and without a floor the
-    // timeout would collapse onto the mean and fire on the first sample
-    // landing a hair above average.
-    static constexpr uint32_t RTO_CLOCK_GRANULARITY_MS = 100;
-    // RFC 6298 rule 2.4 says round a computed RTO up to one second, then
-    // immediately notes that this is about 1980s clock granularity rather than
-    // anything about the network. Linux uses 200 ms and so does this, because
-    // a one-second floor on a datacentre path makes every loss cost a second
-    // of idle time to recover from. Deviating from the RFC deliberately, and
-    // writing down why, is the point of putting it here.
-    static constexpr int MIN_RTO_MS = 200;
-    // RFC 6298 rule 2.5 permits an upper bound provided it is at least 60
-    // seconds. Caps the exponential backoff so a connection to a black hole
-    // stops doubling rather than growing without bound.
-    static constexpr int MAX_RTO_MS = 60000;
     static constexpr int MAX_RETRANSMIT_ATTEMPTS = 5;
 
     // TIME_WAIT lasts twice the maximum segment lifetime, and the doubling is

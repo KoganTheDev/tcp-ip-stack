@@ -1,4 +1,4 @@
-#include "test.h"
+#include "test_support.h"
 #include "exceptions.h"
 #include "ethernet.h"
 #include "arp.h"
@@ -8,6 +8,8 @@
 #include "icmp.h"
 #include "dhcp.h"
 #include "dns.h"
+#include "ipv6.h"
+#include "icmpv6.h"
 
 #include <random>
 
@@ -56,32 +58,32 @@ namespace
     }
 }
 
-TEST(EthernetFromBytesNeverCrashesOnGarbage)
+TEST(ProtocolFuzz, EthernetFromBytesNeverCrashesOnGarbage)
 {
     fuzz_from_bytes<Ethernet>(128);
 }
 
-TEST(ArpFromBytesNeverCrashesOnGarbage)
+TEST(ProtocolFuzz, ArpFromBytesNeverCrashesOnGarbage)
 {
     fuzz_from_bytes<Arp>(64);
 }
 
-TEST(IpFromBytesNeverCrashesOnGarbage)
+TEST(ProtocolFuzz, IpFromBytesNeverCrashesOnGarbage)
 {
     fuzz_from_bytes<Ip>(128);
 }
 
-TEST(TcpFromBytesNeverCrashesOnGarbage)
+TEST(ProtocolFuzz, TcpFromBytesNeverCrashesOnGarbage)
 {
     fuzz_from_bytes<Tcp>(128);
 }
 
-TEST(UdpFromBytesNeverCrashesOnGarbage)
+TEST(ProtocolFuzz, UdpFromBytesNeverCrashesOnGarbage)
 {
     fuzz_from_bytes<Udp>(128);
 }
 
-TEST(IcmpFromBytesNeverCrashesOnGarbage)
+TEST(ProtocolFuzz, IcmpFromBytesNeverCrashesOnGarbage)
 {
     fuzz_from_bytes<Icmp>(128);
 }
@@ -89,7 +91,7 @@ TEST(IcmpFromBytesNeverCrashesOnGarbage)
 // Truncated-but-plausible-looking input is worth testing separately from
 // pure noise: a header that claims a length longer than the data actually
 // present is the classic way an off-by-one in bounds checking gets missed.
-TEST(TruncatedButPlausibleHeadersDoNotCrash)
+TEST(ProtocolFuzz, TruncatedButPlausibleHeadersDoNotCrash)
 {
     // A real Ethernet+IP+TCP header's opening bytes, cut off at every
     // possible length - including lengths that pass Ethernet's own size
@@ -111,7 +113,7 @@ TEST(TruncatedButPlausibleHeadersDoNotCrash)
     }
 }
 
-TEST(DhcpFromBytesNeverCrashesOnGarbage)
+TEST(ProtocolFuzz, DhcpFromBytesNeverCrashesOnGarbage)
 {
     // The one parser here that runs before this host has an address at all,
     // on datagrams from any source, with nothing in the protocol
@@ -122,7 +124,7 @@ TEST(DhcpFromBytesNeverCrashesOnGarbage)
     fuzz_from_bytes<Dhcp>(512);
 }
 
-TEST(DnsFromBytesNeverCrashesOnGarbage)
+TEST(ProtocolFuzz, DnsFromBytesNeverCrashesOnGarbage)
 {
     // Name compression makes this the most dangerous parser in the stack: a
     // label byte can be a 14-bit offset back into the same buffer, chosen by
@@ -130,4 +132,35 @@ TEST(DnsFromBytesNeverCrashesOnGarbage)
     // one label byte in four has both top bits set - so this is a real test of
     // the backwards-only rule and the jump cap rather than a formality.
     fuzz_from_bytes<Dns>(512);
+}
+
+TEST(ProtocolFuzz, Ipv6FromBytesNeverCrashesOnGarbage)
+{
+    // The extension-header chain is v6's equivalent of DNS name compression:
+    // each header names the next, so a crafted packet can present a chain that
+    // loops or runs past the buffer. Random bytes reach that walk constantly,
+    // since roughly one next-header value in eight is an extension type.
+    fuzz_from_bytes<Ipv6>(256);
+}
+
+TEST(ProtocolFuzz, Icmpv6FromBytesNeverCrashesOnGarbage)
+{
+    // NDP rides on this, so it parses unsolicited packets from anyone on the
+    // link - and its option walk is the loop a zero-length option would spin
+    // forever in. from_bytes() alone does not walk the options, so the accessor
+    // is exercised here too.
+    std::mt19937 rng(FUZZ_SEED);
+    for (int i = 0; i < FUZZ_ITERATIONS; i++)
+    {
+        Bytes data = random_bytes(rng, 128);
+        try
+        {
+            Icmpv6 message(data);
+            message.get_options();          // the bounded walk
+            message.get_target_address();   // total accessors on a short body
+            message.get_link_layer_option(NDP_OPTION_SOURCE_LINK_LAYER);
+        }
+        catch (const BaseException&)
+        {}
+    }
 }

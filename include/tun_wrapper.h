@@ -10,10 +10,10 @@ class TunWrapper : public SystemNetworkObject, public PacketChannel
 {
 public:
     TunWrapper(const std::string& device_path = "/dev/net/tun");
-    ~TunWrapper();
+    ~TunWrapper() override;
 
-    virtual void start();
-    virtual void stop();
+    void start() override;
+    void stop() override;
 
     Bytes read(unsigned int max_length) override;
     void write(const Bytes& buffer) override;

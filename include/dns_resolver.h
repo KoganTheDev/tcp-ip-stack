@@ -10,6 +10,7 @@
 #include "bytes.h"
 #include "dns.h"
 #include "network_addresses.h"
+#include "next_timer.h"
 
 // A stub resolver (RFC 1034/1035).
 //
@@ -101,6 +102,9 @@ public:
     void on_datagram(const IPv4Address& source, uint16_t source_port, uint16_t destination_port, const Bytes& payload);
 
     void on_time_passed(uint32_t elapsed_ms);
+    // Until the first outstanding query times out or cached answer expires,
+    // or nullopt if there are neither.
+    NextTimer ms_until_next_timer() const;
 
     // True while any query is outstanding - the "am I waiting on the network"
     // question an application needs before deciding to block.
@@ -113,19 +117,19 @@ private:
     struct Pending
     {
         std::string name;
-        uint16_t transaction_id;
-        uint16_t source_port;
-        size_t server_index;      // which of _servers is being asked
-        int attempts;
-        int timeout_ms_remaining;
-        int cname_depth;          // how many aliases have been followed
+        uint16_t transaction_id{};
+        uint16_t source_port{};
+        size_t server_index{};      // which of _servers is being asked
+        int attempts{};
+        int timeout_ms_remaining{};
+        int cname_depth{};          // how many aliases have been followed
         std::vector<ResolvedFn> callbacks;
     };
 
     struct CacheEntry
     {
         std::vector<IPv4Address> addresses;
-        int ms_remaining;
+        int ms_remaining{};
     };
 
     void _send_query(Pending& query);

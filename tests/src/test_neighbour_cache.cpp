@@ -1,0 +1,480 @@
+#include "test_support.h"
+#include "exceptions.h"
+#include "neighbour_cache.h"
+
+#include <string>
+#include <vector>
+
+namespace
+{
+    const IPv6Address NEIGHBOUR("fe80::1");
+    const MacAddress NEIGHBOUR_MAC("11:22:33:44:55:66");
+    const MacAddress OTHER_MAC("aa:bb:cc:dd:ee:ff");
+
+    struct Solicitation
+    {
+        IPv6Address target;
+        MacAddress unicast_to;
+        bool is_multicast() const { return unicast_to == MacAddress(); }
+    };
+
+    // Records every solicitation the cache asks for, so the tests assert on
+    // what would go on the wire rather than on internal state alone.
+    class CacheHarness
+    {
+    public:
+        CacheHarness()
+            : cache([this](const IPv6Address& target, const MacAddress& unicast_to)
+                    { sent.push_back({target, unicast_to}); })
+        {}
+
+        // Drives the clock in steps no larger than the shortest timer, so
+        // anything due partway through fires partway through.
+        void advance(uint32_t total_ms)
+        {
+            const uint32_t step = 250;
+            while (total_ms > 0)
+            {
+                uint32_t chunk = total_ms < step ? total_ms : step;
+                cache.on_time_passed(chunk);
+                total_ms -= chunk;
+            }
+        }
+
+        NeighbourCache cache;
+        std::vector<Solicitation> sent;
+    };
+
+    // Gets a neighbour to REACHABLE the way it happens in practice: resolve,
+    // then answer with a solicited advertisement.
+    void resolve_to_reachable(CacheHarness& h)
+    {
+        MacAddress mac;
+        h.cache.lookup(NEIGHBOUR, mac);
+        h.cache.on_advertisement(NEIGHBOUR, NEIGHBOUR_MAC, true, true);
+    }
+}
+
+TEST(NeighbourCache, AnUnknownNeighbourStartsResolutionAndHasNothingToSendTo)
+{
+    CacheHarness h;
+    MacAddress mac;
+
+    ASSERT_TRUE(!h.cache.lookup(NEIGHBOUR, mac)) << "there is no link-layer address yet, so the caller must not send";
+    ASSERT_TRUE(h.sent.size() == 1) << "and a solicitation goes out";
+    ASSERT_TRUE(h.sent[0].target == NEIGHBOUR) << "for the right target";
+    ASSERT_TRUE(h.sent[0].is_multicast()) << "multicast, because the address being asked for is the thing that "
+                                             "would be needed to unicast";
+    ASSERT_TRUE(h.cache.state_of(NEIGHBOUR) == NeighbourState::INCOMPLETE) << "state";
+}
+
+TEST(NeighbourCache, OnlyASolicitedAdvertisementProvesReachability)
+{
+    // The S flag means "this answers something you sent". Anyone can volunteer
+    // an advertisement; only a reply demonstrates that packets to this
+    // neighbour actually arrive.
+    CacheHarness h;
+    MacAddress mac;
+    h.cache.lookup(NEIGHBOUR, mac);
+
+    h.cache.on_advertisement(NEIGHBOUR, NEIGHBOUR_MAC, false, true);
+    ASSERT_TRUE(h.cache.state_of(NEIGHBOUR) == NeighbourState::STALE)
+        << "an unsolicited advertisement is believed but not verified";
+
+    h.cache.on_advertisement(NEIGHBOUR, NEIGHBOUR_MAC, true, true);
+    ASSERT_TRUE(h.cache.state_of(NEIGHBOUR) == NeighbourState::REACHABLE) << "a solicited one is proof";
+}
+
+TEST(NeighbourCache, AStaleEntryIsUsedImmediatelyRatherThanBlockingTheSend)
+{
+    // The point that makes STALE different from an expired ARP entry: it is
+    // used freely. Verification happens alongside the traffic, so an
+    // unconfirmed neighbour costs nothing in latency.
+    CacheHarness h;
+    MacAddress mac;
+    h.cache.lookup(NEIGHBOUR, mac);
+    h.cache.on_advertisement(NEIGHBOUR, NEIGHBOUR_MAC, false, true);
+    h.sent.clear();
+
+    MacAddress out;
+    ASSERT_TRUE(h.cache.lookup(NEIGHBOUR, out)) << "a STALE entry is usable";
+    ASSERT_TRUE(out == NEIGHBOUR_MAC) << "and gives the address it knows";
+    ASSERT_TRUE(h.sent.empty()) << "and sends nothing immediately - probing is deferred";
+    ASSERT_TRUE(h.cache.state_of(NEIGHBOUR) == NeighbourState::DELAY)
+        << "but sending to it starts the confirmation cycle";
+}
+
+TEST(NeighbourCache, UpperLayerConfirmationAvoidsProbingEntirely)
+{
+    // The idea ARP has no equivalent of. A TCP ack for new data is proof the
+    // neighbour is receiving, so an active connection confirms its own
+    // neighbour continuously and NDP never has to ask.
+    CacheHarness h;
+    MacAddress mac;
+    h.cache.lookup(NEIGHBOUR, mac);
+    h.cache.on_advertisement(NEIGHBOUR, NEIGHBOUR_MAC, false, true);
+
+    MacAddress out;
+    h.cache.lookup(NEIGHBOUR, out); // -> DELAY
+    h.sent.clear();
+
+    h.cache.confirm_reachability(NEIGHBOUR);
+    ASSERT_TRUE(h.cache.state_of(NEIGHBOUR) == NeighbourState::REACHABLE)
+        << "the transport said it is working, so it is";
+
+    h.advance(NeighbourCache::DELAY_FIRST_PROBE_TIME_MS * 2);
+    ASSERT_TRUE(h.sent.empty()) << "and no probe is ever sent - the connection was the evidence";
+}
+
+TEST(NeighbourCache, WithoutConfirmationDelayBecomesAUnicastProbe)
+{
+    CacheHarness h;
+    MacAddress mac;
+    h.cache.lookup(NEIGHBOUR, mac);
+    h.cache.on_advertisement(NEIGHBOUR, NEIGHBOUR_MAC, false, true);
+    MacAddress out;
+    h.cache.lookup(NEIGHBOUR, out); // -> DELAY
+    h.sent.clear();
+
+    h.advance(NeighbourCache::DELAY_FIRST_PROBE_TIME_MS + 500);
+
+    ASSERT_TRUE(h.cache.state_of(NEIGHBOUR) == NeighbourState::PROBE) << "state";
+    ASSERT_TRUE(h.sent.size() >= 1) << "a probe goes out";
+    ASSERT_TRUE(!h.sent[0].is_multicast()) << "unicast this time - the address is known, so there is no reason to "
+                                              "trouble the rest of the segment";
+    ASSERT_TRUE(h.sent[0].unicast_to == NEIGHBOUR_MAC) << "to the cached address";
+}
+
+TEST(NeighbourCache, AProbedNeighbourThatAnswersReturnsToReachable)
+{
+    CacheHarness h;
+    MacAddress mac;
+    h.cache.lookup(NEIGHBOUR, mac);
+    h.cache.on_advertisement(NEIGHBOUR, NEIGHBOUR_MAC, false, true);
+    MacAddress out;
+    h.cache.lookup(NEIGHBOUR, out);
+    h.advance(NeighbourCache::DELAY_FIRST_PROBE_TIME_MS + 500);
+    ASSERT_TRUE(h.cache.state_of(NEIGHBOUR) == NeighbourState::PROBE) << "probing";
+
+    h.cache.on_advertisement(NEIGHBOUR, NEIGHBOUR_MAC, true, true);
+    ASSERT_TRUE(h.cache.state_of(NEIGHBOUR) == NeighbourState::REACHABLE) << "confirmed again";
+}
+
+TEST(NeighbourCache, ANeighbourThatNeverAnswersProbesIsForgotten)
+{
+    CacheHarness h;
+    MacAddress mac;
+    h.cache.lookup(NEIGHBOUR, mac);
+    h.cache.on_advertisement(NEIGHBOUR, NEIGHBOUR_MAC, false, true);
+    MacAddress out;
+    h.cache.lookup(NEIGHBOUR, out);
+
+    h.advance(NeighbourCache::DELAY_FIRST_PROBE_TIME_MS
+              + NeighbourCache::RETRANS_TIMER_MS * (NeighbourCache::MAX_UNICAST_SOLICIT + 2));
+
+    ASSERT_TRUE(!h.cache.contains(NEIGHBOUR)) << "a neighbour that stopped answering is dropped";
+}
+
+TEST(NeighbourCache, AnUnansweredResolutionGivesUpRatherThanSolicitingForever)
+{
+    CacheHarness h;
+    MacAddress mac;
+    h.cache.lookup(NEIGHBOUR, mac);
+
+    h.advance(NeighbourCache::RETRANS_TIMER_MS * (NeighbourCache::MAX_MULTICAST_SOLICIT + 2));
+
+    ASSERT_TRUE(h.cache.state_of(NEIGHBOUR) == NeighbourState::INCOMPLETE && !h.cache.contains(NEIGHBOUR))
+        << "the entry is gone rather than soliciting indefinitely";
+    ASSERT_TRUE(h.sent.size() <= static_cast<size_t>(NeighbourCache::MAX_MULTICAST_SOLICIT))
+        << "and no more than the solicitation budget went out, got " + std::to_string(h.sent.size());
+}
+
+TEST(NeighbourCache, ConfirmationEventuallyAgesBackToStaleButTheMappingSurvives)
+{
+    // The distinction from an ARP entry expiring: what times out is the
+    // *verification*, not the mapping. The address is still there and still
+    // used - it has simply stopped being proven.
+    CacheHarness h;
+    resolve_to_reachable(h);
+    h.sent.clear();
+
+    h.advance(NeighbourCache::REACHABLE_TIME_MS + 1000);
+
+    ASSERT_TRUE(h.cache.state_of(NEIGHBOUR) == NeighbourState::STALE) << "verification aged out";
+    ASSERT_TRUE(h.cache.contains(NEIGHBOUR)) << "but the mapping is still known";
+
+    MacAddress out;
+    ASSERT_TRUE(h.cache.lookup(NEIGHBOUR, out) && out == NEIGHBOUR_MAC) << "and still usable without re-resolving";
+}
+
+TEST(NeighbourCache, AStaleEntryDoesNotDecayOnItsOwn)
+{
+    // STALE has no state timer by design. What moves it on is *sending* to
+    // it, not the passage of time - which is precisely the difference from an
+    // ARP entry counting down to eviction. (An unused STALE entry is garbage
+    // collected eventually - see GC_STALE_TIME_MS - but never re-probed.)
+    CacheHarness h;
+    resolve_to_reachable(h);
+    h.advance(NeighbourCache::REACHABLE_TIME_MS + 1000); // -> STALE
+    h.sent.clear();
+
+    h.advance(NeighbourCache::GC_STALE_TIME_MS - 2000);
+
+    ASSERT_TRUE(h.cache.state_of(NEIGHBOUR) == NeighbourState::STALE)
+        << "a STALE entry sits unchanged rather than decaying";
+    ASSERT_TRUE(h.cache.contains(NEIGHBOUR)) << "and is still there";
+    ASSERT_TRUE(h.sent.empty()) << "having triggered nothing, because nothing was sent to it";
+}
+
+TEST(NeighbourCache, AConflictingAdvertisementWithoutOverrideIsIgnored)
+{
+    // What stops a proxy, or a host that has made a mistake, silently taking
+    // over a neighbour that is working perfectly well.
+    CacheHarness h;
+    resolve_to_reachable(h);
+
+    h.cache.on_advertisement(NEIGHBOUR, OTHER_MAC, false, false);
+
+    MacAddress out;
+    h.cache.lookup(NEIGHBOUR, out);
+    ASSERT_TRUE(out == NEIGHBOUR_MAC) << "the cached address stands";
+}
+
+TEST(NeighbourCache, AConflictingAdvertisementWithOverrideReplacesTheMapping)
+{
+    CacheHarness h;
+    resolve_to_reachable(h);
+
+    h.cache.on_advertisement(NEIGHBOUR, OTHER_MAC, false, true);
+
+    MacAddress out;
+    h.cache.lookup(NEIGHBOUR, out);
+    ASSERT_TRUE(out == OTHER_MAC) << "an override replaces it";
+    ASSERT_TRUE(h.cache.state_of(NEIGHBOUR) == NeighbourState::DELAY
+                || h.cache.state_of(NEIGHBOUR) == NeighbourState::STALE)
+        << "and the new address is unverified until something proves it";
+}
+
+TEST(NeighbourCache, AnAdvertisementForANeighbourNobodyAskedAboutIsIgnored)
+{
+    // RFC 4861: do not create an entry. Otherwise anyone on the link could fill
+    // this cache with addresses the host has no interest in.
+    CacheHarness h;
+
+    h.cache.on_advertisement(IPv6Address("fe80::99"), OTHER_MAC, true, true);
+
+    ASSERT_TRUE(h.cache.size() == 0) << "no entry is created for an unsolicited advertisement";
+}
+
+TEST(NeighbourCache, HearingASolicitationLearnsTheSenderAsStaleNotReachable)
+{
+    // Hearing from a neighbour proves it can send to us. It says nothing about
+    // whether we can send to it, and on an asymmetric link those genuinely
+    // differ - which is the assumption ARP makes and NDP deliberately does not.
+    CacheHarness h;
+
+    h.cache.on_solicitation_from(NEIGHBOUR, NEIGHBOUR_MAC);
+
+    ASSERT_TRUE(h.cache.contains(NEIGHBOUR)) << "the mapping is learned";
+    ASSERT_TRUE(h.cache.state_of(NEIGHBOUR) == NeighbourState::STALE)
+        << "but unverified - we have not proven we can reach them";
+
+    MacAddress out;
+    ASSERT_TRUE(h.cache.lookup(NEIGHBOUR, out) && out == NEIGHBOUR_MAC)
+        << "and it is usable straight away, saving a resolution";
+}
+
+TEST(NeighbourCache, ASolicitationWithNoLinkLayerOptionTeachesNothing)
+{
+    // A duplicate-address-detection solicitation carries no link-layer option,
+    // because its source is the unspecified address. Learning an empty MAC from
+    // it would poison the cache with an unusable entry.
+    CacheHarness h;
+
+    h.cache.on_solicitation_from(NEIGHBOUR, MacAddress());
+
+    ASSERT_TRUE(h.cache.size() == 0) << "nothing is learned from a message carrying no address";
+}
+
+TEST(NeighbourCache, TheCacheIsBounded)
+{
+    // Entries are created by traffic from the link, so an unbounded cache is a
+    // remote party's decision about this host's memory.
+    CacheHarness h;
+    for (size_t i = 0; i < NeighbourCache::MAX_ENTRIES + 50; i++)
+    {
+        MacAddress mac;
+        h.cache.lookup(IPv6Address("2001:db8::" + std::to_string(i + 1)), mac);
+    }
+
+    ASSERT_TRUE(h.cache.size() <= NeighbourCache::MAX_ENTRIES)
+        << "the cache must not grow without bound, got " + std::to_string(h.cache.size());
+}
+
+TEST(NeighbourCache, TheNextTimerIsTheEarliestEntryAndAStaleEntryHasNone)
+{
+    CacheHarness h;
+    ASSERT_TRUE(!h.cache.ms_until_next_timer().has_value()) << "an empty cache has no timer armed";
+
+    MacAddress mac;
+    h.cache.lookup(NEIGHBOUR, mac); // INCOMPLETE: waiting out a solicitation
+    ASSERT_TRUE(h.cache.ms_until_next_timer() == NextTimer(NeighbourCache::RETRANS_TIMER_MS))
+        << "a resolution in flight is due one retransmit interval from now";
+
+    h.advance(400);
+    ASSERT_TRUE(h.cache.ms_until_next_timer() == NextTimer(NeighbourCache::RETRANS_TIMER_MS - 400))
+        << "and the deadline counts down as time passes";
+
+    h.cache.on_advertisement(NEIGHBOUR, NEIGHBOUR_MAC, false, true); // -> STALE
+    ASSERT_TRUE(h.cache.ms_until_next_timer() == NextTimer(NeighbourCache::GC_STALE_TIME_MS))
+        << "STALE has no state timer, only its garbage-collection deadline";
+}
+
+TEST(NeighbourCache, AnAdvertisementWithoutATargetAddressCannotCompleteResolution)
+{
+    // RFC 4861 7.2.5: an INCOMPLETE entry and an NA with no Target Link-Layer
+    // Address option - discard it. Accepting it would "resolve" the neighbour
+    // to the all-zero MAC and release every queued packet to it.
+    CacheHarness h;
+    MacAddress mac;
+    h.cache.lookup(NEIGHBOUR, mac);
+
+    h.cache.on_advertisement(NEIGHBOUR, MacAddress(), true, true);
+
+    ASSERT_TRUE(h.cache.state_of(NEIGHBOUR) == NeighbourState::INCOMPLETE) << "still resolving";
+    ASSERT_TRUE(!h.cache.contains(NEIGHBOUR)) << "with no usable address";
+    ASSERT_TRUE(!h.cache.lookup(NEIGHBOUR, mac)) << "so nothing may be sent to it";
+}
+
+namespace
+{
+    IPv6Address spoofed(size_t i)
+    {
+        return IPv6Address("2001:db8:bad::" + std::to_string(i + 1));
+    }
+
+    void flood(CacheHarness& h, size_t count)
+    {
+        for (size_t i = 0; i < count; i++)
+            h.cache.on_solicitation_from(spoofed(i), OTHER_MAC);
+    }
+}
+
+// Security review: a flood of spoofed solicitations used to fill the cache
+// for good, after which every resolution this host needed was refused.
+TEST(NeighbourCache, AFullCacheNeverRefusesAResolutionThisHostStarts)
+{
+    CacheHarness h;
+    flood(h, NeighbourCache::MAX_ENTRIES + 100);
+    ASSERT_EQ(h.cache.size(), NeighbourCache::MAX_ENTRIES);
+    h.sent.clear();
+
+    MacAddress mac;
+    ASSERT_FALSE(h.cache.lookup(NEIGHBOUR, mac));
+    EXPECT_TRUE(h.cache.tracks(NEIGHBOUR)) << "an unused flood entry is evicted to make room";
+    EXPECT_EQ(h.sent.size(), 1u) << "and the solicitation goes out";
+    EXPECT_LE(h.cache.size(), NeighbourCache::MAX_ENTRIES);
+}
+
+TEST(NeighbourCache, AnUnsolicitedFloodCannotEvictAnEntryInUse)
+{
+    CacheHarness h;
+    resolve_to_reachable(h);
+    flood(h, NeighbourCache::MAX_ENTRIES * 3);
+    EXPECT_TRUE(h.cache.contains(NEIGHBOUR)) << "only entries nobody has used are fair game for the link";
+    EXPECT_LE(h.cache.size(), NeighbourCache::MAX_ENTRIES);
+}
+
+TEST(NeighbourCache, AnUnusedStaleEntryIsCollected)
+{
+    CacheHarness h;
+    h.cache.on_solicitation_from(NEIGHBOUR, NEIGHBOUR_MAC);
+    h.advance(NeighbourCache::GC_STALE_TIME_MS - 250);
+    ASSERT_TRUE(h.cache.tracks(NEIGHBOUR));
+    h.advance(500);
+    EXPECT_FALSE(h.cache.tracks(NEIGHBOUR)) << "like Linux's gc_stale_time";
+    EXPECT_TRUE(h.sent.empty()) << "collected, not probed";
+}
+
+TEST(NeighbourCache, EachOriginHasItsOwnQuotaOfResolutionsInFlight)
+{
+    CacheHarness h;
+    MacAddress mac;
+    const IPv6Address mine("2001:db8:1::1");
+    h.cache.lookup(mine, mac, NeighbourOrigin::HOST);
+    for (size_t i = 0; i < NeighbourCache::REPLY_INCOMPLETE_MAX * 4; i++)
+        h.cache.lookup(spoofed(i), mac, NeighbourOrigin::REPLY);
+    EXPECT_EQ(h.cache.size(), NeighbourCache::REPLY_INCOMPLETE_MAX + 1) << "replies compete only with replies";
+    EXPECT_TRUE(h.cache.tracks(mine)) << "this host's own resolution is untouched";
+    EXPECT_TRUE(h.cache.tracks(spoofed(NeighbourCache::REPLY_INCOMPLETE_MAX * 4 - 1))) << "the newest is kept";
+    EXPECT_FALSE(h.cache.tracks(spoofed(0))) << "the oldest made room";
+
+    for (size_t i = 0; i < NeighbourCache::HOST_INCOMPLETE_MAX + 5; i++)
+        h.cache.lookup(IPv6Address("2001:db8:2::" + std::to_string(i + 1)), mac, NeighbourOrigin::HOST);
+    EXPECT_TRUE(h.cache.tracks(IPv6Address("2001:db8:2::" + std::to_string(NeighbourCache::HOST_INCOMPLETE_MAX + 5))))
+        << "a host lookup is never refused";
+}
+
+TEST(NeighbourCache, AReplyEntryIsPromotedWhenThisHostUsesIt)
+{
+    CacheHarness h;
+    h.cache.on_solicitation_from(NEIGHBOUR, NEIGHBOUR_MAC);
+    ASSERT_EQ(h.cache.origin_of(NEIGHBOUR), NeighbourOrigin::REPLY);
+    MacAddress mac;
+    h.cache.lookup(NEIGHBOUR, mac, NeighbourOrigin::REPLY);
+    EXPECT_EQ(h.cache.origin_of(NEIGHBOUR), NeighbourOrigin::REPLY) << "answering it is not using it";
+    h.cache.lookup(NEIGHBOUR, mac, NeighbourOrigin::HOST);
+    EXPECT_EQ(h.cache.origin_of(NEIGHBOUR), NeighbourOrigin::HOST);
+}
+
+TEST(NeighbourCache, AFullCacheKeepsEntriesItIsToldAreInUse)
+{
+    CacheHarness h;
+    h.cache.set_in_use_callback([] { return std::unordered_set<IPv6Address>{NEIGHBOUR}; });
+    h.cache.on_solicitation_from(NEIGHBOUR, NEIGHBOUR_MAC); // a REPLY entry, but the router's
+    MacAddress mac;
+    for (size_t i = 0; i < NeighbourCache::MAX_ENTRIES * 3; i++)
+        h.cache.lookup(IPv6Address("2001:db8:3::" + std::to_string(i + 1)), mac, NeighbourOrigin::HOST);
+    EXPECT_TRUE(h.cache.contains(NEIGHBOUR));
+}
+
+TEST(NeighbourCache, AFullCacheNeverGivesUpAResolvedEntryInUseForANewResolution)
+{
+    CacheHarness h;
+    resolve_to_reachable(h);
+    MacAddress mac;
+    ASSERT_TRUE(h.cache.lookup(NEIGHBOUR, mac)); // in use
+    flood(h, NeighbourCache::MAX_ENTRIES);
+    for (size_t i = 0; i < 2000; i++)
+    {
+        h.cache.lookup(IPv6Address("2001:db8:c0::" + std::to_string(i + 1)), mac);
+        if (i % 50 == 0)
+        {
+            h.advance(NeighbourCache::RETRANS_TIMER_MS * 4); // let resolutions give up
+            h.cache.confirm_reachability(NEIGHBOUR);          // still in use: its traffic is acked
+        }
+    }
+    EXPECT_TRUE(h.cache.contains(NEIGHBOUR));
+}
+
+TEST(NeighbourCache, ReplyTrafficCannotDisplaceThisHostsEntries)
+{
+    CacheHarness h;
+    MacAddress mac;
+    for (size_t i = 0; i < NeighbourCache::MAX_ENTRIES; i++)
+    {
+        const IPv6Address mine("2001:db8:4::" + std::to_string(i + 1));
+        h.cache.lookup(mine, mac, NeighbourOrigin::HOST);
+        h.cache.on_advertisement(mine, NEIGHBOUR_MAC, true, true);
+    }
+    ASSERT_EQ(h.cache.size(), NeighbourCache::MAX_ENTRIES);
+
+    h.cache.on_solicitation_from(spoofed(1), OTHER_MAC);
+    EXPECT_FALSE(h.cache.tracks(spoofed(1))) << "unsolicited learning finds no REPLY victim: refused";
+    EXPECT_FALSE(h.cache.lookup(spoofed(2), mac, NeighbourOrigin::REPLY));
+    EXPECT_FALSE(h.cache.tracks(spoofed(2))) << "a REPLY resolution likewise";
+    EXPECT_TRUE(h.cache.contains(IPv6Address("2001:db8:4::1"))) << "and nothing of this host's went";
+
+    h.cache.lookup(IPv6Address("2001:db8:5::1"), mac, NeighbourOrigin::HOST);
+    EXPECT_TRUE(h.cache.tracks(IPv6Address("2001:db8:5::1"))) << "while a HOST lookup still gets its slot";
+}

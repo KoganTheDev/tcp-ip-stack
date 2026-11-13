@@ -6,7 +6,7 @@
 
 // The `: uint16_t` is load-bearing, not decoration. Without an explicit
 // underlying type, an enum's range of *valid values* is only the smallest
-// bit-field that holds its enumerators - here 12 bits, since the largest is
+// bit-field that holds its enumerators - 12 bits when the largest was
 // 0x0806. Loading anything outside that range is undefined behavior, and this
 // field is read straight off the wire, where any of the 65536 values can
 // arrive. Naming the underlying type widens the valid range to all of
@@ -20,6 +20,7 @@ enum EtherType : uint16_t
 {
     IPv4 = 0x0800,
     ARP = 0x0806,
+    IPv6 = 0x86DD,
 };
 
 
@@ -29,6 +30,11 @@ public:
     Ethernet() = default;
     Ethernet(
         const Bytes& data); // Constructor that gets a bytestream and serializes it directly into an Ethernet object
+    // As above, but an IPv4 payload is parsed only as far as its IP header; the
+    // transport payload is left as opaque Raw bytes. The receive path uses this
+    // so that "for me / forward / drop" is decided from the IP header alone and
+    // a transit packet is relayed whatever its transport header looks like.
+    Ethernet(const Bytes& data, bool parse_ip_payload);
     Ethernet(const MacAddress& src, const MacAddress& dest, EtherType ethernet_protocol);
 
     // Implement protocol layer interface
@@ -42,9 +48,11 @@ public:
     EtherType get_ethernet_protocol() const { return this->_ethernet_protocol; }
 
 private:
+    void _parse(const Bytes& data, bool parse_ip_payload);
+
     MacAddress _src;
     MacAddress _dest;
-    EtherType _ethernet_protocol;
+    EtherType _ethernet_protocol{IPv4};
 
     static const std::map<EtherType, const std::string> ETHERTYPE_TO_NAME;
 };

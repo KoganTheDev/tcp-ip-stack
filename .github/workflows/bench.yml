@@ -1,0 +1,121 @@
+name: Benchmarks
+
+# Microbenchmark history, with charts. Every push to main runs the Google
+# Benchmark suite in bench/ and appends the numbers to the gh-pages branch;
+# benchmark-action/github-action-benchmark generates an index.html there with
+# one chart per benchmark over commits, so "did this get faster" is a picture.
+# Published at https://<owner>.github.io/<repo>/dev/bench/ (the action's default
+# benchmark-data-dir-path is dev/bench) once the repository owner enables
+# Settings > Pages > Deploy from a branch > gh-pages. See README.md, Benchmarks.
+#
+# Runner noise. These run on shared hosted runners: other tenants, CPU frequency
+# changes and a different host from one run to the next move a microbenchmark by
+# tens of percent without any code change. The alert threshold is therefore
+# loose (150%: a 1.5x slowdown) so that it fires on a real regression, not on a
+# bad draw; the charts are for the trend, and a small change shows up there over
+# several commits rather than as a failed run. The end-to-end transfer benchmark
+# is the noisiest.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing is writable unless a job asks. The job that publishes asks for
+# contents: write (to push gh-pages and to post the alert comment on a commit);
+# the pull-request job only reads.
+permissions:
+  contents: read
+
+jobs:
+  # Pull requests: run and compare against the history, push nothing. A PR must
+  # never write to gh-pages (an unmerged change would pollute the trend), and a
+  # PR from a fork gets a read-only token anyway. The result goes to the job
+  # summary; it does not fail the PR, because a single noisy run on a shared
+  # runner is not evidence.
+  compare:
+    name: compare (pull request)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: bench
+
+      # The JSON goes to a file (--benchmark_out), not stdout: make prints the
+      # build log to stdout too, and the two would be interleaved.
+      - name: Run the benchmarks
+        run: make bench BENCH_ARGS="--benchmark_min_time=0.5s --benchmark_format=json --benchmark_out=$PWD/bench-result.json --benchmark_out_format=json"
+
+      # continue-on-error: before the first push to main there is no gh-pages
+      # branch to compare with, and that must not turn every early PR red.
+      - name: Compare with the history on gh-pages
+        continue-on-error: true
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
+        with:
+          name: tcp-ip-stack microbenchmarks
+          tool: googlecpp
+          output-file-path: bench-result.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: false
+          save-data-file: false
+          summary-always: true
+          alert-threshold: "150%"
+          fail-on-alert: false
+
+  # main: run, publish to gh-pages, and fail on a regression.
+  publish:
+    name: publish (main)
+    # Only main writes history: a manual run on a feature branch would
+    # otherwise put its numbers in the trend.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # push gh-pages; comment on the commit when an alert fires
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: bench
+
+      - name: Run the benchmarks
+        run: make bench BENCH_ARGS="--benchmark_min_time=0.5s --benchmark_format=json --benchmark_out=$PWD/bench-result.json --benchmark_out_format=json"
+
+      # The action needs the gh-pages branch to exist; it does not create it.
+      # Do that once, as an empty orphan branch, so the first run needs no
+      # manual setup.
+      - name: Create gh-pages on the first run
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            echo "gh-pages already exists"
+            exit 0
+          fi
+          tmp="$(mktemp -d)"
+          git -C "$tmp" init -q -b gh-pages
+          git -C "$tmp" -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com \
+            commit -q --allow-empty -m "Initialize gh-pages for benchmark history"
+          git -C "$tmp" push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
+
+      - name: Publish and check for regressions
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
+        with:
+          name: tcp-ip-stack microbenchmarks
+          tool: googlecpp
+          output-file-path: bench-result.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          summary-always: true
+          alert-threshold: "150%"
+          comment-on-alert: true
+          fail-on-alert: true

@@ -9,6 +9,8 @@
 #include <string>
 #include <cstdint>
 #include <functional>
+#include <optional>
+#include <random>
 
 #include "tun_wrapper.h"
 #include "packet_channel.h"
@@ -20,6 +22,7 @@
 #include "dhcp_client.h"
 #include "dns_resolver.h"
 #include "network_addresses.h"
+#include "ip_address.h"
 #include "ethernet.h"
 #include "arp.h"
 #include "ip.h"
@@ -29,6 +32,10 @@
 #include "udp_socket.h"
 #include "icmp.h"
 #include "syn_cookie.h"
+#include "ipv6.h"
+#include "icmpv6.h"
+#include "neighbour_cache.h"
+#include "ipv6_autoconfig.h"
 
 // Ties Ethernet/Arp/Ip/Tcp/Udp/Icmp together over a PacketChannel - a TAP
 // device or an AF_PACKET socket, indistinguishable from here - into something
@@ -159,6 +166,15 @@ public:
     void set_forwarding(bool enabled) { _forwarding_enabled = enabled; }
     bool forwarding() const { return _forwarding_enabled; }
 
+    // ECN for TCP (RFC 3168), like Linux's net.ipv4.tcp_ecn: OFF (0), ON (1,
+    // ask on connect() and accept when asked) or PASSIVE (2, accept only).
+    // PASSIVE is the default, and Linux's, for the reason Linux chose it:
+    // answering a peer that asks costs nothing, while asking can meet a
+    // middlebox that drops ECN-setup SYNs. Applies to connections opened or
+    // accepted after the call.
+    void set_tcp_ecn(TcpEcnMode mode) { _tcp_ecn = mode; }
+    TcpEcnMode tcp_ecn() const { return _tcp_ecn; }
+
     // Routes beyond the two derived from the interface. Use this for a route
     // to a network reachable through some router other than the default.
     //
@@ -184,9 +200,41 @@ public:
     // of one packet each. A bound is also what makes SYN cookies meaningful -
     // cookies are the fallback for when this limit is hit, not a replacement
     // for having one.
-    void listen(uint16_t port, size_t backlog = DEFAULT_LISTEN_BACKLOG);
+    //
+    // family picks which SYNs the port answers: both (the default, and what
+    // an AF_INET6 socket without IPV6_V6ONLY means), or one family only.
+    enum class ListenFamily
+    {
+        ANY,
+        IPV4_ONLY,
+        IPV6_ONLY,
+    };
+    // local, if given, is the one address the port answers on - a socket
+    // bound to a specific address - and a SYN (or SYN-cookie ACK) sent to any
+    // other of this host's addresses is treated as finding no listener.
+    void listen(uint16_t port, size_t backlog = DEFAULT_LISTEN_BACKLOG, ListenFamily family = ListenFamily::ANY,
+                const std::optional<IpAddress>& local = std::nullopt);
 
     static constexpr size_t DEFAULT_LISTEN_BACKLOG = 128;
+
+    // Stops accepting connections on a port, as closing a listening socket
+    // does: connections waiting in its accept queue are reset (their peers
+    // were told the handshake succeeded, and nobody will ever accept them),
+    // half-open ones are dropped silently. Connections already accepted are
+    // not affected.
+    void unlisten(uint16_t port);
+
+    // Whether accept(port) would return a connection right now. A socket
+    // layer's readiness test for a listening socket (EPOLLIN), which must not
+    // pop anything to find out.
+    bool has_pending_accept(uint16_t port) const;
+
+    // Told whenever a connection joins a port's accept queue, with that port.
+    // The listening-socket half of readiness notification: without it the
+    // only way to learn a connection is waiting is to keep calling accept().
+    // One slot, like the other application-facing callbacks here.
+    using AcceptReadyFn = std::function<void(uint16_t port)>;
+    void set_accept_ready_callback(AcceptReadyFn callback) { _on_accept_ready = std::move(callback); }
     // Separate from the backlog above, which counts only connections that
     // finished the handshake: how many may sit in SYN_RECEIVED on one listening
     // port at once. Without it a SYN flood (whose spoofed sources never
@@ -201,10 +249,55 @@ public:
     // logged: at this rate someone is likely guessing cookies.
     static constexpr uint64_t COOKIE_FAILURE_WARNING_THRESHOLD = 1024;
 
+    // TEST SEAM - never call this in production. Replaces every secret the
+    // stack drew from std::random_device - the ISN key (RFC 6528's F), the
+    // SYN-cookie key and the challenge-ACK jitter - with values derived from
+    // `seed`, and takes the ISN clock term (M) from this stack's own
+    // on_time_passed() clock rather than the wall clock. A deterministic
+    // simulator needs both: with them a seed reproduces every sequence number,
+    // and a test can choose a seed that puts an ISN just below 2^32. Without
+    // it (the default) nothing changes. Call before any traffic.
+    //
+    // Anyone who knows the seed can predict ISNs and mint SYN cookies, which
+    // is exactly what the secrets exist to prevent.
+    void set_secret_seed(uint64_t seed);
+
+    // What set_secret_seed() derives from a seed, exposed so a test can
+    // predict the ISNs a seeded stack will choose.
+    struct SeededSecrets
+    {
+        uint64_t isn_key_low;
+        uint64_t isn_key_high;
+        uint64_t cookie_key_low;
+        uint64_t cookie_key_high;
+        uint64_t challenge_ack_seed;
+        static SeededSecrets from_seed(uint64_t seed);
+    };
+
     // ACKs that arrived on a port in cookie mode and failed the cookie check,
     // since the stack started. Each is a forged or mangled ACK - a steadily
     // climbing count is a blind spoofer guessing cookies (see syn_cookie.h).
     uint64_t syn_cookie_check_failures() const { return _syn_cookie_failures; }
+
+    // RFC 5961 challenge ACKs, across every connection. Each is a reply to a
+    // segment anyone can forge (an in-window RST, a SYN on an open
+    // connection, an ACK far behind SND.UNA), so section 7 asks for them to
+    // be throttled. The budget is per stack and per second of the stack's
+    // elapsed-ms clock: about CHALLENGE_ACK_LIMIT_PER_SECOND, which is Linux's
+    // net.ipv4.tcp_challenge_ack_limit default, with each second's actual
+    // limit drawn at random (see _draw_challenge_ack_limit). Suppressed ones
+    // are counted too: a climbing count means somebody is probing.
+    static constexpr uint64_t CHALLENGE_ACK_LIMIT_PER_SECOND = 1000;
+
+    // Frames a channel dropped for a transient reason (TransientWriteError:
+    // a full transmit queue, an interrupted write, a link that is down), since
+    // the stack started. Each is treated as loss on the wire - TCP retransmits,
+    // ARP and DNS retry - so it never surfaces as an exception; this count is
+    // where it shows instead. Fatal channel errors are not counted here: they
+    // propagate out of poll()/on_time_passed()/send().
+    uint64_t transmit_drops() const { return _transmit_drops; }
+    uint64_t challenge_acks_sent() const { return _challenge_acks_sent; }
+    uint64_t challenge_acks_suppressed() const { return _challenge_acks_suppressed; }
 
     // Pops one ESTABLISHED connection waiting on this port, or nullptr if
     // none are ready. The returned pointer is owned by NetworkStack for the
@@ -213,13 +306,14 @@ public:
     TcpConnection* accept(uint16_t port);
 
     // Actively opens a connection to remote_ip:remote_port from a freshly
-    // allocated ephemeral local port. Returns immediately with a connection
+    // allocated ephemeral local port, or from local_port if it is not 0 (a
+    // socket bound before connect()) - nullptr if that four-tuple is taken. Returns immediately with a connection
     // in SYN_SENT (or briefly LISTEN, if the peer's MAC still needs
     // resolving) - the handshake completes asynchronously as segments and
     // ARP replies arrive via poll(). The returned pointer has the same
     // whole-lifetime ownership as accept()'s. Returns nullptr if every
     // ephemeral port is already connected to this same remote ip:port.
-    TcpConnection* connect(const IPv4Address& remote_ip, uint16_t remote_port);
+    TcpConnection* connect(const IpAddress& remote_ip, uint16_t remote_port, uint16_t local_port = 0);
 
     // Looks a connection up by the stable id from TcpConnection::get_id(),
     // or nullptr if it's since been reaped. This is the safe way to hold
@@ -252,15 +346,20 @@ public:
     // observable rather than silent.
     bool unbind_udp(uint16_t port);
 
+    // Whether anything - an application, DHCP, a DNS query - has the port
+    // bound. bind_udp() would hand that socket over rather than fail, so a
+    // socket layer asks this first to report EADDRINUSE.
+    bool udp_port_bound(uint16_t port) const { return _udp_sockets.count(port) != 0; }
+
     // Sends an ICMP Echo Request - a ping. identifier and sequence are echoed
     // back untouched by the peer, which is how a reply is matched to the
     // request that caused it; the payload comes back verbatim too, which is
     // what lets a ping measure a round trip without any state at this end.
-    void send_echo_request(const IPv4Address& destination, uint16_t identifier, uint16_t sequence,
+    void send_echo_request(const IpAddress& destination, uint16_t identifier, uint16_t sequence,
                            const Bytes& payload = Bytes());
 
     // Notified when an Echo Reply arrives: source, identifier, sequence, payload.
-    using EchoReplyFn = std::function<void(const IPv4Address&, uint16_t, uint16_t, const Bytes&)>;
+    using EchoReplyFn = std::function<void(const IpAddress&, uint16_t, uint16_t, const Bytes&)>;
     void set_echo_reply_callback(EchoReplyFn callback) { _on_echo_reply = std::move(callback); }
 
     // Installs a permanent IP->MAC mapping that never ages out and is never
@@ -273,6 +372,81 @@ public:
     // request/reply exchange first, which makes anything built on top of
     // address resolution deterministic.
     void add_static_arp_entry(const IPv4Address& ip, const MacAddress& mac);
+
+    // ---- IPv6 -------------------------------------------------------------
+    //
+    // Dual stack: everything above IP (TCP, UDP, echo, connect()/listen()/
+    // bind_udp()) takes either family through IpAddress, and a listening port
+    // accepts both unless listen() says otherwise. IPv6 runs on the first
+    // interface only, and is off until one of the two calls below turns it on,
+    // so a stack that never asks for it puts not one IPv6 frame on the wire.
+    //
+    // Scope, deliberately narrower than v4's:
+    //  - no forwarding: a v6 packet for another host is dropped, whatever
+    //    set_forwarding() says. Forwarding stays IPv4-only.
+    //  - no fragmentation in either direction. Sending never fragments (RFC
+    //    8200 5 makes it the source's job, and PMTUD is how TCP avoids it); a
+    //    received packet carrying a Fragment header is dropped, not
+    //    reassembled. Real v6 traffic is rarely fragmented, and a v6 reassembler
+    //    is a second copy of the bounded-memory problem IpReassembler solves.
+    //  - no Redirects (ignored, so a forged one cannot move a route), no MLD
+    //    reports (multicast group membership is local filtering only), no
+    //    DHCPv6, no privacy addresses.
+
+    // Turns IPv6 on with stateless autoconfiguration (RFC 4862): forms the
+    // link-local address from the MAC (modified EUI-64), runs DAD on it,
+    // solicits a router, and turns every /64 an RA offers with the A flag into
+    // a global address after DAD. Idempotent.
+    void enable_ipv6();
+    // A static address, usable at once. No DAD is run for it, the same as
+    // `ip addr add ... nodad`: whoever configures an address by hand is taken
+    // to know it is theirs. Its prefix becomes an on-link route. Turns IPv6 on
+    // without autoconfiguration if enable_ipv6() was not called. Returns false
+    // if MAX_IPV6_ADDRESSES are already configured.
+    bool add_ipv6_address(const IPv6Address& address, uint8_t prefix_length = 64);
+    bool ipv6_enabled() const { return _v6.enabled; }
+    // The addresses this host may use and answers for: static ones, then
+    // SLAAC ones that passed DAD and whose valid lifetime has not run out
+    // (PREFERRED, or DEPRECATED - still answered for, not chosen as a source).
+    std::vector<Ipv6ConfiguredAddress> ipv6_addresses() const;
+    // Null unless enable_ipv6() was called.
+    const Ipv6Autoconfig* ipv6_autoconfig() const { return _v6.autoconfig.get(); }
+    // Null until IPv6 is on.
+    const NeighbourCache* neighbour_cache() const { return _v6.neighbours.get(); }
+
+    // A v6 on-link prefix (RFC 4861 6.3.4), from an RA's L flag or a static
+    // address. Off-link destinations go to the default routers below.
+    static constexpr uint64_t NO_EXPIRY = UINT64_MAX;
+    struct Ipv6Route
+    {
+        IPv6Address prefix;
+        uint8_t prefix_length = 0;
+        uint64_t expires_ms = NO_EXPIRY; // on the stack's clock
+    };
+    struct Ipv6Router
+    {
+        IPv6Address address; // link-local, as RAs come from
+        uint64_t expires_ms = NO_EXPIRY;
+    };
+    const std::vector<Ipv6Route>& ipv6_on_link_prefixes() const { return _v6.on_link; }
+    const std::vector<Ipv6Router>& ipv6_default_routers() const { return _v6.routers; }
+    // Packets waiting on neighbour resolution, across all neighbours.
+    size_t ipv6_pending_packets() const { return _v6.pending_total; }
+
+    // Bounds on everything an unauthenticated NDP message can make this host
+    // hold (RFC 3756 4.3: every table fed from the link is something an
+    // on-link attacker can try to exhaust). Each refuses new entries once
+    // full; existing ones age out on their advertised lifetimes.
+    // NeighbourCache::MAX_ENTRIES and Ipv6Autoconfig::MAX_ADDRESSES bound those
+    // two components the same way.
+    static constexpr size_t MAX_IPV6_ADDRESSES = 16; // static; SLAAC has Ipv6Autoconfig::MAX_ADDRESSES
+    static constexpr size_t MAX_IPV6_ON_LINK_PREFIXES = 16;
+    static constexpr size_t MAX_IPV6_DEFAULT_ROUTERS = 4;
+    static constexpr size_t MAX_IPV6_PENDING_PER_NEIGHBOUR = 16;
+    static constexpr size_t MAX_IPV6_PENDING_TOTAL = 256;
+    // RFC 8200 5: every v6 link carries at least this, and a path MTU report
+    // below it is not believed (RFC 8201 4).
+    static constexpr uint16_t IPV6_MINIMUM_MTU = 1280;
 
     // Reads and processes frames waiting on the channel, then reaps any
     // connection that finished closing.
@@ -305,14 +479,53 @@ public:
     // here means what its RFC says it means regardless of how often, or how
     // regularly, the caller gets round to calling. See
     // TcpConnection::on_time_passed() for the full argument.
+    //
+    // Only connections with a timer due are visited: they wait in a queue
+    // ordered by deadline (see _timer_queue), so the cost is the number of
+    // timers that fire, not the number of connections - an idle connection
+    // costs nothing here however many there are.
+    //
+    // Calling it more often than ms_until_next_timer() asks for is harmless,
+    // and is how the caller keeps the stack's clock current: the stack has no
+    // clock of its own, so anything it timestamps (an RTT sample, a TCP
+    // timestamp, a half-open connection's age) is stamped with the time last
+    // reported here. A reactor should report the time before each poll().
     void on_time_passed(uint32_t elapsed_ms);
+
+    // How long the caller may wait before on_time_passed() has anything to do:
+    // milliseconds until the earliest armed timer anywhere in the stack - a
+    // connection's, ARP's, reassembly's, DHCP's or DNS's - or std::nullopt
+    // when none is armed. 0 means something is already due.
+    //
+    // The contract: report time with on_time_passed() at or after this many
+    // milliseconds and whatever is due fires; earlier is harmless. Anything
+    // the caller does to the stack in the meantime (poll(), send(), close(),
+    // connect()) can arm a timer, so ask again after each of those - it is
+    // cheap enough to ask on every pass of an event loop.
+    //
+    // Relative rather than an absolute deadline because the stack's clock is
+    // only the sum of what on_time_passed() reported; the caller's own clock is
+    // the one to add this to. Saturates at UINT32_MAX, which is as far ahead
+    // as on_time_passed() can report anyway.
+    //
+    // Logically const; tidies the timer queue as it looks (see
+    // _tidy_timer_queue), which is why that is mutable.
+    NextTimer ms_until_next_timer() const;
+
+    // The stack's clock: the sum of every on_time_passed() so far.
+    uint64_t now_ms() const { return _now_ms; }
+
+    // Connections whose timers on_time_passed() has run, since the stack
+    // started - a cost counter. With nothing due it should not move, however
+    // many connections there are.
+    uint64_t connection_timer_runs() const { return _connection_timer_runs; }
 
 private:
     struct ConnectionKey
     {
-        IPv4Address remote_ip;
-        uint16_t remote_port;
-        uint16_t local_port;
+        IpAddress remote_ip;
+        uint16_t remote_port{};
+        uint16_t local_port{};
         bool operator==(const ConnectionKey& other) const;
     };
     struct ConnectionKeyHash
@@ -344,15 +557,37 @@ private:
     // Feeds one fragment to the reassembler and, if that completed a datagram,
     // rebuilds it and sends it on to _dispatch_transport as though it had
     // arrived whole.
-    void _handle_ip_fragment(const Ip& ip);
+    void _handle_ip_fragment(const Ip& ip, const Bytes& ip_bytes);
     // Protocol demux for a complete datagram. Split out of _handle_ip so a
     // reassembled datagram takes exactly the same path as one that was never
     // fragmented, rather than a parallel one that could drift from it.
-    void _dispatch_transport(const Ip& ip);
-    void _handle_tcp(const Ip& ip, const Tcp& tcp);
-    void _handle_udp(const Ip& ip, const Udp& udp);
+    //
+    // `received` is the packet as it arrived - or, for a reassembled datagram,
+    // the first fragment's header plus the first 8 payload bytes as they
+    // arrived - and is what an ICMP error about it quotes (RFC 792).
+    void _dispatch_transport(const Ip& ip, const Bytes& received);
+    // Family-neutral from here up: the caller has verified the transport
+    // checksum over its own pseudo-header (RFC 793 / RFC 8200 8.1).
+    void _handle_tcp(const IpAddress& source, const IpAddress& destination, const Tcp& tcp, Ecn ecn);
+    // Hands a datagram to the socket bound to its port. False when nothing
+    // is bound there, so the caller answers with its own family's Port
+    // Unreachable.
+    bool _deliver_udp(const IpAddress& source, const IpAddress& destination, const Udp& udp);
+    void _handle_udp(const Ip& ip, const Udp& udp, const Bytes& received);
     void _handle_icmp(const Ip& ip, const Icmp& icmp);
     void _reap_closed_connections();
+    // Puts a connection in the tables and in the timer queue. Every
+    // connection the stack creates comes through here.
+    void _register_connection(const ConnectionKey& key, std::unique_ptr<TcpConnection> connection);
+    // Makes the timer queue hold this connection's current deadline - called
+    // whenever it may have moved (TcpConnection's timer-changed callback) and
+    // after its timers have run.
+    void _schedule_connection_timer(uint64_t connection_id) const;
+    // Pops stale entries off the front of the timer queue until the front is
+    // a connection's real, current deadline.
+    void _tidy_timer_queue() const;
+    // The connection's next deadline on the stack's clock, or NO_DEADLINE.
+    uint64_t _connection_deadline(const TcpConnection& connection) const;
     // Wires a connection's state-change notification to push its id onto
     // _pending_reap_ids the instant it reaches CLOSED - never erases
     // directly here. This fires synchronously from inside the connection's
@@ -362,35 +597,51 @@ private:
     // method. The actual erase happens later, safely, in
     // _reap_closed_connections().
     void _watch_for_close(TcpConnection& connection);
+    // Everything a freshly created connection is hooked up to: the close watch
+    // above, and the stack-wide challenge-ACK budget.
+    void _wire_connection(TcpConnection& connection);
+    // The gate installed on every connection (TcpConnection::
+    // set_challenge_ack_gate): true while this second's budget lasts.
+    bool _may_send_challenge_ack();
+    uint64_t _draw_challenge_ack_limit();
     // Records a freshly accepted SYN_RECEIVED connection against its port, and
     // removes it on its first transition anywhere else - completion, RST,
     // give-up, eviction - which is every way out of the state, so the record
     // cannot leak.
     void _track_half_open(TcpConnection& connection, uint16_t local_port);
     // Answers a SYN with a stateless SYN-ACK whose ISN is a SYN cookie.
-    void _send_syn_cookie(const Ip& ip, const Tcp& tcp);
+    void _send_syn_cookie(const IpAddress& source, const IpAddress& destination, const Tcp& tcp);
     // For an ACK matching no connection: if it carries a valid cookie for a
     // listening port that sent cookies recently, creates the connection
     // (established) and returns true. False means: not a cookie ACK.
-    bool _try_complete_cookie_handshake(const Ip& ip, const Tcp& tcp);
+    bool _try_complete_cookie_handshake(const IpAddress& source, const IpAddress& destination, const Tcp& tcp, Ecn ecn);
 
     // dont_fragment sets the DF bit, which is what asks the network to report
     // a too-small link rather than silently splitting the packet. That report
     // is the only way a sender can learn the path MTU, so TCP sets it; UDP does
     // not, because this stack fragments oversized datagrams itself and there is
     // no per-connection state to adjust in response.
-    void _send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol, const Bytes& payload,
-                         bool dont_fragment = false);
-    void _send_tcp_segment(const IPv4Address& dest_ip, const Tcp& header, const Bytes& payload);
+    // `ecn` goes in the TOS octet's ECN field (RFC 3168); DSCP is 0.
+    void _send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol, const Bytes& payload, bool dont_fragment = false,
+                         Ecn ecn = Ecn::NOT_ECT);
+    // local_v6 pins the source of a v6 segment - a connection's own address;
+    // without it one is chosen for the destination.
+    void _send_tcp_segment(const IpAddress& destination, const Tcp& header, const Bytes& payload,
+                           Ecn ecn = Ecn::NOT_ECT, const std::optional<IPv6Address>& local_v6 = std::nullopt);
     // RFC 793 SS3.4's reset-generation rule for a segment that doesn't match
     // any existing connection and isn't a SYN to a listening port: no
     // TcpConnection exists to answer through, so this builds and sends the
     // RST directly.
-    void _send_rst(const Ip& ip, const Tcp& tcp);
+    void _send_rst(const IpAddress& source, const IpAddress& destination, const Tcp& tcp);
+    // The MSS this host advertises to a peer of this family: the link MTU less
+    // 40 bytes of headers for IPv4, 60 for IPv6.
+    uint16_t _local_mss_for(const IpAddress& peer) const;
+    // A new connection's send function, bound to its peer.
+    TcpConnection::SendSegmentEcnFn _segment_sender(const IpAddress& peer, const IpAddress& local);
     // Sends a UDP datagram if the peer's MAC is already known, otherwise
     // queues it and kicks off ARP resolution (see _pending_outbound_datagrams)
     // - the UDP-side counterpart to connect()'s resolve-and-queue.
-    void _send_or_queue_udp(const IPv4Address& dest_ip, const Udp& header, const Bytes& payload);
+    void _send_or_queue_udp(const IpAddress& destination, const Udp& header, const Bytes& payload);
     void _send_udp_datagram(const IPv4Address& dest_ip, const Udp& header, const Bytes& payload);
     // Flushes every datagram queued for ip once its MAC has just been learned.
     void _flush_pending_outbound_datagrams(size_t index, const IPv4Address& ip);
@@ -403,7 +654,14 @@ private:
     void _send_icmp_message(const IPv4Address& dest_ip, const Icmp& header, const Bytes& payload);
     // RFC 792: Destination Unreachable/Port Unreachable, for a UDP
     // datagram that arrived at a port nothing is bound to.
-    void _send_icmp_port_unreachable(const Ip& ip);
+    void _send_icmp_port_unreachable(const Ip& ip, const Bytes& received);
+    // Destination Unreachable code 2, for a datagram to this host carrying an
+    // IP protocol number nothing here handles (RFC 1122 3.2.2.1).
+    void _send_icmp_protocol_unreachable(const Ip& ip, const Bytes& received);
+    // Parameter Problem (RFC 792), code 0: `pointer` is the offset into the IP
+    // header of the octet that made the header undeliverable. Sent only when
+    // the datagram was discarded for it, by a host or a router alike.
+    void _send_icmp_parameter_problem(const Ip& ip, const Bytes& received, uint8_t pointer);
     // The two errors only a router generates, both quoting the packet that
     // caused them so the sender can tell which of its flows died.
     //
@@ -413,11 +671,11 @@ private:
     // timeout, is the one a host emits. This is what makes traceroute work:
     // each probe is sent with a TTL one larger than the last, and the hop that
     // discards it names itself by replying.
-    void _send_icmp_time_exceeded(const Ip& ip);
+    void _send_icmp_time_exceeded(const Ip& ip, const Bytes& received);
     // Destination Unreachable code 0 - no route. Distinct from the port
     // unreachable a host sends: that one means "this machine, wrong port", this
     // one means "I have no idea how to reach that network at all".
-    void _send_icmp_net_unreachable(const Ip& ip);
+    void _send_icmp_net_unreachable(const Ip& ip, const Bytes& received);
     // Consumes one token from the ICMP error budget, returning false when there
     // is none. Errors are generated in response to received traffic, so without
     // a bound a peer sets the rate at which this stack emits them - and can aim
@@ -489,15 +747,30 @@ private:
     // hole rather than a feature. Linux makes the same choice with
     // net.ipv4.ip_forward.
     bool _forwarding_enabled = false;
+    TcpEcnMode _tcp_ecn = TcpEcnMode::PASSIVE;
+    // False until the constructor has finished: configure_interface() does
+    // not announce the address it is given at construction.
+    bool _constructed = false;
     MacAddress _resolve_mac(size_t interface_index, const IPv4Address& ip) const;
 
     uint16_t _allocate_ephemeral_port();
     void _send_arp_request(size_t interface_index, const IPv4Address& target_ip);
+    // RFC 5227 2.3 ARP Announcement: a broadcast request whose sender and
+    // target IP are both this interface's address and whose target hardware
+    // address is zero. Tells neighbours holding a stale mapping for this
+    // address (a previous holder's MAC) to replace it. Sent when an address is
+    // configured, then once more ANNOUNCE_INTERVAL later.
+    void _send_arp_announcement(size_t interface_index);
+    // RFC 5227 2.1.1 ARP Probe: a broadcast request for target_ip with sender
+    // protocol address 0.0.0.0, sent by DHCP before it binds an address.
+    void _send_arp_probe(size_t interface_index, const IPv4Address& target_ip);
     // Sends an ARP request for ip and registers its retry state, unless one is
     // already in flight for that ip - shared by connect() and UDP sends to a
     // peer whose MAC isn't cached yet.
     void _ensure_arp_resolution(size_t interface_index, const IPv4Address& ip);
     void _fail_pending_outbound_connects(size_t interface_index, const IPv4Address& ip);
+    // connect()'s second half, once the local port is settled.
+    TcpConnection* _open_connection(const IpAddress& remote_address, uint16_t remote_port, uint16_t local_port);
 
     // A UDP datagram whose send had to wait on ARP resolution - enough to
     // rebuild it once the peer's MAC is known. Keyed (in Interface, below) by
@@ -510,8 +783,8 @@ private:
         // releases it - but the packet still has to be addressed to where it
         // was actually going.
         IPv4Address destination;
-        uint16_t src_port;
-        uint16_t dest_port;
+        uint16_t src_port{};
+        uint16_t dest_port{};
         Bytes payload;
     };
 
@@ -546,6 +819,10 @@ private:
             int ms_until_retry;
         };
         std::unordered_map<IPv4Address, ArpRequestState> arp_requests_in_flight;
+        // RFC 5227 2.3: announcements still to send after the first, and the
+        // countdown to the next. Zero remaining means none is pending.
+        int announcements_remaining = 0;
+        int ms_until_announcement = 0;
         std::unordered_map<IPv4Address, std::vector<ConnectionKey>> pending_outbound_connects;
         std::unordered_map<IPv4Address, std::vector<PendingDatagram>> pending_outbound_datagrams;
     };
@@ -556,6 +833,10 @@ private:
     // the forwarding work has to replace one call site at a time.
     Interface& _primary() { return *this->_interfaces.front(); }
     const Interface& _primary() const { return *this->_interfaces.front(); }
+
+    // The one place a frame is handed to a channel. A TransientWriteError is
+    // a dropped frame (counted in transmit_drops()); anything else propagates.
+    void _transmit(const Interface& interface, const Bytes& frame);
 
     // Held by pointer so an Interface's address is stable: the channel, the ARP
     // table and the pending maps are all referred to across a poll(), and a
@@ -594,6 +875,23 @@ private:
     uint64_t _cookie_failure_slot = 0;
     uint64_t _cookie_failures_in_slot = 0;
 
+    // Challenge-ACK throttling (see challenge_acks_sent()). Not a security
+    // secret, so an ordinary engine is enough - it only has to be
+    // unpredictable to someone counting replies, not cryptographically.
+    std::minstd_rand _challenge_ack_rng{std::random_device{}()};
+    // Set by set_secret_seed(): M comes from _now_ms, not the wall clock.
+    bool _isn_on_virtual_clock = false;
+    // The ISN for a new connection, from whichever clock is in use.
+    uint32_t _next_isn(const IpAddress& local_ip, uint16_t local_port, const IpAddress& remote_ip,
+                       uint16_t remote_port) const;
+    bool _challenge_ack_window_open = false; // false until the first challenge ACK draws a limit
+    uint64_t _challenge_ack_window_start_ms = 0;
+    uint64_t _challenge_ack_window_limit = 0;
+    uint64_t _challenge_acks_in_window = 0;
+    uint64_t _challenge_acks_sent = 0;
+    uint64_t _challenge_acks_suppressed = 0;
+    uint64_t _transmit_drops = 0;
+
     // Null until start_dhcp(). Owned here rather than by the application
     // because it reconfigures the interface, which is this class's state.
     std::unique_ptr<DhcpClient> _dhcp_client;
@@ -617,8 +915,104 @@ private:
     static constexpr int MS_PER_SECOND = 1000;
     int _icmp_error_tokens_scaled;
     EchoReplyFn _on_echo_reply;
-    std::unordered_map<uint16_t, size_t> _listening_ports; // port -> backlog
-    std::unordered_map<uint16_t, std::deque<ConnectionKey>> _pending_accepts;
+
+    // ---- IPv6 internals (network_stack_ipv6.cpp) ---------------------------
+    struct Ipv6State
+    {
+        bool enabled = false;
+        std::unique_ptr<NeighbourCache> neighbours;
+        std::unique_ptr<Ipv6Autoconfig> autoconfig;
+        std::vector<Ipv6ConfiguredAddress> addresses; // static only; SLAAC's live in autoconfig
+        std::vector<Ipv6Route> on_link;
+        std::vector<Ipv6Router> routers;
+        // Whole IPv6 packets, built and checksummed, waiting for their next
+        // hop's MAC - keyed by that next hop, released by its advertisement
+        // and dropped if resolution gives up. The v6 counterpart of the ARP
+        // pending maps, holding packets rather than recipes for them because
+        // nothing in a v6 packet depends on the MAC it is sent to.
+        std::unordered_map<IPv6Address, std::deque<Bytes>> pending;
+        size_t pending_total = 0;
+    };
+    Ipv6State _v6;
+
+    void _ensure_ipv6();
+    TcpConnection* _open_ipv6_connection(const IPv6Address& remote_ip, uint16_t remote_port, uint16_t local_port);
+    void _handle_ipv6(size_t ingress, const Bytes& packet, const MacAddress& link_destination);
+    void _handle_icmpv6(const Ipv6& ip);
+    void _handle_neighbour_solicitation(const Ipv6& ip, const Icmpv6& message);
+    void _handle_neighbour_advertisement(const Ipv6& ip, const Icmpv6& message);
+    void _handle_router_advertisement(const Ipv6& ip, const Icmpv6& message);
+    void _handle_icmpv6_error(const Icmpv6& message);
+    // A host's multicast memberships: all-nodes and the solicited-node group
+    // of every address it has or is testing (RFC 4861 7.2.1, RFC 4862 5.4.2).
+    bool _ipv6_group_joined(const IPv6Address& group) const;
+    bool _is_our_ipv6(const IPv6Address& address) const;
+    // RFC 6724, cut down: link-local for link-scope destinations, otherwise a
+    // global address if there is one. Empty when nothing usable is configured.
+    std::optional<IPv6Address> _ipv6_source_for(const IPv6Address& destination) const;
+    // Link-local or longest on-link prefix, then the first default router.
+    // False: no route.
+    bool _ipv6_route_for(const IPv6Address& destination, IPv6Address& out_next_hop) const;
+    // Builds the IPv6 header and sends - or queues, if the next hop is not
+    // resolved yet. Never fragments: a packet larger than the link MTU is
+    // dropped. `origin` tells the neighbour cache whether this is the host's
+    // own traffic or an answer to an unverified source (see NeighbourOrigin).
+    void _send_ipv6_packet(const IPv6Address& source, const IPv6Address& destination, uint8_t next_header,
+                           const Bytes& payload, uint8_t hop_limit = 64, uint8_t traffic_class = 0,
+                           NeighbourOrigin origin = NeighbourOrigin::HOST);
+    void _send_icmpv6(const IPv6Address& source, const IPv6Address& destination, uint8_t type, uint8_t code,
+                      const Bytes& body, uint8_t hop_limit = 64, NeighbourOrigin origin = NeighbourOrigin::HOST);
+    // The neighbours a full cache must keep: the default routers, and the
+    // next hops of live connections (any but a half-open passive one, which a
+    // spoofed SYN can create).
+    std::unordered_set<IPv6Address> _ipv6_neighbours_in_use() const;
+    void _send_ipv6_datagram(const IPv6Address& destination, const Udp& header, const Bytes& payload);
+    void _send_ipv6_echo_request(const IPv6Address& destination, uint16_t identifier, uint16_t sequence,
+                                 const Bytes& payload);
+    void _send_neighbour_solicitation(const IPv6Address& target, const MacAddress& unicast_to);
+    void _send_dad_probe(const IPv6Address& target);
+    void _send_router_solicitation();
+    void _transmit_ipv6(const MacAddress& destination_mac, const Bytes& packet);
+    void _flush_ipv6_pending(const IPv6Address& neighbour);
+    // RFC 4443 2.4: an error about `packet` (the invoking packet as received,
+    // quoted up to the 1280-byte minimum MTU), subject to the same rules and
+    // the same token bucket as ICMPv4's errors.
+    void _send_icmpv6_error(const Ipv6& about, const Bytes& packet, bool link_layer_group, uint8_t type, uint8_t code,
+                            uint32_t parameter);
+    void _ipv6_on_time_passed(uint32_t elapsed_ms);
+    void _fold_ipv6_timers(NextTimer& next) const;
+
+    AcceptReadyFn _on_accept_ready;
+    struct Listener
+    {
+        size_t backlog = 0;
+        ListenFamily family = ListenFamily::ANY;
+        std::optional<IpAddress> local;
+        bool accepts(const IpAddress& peer, const IpAddress& destination) const
+        {
+            if (local && *local != destination)
+            {
+                return false;
+            }
+            // A v4-mapped v6 address is never a real peer (dropped on receive
+            // too); refused here as well, as defence in depth.
+            if (peer.is_v6() && IpAddress::is_v4_mapped(peer.v6()))
+            {
+                return false;
+            }
+            return family == ListenFamily::ANY || (family == ListenFamily::IPV4_ONLY) == peer.is_v4();
+        }
+    };
+    std::unordered_map<uint16_t, Listener> _listening_ports;
+    // Per listening port, the connections waiting for accept(), by id. Ids,
+    // not four-tuples: an entry can outlive its connection (reset and reaped
+    // before accept()), and a tuple left behind could name a different, later
+    // connection - an active open over the same tuple, which accept() would
+    // then hand out. An id names one connection, ever.
+    std::unordered_map<uint16_t, std::deque<uint64_t>> _pending_accepts;
+    // The connection a queued id names, if it is still live and still a
+    // passive open; nullptr for an entry to skip.
+    TcpConnection* _queued_connection(uint64_t connection_id) const;
     // Connections in SYN_RECEIVED, per local port: connection id -> the stack
     // clock when it was created. Ids only ever increase, so the map's order is
     // creation order - begin() is the oldest, which is what eviction needs -
@@ -633,11 +1027,54 @@ private:
     // refuses them; the resolver binds through _bind_udp_socket() instead.
     std::unordered_set<uint16_t> _resolver_ports;
     std::unordered_map<ConnectionKey, std::unique_ptr<TcpConnection>, ConnectionKeyHash> _connections;
-    // id -> key, not id -> TcpConnection* - find_connection() and reaping
-    // both need to reach the owning entry in _connections (keyed by
-    // ConnectionKey), and this is what makes that an O(1) hash lookup
-    // instead of a linear scan over every connection
-    std::unordered_map<uint64_t, ConnectionKey> _connections_by_id;
+    // Per connection id: its key, so reaping can reach the owning entry in
+    // _connections in O(1) rather than by a scan; the connection itself, so
+    // find_connection() and the timer queue need one lookup rather than two;
+    // and the deadline of its live entry in the timer queue.
+    struct ConnectionRecord
+    {
+        ConnectionKey key;
+        TcpConnection* connection = nullptr;
+        // The deadline of this connection's one live entry in _timer_queue,
+        // or NO_DEADLINE if it has none. An entry whose deadline differs is
+        // stale and is skipped when it surfaces. Invariant: never later than
+        // the connection's real deadline - see _schedule_connection_timer().
+        uint64_t queued_deadline = TcpConnection::NO_DEADLINE;
+    };
+    // mutable only for queued_deadline, which ms_until_next_timer() maintains.
+    mutable std::unordered_map<uint64_t, ConnectionRecord> _connections_by_id;
+
+    // The connection timer queue: a binary min-heap of (deadline on the
+    // stack's clock, connection id), so on_time_passed() reaches only the
+    // connections with something due. O(log n) to add an entry, O(log n) to
+    // take the earliest, O(1) to look at it.
+    //
+    // Entries are never updated or removed in place - a heap cannot find them
+    // to - so a connection's deadline moving makes its old entry stale, and
+    // stale entries are dropped when they reach the front. Two things keep
+    // that cheap. A deadline moving LATER (every ack re-arms the retransmit
+    // timer further out) pushes nothing: the existing, earlier entry stays and,
+    // when it surfaces, the connection is simply re-queued at its real
+    // deadline - one heap operation per round trip, not per ack. Only a
+    // deadline moving EARLIER needs a new entry. And when stale entries
+    // outnumber live ones the heap is rebuilt from the records, so it stays
+    // O(connections) in size.
+    //
+    // Ids rather than pointers, so an entry for a connection reaped in the
+    // meantime is detected (no record) instead of dereferenced.
+    struct TimerEntry
+    {
+        uint64_t deadline;
+        uint64_t connection_id;
+        // Ordered for std::*_heap, which builds a max-heap: "less" means later.
+        // Ties go to the lower id, so the order timers fire in is deterministic.
+        bool operator<(const TimerEntry& other) const
+        {
+            return deadline != other.deadline ? deadline > other.deadline : connection_id > other.connection_id;
+        }
+    };
+    mutable std::vector<TimerEntry> _timer_queue;
+    uint64_t _connection_timer_runs = 0;
     // ids that reached CLOSED since the last reap pass - see
     // _watch_for_close()'s comment for why this exists instead of scanning
     // every connection on every poll()/on_time_passed()

@@ -24,6 +24,16 @@ IpReassembler::Result IpReassembler::offer(const IPv4Address& source, const IPv4
                                            uint16_t identification, uint8_t protocol, uint16_t fragment_offset,
                                            bool more_fragments, const Bytes& payload, Bytes& out_datagram)
 {
+    Bytes unused_header;
+    return this->offer(source, destination, identification, protocol, fragment_offset, more_fragments, payload, Bytes(),
+                       out_datagram, unused_header);
+}
+
+IpReassembler::Result IpReassembler::offer(const IPv4Address& source, const IPv4Address& destination,
+                                           uint16_t identification, uint8_t protocol, uint16_t fragment_offset,
+                                           bool more_fragments, const Bytes& payload, const Bytes& ip_header,
+                                           Bytes& out_datagram, Bytes& out_first_header)
+{
     // The offset field counts 8-byte units, which is why a non-last fragment's
     // payload must itself be a multiple of 8 - there would be no way to express
     // where the next one starts otherwise.
@@ -116,6 +126,10 @@ IpReassembler::Result IpReassembler::offer(const IPv4Address& source, const IPv4
     }
 
     partial.fragments[start] = payload;
+    if (fragment_offset == 0)
+    {
+        partial.first_header = ip_header;
+    }
     partial.received_bytes += payload.size();
     this->_buffered_bytes += payload.size();
 
@@ -125,6 +139,7 @@ IpReassembler::Result IpReassembler::offer(const IPv4Address& source, const IPv4
     }
 
     out_datagram = this->_assemble(partial);
+    out_first_header = partial.first_header;
     LOG_DEBUG("IpReassembler: reassembled a " << out_datagram.size() << "-byte datagram from " << source.to_string()
                                               << " out of " << partial.fragments.size() << " fragments");
     this->_drop(key);
@@ -201,4 +216,14 @@ void IpReassembler::age(uint32_t elapsed_ms, std::vector<Expired>& expired)
             ++it;
         }
     }
+}
+
+NextTimer IpReassembler::ms_until_next_timer() const
+{
+    NextTimer next;
+    for (const auto& partial : this->_partials)
+    {
+        fold_next_timer(next, partial.second.ms_remaining);
+    }
+    return next;
 }

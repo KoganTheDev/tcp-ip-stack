@@ -1,11 +1,11 @@
-#include "test.h"
+#include "test_support.h"
 #include "tcp.h"
 #include "bytes.h"
 
 // MSS and window-scale options should round-trip through to_bytes()/
 // from_bytes() unchanged, with data_offset correctly reflecting the
 // resulting (NOP-padded) header length.
-TEST(MssAndWindowScaleOptionsRoundTrip)
+TEST(Tcp, MssAndWindowScaleOptionsRoundTrip)
 {
     Tcp segment(12345, 80, 1000, 2000, 5, 0x10 /* ACK */, 65535, 0, 0);
     segment.set_mss_option(1460);
@@ -13,93 +13,93 @@ TEST(MssAndWindowScaleOptionsRoundTrip)
 
     Bytes bytes = segment.to_bytes();
     // MSS (4 bytes) + window scale (3 bytes) = 7, NOP-padded to 8 -> 28-byte header
-    test_assert(bytes.size() == 28,
-                "20-byte fixed header + 8 bytes of NOP-padded options should give a 28-byte segment");
+    ASSERT_TRUE(bytes.size() == 28)
+        << "20-byte fixed header + 8 bytes of NOP-padded options should give a 28-byte segment";
 
     Tcp parsed(bytes);
-    test_assert(parsed.has_mss_option(), "MSS option should round-trip");
-    test_assert(parsed.get_mss_option() == 1460, "MSS value should round-trip exactly");
-    test_assert(parsed.has_window_scale_option(), "window scale option should round-trip");
-    test_assert(parsed.get_window_scale_option() == 3, "window scale value should round-trip exactly");
-    test_assert(parsed.get_data_offset() == 7, "data_offset should reflect the 28-byte header (7 32-bit words)");
+    ASSERT_TRUE(parsed.has_mss_option()) << "MSS option should round-trip";
+    ASSERT_TRUE(parsed.get_mss_option() == 1460) << "MSS value should round-trip exactly";
+    ASSERT_TRUE(parsed.has_window_scale_option()) << "window scale option should round-trip";
+    ASSERT_TRUE(parsed.get_window_scale_option() == 3) << "window scale value should round-trip exactly";
+    ASSERT_TRUE(parsed.get_data_offset() == 7) << "data_offset should reflect the 28-byte header (7 32-bit words)";
 }
 
-TEST(SegmentWithoutOptionsHasNoOptionsAfterRoundTrip)
+TEST(Tcp, SegmentWithoutOptionsHasNoOptionsAfterRoundTrip)
 {
     Tcp segment(12345, 80, 1000, 2000, 5, 0x10, 65535, 0, 0);
     Bytes bytes = segment.to_bytes();
-    test_assert(bytes.size() == 20,
-                "a segment with no options set should serialize to exactly the fixed 20-byte header");
+    ASSERT_TRUE(bytes.size() == 20)
+        << "a segment with no options set should serialize to exactly the fixed 20-byte header";
 
     Tcp parsed(bytes);
-    test_assert(!parsed.has_mss_option(), "no MSS option should be present if none was set");
-    test_assert(!parsed.has_window_scale_option(), "no window scale option should be present if none was set");
+    ASSERT_TRUE(!parsed.has_mss_option()) << "no MSS option should be present if none was set";
+    ASSERT_TRUE(!parsed.has_window_scale_option()) << "no window scale option should be present if none was set";
 }
 
 // An unrecognized option kind must be skipped via its own length field,
 // not cause a parse error or misalign the options that follow it - this is
 // what makes option parsing forward-compatible instead of brittle.
-TEST(UnknownOptionKindIsSkippedWithoutBreakingParsing)
+TEST(Tcp, UnknownOptionKindIsSkippedWithoutBreakingParsing)
 {
     Tcp segment(12345, 80, 1000, 2000, 5, 0x10, 65535, 0, 0);
     segment.set_mss_option(1460); // 4 bytes, already 4-byte aligned - no padding added
     Bytes bytes = segment.to_bytes();
-    test_assert(bytes.size() == 24, "MSS alone should need no NOP padding - a 24-byte header");
+    ASSERT_TRUE(bytes.size() == 24) << "MSS alone should need no NOP padding - a 24-byte header";
 
     Bytes unknown_option = Bytes::from_hex("1e04aaaa"); // kind 30 (unrecognized), length 4, 2 junk bytes
     Bytes with_unknown = bytes | unknown_option;
     with_unknown[12] = static_cast<uint8_t>(7 << 4); // data_offset: (24 + 4) / 4 = 7 words
 
     Tcp parsed(with_unknown);
-    test_assert(parsed.has_mss_option(), "the known MSS option before the unknown one should still parse correctly");
-    test_assert(parsed.get_mss_option() == 1460,
-                "the known MSS option's value should be unaffected by the unknown option after it");
+    ASSERT_TRUE(parsed.has_mss_option()) << "the known MSS option before the unknown one should still parse correctly";
+    ASSERT_TRUE(parsed.get_mss_option() == 1460)
+        << "the known MSS option's value should be unaffected by the unknown option after it";
 }
 
 // RFC 7323 SS2.3 caps the window scale shift at 14. The value arrives as a raw
 // byte off the wire and is later used as a shift count, so an unclamped one is
 // undefined behaviour (shifting a uint32_t by >= 32) that a peer can trigger
 // with a single crafted SYN. The clamp must therefore happen at parse time.
-TEST(OversizedWindowScaleOptionIsClampedAtParseTime)
+TEST(Tcp, OversizedWindowScaleOptionIsClampedAtParseTime)
 {
     Tcp segment(12345, 80, 1000, 2000, 5, 0x02 /* SYN */, 65535, 0, 0);
     segment.set_window_scale_option(200); // absurd, but a legal byte on the wire
 
     Tcp parsed(segment.to_bytes());
 
-    test_assert(parsed.has_window_scale_option(), "the option should still be recognised, not discarded");
-    test_assert(parsed.get_window_scale_option() == Tcp::MAX_WINDOW_SCALE,
-                "a shift count above the RFC 7323 maximum must be clamped to 14, never stored raw - it is used as a "
-                "shift count");
+    ASSERT_TRUE(parsed.has_window_scale_option()) << "the option should still be recognised, not discarded";
+    ASSERT_TRUE(parsed.get_window_scale_option() == Tcp::MAX_WINDOW_SCALE)
+        << "a shift count above the RFC 7323 maximum must be clamped to 14, never stored raw - it is used as a "
+           "shift count";
 }
 
 // The boundary itself must pass through untouched - the clamp has to be a cap,
 // not an off-by-one that also rewrites legal values.
-TEST(MaximumLegalWindowScaleOptionIsPreservedExactly)
+TEST(Tcp, MaximumLegalWindowScaleOptionIsPreservedExactly)
 {
     Tcp segment(12345, 80, 1000, 2000, 5, 0x02 /* SYN */, 65535, 0, 0);
     segment.set_window_scale_option(14);
 
     Tcp parsed(segment.to_bytes());
-    test_assert(parsed.get_window_scale_option() == 14,
-                "a shift count of exactly 14 is legal and must survive parsing unchanged");
+    ASSERT_TRUE(parsed.get_window_scale_option() == 14)
+        << "a shift count of exactly 14 is legal and must survive parsing unchanged";
 }
 
 // Timestamps differ from MSS and window scale in that they appear on every
 // segment, not only the SYN - each one is a fresh clock reading rather than a
 // parameter agreed once.
-TEST(TimestampOptionRoundTrips)
+TEST(Tcp, TimestampOptionRoundTrips)
 {
     Tcp segment(12345, 80, 1000, 2000, 5, 0x10 /* ACK */, 65535, 0, 0);
     segment.set_timestamp_option(0xAABBCCDD, 0x11223344);
 
     Tcp parsed(segment.to_bytes());
-    test_assert(parsed.has_timestamp_option(), "the timestamp option should round-trip");
-    test_assert(parsed.get_timestamp_value() == 0xAABBCCDD, "TSval should round-trip exactly");
-    test_assert(parsed.get_timestamp_echo() == 0x11223344, "TSecr should round-trip exactly");
+    ASSERT_TRUE(parsed.has_timestamp_option()) << "the timestamp option should round-trip";
+    ASSERT_TRUE(parsed.get_timestamp_value() == 0xAABBCCDD) << "TSval should round-trip exactly";
+    ASSERT_TRUE(parsed.get_timestamp_echo() == 0x11223344) << "TSecr should round-trip exactly";
 }
 
-TEST(TimestampCoexistsWithTheSynOptions)
+TEST(Tcp, TimestampCoexistsWithTheSynOptions)
 {
     Tcp segment(12345, 80, 1000, 0, 5, 0x02 /* SYN */, 65535, 0, 0);
     segment.set_mss_option(1460);
@@ -107,8 +107,8 @@ TEST(TimestampCoexistsWithTheSynOptions)
     segment.set_timestamp_option(99, 0);
 
     Tcp parsed(segment.to_bytes());
-    test_assert(parsed.get_mss_option() == 1460, "MSS should survive alongside a timestamp");
-    test_assert(parsed.get_window_scale_option() == 7, "window scale should too");
-    test_assert(parsed.get_timestamp_value() == 99, "and the timestamp itself");
-    test_assert(segment.to_bytes().size() % 4 == 0, "the header must stay a whole number of 32-bit words");
+    ASSERT_TRUE(parsed.get_mss_option() == 1460) << "MSS should survive alongside a timestamp";
+    ASSERT_TRUE(parsed.get_window_scale_option() == 7) << "window scale should too";
+    ASSERT_TRUE(parsed.get_timestamp_value() == 99) << "and the timestamp itself";
+    ASSERT_TRUE(segment.to_bytes().size() % 4 == 0) << "the header must stay a whole number of 32-bit words";
 }

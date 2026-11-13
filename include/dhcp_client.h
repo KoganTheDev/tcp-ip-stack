@@ -2,11 +2,13 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <vector>
 
 #include "bytes.h"
 #include "dhcp.h"
 #include "network_addresses.h"
+#include "next_timer.h"
 
 // What a completed lease actually told us. Deliberately a plain struct: it is
 // the boundary between "what the server said" and "what the stack does about
@@ -37,6 +39,13 @@ enum class DhcpClientState
     SELECTING,
     // REQUEST sent for a specific offer, waiting for the ACK that commits it.
     REQUESTING,
+    // ACK received for a fresh address, which is not yet configured: RFC 5227
+    // ARP probes are going out and a conflicting host would still stop it.
+    PROBING,
+    // The address was declined after a conflict; waiting 10 s (RFC 2131
+    // 3.1.5) before starting over, so a looping server cannot make this
+    // client spin.
+    DECLINED,
     // Lease held and in use.
     BOUND,
     // Past T1: asking the server that granted the lease to extend it, unicast.
@@ -83,6 +92,10 @@ public:
     // The lease expired without being renewed, or was refused with a NAK. The
     // address must stop being used immediately.
     using LeaseLostFn = std::function<void()>;
+    // Sends one RFC 5227 ARP probe for ip: a broadcast ARP request with sender
+    // protocol address 0.0.0.0. The client schedules them; the stack, which
+    // owns the link, puts them on the wire.
+    using ProbeFn = std::function<void(const IPv4Address& ip)>;
 
     // random_seed feeds the transaction id, which is the only thing tying a
     // reply to a request - there is no port demultiplexing to help, since
@@ -94,6 +107,22 @@ public:
     void set_lease_acquired_callback(LeaseAcquiredFn callback) { _on_lease_acquired = std::move(callback); }
     void set_lease_lost_callback(LeaseLostFn callback) { _on_lease_lost = std::move(callback); }
 
+    // Without a probe callback an ACK binds at once, as it did before address
+    // probing existed. With one, a fresh address (an ACK in REQUESTING, not a
+    // renewal) is first probed for PROBE_NUM times, PROBE_MIN..PROBE_MAX
+    // apart after a random PROBE_WAIT start, then ANNOUNCE_WAIT is allowed for
+    // an objection before the lease is bound (RFC 5227 2.1.1). Timers come
+    // from ms_until_next_timer() like the others.
+    void set_probe_callback(ProbeFn callback) { _probe = std::move(callback); }
+
+    // The stack saw ARP traffic that conflicts with the address being probed:
+    // a reply or request from another host using it as sender, or another
+    // host's probe for it (RFC 5227 2.1.1). Sends DHCPDECLINE, drops the
+    // offer and restarts discovery after 10 s. Ignored unless PROBING.
+    void on_address_conflict();
+    // The address being probed, or nullopt when not PROBING.
+    std::optional<IPv4Address> probed_address() const;
+
     // Begins acquisition: sends a DISCOVER and enters SELECTING. Safe to call
     // again at any point; it restarts from scratch.
     void start();
@@ -103,6 +132,9 @@ public:
 
     // Drives every timer: retransmission backoff, T1, T2, and expiry.
     void on_time_passed(uint32_t elapsed_ms);
+    // Until on_time_passed() next has something to do, or nullopt when it
+    // has nothing (INIT).
+    NextTimer ms_until_next_timer() const;
 
     DhcpClientState state() const { return _state; }
     const DhcpLease& lease() const { return _lease; }
@@ -129,6 +161,14 @@ private:
     // carries, for the same reason.
     void _fill_message(Dhcp& message, DhcpMessageType type) const;
     void _apply_ack(const Dhcp& message);
+    // Commits a granted lease: BOUND, timers armed (less probe_elapsed_ms
+    // already spent since the ACK), callback fired.
+    void _bind(DhcpLease granted, uint32_t t1_seconds, uint32_t t2_seconds, uint32_t probe_elapsed_ms);
+    void _on_probe_time_passed(uint32_t elapsed_ms);
+    // Uniform in [low, high], from a small generator seeded with the
+    // transaction id: random enough to keep clients booting together apart,
+    // and deterministic in tests.
+    int _jitter_ms(int low, int high);
     void _restart();
     // Doubles the retransmit timer up to RETRANSMIT_MAX_MS. RFC 2131 4.1 asks
     // for randomization on top; this omits it, and the reason it is safe to
@@ -141,6 +181,7 @@ private:
     SendFn _send;
     LeaseAcquiredFn _on_lease_acquired;
     LeaseLostFn _on_lease_lost;
+    ProbeFn _probe;
 
     DhcpClientState _state;
     uint32_t _transaction_id;
@@ -148,6 +189,18 @@ private:
     // The offer being requested, before it is confirmed by an ACK. Kept
     // separate from _lease so a NAK cannot leave a half-applied lease behind.
     DhcpLease _offer;
+
+    // Address probing (RFC 5227): the ACKed lease waiting to be bound, how
+    // many probes went out, and the time until the next probe or, after the
+    // last, until binding.
+    DhcpLease _pending_lease;
+    uint32_t _pending_t1_seconds = 0;
+    uint32_t _pending_t2_seconds = 0;
+    int _probes_sent = 0;
+    int _probe_ms_remaining = 0;
+    uint32_t _probe_elapsed_ms = 0;
+    int _decline_ms_remaining = 0;
+    uint32_t _rng_state;
 
     int _retransmit_ms_remaining;
     int _retransmit_interval_ms;
@@ -159,6 +212,15 @@ private:
     int _renewal_ms_remaining;   // T1
     int _rebinding_ms_remaining; // T2
     int _expiry_ms_remaining;
+
+    // RFC 5227 section 1.1.
+    static constexpr int PROBE_NUM = 3;
+    static constexpr int PROBE_WAIT_MS = 1000;
+    static constexpr int PROBE_MIN_MS = 1000;
+    static constexpr int PROBE_MAX_MS = 2000;
+    static constexpr int ANNOUNCE_WAIT_MS = 2000;
+    // RFC 2131 3.1.5: wait at least this long after a DHCPDECLINE.
+    static constexpr int DECLINE_BACKOFF_MS = 10000;
 
     // RFC 2131 4.1: begin at 4 seconds and double, capped at 64. Slow on
     // purpose - a client that cannot get an address is usually on a network

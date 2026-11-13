@@ -84,3 +84,16 @@ void ArpTable::age(uint32_t elapsed_ms)
         }
     }
 }
+
+NextTimer ArpTable::ms_until_next_timer() const
+{
+    NextTimer next;
+    for (const auto& entry : this->_entries)
+    {
+        if (!entry.second.is_static)
+        {
+            fold_next_timer(next, entry.second.ms_remaining);
+        }
+    }
+    return next;
+}

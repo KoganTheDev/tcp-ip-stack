@@ -1,0 +1,89 @@
+name: Static analysis
+
+# Kept apart from ci.yml on purpose: these jobs fail for reasons a build or a
+# test never would (a style nit, a lint finding), and a reviewer should be able
+# to see "the code is fine, the formatting is not" at a glance instead of
+# digging through one long checklist. They also run on tools whose version we
+# do not control as tightly as the compiler, so a toolchain bump on the runner
+# image can turn this workflow red without touching the build.
+#
+# TOOL VERSIONS: clang-format is pinned from PyPI to the exact version used
+# locally (23.1.4). Formatting output changes between LLVM releases, and
+# .clang-format uses options (nested KeepEmptyLines) that the distro's LLVM 18
+# does not understand, so "whatever apt has" would either reject the config or
+# disagree with the developer's machine. clang-tidy and cppcheck come from apt;
+# a runner image bump can surface new findings there, which is acceptable.
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same ref makes the previous run's result irrelevant, so stop
+# paying for it. The group is per-ref, so unrelated PRs do not cancel each other.
+concurrency:
+  group: sa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Formatting is checked, never auto-fixed, in CI: a bot commit on a PR branch
+  # surprises people and races with their next push. The failure message is the
+  # diff clang-format would apply, so the fix is one local command.
+  format:
+    name: clang-format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install clang-format (pinned, same version as local)
+        run: pipx install clang-format==23.1.4
+      - name: Check every tracked C++ file
+        run: git ls-files '*.cpp' '*.h' | xargs clang-format --dry-run --Werror
+
+  # Finds the bug classes the compiler's -Wall does not: bugprone-*, cert-*,
+  # concurrency-*, performance-* and the clang static analyzer (see
+  # .clang-tidy for what is disabled and why). It gates at zero findings, so a
+  # new warning is a failure on the PR that introduced it rather than a
+  # backlog nobody reads.
+  #
+  # DEPENDS ON THE CMAKE `debug` PRESET (added separately): tidy needs a
+  # compile database, and the preset is what writes
+  # build/debug/compile_commands.json. CMake's database uses absolute paths, so
+  # it does not have the duplicate-entry problem that bear produces locally
+  # (see the header of .clang-tidy). tests/ is excluded by the file filter:
+  # the test code is deliberately blunt (empty catches, constant seeds).
+  clang-tidy:
+    name: clang-tidy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install clang-tidy and cmake
+        run: sudo apt-get update && sudo apt-get install -y clang-tidy cmake ninja-build
+      - name: Configure (writes build/debug/compile_commands.json)
+        run: cmake --preset debug
+      - name: Run clang-tidy over the stack, epoll-server and loadgen
+        run: |
+          run-clang-tidy -p build/debug -j"$(nproc)" -quiet \
+            '^(?!.*/tests/).*/(src|epoll-server/src|tools/loadgen)/[^/]*\.cpp$'
+
+  # A second, independent analyzer. cppcheck reasons about values across
+  # statements differently from clang's checks and has caught things in
+  # neither's lane (members left uninitialized by a defaulted constructor, for
+  # one). It needs no compile database, so it is the cheap job. --error-exitcode
+  # is what makes a finding fail the build; without it cppcheck exits 0 and the
+  # job would be decorative.
+  cppcheck:
+    name: cppcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install cppcheck
+        run: sudo apt-get update && sudo apt-get install -y cppcheck
+      - name: Analyse src and epoll-server
+        run: |
+          cppcheck --enable=warning,performance,portability --std=c++17 \
+            --inline-suppr --error-exitcode=1 -q \
+            -I include -I epoll-server/include src epoll-server/src

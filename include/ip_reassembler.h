@@ -6,6 +6,7 @@
 
 #include "bytes.h"
 #include "network_addresses.h"
+#include "next_timer.h"
 
 // Reassembles IPv4 datagrams that arrived in fragments (RFC 791 SS3.2).
 //
@@ -53,6 +54,16 @@ public:
     Result offer(const IPv4Address& source, const IPv4Address& destination, uint16_t identification, uint8_t protocol,
                  uint16_t fragment_offset, bool more_fragments, const Bytes& payload, Bytes& out_datagram);
 
+    // The same, also remembering the IP header of fragment zero exactly as it
+    // arrived (`ip_header`, ignored for any other fragment) and handing it back
+    // in `out_first_header` when the datagram completes. An ICMP error about a
+    // reassembled datagram quotes the header the sender actually sent
+    // (RFC 792), and the rebuilt one differs from it in IHL and options, the
+    // flags and offset, the total length and the checksum.
+    Result offer(const IPv4Address& source, const IPv4Address& destination, uint16_t identification, uint8_t protocol,
+                 uint16_t fragment_offset, bool more_fragments, const Bytes& payload, const Bytes& ip_header,
+                 Bytes& out_datagram, Bytes& out_first_header);
+
     // What is known about a datagram that timed out - enough for the caller to
     // decide whether an ICMP Time Exceeded may be sent about it at all (this
     // class knows nothing about ICMP and should not).
@@ -70,6 +81,10 @@ public:
     // appending each one dropped to `expired`.
     void age(uint32_t elapsed_ms, std::vector<Expired>& expired);
 
+    // Until the first partial datagram times out, or nullopt if none is held.
+    // A scan, bounded by MAX_PENDING_DATAGRAMS.
+    NextTimer ms_until_next_timer() const;
+
     size_t pending_datagrams() const { return _partials.size(); }
     size_t buffered_bytes() const { return _buffered_bytes; }
 
@@ -80,7 +95,7 @@ public:
     // caps on what an attacker can make this hold by sending fragments that
     // never complete.
     static constexpr size_t MAX_PENDING_DATAGRAMS = 64;
-    static constexpr size_t MAX_BUFFERED_BYTES = 1024 * 1024;
+    static constexpr size_t MAX_BUFFERED_BYTES = size_t{1024} * 1024;
     // Fragments in one datagram. A legitimate sender needs few; a large number
     // of tiny fragments is a way to make reassembly expensive.
     static constexpr size_t MAX_FRAGMENTS_PER_DATAGRAM = 128;
@@ -93,8 +108,8 @@ private:
     {
         IPv4Address source;
         IPv4Address destination;
-        uint16_t identification;
-        uint8_t protocol;
+        uint16_t identification{};
+        uint8_t protocol{};
         bool operator==(const Key& other) const;
     };
     struct KeyHash
@@ -108,6 +123,9 @@ private:
         size_t total_length = 0;           // known once the last fragment arrives
         bool have_last = false;
         size_t received_bytes = 0;
+        // Fragment zero's IP header as received (at most 60 bytes), kept for
+        // the ICMP quote; empty until that fragment arrives.
+        Bytes first_header;
         int ms_remaining = 0;
         IPv4Address source;
     };

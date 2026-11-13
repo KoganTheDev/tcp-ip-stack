@@ -404,3 +404,17 @@ void DnsResolver::on_time_passed(uint32_t elapsed_ms)
         }
     }
 }
+
+NextTimer DnsResolver::ms_until_next_timer() const
+{
+    NextTimer next;
+    for (const auto& entry : this->_cache)
+    {
+        fold_next_timer(next, entry.second.ms_remaining);
+    }
+    for (const auto& entry : this->_pending)
+    {
+        fold_next_timer(next, entry.second.timeout_ms_remaining);
+    }
+    return next;
+}

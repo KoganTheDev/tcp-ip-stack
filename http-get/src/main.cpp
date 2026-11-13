@@ -14,15 +14,20 @@
 //
 // It is deliberately single-threaded and blocking-shaped, unlike epoll-server
 // next door. That is not laziness - it is the demonstration. A client doing one
-// request has no concurrency problem to solve, so the loop is just "poll the
-// wire, advance the clock, check what state the request is in", and every
+// request has no concurrency problem to solve, so the loop is just "wait for a
+// frame or the stack's next deadline, advance the clock, read the wire, check
+// what state the request is in", and every
 // interesting thing in the output comes from the stack rather than from the
 // application's structure.
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -376,10 +381,15 @@ int main(int argc, char** argv)
 
         uint64_t last_tick_ms = monotonic_now_ms();
         uint64_t deadline_ms = last_tick_ms + static_cast<uint64_t>(config.timeout_seconds) * 1000;
+        // True when the last pass moved to a new stage, which then has work to
+        // start straight away (a connect(), a resolve()) - so the next wait
+        // must not sleep. Starts true so the first stage runs before any wait.
+        bool stage_changed = true;
 
         while (stage != Stage::Done && stage != Stage::Failed)
         {
-            if (monotonic_now_ms() >= deadline_ms)
+            uint64_t now_ms = monotonic_now_ms();
+            if (now_ms >= deadline_ms)
             {
                 std::cerr << "\ntimed out while " << stage_name(stage) << "\n";
                 return 1;
@@ -395,14 +405,33 @@ int main(int argc, char** argv)
                 fds.push_back(pollfd{fd, POLLIN, 0});
             }
 
-            // A short wait rather than a blocking one: the stack's timers are
-            // driven by this loop, so it has to come back regularly even when
-            // nothing arrives. 50 ms is well under every timeout the stack has.
-            int ready = ::poll(fds.data(), static_cast<nfds_t>(fds.size()), 50);
+            // Sleep until a frame arrives or the stack's next timer is due,
+            // whichever is first - the stack says when that is, so there is no
+            // need to wake on a fixed short interval just in case (this used
+            // to wait 50 ms at a time). Never past the overall timeout, and
+            // not at all if a new stage has work to start.
+            int wait_ms = 0;
+            if (!stage_changed)
+            {
+                uint64_t until_timeout_ms = deadline_ms - now_ms;
+                std::optional<uint32_t> until_timer_ms = stack.ms_until_next_timer();
+                uint64_t wait = until_timer_ms.has_value() ? std::min<uint64_t>(*until_timer_ms, until_timeout_ms)
+                                                           : until_timeout_ms;
+                wait_ms = static_cast<int>(std::min<uint64_t>(wait, std::numeric_limits<int>::max()));
+            }
+            int ready = ::poll(fds.data(), static_cast<nfds_t>(fds.size()), wait_ms);
             if (ready < 0 && errno != EINTR)
             {
                 throw EXCEPTION(SystemException, "poll failed");
             }
+
+            // The clock first, whatever woke us: that fires anything due, and
+            // stamps the frames about to be read with the current time rather
+            // than the time of the last wakeup. Reported even when under a
+            // millisecond has passed, since a timer may be due already.
+            now_ms = monotonic_now_ms();
+            stack.on_time_passed(static_cast<uint32_t>(std::min<uint64_t>(now_ms - last_tick_ms, UINT32_MAX)));
+            last_tick_ms = now_ms;
 
             bool readable = false;
             for (const pollfd& entry : fds)
@@ -420,14 +449,7 @@ int main(int argc, char** argv)
                 }
             }
 
-            uint64_t now_ms = monotonic_now_ms();
-            uint32_t elapsed_ms = static_cast<uint32_t>(now_ms - last_tick_ms);
-            if (elapsed_ms > 0)
-            {
-                last_tick_ms = now_ms;
-                stack.on_time_passed(elapsed_ms);
-            }
-
+            Stage stage_before = stage;
             switch (stage)
             {
             case Stage::WaitingForLease:
@@ -572,6 +594,7 @@ int main(int argc, char** argv)
             case Stage::Failed:
                 break;
             }
+            stage_changed = stage != stage_before;
         }
 
         if (stage == Stage::Failed)

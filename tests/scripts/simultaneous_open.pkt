@@ -1,0 +1,11 @@
+# PENDING - fails today. Simultaneous open, RFC 9293 3.5 figure 7 and
+# 3.10.7.3: a SYN (without ACK) arriving in SYN-SENT moves the connection to
+# SYN-RECEIVED and is answered with a SYN-ACK repeating our ISN. The peer's
+# own SYN-ACK then completes it.
+0      connect 9000
++0     > S 0:0(0) win 65535 <mss 1460,sackOK,TS val * ecr 0,wscale 1>
++0.005 < S 0:0(0) win 65535 <mss 1460>
++0     > S. 0:0(0) ack 1 <...>
++0     state SYN_RECEIVED
++0.005 < S. 0:0(0) ack 1 win 65535 <mss 1460>
++0     state ESTABLISHED

@@ -1,44 +1,71 @@
 # epoll-server
 
-A multithreaded TCP echo server on Linux - built on `epoll`, but talking TCP through
-this repo's own from-scratch Ethernet/ARP/IP/TCP stack (`../include/network_stack.h`)
-over a TAP device, not kernel sockets. No framework, no kernel TCP/IP involved at all
-for the connections this server serves.
+A multithreaded TCP echo server on Linux, written against the `ustack` socket API
+(`../include/ustack/stack.h`): `socket`, `accept4`, `recv`, `send`, `epoll_wait` and
+friends, with the kernel's names and semantics, over this repo's own from-scratch
+Ethernet/ARP/IP/TCP stack and a TAP device. No kernel TCP/IP is involved for the
+connections it serves. The same source also builds against the real kernel
+(`KERNEL=1`, below), which is what makes the two comparable.
 
 ## Architecture
 
-- `NetworkStack` (root project) - owns the TAP device, ARP table, and TCP connection
-  table; this is what actually accepts connections and moves bytes
-- `TcpConnection` (root project) - one connection's TCP state machine (handshake,
-  sequencing, retransmission, teardown)
-- `EpollWrapper` - thin wrapper over `epoll_create1`/`epoll_ctl`/`epoll_wait`
+- `EchoServer<StackT>` (`include/echo_server.h`) - the whole server: a level-triggered
+  epoll loop, generic over the stack. `StackT` is `ustack::Stack` or
+  `ustack::KernelStack` (`../include/ustack/kernel_stack.h`, the kernel behind the same
+  method names)
 - `ThreadPool` - fixed-size worker pool with a task queue
 - `CompletionQueue` - an `eventfd`-backed handoff from worker threads back to the
   reactor thread
-- `Server` - runs the `epoll_wait` loop
+- `main.cpp` - parses options, builds the stack (and the second interface in router
+  mode), runs the server until a signal
 
-### Why this looks different from a kernel-socket epoll server
+### Threads
 
-A kernel-socket version has one fd per connection, so epoll can fan connections out
-across worker threads directly - each fd is independent. Here there is exactly one
-real fd: the TAP device. Every "connection" is a userspace abstraction demultiplexed
-from frames arriving on that one fd, and `NetworkStack`/`TcpConnection` are not
-thread-safe - only the reactor thread (the one running the `epoll_wait` loop) may
-touch them.
+The stack is single-threaded: only the thread that calls `EchoServer::step()`/`run()`
+touches it. A worker gets a copy of the bytes the reactor read, computes the response
+(a plain echo here; this is the seam for real work) and pushes a closure onto the
+`CompletionQueue`; the reactor runs the closure, and so does the `send()`. Workers never
+see a socket.
 
-So the thread pool's role shifts: a worker computes a connection's response (the
-"work" - a plain echo here, but this is the seam where real per-connection processing
-would go) off the reactor thread, then hands the result back through
-`CompletionQueue`, which the reactor drains and applies (calling
-`TcpConnection::send()`) itself. `EPOLLONESHOT` isn't used or needed here, since
-connections are never registered as separate epoll fds in the first place.
+The completion queue's eventfd is registered with the stack's epoll through
+`epoll_ctl_external()`, so the reactor sleeps until a socket, a timer or finished pool
+work wakes it. Only the simulator's driver (no kernel epoll) refuses; the reactor then
+waits at most 1 ms while any connection has work in the pool.
 
-Dispatch is tracked by `TcpConnection::get_id()`, not by raw pointer - a pointer held
-across the thread-pool/completion-queue gap could dangle if `NetworkStack` reaps the
-connection first; `find_connection(id)` safely returns `nullptr` instead. It's also
-serialized per connection: at most one chunk per connection is ever in flight in the
-thread pool at once, so two chunks from the same connection can't have their
-responses applied out of order.
+Connections are keyed by a server-assigned id, not the fd (the kernel reuses fd numbers
+at once). While a connection's chunk is in the pool or its response is not fully
+written it is not read from: its epoll interest drops to nothing, the unread bytes keep
+the TCP window closed, and the peer slows down. At most one chunk per connection is in
+flight, so responses stay in order.
+
+### Overload
+
+When `accept4()` fails with anything but "nothing waiting" (EMFILE, ENFILE, ENOBUFS,
+ENOMEM), or `--max-connections` (default 1024) is reached, the listeners are paused with
+`EPOLL_CTL_MOD` and no events: a level-triggered listener left watched would be reported
+on every pass, a busy loop. They resume when a connection closes, or after a second if
+there was nothing to close. The error is logged at most once a second. Clients wait in
+the stack's accept queue meanwhile.
+
+### Graceful shutdown
+
+On SIGINT/SIGTERM the server stops accepting (the listeners are closed), waits until
+each connection has nothing in the pool or unwritten, then `shutdown(SHUT_WR)`s it: the
+peer gets its answers and then a FIN. It keeps running until every peer has closed too,
+or 5 seconds pass, then closes whatever is left.
+
+### Timers
+
+The server no longer drives the stack's clock itself: `ustack::Stack::epoll_wait()` does,
+through its `RealDriver`. The driver reports the real time that passed
+(`NetworkStack::on_time_passed`, from `CLOCK_MONOTONIC`) on every call, and sleeps in a
+kernel epoll over the interface fds plus a one-shot `timerfd` armed for
+`NetworkStack::ms_until_next_timer()` - the earliest deadline of any timer in the stack:
+a delayed ACK, a retransmission, a persist or keepalive probe, TIME_WAIT, an ARP retry.
+With nothing pending it is disarmed and an idle server sleeps until a frame arrives. (The
+conversion to an `itimerspec` is `timer_setting_for()` in `include/timer_setting.h`; an
+`it_value` of {0, 0} *disarms* a timerfd, so "due now" is armed as 1 ns.) In the
+kernel build the kernel's own timers do all of this.
 
 ## Build & run
 
@@ -46,6 +73,19 @@ responses applied out of order.
 make
 sudo ./epoll-server
 ```
+
+### Against the kernel instead
+
+```sh
+make KERNEL=1            # or: cmake -DTCPIP_EPOLL_SERVER_KERNEL=ON
+./epoll-server-kernel --port 8080 --port 8081
+```
+
+The same server on real kernel sockets: no TAP device, no root, `--port`, `--workers`
+and `--max-connections` only (the transport and address options are refused). It builds
+into `bin-kernel/` and a different binary name, so it never replaces `epoll-server`,
+which `../scripts/*.sh` run. The unit tests (`tests/src/test_echo_server.cpp`) run the
+server on both stacks, over the simulator and over 127.0.0.1.
 
 Requires root (`/dev/net/tun` for a TAP device, `CAP_NET_RAW` for a packet socket).
 With no arguments it brings up a TAP interface answering for `10.0.0.2` and listens on
@@ -66,7 +106,8 @@ TCP port 8080. `Ctrl+C`/`SIGTERM` shut it down cleanly.
 --mac AA:BB:...       override the MAC. Defaults to a fixed locally administered
                         address for tap, and to the interface's real hardware
                         address for nic
---port N              TCP port to listen on (default 8080)
+--port N              TCP port to listen on; may be repeated (default 8080)
+--max-connections N   connections served at once (default 1024)
 --workers N           thread pool size (default 4)
 ```
 
@@ -88,13 +129,20 @@ sudo ../scripts/veth_test.sh
 
 ## Load testing
 
-`load_test.py` drives N concurrent connections against a running server and asserts
-every echo matches exactly - run it in the same privileged container as the server,
-once it's up and `tap0` has an IP:
+`tools/loadgen` (built as `build/<preset>/loadgen`) drives connections against a running
+server and checks every echo byte for byte; a wrong echo, a dropped connection or data
+crossing between connections is a failure, not just a hang. It uses the kernel's sockets, so
+the same client works against either build of this server - unprivileged against the kernel
+build on 127.0.0.1:
 
 ```sh
-python3 load_test.py [connection_count] [payload_size]   # defaults: 30, 256
+make -C epoll-server KERNEL=1 && ./epoll-server/epoll-server-kernel --port 18080 &
+cmake --build --preset debug --target loadgen
+./build/debug/loadgen --port 18080 --connections 200 --size 4096 --rounds 5 --threads 2
 ```
+
+and against the real stack over a veth pair with `scripts/loadtest_netns.sh` (root). See
+the top-level README, "Load testing".
 
 This is what caught a real bug: under a burst of connections, a connection's
 handshake-completing ACK and its first data segment could land in the same

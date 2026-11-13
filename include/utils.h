@@ -5,10 +5,6 @@
 #include "bytes.h"
 #include "network_addresses.h"
 
-// Throws a system exception
-// Prints the following: a message, the error number, file, func and the specific line
-void system_wrapper(const std::string& command);
-
 // In a string, replace each substring with another substring
 std::string string_replace_all(const std::string& str, const std::string& to_replace, const std::string& replace_with);
 
@@ -90,16 +86,4 @@ T Bytes::slice_int(size_t index) const
         result = static_cast<T>((result << 8) | (*this)[index + i]);
     }
     return result;
-}
-
-template <typename T>
-void Bytes::append_int(T value)
-{
-    size_t offset = this->size();
-    this->resize(offset + sizeof(T));
-    for (size_t i = 0; i < sizeof(T); i++)
-    {
-        (*this)[offset + sizeof(T) - i - 1] = static_cast<byte_t>(value & 0xff);
-        value /= 0x100;
-    }
 }

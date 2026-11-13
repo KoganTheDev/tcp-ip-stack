@@ -1,0 +1,40 @@
+# What every job that builds through CMake needs: Ninja, GoogleTest/GMock from
+# the distribution (so configuring never touches the network - CMakeLists.txt
+# only fetches GoogleTest when no package is installed), ccache, and the
+# compiler cache itself restored from the last run.
+#
+# The cache key ends in the commit SHA, so every run saves a fresh cache and the
+# next run restores the most recent one for the same job through restore-keys.
+# ccache's own hashing decides what is reusable; the key only decides what gets
+# downloaded.
+name: build deps
+description: Install the CMake build's dependencies and restore the ccache directory.
+inputs:
+  cache-name:
+    description: Distinguishes caches of jobs that compile with different flags or compilers.
+    required: true
+  extra-packages:
+    description: Space-separated apt packages to install on top of the common set (e.g. clang).
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Install build dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ninja-build ccache libgtest-dev libgmock-dev ${{ inputs.extra-packages }}
+
+    - name: Point ccache at the workspace
+      shell: bash
+      run: |
+        echo "CCACHE_DIR=${{ github.workspace }}/.ccache" >> "$GITHUB_ENV"
+        echo "CCACHE_MAXSIZE=300M" >> "$GITHUB_ENV"
+
+    - name: Restore the compiler cache
+      uses: actions/cache@v4
+      with:
+        path: .ccache
+        key: ccache-${{ inputs.cache-name }}-${{ github.sha }}
+        restore-keys: ccache-${{ inputs.cache-name }}-

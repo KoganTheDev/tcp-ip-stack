@@ -1,0 +1,27 @@
+# clang plus the libFuzzer runtime, for the `fuzz` preset (make fuzz).
+#
+# clang alone is not always enough: on Debian/Ubuntu the compiler-rt archives
+# (libclang_rt.fuzzer, the ASan and UBSan runtimes) ship in a separate
+# libclang-rt-<N>-dev package that some releases of the clang package only
+# recommend. So install clang, ask it where it expects the fuzzer runtime, and
+# add the matching package only if that file is missing. That works whichever
+# way the distribution split things, instead of hard-coding a package name that
+# exists on one runner image and not the next.
+name: install libFuzzer
+description: Install clang and make sure its libFuzzer runtime is present.
+runs:
+  using: composite
+  steps:
+    - name: Install clang and the libFuzzer runtime
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang
+        runtime="$(clang++ -print-file-name=libclang_rt.fuzzer-x86_64.a)"
+        if [ ! -f "$runtime" ]; then
+          major="$(clang++ --version | sed -n 's/.*version \([0-9]\+\).*/\1/p' | head -n1)"
+          sudo apt-get install -y "libclang-rt-${major}-dev"
+          runtime="$(clang++ -print-file-name=libclang_rt.fuzzer-x86_64.a)"
+        fi
+        echo "libFuzzer runtime: $runtime"
+        test -f "$runtime"

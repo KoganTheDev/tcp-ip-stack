@@ -6,11 +6,20 @@
 #include "arp.h"
 #include "ip.h"
 
-const std::map<EtherType, const std::string> Ethernet::ETHERTYPE_TO_NAME = {{ARP, "ARP"}, {IPv4, "IPv4"}};
+// NOLINTNEXTLINE(bugprone-throwing-static-initialization,cert-err58-cpp): a small map built once at startup; bad_alloc here is fatal either way
+const std::map<EtherType, const std::string> Ethernet::ETHERTYPE_TO_NAME = {
+    {ARP, "ARP"}, {IPv4, "IPv4"}, {IPv6, "IPv6"}};
 
 Ethernet::Ethernet(const Bytes& data)
 {
+    // NOLINTNEXTLINE(clang-analyzer-optin.cplusplus.VirtualCall): intended: parses with this class's own from_bytes, which no subclass overrides
     this->from_bytes(data);
+}
+
+Ethernet::Ethernet(const Bytes& data, bool parse_ip_payload)
+{
+    // NOLINTNEXTLINE(clang-analyzer-optin.cplusplus.VirtualCall): intended: parses with this class's own _parse
+    this->_parse(data, parse_ip_payload);
 }
 
 Ethernet::Ethernet(const MacAddress& src, const MacAddress& dest, EtherType ethernet_protocol)
@@ -18,6 +27,11 @@ Ethernet::Ethernet(const MacAddress& src, const MacAddress& dest, EtherType ethe
 {}
 
 void Ethernet::from_bytes(const Bytes& data)
+{
+    this->_parse(data, true);
+}
+
+void Ethernet::_parse(const Bytes& data, bool parse_ip_payload)
 {
     if (data.size() < 14)
     {
@@ -33,7 +47,7 @@ void Ethernet::from_bytes(const Bytes& data)
         this->_next_layer = std::make_unique<Arp>(data.slice(14, 28));
         break;
     case EtherType::IPv4:
-        this->_next_layer = std::make_unique<Ip>(data.slice(14));
+        this->_next_layer = std::make_unique<Ip>(data.slice(14), parse_ip_payload);
         break;
     default:
         this->_next_layer = std::make_unique<Raw>(data.slice(14));

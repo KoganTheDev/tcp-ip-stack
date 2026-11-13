@@ -6,13 +6,34 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A newer push to the same branch or PR makes an in-flight run's answer
+# irrelevant, so cancel it rather than queue behind it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# How the jobs below build: the unit-test jobs go through the CMake presets in
+# CMakePresets.json (directly, or through the root Makefile where it adds
+# something a preset cannot - the TSan ASLR probe and the sanitizer runtime
+# options). The end-to-end jobs build through epoll-server/ and http-get/'s own
+# Makefiles, because that is what scripts/*.sh do.
+#
+# Every unit-test job writes GoogleTest's JUnit-style XML and uploads it when
+# the job fails, so a failure on CI can be read without re-running it.
+#
+# Linters (clang-tidy, cppcheck, clang-format) live in their own workflow.
+
 jobs:
   # The ordinary build most changes need to pass. Runs on two compilers because
   # they disagree about enough real things (uninitialized-use analysis, template
   # diagnostics, standard-library assertions) to be worth the extra minute.
+  #
+  # The debug preset builds everything, epoll-server and http-get included, so
+  # both applications are compiled by both compilers here too.
   test:
     name: test (${{ matrix.cxx }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -20,42 +41,92 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install clang
-        if: matrix.cxx == 'clang++'
-        run: sudo apt-get update && sudo apt-get install -y clang
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: debug-${{ matrix.cxx }}
+          extra-packages: ${{ matrix.cxx == 'clang++' && 'clang' || '' }}
 
-      - name: Build and run the test suite
-        run: make test CXX=${{ matrix.cxx }}
+      - name: Configure
+        run: cmake --preset debug -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
 
-      - name: Build epoll-server
-        working-directory: epoll-server
-        run: make CXX=${{ matrix.cxx }}
+      - name: Build
+        run: cmake --build --preset debug
+
+      - name: Run the unit tests
+        run: ctest --preset debug -L unit --parallel "$(nproc)"
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-debug-${{ matrix.cxx }}
+          path: build/debug/test-results/
+          if-no-files-found: ignore
+
+  # The network simulator's seeded property tests (ctest label `sim`), which the
+  # unit runs above leave out. The default 200 seeds take a few seconds; the
+  # nightly workflow runs 100000. A failing seed leaves a pcap of the run, which
+  # is uploaded with the logs.
+  sim:
+    name: simulator (200 seeds)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: debug-g++
+
+      - name: Run the simulator property tests
+        run: make sim
+
+      - name: Upload captures and logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-pcaps
+          path: |
+            build/debug/sim-pcaps/
+            build/debug/sim-shard-*.log
+          if-no-files-found: ignore
 
   # Treat warnings as errors, but only on the code this project actually owns.
   # A blanket -Werror would fail on -Wextra noise coming out of system headers
   # (sockaddr_ll and ifreq have members no caller is meant to initialize), which
-  # would make the job fail for reasons nobody can act on.
+  # would make the job fail for reasons nobody can act on - hence
+  # -Wno-missing-field-initializers in the strict preset. GoogleTest is an
+  # imported package, so its headers are system headers and exempt too.
+  #
+  # The preset covers epoll-server and http-get as well as the stack and the
+  # tests. epoll-server used to be outside this job, which left the only
+  # threaded code in the project as the only code not held to -Werror.
   warnings:
     name: strict warnings
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
-      - name: Build with -Wall -Wextra -Werror
-        run: |
-          make run_tests CXXFLAGS="-std=c++17 -Wall -Wextra -Werror -g \
-            -Wno-missing-field-initializers -Wno-unused-parameter"
 
-      # epoll-server was outside this job until now, which left the only
-      # threaded code in the project as the only code not held to -Werror.
-      # It compiles the shared stack sources a second time with its own flags,
-      # so this also catches anything that is only a warning in its
-      # translation-unit set.
-      - name: Build epoll-server with -Wall -Wextra -Werror
-        working-directory: epoll-server
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: strict
+
+      - name: Build everything with -Wall -Wextra -Werror
         run: |
-          make CXXFLAGS="-std=c++17 -Wall -Wextra -Werror -pthread -MMD -MP \
-            -Wno-missing-field-initializers -Wno-unused-parameter \
-            -I./include -I../include"
+          cmake --preset strict
+          cmake --build --preset strict
+
+      - name: Run the unit tests
+        run: ctest --preset strict -L unit --parallel "$(nproc)"
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-strict
+          path: build/strict/test-results/
+          if-no-files-found: ignore
 
   # The test the unit suite structurally cannot be. Every unit test drives two
   # instances of THIS stack, which agree with each other by construction - and
@@ -70,12 +141,10 @@ jobs:
   integration:
     name: veth integration
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - name: Install network tooling
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y iproute2 ethtool iputils-ping netcat-openbsd
+      - uses: ./.github/actions/netns-tools
       - name: Drive the stack over a veth pair against the kernel
         run: sudo scripts/veth_test.sh
 
@@ -88,12 +157,12 @@ jobs:
   router:
     name: router forwarding
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - name: Install network tooling
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y iproute2 ethtool netcat-openbsd iputils-ping traceroute
+      - uses: ./.github/actions/netns-tools
+        with:
+          extra-packages: traceroute
       - name: Forward between two segments, and show up in a traceroute
         run: sudo scripts/router_test.sh
 
@@ -110,16 +179,14 @@ jobs:
   demonstrator:
     name: http-get end to end
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - name: Install network tooling and servers
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y iproute2 ethtool dnsmasq python3
-          # Ubuntu's dnsmasq package starts a system-wide instance on install,
-          # which would hold port 53. The test runs its own in a namespace.
-          sudo systemctl stop dnsmasq 2>/dev/null || true
-          sudo systemctl disable dnsmasq 2>/dev/null || true
+      # The action also stops the system-wide dnsmasq the package starts on
+      # install; the test runs its own in a namespace.
+      - uses: ./.github/actions/netns-tools
+        with:
+          extra-packages: dnsmasq python3
       - name: Fetch a URL over the stack - DHCP, DNS, routing, TCP, HTTP
         run: sudo scripts/http_get_test.sh
 
@@ -130,28 +197,147 @@ jobs:
   # underlying type) were invisible to a fully passing test suite and caught
   # here.
   #
-  # Note what each job is actually worth. The asan job carries the weight: it
-  # runs ASan, UBSan, and leak detection over the whole suite, which parses
-  # deliberately malformed input in the fuzz tests. The tsan job is currently a
-  # build-and-link check rather than a real race hunt, because the unit tests
-  # are single-threaded - the only threaded code in this project is
-  # epoll-server's reactor and thread pool, and exercising that needs a TAP
-  # device and NET_ADMIN, which this workflow does not have. It is here so the
-  # suite stays TSan-clean and ready the moment threaded tests exist.
+  # Note what each job is actually worth. The asan job runs ASan, UBSan, and
+  # leak detection over the whole suite, which parses deliberately malformed
+  # input in the fuzz tests. The tsan job hunts real races: test_threading.cpp
+  # drives epoll-server's thread pool and completion queue under contention,
+  # which needs only eventfd - no TAP device or NET_ADMIN.
+  #
+  # These run through `make asan` / `make tsan` rather than ctest: the Makefile
+  # sets the sanitizer runtime options (halt_on_error, so a report is a
+  # failure) and, for TSan, probes whether ASLR can be disabled. GTEST_OUTPUT
+  # gets the JUnit XML out of a binary run directly.
+  #
+  # GoogleTest itself comes from the distribution package and is not
+  # instrumented. That is fine for ASan; for TSan it means a race inside
+  # GoogleTest's own bookkeeping would go unseen, and the tests only assert
+  # from the test thread, so there is none to see.
   sanitizers:
     name: ${{ matrix.sanitizer }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         sanitizer: [asan, tsan]
-    # asan blocks the build; tsan reports without blocking. TSan aborts at
-    # startup (exit 66) on hosts where it cannot get the memory layout it
-    # needs, which is an environment property rather than anything about this
-    # code - not worth failing a build over while the suite it runs is still
-    # single-threaded. Revisit once there are threaded tests for it to bite on.
-    continue-on-error: ${{ matrix.sanitizer == 'tsan' }}
+    # Both block the build. TSan aborts at startup (exit 66) on a host where it
+    # cannot disable ASLR, but `make tsan` probes for that and runs under
+    # setarch -R when it can, which hosted runners allow - see the Makefile.
+    env:
+      GTEST_OUTPUT: xml:${{ github.workspace }}/test-results/
     steps:
       - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: ${{ matrix.sanitizer }}
+
       - name: Run the suite under ${{ matrix.sanitizer }}
         run: make ${{ matrix.sanitizer }}
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.sanitizer }}
+          path: test-results/
+          if-no-files-found: ignore
+
+  # What the unit suite never reaches, per file, on every push. Informational:
+  # there is no threshold, because a number to defend invites tests written for
+  # the number. The table goes into the job summary so it can be read on the
+  # run page without downloading anything; the HTML version is an artifact.
+  #
+  # Coverage is clang's source-based coverage, so this job installs clang and
+  # llvm (for llvm-profdata and llvm-cov of the same version) whatever the
+  # other jobs use.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GTEST_OUTPUT: xml:${{ github.workspace }}/test-results/
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: coverage
+          extra-packages: clang llvm
+
+      - name: Run the suite with coverage
+        run: make coverage
+
+      - name: Write the report to the job summary
+        run: |
+          {
+            echo "## Unit-test coverage"
+            echo
+            echo '```'
+            cat build/coverage/report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: build/coverage/html/
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-coverage
+          path: test-results/
+          if-no-files-found: ignore
+
+  # Coverage-guided fuzzing, briefly, on every push. The unit suite's fuzz tests
+  # replay a fixed 2000 random inputs per parser and are deterministic by design;
+  # this is the other half - libFuzzer steering by branch coverage, which is what
+  # finds the inputs random bytes almost never produce. Twenty seconds per
+  # harness (ten harnesses, a few minutes with the build) is enough to run the
+  # committed seeds through the current code, which alone catches a parser
+  # regression, and to re-find anything a change makes shallow. A clean result
+  # here means "nothing found in twenty seconds", not "nothing there"; the long
+  # run is in nightly.yml.
+  #
+  # The corpus the nightly run has grown is restored read-only (restore, never
+  # save: a per-push run is too short to add much and would churn the cache), so
+  # the push starts from where the long runs left off.
+  #
+  # A finding fails the job and uploads the reproducer. Replay it locally by
+  # building the fuzz preset (cmake --preset fuzz, then cmake --build --preset
+  # fuzz) and running ./build/fuzz/fuzz/fuzz_<harness> <downloaded file>.
+  fuzz:
+    name: fuzz (20 s per harness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: fuzz
+
+      - uses: ./.github/actions/install-libfuzzer
+
+      - name: Restore the grown corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: build/fuzz/corpus
+          key: fuzz-corpus-restore-only
+          restore-keys: fuzz-corpus-
+
+      - name: Fuzz every harness
+        run: make fuzz FUZZ_SECONDS=20
+
+      - name: Upload reproducers and logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            build/fuzz/crashes/
+            build/fuzz/*.log
+          if-no-files-found: ignore

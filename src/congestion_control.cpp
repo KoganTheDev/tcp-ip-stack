@@ -5,12 +5,18 @@
 
 // --- shared machinery -------------------------------------------------------
 
-void CongestionControl::on_established(uint32_t mss)
+void CongestionControl::on_established(uint32_t mss, uint32_t syn_retransmissions)
 {
     _mss = mss;
-    _cwnd = mss;
+    _cwnd = syn_retransmissions > 1 ? mss : initial_window(mss);
     _ssthresh = INITIAL_SSTHRESH;
     _on_reset();
+}
+
+void CongestionControl::on_idle_restart()
+{
+    _cwnd = std::min(_cwnd, initial_window(_mss));
+    _on_idle_restart();
 }
 
 void CongestionControl::on_ack(uint32_t bytes_acked, uint32_t bytes_in_flight, uint32_t srtt_ms, uint64_t now_ms)
@@ -50,6 +56,16 @@ void CongestionControl::on_retransmit_timeout(uint32_t bytes_in_flight, uint64_t
 void CongestionControl::on_recovery_inflate()
 {
     _cwnd = std::min(_cwnd + _mss, MAX_CWND);
+}
+
+void CongestionControl::on_partial_ack(uint32_t bytes_acked)
+{
+    _cwnd -= std::min(bytes_acked, _cwnd);
+    if (bytes_acked >= _mss)
+    {
+        _cwnd += _mss;
+    }
+    _cwnd = std::max(_cwnd, _mss);
 }
 
 // --- Reno -------------------------------------------------------------------

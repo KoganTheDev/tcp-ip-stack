@@ -232,12 +232,20 @@ void RawPacketChannel::write(const Bytes& buffer)
 
     if (sent < 0)
     {
-        throw EXCEPTION(SystemException, "sendto() on the packet socket failed");
+        // ENOBUFS is the everyday one here: the NIC's transmit queue is full
+        // and the kernel drops the frame rather than block. That is loss, not
+        // failure, and TCP's retransmission is what recovers it. See
+        // packet_channel.h for the split.
+        if (is_transient_write_errno(errno))
+        {
+            throw EXCEPTION(TransientWriteError, "sendto() on the packet socket dropped a frame (transient)");
+        }
+        throw EXCEPTION(FatalChannelError, "sendto() on the packet socket failed");
     }
     if (static_cast<size_t>(sent) != buffer.size())
     {
         // A packet socket sends a frame whole or not at all, so this should be
         // unreachable; treated as an error rather than silently truncating.
-        throw EXCEPTION(BaseException, "sendto() sent a partial frame");
+        throw EXCEPTION(FatalChannelError, "sendto() sent a partial frame");
     }
 }

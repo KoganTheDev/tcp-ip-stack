@@ -38,5 +38,6 @@ protected:
 template <typename T>
 void ProtocolLayer::encapsulate(T&& next_layer)
 {
+    // NOLINTNEXTLINE(bugprone-move-forwarding-reference): T is only ever a concrete layer type passed as an rvalue; make_unique<T&> would not compile
     this->encapsulate(std::make_unique<T>(std::move(next_layer)));
 }
