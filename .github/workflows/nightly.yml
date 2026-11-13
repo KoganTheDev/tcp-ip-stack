@@ -108,10 +108,17 @@ jobs:
 
       - name: Install Mull
         run: |
-          deb=Mull-19-0.38.0-LLVM-19.1.1-ubuntu-amd64-24.04.deb
-          curl -fsSL -o "$deb" "https://github.com/mull-project/mull/releases/download/0.38.0/$deb"
-          echo "ee0b582a2e9fcd4861c842d1fdf9fa814b513ebf9957a3b5753b839672bf0741  $deb" | sha256sum -c -
-          sudo apt-get install -y "./$deb"
+          # mull-19 (the LLVM 19 plugin) depends on the base mull package,
+          # which is a separate .deb in the same release.
+          base=Mull-0.38.0-ubuntu-amd64-24.04.deb
+          plugin=Mull-19-0.38.0-LLVM-19.1.1-ubuntu-amd64-24.04.deb
+          url=https://github.com/mull-project/mull/releases/download/0.38.0
+          curl -fsSL -o "$base" "$url/$base"
+          curl -fsSL -o "$plugin" "$url/$plugin"
+          printf '%s  %s\n' \
+            83ebc3c49f173b83dc0d991fff4b3ac8d6a2a7ecf51244d598507f85b04d5a29 "$base" \
+            ee0b582a2e9fcd4861c842d1fdf9fa814b513ebf9957a3b5753b839672bf0741 "$plugin" | sha256sum -c -
+          sudo apt-get install -y "./$base" "./$plugin"
           mull-runner-19 --version || mull-runner --version
 
       - name: Build with the plugin and run Mull
