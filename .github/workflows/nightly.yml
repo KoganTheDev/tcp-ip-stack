@@ -209,7 +209,8 @@ jobs:
   # an independent implementation, so an echo that comes back wrong, a reset or a
   # stall is a bug in our stack and fails the job. The logic is in
   # scripts/loadtest_netns.sh (it needs root, so it is not part of any local
-  # test run); the JSON reports are uploaded whatever the outcome.
+  # test run); the JSON reports are uploaded whatever the outcome, and a failed
+  # phase adds a packet capture and a DEBUG-level rerun of itself.
   loadtest:
     name: load test (veth, real stack)
     runs-on: ubuntu-latest
@@ -221,7 +222,10 @@ jobs:
         with:
           cache-name: loadtest
 
+      # tcpdump: a failed phase keeps a capture of itself (see the script).
       - uses: ./.github/actions/netns-tools
+        with:
+          extra-packages: tcpdump
 
       # sch_netem is in linux-modules-extra on Ubuntu's cloud kernels; without
       # it the script skips the lossy phase with a warning instead of failing.
