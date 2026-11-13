@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <random>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -79,6 +80,10 @@ public:
     // per-connection processing would. Mostly for tests of the reactor's
     // sleeping.
     void set_work_delay(std::chrono::milliseconds delay) { this->_work_delay = delay; }
+    // Adds a random extra delay, up to `max`, to every piece of pool work:
+    // tests use it to vary the order in which workers finish.
+    void set_work_delay_jitter(std::chrono::microseconds max) { this->_work_jitter = max; }
+
 
     EchoServer(StackT& stack, size_t worker_count)
         : _stack(stack), _epfd(stack.epoll_create1(0)), _thread_pool(worker_count)
@@ -496,6 +501,12 @@ private:
                 {
                     std::this_thread::sleep_for(this->_work_delay);
                 }
+                if (this->_work_jitter.count() > 0)
+                {
+                    thread_local std::minstd_rand rng(std::random_device{}());
+                    std::this_thread::sleep_for(std::chrono::microseconds(
+                        static_cast<int64_t>(rng() % static_cast<uint64_t>(this->_work_jitter.count() + 1))));
+                }
                 std::string response = data;
                 // The completion MUST be pushed whatever happened above: it is
                 // what clears `busy`. Failing to push wedges the connection.
@@ -653,6 +664,7 @@ private:
     static constexpr uint64_t COMPLETION_ID = 0;
     bool _completion_watched = false;
     std::chrono::milliseconds _work_delay{0};
+    std::chrono::microseconds _work_jitter{0};
 
     int _shutdown_deadline_ms = DEFAULT_SHUTDOWN_DEADLINE_MS;
     size_t _max_connections = DEFAULT_MAX_CONNECTIONS;
