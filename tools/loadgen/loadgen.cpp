@@ -48,6 +48,7 @@
 #include <vector>
 
 #include "histogram.h"
+#include "progress.h"
 
 namespace
 {
@@ -807,7 +808,7 @@ namespace
             std::vector<std::pair<uint64_t, Err>> expired;
             for (const auto& entry : _live)
             {
-                if (now - entry.second.last_progress_ns > limit)
+                if (loadgen::idle_too_long(now, entry.second.last_progress_ns, limit))
                 {
                     expired.emplace_back(entry.first, entry.second.established ? Err::Timeout : Err::ConnectTimeout);
                 }

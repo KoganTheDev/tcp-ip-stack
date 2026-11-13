@@ -422,10 +422,9 @@ TEST(EchoLoad, BurstOverALossyJitteryLinkCompletes)
 // on the same server, so the port is still checking ACKs as cookies (for up
 // to two 64 s slots) while a steady rate of 50-in-flight connections, 2 KiB x
 // 10 rounds each, goes through. On the real run this phase had 131 of 6000
-// connections time out with no reset. Here, with this stack as the client,
-// it passes: whatever stalled those needs something the simulated client
-// does not do (a Linux-specific segment pattern, or the real driver's
-// timing), and the loadgen and script diagnostics are there to catch it.
+// connections "time out" with no reset; those were loadgen failing busy
+// connections through an unsigned underflow in its timeout sweep (idle 0 ms
+// in every report; see tools/loadgen/progress.h), not stalls in the server.
 TEST(EchoLoad, SustainedRateAfterABurstCompletes)
 {
     LoadConfig burst;
