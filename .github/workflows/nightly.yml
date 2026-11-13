@@ -244,6 +244,13 @@ jobs:
       - name: Run the load test
         run: sudo env OUT_DIR="$PWD/loadtest-results" scripts/loadtest_netns.sh
 
+      # The script runs under sudo, so what it wrote (server.log above all) is
+      # root's and may be unreadable to the runner user that the upload runs
+      # as - which failed the upload with EACCES. Hand it back first.
+      - name: Make the results readable by the runner
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" loadtest-results 2>/dev/null || true
+
       - name: Upload the JSON reports
         if: always()
         uses: actions/upload-artifact@v4
