@@ -25,6 +25,7 @@ Compiler is g++ with `-std=c++17 -Wall -g -pthread` (the coverage preset uses cl
 
 ## Rules
 - Before saying a change is done, run `make test`. For anything touching threads, also `make tsan`. For memory or parsing changes, also `make asan`.
+- Before pushing, run the gates CI enforces in static-analysis.yml, all must be clean: `git ls-files '*.cpp' '*.h' | xargs clang-format --dry-run --Werror`, `run-clang-tidy -p build/debug -quiet '^(?!.*/tests/).*/(src|epoll-server/src|tools/loadgen)/[^/]*\.cpp$'`, and `cppcheck --enable=warning,performance,portability --std=c++17 --inline-suppr --error-exitcode=1 -q -I include -I epoll-server/include src epoll-server/src`.
 - `make asan` / `make tsan` wipe their build directory and rebuild from scratch on purpose. Do not try to reuse objects from another build.
 - A TSan abort with exit 66 at startup is environmental (ASLR/seccomp), not a race. See the comment above the `tsan` target.
 - Do not run scripts/*.sh without asking. They set up network devices and may need root or a TAP device.
