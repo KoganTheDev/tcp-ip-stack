@@ -3337,6 +3337,43 @@ TEST(NetworkStack, AnAckWithAForgedCookieIsResetAndCreatesNothing)
     ASSERT_TRUE(reply.is_tcp && reply.rst) << "and gets the ordinary RST for a segment matching nothing";
 }
 
+TEST(NetworkStack, ACookieConnectionsLaterSegmentArrivingFirstIsHeldNotReset)
+{
+    // The cookie check rebuilds the client's ISN from seq - 1, so it only
+    // works on the first segment after the handshake. Under reordering (the
+    // nightly load test's netem phase) the client's second data segment can
+    // arrive before its ACK and first segment; a RST for it killed a
+    // connection the client already counted as established.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_flooded_stack(channel);
+    TcpView answer = syn_for_a_cookie(*stack, *channel, 20000, 5000);
+
+    channel->clear_outbound();
+    channel->push_inbound(build_tcp_data(FLAG_ACK, 5003, answer.seq + 1, 20000, 80, Bytes::from_hex("6869")));
+    stack->poll();
+    ASSERT_TRUE(!find_tcp(channel->outbound_frames()).is_tcp) << "the overtaking segment draws no RST";
+    ASSERT_TRUE(stack->accept(80) == nullptr) << "and cannot open the connection by itself";
+
+    channel->push_inbound(build_tcp_data(FLAG_ACK, 5001, answer.seq + 1, 20000, 80, Bytes::from_hex("6869")));
+    stack->poll();
+    TcpConnection* connection = stack->accept(80);
+    ASSERT_TRUE(connection != nullptr && connection->get_state() == TcpState::ESTABLISHED)
+        << "the first segment, arriving late, still completes the cookie handshake";
+}
+
+TEST(NetworkStack, AStrayAckWithNoDataStillGetsAResetInCookieMode)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_flooded_stack(channel);
+    TcpView answer = syn_for_a_cookie(*stack, *channel, 20000, 5000);
+
+    channel->clear_outbound();
+    channel->push_inbound(build_tcp_data(FLAG_ACK, 5003, answer.seq + 1, 20000, 80, Bytes()));
+    stack->poll();
+    TcpView reply = find_tcp(channel->outbound_frames());
+    ASSERT_TRUE(reply.is_tcp && reply.rst) << "a pure ACK is a cookie ACK only at ISN + 1; anything else is reset";
+}
+
 TEST(NetworkStack, AnExpiredCookieIsRefused)
 {
     FakePacketChannel* channel = nullptr;

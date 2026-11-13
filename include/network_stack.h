@@ -278,6 +278,8 @@ public:
     // since the stack started. Each is a forged or mangled ACK - a steadily
     // climbing count is a blind spoofer guessing cookies (see syn_cookie.h).
     uint64_t syn_cookie_check_failures() const { return _syn_cookie_failures; }
+    // SYN-ACKs answered with a cookie (no state kept), since the stack started.
+    uint64_t syn_cookies_sent() const { return _syn_cookies_sent; }
 
     // RFC 5961 challenge ACKs, across every connection. Each is a reply to a
     // segment anyone can forge (an in-window RST, a SYN on an open
@@ -611,10 +613,19 @@ private:
     void _track_half_open(TcpConnection& connection, uint16_t local_port);
     // Answers a SYN with a stateless SYN-ACK whose ISN is a SYN cookie.
     void _send_syn_cookie(const IpAddress& source, const IpAddress& destination, const Tcp& tcp);
+    // What _try_complete_cookie_handshake made of a segment matching no
+    // connection.
+    enum class CookieAck
+    {
+        NOT_A_COOKIE, // the ordinary no-connection handling applies (a RST)
+        COMPLETED,    // a genuine cookie ACK: the connection now exists
+        DROPPED,      // possibly a cookie connection's later segment: no RST
+    };
     // For an ACK matching no connection: if it carries a valid cookie for a
     // listening port that sent cookies recently, creates the connection
-    // (established) and returns true. False means: not a cookie ACK.
-    bool _try_complete_cookie_handshake(const IpAddress& source, const IpAddress& destination, const Tcp& tcp, Ecn ecn);
+    // (established).
+    CookieAck _try_complete_cookie_handshake(const IpAddress& source, const IpAddress& destination, const Tcp& tcp,
+                                             Ecn ecn);
 
     // dont_fragment sets the DF bit, which is what asks the network to report
     // a too-small link rather than silently splitting the packet. That report
@@ -871,6 +882,7 @@ private:
     // a chance to guess a cookie, on a port that is not even under attack.
     std::unordered_map<uint16_t, uint64_t> _last_cookie_sent_ms;
     uint64_t _syn_cookie_failures = 0;
+    uint64_t _syn_cookies_sent = 0;
     // For the warning: failures counted within the current cookie slot.
     uint64_t _cookie_failure_slot = 0;
     uint64_t _cookie_failures_in_slot = 0;

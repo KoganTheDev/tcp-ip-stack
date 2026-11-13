@@ -77,3 +77,12 @@ TEST(SynCookie, ACookieExpiresAfterTheFollowingSlot)
                 == 0)
         << "including when the 5-bit slot counter has wrapped back to the same value";
 }
+
+TEST(SynCookie, SlotIsCurrentNeedsNoIsnAndFollowsTheSameTwoSlots)
+{
+    SynCookies cookies = keyed();
+    uint32_t cookie = cookies.make(LOCAL, LOCAL_PORT, REMOTE, REMOTE_PORT, PEER_ISN, 1460, NOW);
+    ASSERT_TRUE(SynCookies::slot_is_current(cookie, NOW)) << "made in this slot";
+    ASSERT_TRUE(SynCookies::slot_is_current(cookie, NOW + SynCookies::SLOT_MS)) << "or the one before";
+    ASSERT_TRUE(!SynCookies::slot_is_current(cookie, NOW + 2 * SynCookies::SLOT_MS)) << "but no older";
+}

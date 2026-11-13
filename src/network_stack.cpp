@@ -1678,7 +1678,7 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
 
     if (!is_new_connection_request)
     {
-        if (this->_try_complete_cookie_handshake(source, destination, tcp, ecn))
+        if (this->_try_complete_cookie_handshake(source, destination, tcp, ecn) != CookieAck::NOT_A_COOKIE)
         {
             return;
         }
@@ -1740,6 +1740,7 @@ void NetworkStack::_send_syn_cookie(const IpAddress& source, const IpAddress& de
     uint32_t cookie = this->_syn_cookies.make(local_ip, local_port, remote_ip, tcp.get_src_port(),
                                               tcp.get_sequence_number(), peer_mss, this->_now_ms);
     this->_last_cookie_sent_ms[local_port] = this->_now_ms;
+    this->_syn_cookies_sent += 1;
 
     // MSS only: window scaling, SACK and timestamps cannot be remembered in a
     // cookie, so they must not be offered - the peer would otherwise use
@@ -1751,23 +1752,24 @@ void NetworkStack::_send_syn_cookie(const IpAddress& source, const IpAddress& de
                             local_ip.is_v6() ? std::optional<IPv6Address>(local_ip.v6()) : std::nullopt);
 }
 
-bool NetworkStack::_try_complete_cookie_handshake(const IpAddress& source, const IpAddress& destination, const Tcp& tcp,
-                                                  Ecn ecn)
+NetworkStack::CookieAck NetworkStack::_try_complete_cookie_handshake(const IpAddress& source,
+                                                                     const IpAddress& destination, const Tcp& tcp,
+                                                                     Ecn ecn)
 {
     if (!tcp.get_ack() || tcp.get_syn() || tcp.get_rst())
     {
-        return false;
+        return CookieAck::NOT_A_COOKIE;
     }
     uint16_t local_port = tcp.get_dest_port();
     auto listening_it = this->_listening_ports.find(local_port);
     if (listening_it == this->_listening_ports.end() || !listening_it->second.accepts(source, destination))
     {
-        return false;
+        return CookieAck::NOT_A_COOKIE;
     }
     auto sent_it = this->_last_cookie_sent_ms.find(local_port);
     if (sent_it == this->_last_cookie_sent_ms.end() || this->_now_ms - sent_it->second > 2 * SynCookies::SLOT_MS)
     {
-        return false; // no cookie this port sent could still be valid
+        return CookieAck::NOT_A_COOKIE; // no cookie this port sent could still be valid
     }
 
     const IpAddress& local_ip = destination;
@@ -1795,7 +1797,30 @@ bool NetworkStack::_try_complete_cookie_handshake(const IpAddress& source, const
                                          << " ACKs failed the SYN-cookie check on port " << local_port
                                          << " within one cookie slot - someone may be guessing cookies");
         }
-        return false;
+
+        // The check rebuilds the client's ISN from this segment's sequence
+        // number, which is right only for the first segment after the
+        // handshake: the ACK itself, or the first data segment. Anything
+        // later - the second data segment overtaking the first, or arriving
+        // after the ACK and the first were lost, or the FIN - fails the check
+        // although the cookie is genuine. A RST for it kills a connection the
+        // client already counts as established (the load test's netem phase:
+        // 9 of 100 reset, all in round 0). So a segment that carries data or
+        // a FIN, whose acknowledgement number is plausibly a cookie from a
+        // live slot, is dropped silently: the client retransmits, and once
+        // its first segment arrives the cookie checks out. Linux resets here,
+        // but Linux also only reaches cookies under a real flood. The cost is
+        // that a stray segment for a long-dead connection, landing in cookie
+        // mode with the right 5 slot bits (1 in 16), gets no RST.
+        const Raw* payload = tcp.has_next_layer() ? dynamic_cast<const Raw*>(&tcp.get_next_layer()) : nullptr;
+        bool carries_sequence_space = tcp.get_fin() || (payload != nullptr && !payload->get_data().empty());
+        if (carries_sequence_space && SynCookies::slot_is_current(cookie, this->_now_ms))
+        {
+            LOG_DEBUG("NetworkStack: dropping a segment from " << remote_ip.to_string() << ":" << tcp.get_src_port()
+                                                               << " that may belong to a cookie connection");
+            return CookieAck::DROPPED;
+        }
+        return CookieAck::NOT_A_COOKIE;
     }
 
     // Genuine. The accept queue still bounds it, exactly as for a handshake
@@ -1807,7 +1832,7 @@ bool NetworkStack::_try_complete_cookie_handshake(const IpAddress& source, const
     {
         LOG_WARNING("NetworkStack: a valid SYN cookie for port " << local_port
                                                                  << " arrived with the accept queue full - dropped");
-        return true;
+        return CookieAck::DROPPED;
     }
 
     ConnectionKey key{remote_ip, tcp.get_src_port(), local_port};
@@ -1830,7 +1855,7 @@ bool NetworkStack::_try_complete_cookie_handshake(const IpAddress& source, const
     // The completing ACK may carry data (or its window), so it is processed
     // like any segment of an established connection.
     connection_ptr->on_segment(tcp, ecn);
-    return true;
+    return CookieAck::COMPLETED;
 }
 
 void NetworkStack::_track_half_open(TcpConnection& connection, uint16_t local_port)
