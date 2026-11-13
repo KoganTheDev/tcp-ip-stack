@@ -86,7 +86,7 @@ public:
 private:
     struct Range
     {
-        uint64_t end; // one past the last byte; the map key is the first
+        uint64_t end = 0; // one past the last byte; the map key is the first
         std::list<Bytes> chunks;
     };
     // Stores one piece that lies entirely in a hole, joining it to whichever

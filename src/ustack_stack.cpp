@@ -1134,7 +1134,12 @@ namespace ustack
         {
             std::string name(static_cast<const char*>(optval),
                              std::min<size_t>(static_cast<size_t>(optlen), CONGESTION_NAME_MAX));
-            name = name.substr(0, name.find('\0'));
+            // resize, not substr: no copy. find() can return npos, which
+            // resize() would reject, so only cut when a NUL is present.
+            if (size_t nul = name.find('\0'); nul != std::string::npos)
+            {
+                name.resize(nul);
+            }
             if (name == "reno")
             {
                 socket->congestion = CongestionControlAlgorithm::RENO;

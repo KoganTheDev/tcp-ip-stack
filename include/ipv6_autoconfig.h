@@ -148,11 +148,11 @@ private:
     struct Tentative
     {
         IPv6Address address;
-        uint8_t prefix_length;
-        int probes_sent;
-        int timer_ms;
-        uint32_t valid_lifetime_s;
-        uint32_t preferred_lifetime_s;
+        uint8_t prefix_length = 0;
+        int probes_sent = 0;
+        int timer_ms = 0;
+        uint32_t valid_lifetime_s = 0;
+        uint32_t preferred_lifetime_s = 0;
     };
 
     void _begin_dad(const IPv6Address& address, uint8_t prefix_length, uint32_t valid_lifetime_s,

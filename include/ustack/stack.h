@@ -258,7 +258,7 @@ namespace ustack
         {
             struct epoll_event event{};
             bool queued = false;              // on the ready list (or being collected)
-            std::list<int>::iterator ready_position;
+            std::list<int>::iterator ready_position{};
         };
 
         // The kernel's struct eventpoll: an interest list, and a ready list
