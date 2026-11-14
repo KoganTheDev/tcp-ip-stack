@@ -97,3 +97,10 @@ uint16_t SynCookies::check(const IpAddress& local_ip, uint16_t local_port, const
     }
     return 0;
 }
+
+bool SynCookies::slot_is_current(uint32_t cookie, uint64_t now_ms)
+{
+    uint32_t slot_bits = cookie >> 27;
+    uint64_t current = now_ms / SLOT_MS;
+    return (current & 0x1F) == slot_bits || (current >= 1 && ((current - 1) & 0x1F) == slot_bits);
+}

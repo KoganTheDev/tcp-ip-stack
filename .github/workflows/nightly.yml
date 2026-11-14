@@ -88,12 +88,15 @@ jobs:
   # behaviour nothing pins down. The score goes in the job summary and the full
   # report is uploaded; there is no threshold, so this job reports and does not
   # gate. Mull's plugin has to match the compiler's LLVM exactly, hence clang-19
-  # (from the distribution) with mull-19 (from Mull's apt repository). If the
-  # repository or the version moves, this is the job that breaks - and it is
-  # separate so that it breaks alone.
+  # (from the distribution) with the mull-19 package built against LLVM 19.1.1.
+  # The package comes from Mull's GitHub release, pinned by version and sha256:
+  # its old apt repository (cloudsmith) started answering 402 Payment Required.
+  # ubuntu-24.04 is pinned rather than ubuntu-latest because that .deb is built
+  # for 24.04 and clang-19 is in its archive. If the version moves, this is the
+  # job that breaks - and it is separate so that it breaks alone.
   mutation:
     name: mutation testing (Mull)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v5
@@ -105,8 +108,17 @@ jobs:
 
       - name: Install Mull
         run: |
-          curl -1sLf 'https://dl.cloudsmith.io/public/mull-project/mull-stable/setup.deb.sh' | sudo -E bash
-          sudo apt-get install -y mull-19
+          # mull-19 (the LLVM 19 plugin) depends on the base mull package,
+          # which is a separate .deb in the same release.
+          base=Mull-0.38.0-ubuntu-amd64-24.04.deb
+          plugin=Mull-19-0.38.0-LLVM-19.1.1-ubuntu-amd64-24.04.deb
+          url=https://github.com/mull-project/mull/releases/download/0.38.0
+          curl -fsSL -o "$base" "$url/$base"
+          curl -fsSL -o "$plugin" "$url/$plugin"
+          printf '%s  %s\n' \
+            83ebc3c49f173b83dc0d991fff4b3ac8d6a2a7ecf51244d598507f85b04d5a29 "$base" \
+            ee0b582a2e9fcd4861c842d1fdf9fa814b513ebf9957a3b5753b839672bf0741 "$plugin" | sha256sum -c -
+          sudo apt-get install -y "./$base" "./$plugin"
           mull-runner-19 --version || mull-runner --version
 
       - name: Build with the plugin and run Mull
@@ -197,7 +209,8 @@ jobs:
   # an independent implementation, so an echo that comes back wrong, a reset or a
   # stall is a bug in our stack and fails the job. The logic is in
   # scripts/loadtest_netns.sh (it needs root, so it is not part of any local
-  # test run); the JSON reports are uploaded whatever the outcome.
+  # test run); the JSON reports are uploaded whatever the outcome, and a failed
+  # phase adds a packet capture and a DEBUG-level rerun of itself.
   loadtest:
     name: load test (veth, real stack)
     runs-on: ubuntu-latest
@@ -209,7 +222,10 @@ jobs:
         with:
           cache-name: loadtest
 
+      # tcpdump: a failed phase keeps a capture of itself (see the script).
       - uses: ./.github/actions/netns-tools
+        with:
+          extra-packages: tcpdump
 
       # sch_netem is in linux-modules-extra on Ubuntu's cloud kernels; without
       # it the script skips the lossy phase with a warning instead of failing.
@@ -227,6 +243,13 @@ jobs:
 
       - name: Run the load test
         run: sudo env OUT_DIR="$PWD/loadtest-results" scripts/loadtest_netns.sh
+
+      # The script runs under sudo, so what it wrote (server.log above all) is
+      # root's and may be unreadable to the runner user that the upload runs
+      # as - which failed the upload with EACCES. Hand it back first.
+      - name: Make the results readable by the runner
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" loadtest-results 2>/dev/null || true
 
       - name: Upload the JSON reports
         if: always()

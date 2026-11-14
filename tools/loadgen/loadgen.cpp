@@ -2,8 +2,11 @@
 //
 // It opens connections to an echo server, sends each one a payload, checks the
 // echo comes back byte for byte, optionally repeats that for R round trips on
-// the same connection, then closes. It reports connections per second,
-// throughput, latency percentiles and errors by type, as text or as JSON.
+// the same connection, then half-closes and waits for the server's own FIN. It
+// reports connections per second, throughput, latency percentiles and errors
+// by type, as text or as JSON, and every failed connection by itself: its
+// source port (to find it in a capture), the phase it failed in (connect,
+// round N, close) and how far that round had got.
 //
 // The client side is always the kernel's own TCP, whatever the server runs on:
 // that is the point. Pointing it at epoll-server on this repo's stack puts an
@@ -39,11 +42,13 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "histogram.h"
+#include "progress.h"
 
 namespace
 {
@@ -228,6 +233,49 @@ namespace
         return "io_error";
     }
 
+    // Where a connection was when it failed.
+    enum class Phase : unsigned
+    {
+        Connect, // before the handshake completed
+        Round,   // sending a payload or waiting for its echo
+        Close,   // after the last round: our FIN sent, waiting for the server's
+    };
+
+    // One failed connection, for the per-connection report. What a capture
+    // needs to find it (the source port) and what the stall looked like: in
+    // which phase, how many bytes of the round had gone out, how many of its
+    // echo had come back, and for how long nothing had moved.
+    struct Failure
+    {
+        Err kind = Err::Other;
+        int error = 0; // errno behind it, 0 for a timeout
+        uint16_t source_port = 0;
+        Phase phase = Phase::Connect;
+        uint64_t round = 0;
+        size_t sent = 0;
+        size_t received = 0;
+        uint64_t age_ms = 0;  // since connect() was called
+        uint64_t idle_ms = 0; // since the last byte moved either way
+    };
+
+    // Per-connection records kept; past this only the count goes on. A run that
+    // fails thousands of connections fails them the same way.
+    constexpr size_t MAX_FAILURE_RECORDS = 200;
+
+    const char* phase_name(Phase phase)
+    {
+        switch (phase)
+        {
+        case Phase::Connect:
+            return "connect";
+        case Phase::Round:
+            return "round";
+        case Phase::Close:
+            return "close";
+        }
+        return "?";
+    }
+
     struct Stats
     {
         uint64_t attempted = 0;
@@ -239,6 +287,20 @@ namespace
         std::array<uint64_t, ERR_KINDS> errors{};
         Histogram connect_us; // connect() to established
         Histogram rtt_us;     // first byte of a payload sent to last byte of its echo received
+        std::vector<Failure> failures; // the first MAX_FAILURE_RECORDS of them
+        uint64_t failures_not_recorded = 0;
+
+        void record_failure(const Failure& failure)
+        {
+            if (failures.size() < MAX_FAILURE_RECORDS)
+            {
+                failures.push_back(failure);
+            }
+            else
+            {
+                ++failures_not_recorded;
+            }
+        }
 
         uint64_t failed() const
         {
@@ -264,6 +326,11 @@ namespace
             }
             connect_us.merge(other.connect_us);
             rtt_us.merge(other.rtt_us);
+            for (const Failure& failure : other.failures)
+            {
+                record_failure(failure);
+            }
+            failures_not_recorded += other.failures_not_recorded;
         }
     };
 
@@ -295,7 +362,9 @@ namespace
     struct Conn
     {
         int fd = -1;
+        uint16_t source_port = 0;
         bool established = false;
+        bool closing = false; // every round done, our FIN sent
         uint64_t round = 0;
         uint64_t seed = 0; // of the current round's payload
         size_t sent = 0;
@@ -409,10 +478,38 @@ namespace
 
         void count_error(Err kind) { ++_stats.errors[static_cast<size_t>(kind)]; }
 
-        void fail(uint64_t id, Err kind)
+        void fail(uint64_t id, Err kind, int error = 0)
         {
             count_error(kind);
+            auto found = _live.find(id);
+            if (found != _live.end())
+            {
+                const Conn& conn = found->second;
+                uint64_t now = now_ns();
+                Failure failure;
+                failure.kind = kind;
+                failure.error = error;
+                failure.source_port = conn.source_port;
+                failure.phase = !conn.established ? Phase::Connect : (conn.closing ? Phase::Close : Phase::Round);
+                failure.round = conn.round;
+                failure.sent = conn.sent;
+                failure.received = conn.received;
+                failure.age_ms = (now - conn.connect_started_ns) / NS_PER_MS;
+                failure.idle_ms = (now - conn.last_progress_ns) / NS_PER_MS;
+                _stats.record_failure(failure);
+            }
             drop(id);
+        }
+
+        // A failure before there was a connection to speak of: socket() or
+        // connect() itself refused.
+        void fail_to_start(Err kind, int error)
+        {
+            count_error(kind);
+            Failure failure;
+            failure.kind = kind;
+            failure.error = error;
+            _stats.record_failure(failure);
         }
 
         void drop(uint64_t id)
@@ -462,7 +559,8 @@ namespace
             int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
             if (fd < 0)
             {
-                count_error(classify(errno, true));
+                int error = errno;
+                fail_to_start(classify(error, true), error);
                 return;
             }
             int one = 1;
@@ -478,9 +576,18 @@ namespace
             int rc = ::connect(fd, reinterpret_cast<const sockaddr*>(&_server), sizeof(_server));
             if (rc != 0 && errno != EINPROGRESS)
             {
-                count_error(classify(errno, true));
+                int error = errno;
+                fail_to_start(classify(error, true), error);
                 static_cast<void>(::close(fd));
                 return;
+            }
+            // connect() has bound the ephemeral port by now, even while the
+            // handshake is still in progress.
+            sockaddr_in local{};
+            socklen_t local_length = sizeof(local);
+            if (::getsockname(fd, reinterpret_cast<sockaddr*>(&local), &local_length) == 0)
+            {
+                conn.source_port = ntohs(local.sin_port);
             }
 
             epoll_event event{};
@@ -488,7 +595,7 @@ namespace
             event.data.u64 = id;
             if (::epoll_ctl(_epfd, EPOLL_CTL_ADD, fd, &event) != 0)
             {
-                count_error(Err::Other);
+                fail_to_start(Err::Other, errno);
                 static_cast<void>(::close(fd));
                 return;
             }
@@ -520,7 +627,7 @@ namespace
                 }
                 if (error != 0)
                 {
-                    fail(id, classify(error, true));
+                    fail(id, classify(error, true), error);
                     return;
                 }
                 if ((events & (EPOLLOUT | EPOLLIN)) == 0)
@@ -551,6 +658,11 @@ namespace
         // socket would block. May finish the connection (and so erase it).
         void pump(uint64_t id, Conn& conn, uint32_t events, uint64_t now)
         {
+            if (conn.closing)
+            {
+                await_close(id, conn);
+                return;
+            }
             const size_t size = _options.size;
             bool progress = true;
             while (progress)
@@ -571,7 +683,8 @@ namespace
                     }
                     else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
                     {
-                        fail(id, classify(errno, false));
+                        int error = errno;
+                        fail(id, classify(error, false), error);
                         return;
                     }
                 }
@@ -591,8 +704,9 @@ namespace
                             {
                                 at++;
                             }
-                            std::cerr << "loadgen: ECHO MISMATCH on a connection (thread " << _index << ", round "
-                                      << conn.round << ") at payload offset " << (conn.received + at) << "\n";
+                            std::cerr << "loadgen: ECHO MISMATCH on a connection (thread " << _index << ", source port "
+                                      << conn.source_port << ", round " << conn.round << ") at payload offset "
+                                      << (conn.received + at) << "\n";
                             fail(id, Err::Mismatch);
                             return;
                         }
@@ -608,7 +722,8 @@ namespace
                     }
                     else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
                     {
-                        fail(id, classify(errno, false));
+                        int error = errno;
+                        fail(id, classify(error, false), error);
                         return;
                     }
                 }
@@ -620,8 +735,7 @@ namespace
                     ++_stats.round_trips;
                     if (++conn.round >= _options.rounds)
                     {
-                        ++_stats.completed;
-                        drop(id);
+                        begin_close(id, conn, now);
                         return;
                     }
                     begin_round(conn, now);
@@ -639,11 +753,53 @@ namespace
                 static_cast<void>(::getsockopt(conn.fd, SOL_SOCKET, SO_ERROR, &error, &length));
                 if (error != 0)
                 {
-                    fail(id, classify(error, false));
+                    fail(id, classify(error, false), error);
                     return;
                 }
             }
             set_write_interest(id, conn, conn.sent < size);
+        }
+
+        // Every round verified: half-close, so the server reads its EOF, and
+        // wait for its FIN in turn. A server that never closes its side (or a
+        // FIN lost for good) is a failure in the close phase rather than a
+        // connection silently counted as done.
+        void begin_close(uint64_t id, Conn& conn, uint64_t now)
+        {
+            conn.closing = true;
+            conn.sent = 0;
+            conn.received = 0;
+            conn.last_progress_ns = now;
+            if (::shutdown(conn.fd, SHUT_WR) != 0)
+            {
+                int error = errno;
+                fail(id, classify(error, false), error);
+                return;
+            }
+            set_write_interest(id, conn, false);
+            await_close(id, conn);
+        }
+
+        void await_close(uint64_t id, Conn& conn)
+        {
+            ssize_t n = ::recv(conn.fd, _scratch.data(), _scratch.size(), 0);
+            if (n == 0)
+            {
+                ++_stats.completed;
+                drop(id);
+            }
+            else if (n > 0)
+            {
+                std::cerr << "loadgen: " << n << " unexpected byte(s) after the last round (source port "
+                          << conn.source_port << ")\n";
+                conn.received += static_cast<size_t>(n);
+                fail(id, Err::Mismatch);
+            }
+            else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            {
+                int error = errno;
+                fail(id, classify(error, false), error);
+            }
         }
 
         void sweep(uint64_t now)
@@ -652,7 +808,7 @@ namespace
             std::vector<std::pair<uint64_t, Err>> expired;
             for (const auto& entry : _live)
             {
-                if (now - entry.second.last_progress_ns > limit)
+                if (loadgen::idle_too_long(now, entry.second.last_progress_ns, limit))
                 {
                     expired.emplace_back(entry.first, entry.second.established ? Err::Timeout : Err::ConnectTimeout);
                 }
@@ -709,6 +865,39 @@ namespace
         char buffer[64];
         static_cast<void>(std::snprintf(buffer, sizeof(buffer), "%.1f/s", options.rate));
         return buffer;
+    }
+
+    // One line per failed connection, on stderr in either output mode: the
+    // script keeps stderr next to the JSON and prints it when a phase fails.
+    // A round's "sent" and "received" are of --size bytes; the server owes
+    // the difference between them.
+    void print_failures(const Options& options, const Stats& stats)
+    {
+        for (const Failure& f : stats.failures)
+        {
+            std::cerr << "loadgen: failed  " << err_name(f.kind) << "  source port " << f.source_port << "  ";
+            if (f.phase == Phase::Round)
+            {
+                std::cerr << "round " << (f.round + 1) << "/" << options.rounds << "  sent " << f.sent << "/"
+                          << options.size << "  echoed " << f.received << "/" << options.size << " (waiting for "
+                          << (f.sent - std::min(f.sent, f.received)) << ")  ";
+            }
+            else
+            {
+                std::cerr << phase_name(f.phase) << "  ";
+            }
+            std::cerr << "age " << f.age_ms << " ms  idle " << f.idle_ms << " ms";
+            if (f.error != 0)
+            {
+                std::cerr << "  " << std::generic_category().message(f.error);
+            }
+            std::cerr << "\n";
+        }
+        if (stats.failures_not_recorded != 0)
+        {
+            std::cerr << "loadgen: ... and " << stats.failures_not_recorded
+                      << " more failed connection(s) not listed\n";
+        }
     }
 
     void print_latency_text(const char* label, const Histogram& histogram)
@@ -810,6 +999,20 @@ namespace
         std::printf("},\n");
         std::printf("  \"echo_mismatches\": %llu,\n",
                     static_cast<unsigned long long>(stats.errors[static_cast<size_t>(Err::Mismatch)]));
+        std::printf("  \"failed_connections\": [");
+        for (size_t i = 0; i < stats.failures.size(); i++)
+        {
+            const Failure& f = stats.failures[i];
+            std::printf(
+                "%s\n    {\"error\": \"%s\", \"errno\": %d, \"source_port\": %u, \"phase\": \"%s\", "
+                "\"rounds_completed\": %llu, \"sent\": %zu, \"received\": %zu, \"age_ms\": %llu, \"idle_ms\": %llu}",
+                i == 0 ? "" : ",", err_name(f.kind), f.error, static_cast<unsigned>(f.source_port), phase_name(f.phase),
+                static_cast<unsigned long long>(f.round), f.sent, f.received, static_cast<unsigned long long>(f.age_ms),
+                static_cast<unsigned long long>(f.idle_ms));
+        }
+        std::printf("%s],\n", stats.failures.empty() ? "" : "\n  ");
+        std::printf("  \"failed_connections_not_listed\": %llu,\n",
+                    static_cast<unsigned long long>(stats.failures_not_recorded));
         std::printf("  \"pass\": %s\n}\n", stats.failed() == 0 ? "true" : "false");
     }
 
@@ -886,6 +1089,7 @@ int main(int argc, char** argv)
         setup_failed = setup_failed || worker->failed_to_start();
     }
 
+    print_failures(options, result.stats);
     if (options.json)
     {
         print_json(options, result, total_concurrency);

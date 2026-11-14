@@ -165,7 +165,9 @@ endif()
 enable_testing()
 file(GLOB TEST_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/tests/src/*.cpp)
 add_executable(run_tests ${TEST_SOURCES})
-target_include_directories(run_tests PRIVATE ${PROJECT_SOURCE_DIR}/tests/include)
+# tools/loadgen for its header-only pieces (progress.h): loadgen itself is a
+# single-file program the tests cannot link.
+target_include_directories(run_tests PRIVATE ${PROJECT_SOURCE_DIR}/tests/include ${PROJECT_SOURCE_DIR}/tools/loadgen)
 # gmock_main provides main() and initialises both GoogleTest and GMock.
 target_link_libraries(run_tests PRIVATE tcpip epoll_threaded GTest::gmock_main)
 # The network simulator (tests/include/sim) writes a failing test's capture

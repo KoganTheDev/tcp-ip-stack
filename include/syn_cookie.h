@@ -50,6 +50,12 @@ public:
     uint16_t check(const IpAddress& local_ip, uint16_t local_port, const IpAddress& remote_ip, uint16_t remote_port,
                    uint32_t peer_isn, uint32_t cookie, uint64_t now_ms) const;
 
+    // Whether `cookie` names this slot or the one before - the part of the
+    // check that needs no ISN. For a segment that cannot be checked in full
+    // because its sequence number is not the peer's ISN + 1 (see
+    // NetworkStack::_try_complete_cookie_handshake).
+    static bool slot_is_current(uint32_t cookie, uint64_t now_ms);
+
 private:
     uint32_t _mac(const IpAddress& local_ip, uint16_t local_port, const IpAddress& remote_ip, uint16_t remote_port,
                   uint32_t peer_isn, uint64_t slot, uint32_t mss_index) const;
