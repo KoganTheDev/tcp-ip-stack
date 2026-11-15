@@ -463,3 +463,46 @@ TEST_F(SimTcp, FullSizedSegmentsFitAnMtuThatIsNotAMultipleOfEight)
     ASSERT_TRUE(server_received == payload) << "intact";
     ASSERT_TRUE(client_stack->transmit_drops() == 0) << "nothing should have been dropped by the sender itself";
 }
+
+// Request/response rounds of 2 KiB each way - one full segment and a short
+// tail. With classic Nagle the tail waited for the full segment's ack, and the
+// receiver, holding a single segment, delayed that ack (200 ms here, 40 ms on
+// Linux): every round paid the delayed-ACK timer, the ~41 ms per round the
+// nightly load test showed against a Linux client. Minshall's Nagle sends the
+// tail at once, so a round costs a couple of link delays.
+TEST_F(SimTcp, AShortTailDoesNotWaitOutThePeersDelayedAck)
+{
+    LinkParams wire;
+    wire.delay_ms = 1;
+    build(1, wire, wire);
+
+    constexpr size_t MESSAGE = 2048;
+    constexpr int ROUNDS = 10;
+    constexpr uint64_t DELAYED_ACK_MS = 200; // TcpConnection's delayed-ACK timeout
+    Bytes client_received;
+    size_t echoed = 0;
+    int round = 1;
+    observe = [&](TcpConnection& client, TcpConnection& server)
+    {
+        while (echoed < server_received.size())
+        {
+            size_t accepted = server.send(server_received.slice(echoed, server_received.size() - echoed));
+            echoed += accepted;
+            if (accepted == 0)
+                break;
+        }
+        client_received |= client.read();
+        if (client_received.size() == MESSAGE * static_cast<size_t>(round) && round < ROUNDS)
+        {
+            round++;
+            to_send |= pattern(MESSAGE); // the tick hook sends whatever to_send holds beyond `sent`
+        }
+    };
+    ASSERT_TRUE(send_one_way(pattern(MESSAGE), 1000)) << "precondition: the first request arrives";
+    uint64_t first_request_done = net->now_ms();
+    ASSERT_TRUE(net->run_until([&] { return client_received.size() >= MESSAGE * ROUNDS; }, 60000))
+        << "every round completes; got " << client_received.size();
+    uint64_t elapsed = net->now_ms() - first_request_done;
+    ASSERT_LT(elapsed, DELAYED_ACK_MS) << ROUNDS << " rounds took " << elapsed
+                                       << " virtual ms - a tail is waiting on the delayed ACK";
+}

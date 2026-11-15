@@ -99,8 +99,9 @@ simultaneous close rather than folding it into `FIN_WAIT_2`. On top of that:
 - **Keepalive** (RFC 1122 4.2.3.6), off by default as the RFC requires, probing one byte
   *behind* SND.NXT because that is the only segment that compels a reply without moving
   the stream
-- Delayed ACK and Nagle's algorithm, deliberately guarded against their well-known
-  pathological interaction
+- Delayed ACK and Nagle's algorithm with Minshall's change (as Linux does it): only an
+  unacked *short* segment holds the next one, so the tail of a large write never waits
+  out the peer's delayed-ACK timer
 - A zero-window persist timer, whose probe byte is intentionally kept outside the
   in-flight window so it cannot trip the retransmit give-up or the duplicate-ack
   machinery

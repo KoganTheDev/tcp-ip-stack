@@ -740,6 +740,9 @@ private:
     // Sends one chunk taken off the send queue, with the FIN if it is the
     // last one after close().
     void _send_chunk(const Bytes& chunk);
+    // Nagle with Minshall's change: a sub-MSS chunk waits only while an
+    // earlier sub-MSS segment is still unacked. TCP_NODELAY turns it off.
+    bool _nagle_holds(size_t chunk_size) const;
 
     // when TIME_WAIT ends; pushed back if a duplicate FIN arrives (meaning
     // our ack for it was likely lost)
@@ -983,6 +986,11 @@ private:
     Stats _stats;
     TcpCloseReason _close_reason = TcpCloseReason::NONE;
     bool _nodelay = false;
+    // SND.SML (Minshall): the end of the last sub-MSS segment sent with new
+    // data. Nagle holds a small segment only while this is unacked - see
+    // _nagle_holds(). _small_segment_sent is false until the first one.
+    uint32_t _small_segment_end = 0;
+    bool _small_segment_sent = false;
     SendSpaceFn _on_send_space;
     // send_space_available() as of the last _report_send_space().
     size_t _reported_send_space = SEND_BUFFER_CAPACITY;

@@ -238,10 +238,10 @@ TEST_F(SimRecovery, ALostRetransmissionIsRepairedWithoutATimeout)
 }
 
 // The last two full segments of the transfer lost (400000 bytes are 276
-// segments of 1448 and one of 352, which Nagle holds behind them). Nothing
-// that is sent follows them to draw duplicate acks, so only a timeout used to
-// notice. A tail loss probe (RFC 8985 section 7) notices sooner: here it is
-// the held 352 bytes, whose SACK tells RACK the two before it are lost.
+// segments of 1448 and one of 352). Nothing after them draws duplicate acks,
+// so only a timeout used to notice. A tail loss probe (RFC 8985 section 7)
+// notices sooner, and the SACK of the 352-byte tail tells RACK the two before
+// it are lost.
 TEST_F(SimRecovery, ATailLossIsRepairedWithoutATimeout)
 {
     constexpr size_t SIZE = 400000;

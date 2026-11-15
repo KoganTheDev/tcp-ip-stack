@@ -578,6 +578,41 @@ TEST(TcpConnection, NagleHoldsSmallSegmentWhileDataIsInFlight)
     ASSERT_TRUE(sent[1].payload.to_hex() == "02") << "the released segment should carry the held data";
 }
 
+// Minshall's Nagle (draft-minshall-nagle, what Linux does): only an unacked
+// *small* segment holds the next small one. A write of one full segment plus
+// a tail sends both at once - classic Nagle held the tail behind the full
+// segment until it was acked, which against a delayed-ACK peer cost ~40 ms
+// per request/response round.
+TEST(TcpConnection, NagleSendsTheTailOfAWriteBehindAFullSegment)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    size_t mss = connection->get_effective_mss();
+
+    connection->send(Bytes(std::vector<uint8_t>(mss + 100, 0xab)));
+    ASSERT_EQ(sent.size(), 2u) << "the full segment and the tail both go out without waiting for an ack";
+    ASSERT_EQ(sent[0].payload.size(), mss);
+    ASSERT_EQ(sent[1].payload.size(), 100u);
+}
+
+TEST(TcpConnection, NagleDoesNotHoldASmallWriteBehindOnlyFullSegments)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    size_t mss = connection->get_effective_mss();
+
+    connection->send(Bytes(std::vector<uint8_t>(mss, 0x01)));
+    ASSERT_EQ(sent.size(), 1u) << "precondition: one full segment in flight";
+    connection->send(Bytes::from_hex("02"));
+    ASSERT_EQ(sent.size(), 2u) << "no small segment is unacked, so the small write goes now";
+
+    connection->send(Bytes::from_hex("03"));
+    ASSERT_EQ(sent.size(), 2u) << "the 1-byte segment is unacked, so the next small write waits";
+    connection->on_segment(*make_incoming_segment(501, sent[1].seq + 1, FLAG_ACK));
+    ASSERT_EQ(sent.size(), 3u) << "acking the small segment releases the held one";
+    ASSERT_EQ(sent[2].payload.to_hex(), "03");
+}
+
 // Out-of-order reassembly: a segment arriving ahead of RCV.NXT must be
 // buffered, not delivered or dropped, and only released once the gap in
 // front of it is filled.
@@ -710,11 +745,11 @@ TEST(TcpConnection, NegotiatedMssCapsSentSegmentSize)
     connection.on_segment(*make_incoming_segment(501, 1001, FLAG_ACK));
     sent.clear();
 
-    // two full chunks go out at once (the initial window is ten segments);
-    // the 50-byte tail is held by Nagle while they are unacked
+    // all three go out at once (the initial window is ten segments, and with
+    // Minshall's Nagle a tail is not held behind full segments)
     connection.send(Bytes(250));
-    ASSERT_TRUE(sent.size() == 2) << "the two MSS-sized chunks should go out, the sub-MSS tail held by Nagle";
-    ASSERT_TRUE(sent[0].payload.size() == 100 && sent[1].payload.size() == 100)
+    ASSERT_TRUE(sent.size() == 3) << "250 bytes at a 100-byte MSS are three segments";
+    ASSERT_TRUE(sent[0].payload.size() == 100 && sent[1].payload.size() == 100 && sent[2].payload.size() == 50)
         << "the sent chunk must be capped at the negotiated 100-byte MSS, not sent as one 250-byte segment";
 }
 
@@ -2960,13 +2995,15 @@ TEST(TcpConnection, ALaterWriteTopsUpAPartialSegmentWaitingInTheQueue)
     std::vector<RecordedSegment> sent;
     auto connection = make_established_connection(sent); // MSS 536
 
-    connection->send(Bytes(600u)); // 536 goes out, the 64-byte tail is held by Nagle
-    ASSERT_EQ(sent.size(), 1u) << "precondition: the tail waits behind the segment in flight";
+    connection->send(Bytes(1u)); // a small segment in flight makes Nagle hold the next tail
+    connection->send(Bytes(600u)); // 536 goes out, the 64-byte tail is held
+    ASSERT_EQ(sent.size(), 2u) << "precondition: the tail waits behind the small segment in flight";
     connection->send(Bytes(1000u));
 
-    connection->on_segment(*make_incoming_segment(501, sent[0].seq + 536, FLAG_ACK));
-    ASSERT_EQ(sent.size(), 2u) << "only the final 464-byte tail is held by Nagle";
-    ASSERT_EQ(sent[1].payload.size(), 536u) << "the 64-byte tail and the next write go out as one full segment";
+    connection->on_segment(*make_incoming_segment(501, sent[0].seq + 1 + 536, FLAG_ACK));
+    ASSERT_EQ(sent.size(), 4u) << "with nothing small unacked, the queue drains";
+    ASSERT_EQ(sent[2].payload.size(), 536u) << "the 64-byte tail and the next write go out as one full segment";
+    ASSERT_EQ(sent[3].payload.size(), 528u) << "and the rest as one more, not cut per write";
 }
 
 // close() right after a write: the FIN goes out at once, behind the data

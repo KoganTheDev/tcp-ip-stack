@@ -335,6 +335,11 @@ void TcpConnection::_send_flags(uint8_t flags, const Bytes& payload, bool includ
     {
         _send_max = _send_next;
     }
+    if (!payload.empty() && (flags & FLAG_SYN) == 0 && payload.size() < _max_segment_payload())
+    {
+        _small_segment_end = _send_next; // SND.SML, see _nagle_holds()
+        _small_segment_sent = true;
+    }
 
     SentSegment entry;
     entry.seq = seq;
@@ -657,14 +662,11 @@ void TcpConnection::_send_queued_while_window_allows()
         {
             break;
         }
-        // Nagle (RFC 896): keep holding a sub-MSS segment while earlier data is
-        // still unacked - it goes out once the pipe drains (or the window/cwnd
-        // frees up enough for a full segment). A full-sized segment is never
-        // held.
-        // After close() nothing more is coming to fill a short last segment,
-        // so it goes now (Linux pushes with Nagle off on close too).
+        // Nagle (see _nagle_holds()). After close() nothing more is coming to
+        // fill a short last segment, so it goes now (Linux pushes with Nagle
+        // off on close too).
         bool final_chunk = _fin_requested && _send_queue.size() == 1;
-        if (!_nodelay && !final_chunk && _send_queue.front().size() < _max_segment_payload() && _bytes_in_flight() > 0)
+        if (!final_chunk && _nagle_holds(_send_queue.front().size()))
         {
             break;
         }
@@ -1161,7 +1163,7 @@ bool TcpConnection::_send_one_new_segment(uint32_t pipe, uint32_t window)
     // The peer's window bounds new data by sequence space, as everywhere.
     bool peer_window_allows = (_send_next - snd_una) + next.size() <= _peer_window;
     bool final_chunk = _fin_requested && _send_queue.size() == 1;
-    bool nagle_holds = !_nodelay && !final_chunk && next.size() < _max_segment_payload() && pipe > 0;
+    bool nagle_holds = !final_chunk && _nagle_holds(next.size());
     if (!peer_window_allows || nagle_holds || pipe + next.size() > window)
     {
         return false;
@@ -2335,12 +2337,7 @@ size_t TcpConnection::send(const Bytes& data)
         size_t chunk_size = std::min<size_t>(_max_segment_payload(), accepted - offset);
         Bytes chunk = data.slice(offset, chunk_size);
 
-        // Nagle (RFC 896): a sub-MSS segment waits while earlier data is still
-        // in flight, so small writes coalesce into fewer, larger segments
-        // instead of dribbling out one tiny packet at a time. A full-sized
-        // segment, or one sent with an empty pipe, always goes immediately.
-        // TCP_NODELAY (set_nodelay()) turns it off.
-        bool nagle_holds = !_nodelay && chunk.size() < _max_segment_payload() && _bytes_in_flight() > 0;
+        bool nagle_holds = _nagle_holds(chunk.size());
 
         // once anything is queued, everything after it must queue too -
         // otherwise a later, smaller chunk could jump ahead of an earlier
@@ -2399,6 +2396,23 @@ void TcpConnection::_send_fin(const Bytes& payload)
     _fin_requested = false;
     _transition(_state == TcpState::ESTABLISHED ? TcpState::FIN_WAIT_1 : TcpState::LAST_ACK);
     _send_flags(FLAG_FIN, payload);
+}
+
+bool TcpConnection::_nagle_holds(size_t chunk_size) const
+{
+    // Nagle (RFC 896, RFC 1122 4.2.3.4) holds a sub-MSS segment while data
+    // is unacked, so small writes coalesce instead of dribbling out one tiny
+    // packet each. Minshall's change (draft-minshall-nagle-01, Linux's
+    // tcp_minshall_check()) narrows "data is unacked" to "a small segment is
+    // unacked": the tail of a large write then follows its full segments at
+    // once instead of waiting for their ack - which a delayed-ACK peer sends
+    // up to 40 ms late. There is still at most one small segment in flight.
+    if (_nodelay || chunk_size >= _max_segment_payload() || !_small_segment_sent)
+    {
+        return false;
+    }
+    uint32_t snd_una = _in_flight.snd_una_or(_send_next);
+    return seq_before(snd_una, _small_segment_end) && seq_at_or_before(_small_segment_end, _send_next);
 }
 
 void TcpConnection::_send_chunk(const Bytes& chunk)
