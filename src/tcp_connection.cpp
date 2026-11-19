@@ -1081,6 +1081,8 @@ void TcpConnection::_on_dsack(const Tcp::SackBlock& block)
         return;
     }
     _stats.dsacks_received += 1;
+    _in_flight.note_reordering();
+    _rack_grow_reo_wnd();
     LOG_DEBUG("TcpConnection[" << _id << "] D-SACK " << block.start << ":" << block.end
                                << " reports a spurious retransmission");
 }
@@ -1093,6 +1095,16 @@ void TcpConnection::_begin_episode()
     }
     _episode_open = true;
     _in_flight.begin_episode();
+}
+
+void TcpConnection::_end_episode()
+{
+    _episode_open = false; // its ledger stays, for the D-SACKs still to come
+    // RFC 8985 6.2 step 4: one recovery fewer for a widened window to last.
+    if (_rack_reo_wnd_persist > 0 && --_rack_reo_wnd_persist == 0)
+    {
+        _rack_reo_wnd_mult = 1;
+    }
 }
 
 SendScoreboard::AckContext TcpConnection::_rack_context(const Tcp& segment) const
@@ -1116,7 +1128,24 @@ uint64_t TcpConnection::_rack_reo_wnd_ms() const
     {
         return 0;
     }
-    return std::min<uint64_t>(_rack_min_rtt_ms / 4, _rtt.srtt_ms());
+    return std::min<uint64_t>(uint64_t{_rack_reo_wnd_mult} * _rack_min_rtt_ms / 4, _rtt.srtt_ms());
+}
+
+void TcpConnection::_rack_grow_reo_wnd()
+{
+    uint32_t snd_una = _in_flight.snd_una_or(_send_next);
+    if (_rack_dsack_round_valid && seq_at_or_before(_rack_dsack_round, snd_una))
+    {
+        _rack_dsack_round_valid = false;
+    }
+    if (_rack_dsack_round_valid)
+    {
+        return;
+    }
+    _rack_dsack_round = _send_next;
+    _rack_dsack_round_valid = true;
+    _rack_reo_wnd_mult = std::min(_rack_reo_wnd_mult + 1, RACK_REO_WND_MAX_MULT);
+    _rack_reo_wnd_persist = RACK_REO_WND_PERSIST;
 }
 
 uint32_t TcpConnection::_rack_detect_loss()
@@ -1540,7 +1569,14 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     uint32_t sacked_before = _in_flight.sacked_bytes();
     _in_flight.rack_begin_ack();
     bool sack_advanced = _apply_sack_blocks(segment);
-    if (_sack_permitted)
+    // Once this path is known to reorder, RACK alone decides what is lost,
+    // as in Linux (tcp_time_to_recover() skips the DupThresh rule when RACK
+    // is on): three segments SACKed above a hole is exactly what reordering
+    // looks like, and RACK's reordering window is the part that adapts to
+    // how much of it the path does. Until then DupThresh stays - with no
+    // reordering seen RACK's window is zero there anyway (6.2 step 4).
+    bool dup_thresh = !_sack_permitted || !_in_flight.reordering_seen() || !_have_rack_min_rtt;
+    if (_sack_permitted && dup_thresh)
     {
         _in_flight.mark_losses(DUP_ACK_FAST_RETRANSMIT_THRESHOLD, static_cast<uint32_t>(_max_segment_payload()));
     }
@@ -1595,7 +1631,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         // carrying them were lost. RACK finding a loss starts it too (RFC
         // 8985 3.4): with timing on its side it need not wait for three.
         bool loss_signalled =
-            _dup_ack_count >= DUP_ACK_FAST_RETRANSMIT_THRESHOLD || rack_lost
+            (dup_thresh && _dup_ack_count >= DUP_ACK_FAST_RETRANSMIT_THRESHOLD) || rack_lost
             || (_sack_permitted && _in_flight.oldest_unsacked() != nullptr && _in_flight.oldest_unsacked()->lost);
         if (_in_recovery && _sack_permitted)
         {
@@ -1697,7 +1733,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     }
     if (_episode_open && _recovery_point_valid && seq_at_or_before(_recovery_point, ack))
     {
-        _episode_open = false; // its ledger stays, for the D-SACKs still to come
+        _end_episode();
     }
     _schedule_loss_probe(); // RFC 8985 7.2: on an ack that acknowledges new data
 

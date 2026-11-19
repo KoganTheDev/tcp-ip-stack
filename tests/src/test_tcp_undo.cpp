@@ -218,3 +218,66 @@ TEST(TcpDsackSender, ADsackForTheLossProbeMeansNoLoss)
         }
     }
 }
+
+// --- RACK's reordering window (RFC 8985 6.2 step 4) ---
+
+namespace
+{
+    // Segments `first`..`first + 9` go out together; the first of them is
+    // held back while 1, 2 and 3 arrive (three SACKed above it), then it
+    // arrives `late_ms` after them. Returns whether it was resent meanwhile.
+    bool reorder_first_of_ten(Sender& s, uint32_t first, uint32_t late_ms)
+    {
+        size_t before = s.count_sent(s.seg(first));
+        s.send(10);
+        s.pass(20);
+        Blocks blocks;
+        for (uint32_t n = first + 1; n <= first + 3; n++)
+        {
+            blocks = {{s.seg(first + 1), s.seg(n + 1)}};
+            s.ack(s.seg(first), blocks);
+        }
+        s.pass(late_ms);
+        s.ack(s.seg(first + 10));
+        bool resent = s.count_sent(s.seg(first)) > before + 1;
+        if (resent)
+            s.ack(s.seg(first + 10), {s.block(first)}); // the copy arrives too
+        return resent;
+    }
+}
+
+// Segment 0 is reordered past three others. Nothing says yet that this path
+// reorders, so three SACKed segments are a loss and it is resent - the copy
+// draws a D-SACK. That D-SACK widens the reordering window to 2 * min_RTT/4,
+// so the same reordering next time (the segment 7 ms late, past one quarter
+// of the 20 ms min_RTT but inside two) waits instead of resending.
+TEST(TcpRackReoWnd, ADsackWidensTheReorderingWindow)
+{
+    Sender s = measured();
+    ASSERT_TRUE(reorder_first_of_ten(s, 0, 1)) << "the first reordering costs a spurious retransmission";
+    ASSERT_EQ(s.stats().dsacks_received, 1u);
+    ASSERT_EQ(s.c->rack_reo_wnd_mult(), 2u);
+    uint64_t retransmitted = s.stats().retransmitted_segments;
+    ASSERT_FALSE(reorder_first_of_ten(s, 10, 7)) << "the second waits for it";
+    ASSERT_EQ(s.stats().retransmitted_segments, retransmitted);
+}
+
+// The window stays wide for 16 recoveries without another D-SACK, then
+// returns to one quarter of min_RTT.
+TEST(TcpRackReoWnd, TheWiderWindowLastsSixteenRecoveries)
+{
+    Sender s = measured();
+    reorder_first_of_ten(s, 0, 1);
+    ASSERT_EQ(s.c->rack_reo_wnd_mult(), 2u);
+    uint32_t next = 10;
+    for (int recovery = 1; recovery <= 16; recovery++)
+    {
+        uint64_t timeouts = s.stats().retransmit_timeouts;
+        s.send(2);
+        while (s.stats().retransmit_timeouts == timeouts)
+            s.pass_to_next_timer();
+        s.ack(s.seg(next + 2));
+        next += 2;
+        ASSERT_EQ(s.c->rack_reo_wnd_mult(), recovery < 16 ? 2u : 1u) << "after recovery " << recovery;
+    }
+}

@@ -231,6 +231,10 @@ public:
     // RACK.reordering_seen (step 3): an original transmission was delivered
     // below RACK.fack.
     bool reordering_seen() const { return _reordering_seen; }
+    // A D-SACK showed a retransmission was not needed: the original was
+    // only late, which is reordering as far as loss detection is concerned
+    // (Linux's tcp_sacktag_one() records it the same way).
+    void note_reordering() { _reordering_seen = true; }
     // RACK.segs_sacked: segments currently SACKed.
     uint32_t sacked_segments() const { return _sacked_segments; }
     // RFC 8985 RACK_detect_loss() (step 5) with reordering window reo_wnd_ms:

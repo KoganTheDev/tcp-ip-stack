@@ -662,6 +662,9 @@ public:
     uint64_t scoreboard_visits() const { return _in_flight.visits(); }
     // The part of it spent by RACK.
     uint64_t rack_visits() const { return _in_flight.rack_visits(); }
+    // RACK.reo_wnd_mult (RFC 8985 6.2 step 4): the reordering window in
+    // quarters of min_RTT, grown by D-SACKs.
+    uint32_t rack_reo_wnd_mult() const { return _rack_reo_wnd_mult; }
 
 private:
     void _transition(TcpState new_state);
@@ -782,6 +785,8 @@ private:
     // retransmission while one is open goes on its ledger.
     bool _episode_open = false;
     void _begin_episode();
+    // The cumulative ack reached the recovery point: the episode is over.
+    void _end_episode();
     // What RACK needs from this ack (see SendScoreboard::AckContext).
     SendScoreboard::AckContext _rack_context(const Tcp& segment) const;
 
@@ -841,9 +846,24 @@ private:
     uint64_t _rack_min_rtt_at_ms = 0;
     bool _have_rack_min_rtt = false;
     static constexpr uint64_t MIN_RTT_WINDOW_MS = 300000; // Linux's tcp_min_rtt_wlen
-    // RFC 8985 6.2 step 4, RACK_update_reo_wnd() with reo_wnd_mult fixed at
-    // 1: the window grows only on D-SACK, which this stack does not parse.
+    // RFC 8985 6.2 step 4, RACK_update_reo_wnd(): reo_wnd_mult quarters of
+    // min_RTT, at most SRTT - or no wait at all, see the definition.
     uint64_t _rack_reo_wnd_ms() const;
+    // The multiplier grows by one for a D-SACK that counted (_on_dsack()),
+    // at most once per round trip: not again until SND.UNA passes what was
+    // SND.NXT at the last step (RACK.dsack_round). A spurious retransmission
+    // means the window was too narrow for this path; one round's D-SACKs
+    // all report the same mistake. It stays for RACK_REO_WND_PERSIST
+    // episodes (RACK.reo_wnd_persist), then falls back to one quarter.
+    uint32_t _rack_reo_wnd_mult = 1;
+    uint32_t _rack_reo_wnd_persist = 0;
+    uint32_t _rack_dsack_round = 0;
+    bool _rack_dsack_round_valid = false;
+    static constexpr uint32_t RACK_REO_WND_PERSIST = 16;
+    // Linux caps reo_wnd_steps at 0xFF; past min_RTT * 4 the SRTT cap has
+    // long taken over anyway.
+    static constexpr uint32_t RACK_REO_WND_MAX_MULT = 255;
+    void _rack_grow_reo_wnd();
     // Runs RACK_detect_loss() and arms or disarms the reordering timer.
     // Returns how many segments it marked lost.
     uint32_t _rack_detect_loss();
