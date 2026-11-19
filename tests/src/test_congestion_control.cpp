@@ -407,6 +407,81 @@ TEST(CongestionControl, FastConvergenceAimsLowerWhenTheSecondLossComesBelowTheFi
                + std::to_string(shrinking->window()) + " vs " + std::to_string(steady->window());
 }
 
+// --- undo (RFC 3708 / RFC 4015) ---------------------------------------------
+
+// A reduction later shown to have been spurious is taken back: cwnd and
+// ssthresh return to what they were when the snapshot was taken, whichever
+// reduction (fast recovery or timeout) came in between.
+TEST(CongestionControl, AnUndoRestoresTheWindowAndThresholdInBothAlgorithms)
+{
+    for (CongestionControlAlgorithm algorithm : {CongestionControlAlgorithm::RENO, CongestionControlAlgorithm::CUBIC})
+    {
+        auto cc = established_at(algorithm, BIG_WINDOW_SEGMENTS);
+        cc->on_fast_retransmit(BIG_WINDOW_SEGMENTS * MSS, 3, 0);
+        cc->on_recovery_end();
+        acknowledge(*cc, 20 * MSS, FULL_WINDOW, 100, 500);
+        uint32_t cwnd = cc->window();
+        uint32_t ssthresh = cc->slow_start_threshold();
+        ASSERT_FALSE(cc->has_undo());
+
+        cc->save_for_undo(1000);
+        cc->on_retransmit_timeout(cwnd, 1000);
+        ASSERT_TRUE(cc->has_undo());
+        ASSERT_EQ(cc->undo_window(), cwnd);
+        cc->undo(1300);
+        ASSERT_EQ(cc->window(), cwnd) << cc->name();
+        ASSERT_EQ(cc->slow_start_threshold(), ssthresh) << cc->name();
+        ASSERT_FALSE(cc->has_undo()) << "a snapshot is used once";
+
+        cc->save_for_undo(2000);
+        cc->on_recovery_start(cwnd, 2000);
+        cc->on_recovery_end();
+        cc->undo(2100);
+        ASSERT_EQ(cc->window(), cwnd) << cc->name();
+        ASSERT_EQ(cc->slow_start_threshold(), ssthresh) << cc->name();
+    }
+}
+
+// Undo only takes back the reduction: a window that has grown past the
+// snapshot since is left where it is.
+TEST(CongestionControl, AnUndoNeverLowersTheWindow)
+{
+    auto cc = established_at(CongestionControlAlgorithm::RENO, 10);
+    cc->save_for_undo(0);
+    acknowledge(*cc, 10 * MSS);
+    uint32_t grown = cc->window();
+    cc->undo(0);
+    ASSERT_EQ(cc->window(), grown);
+}
+
+// CUBIC's curve is part of what is restored: W_max, K and the epoch. Two
+// identical flows, one of which has a spurious timeout and its undo 300 ms
+// later. Shifted by those 300 ms - time spent in the episode is not time the
+// curve should have grown through - the two windows grow in step.
+TEST(CongestionControl, CubicResumesItsCurveAfterAnUndo)
+{
+    auto steady = established_at(CongestionControlAlgorithm::CUBIC, BIG_WINDOW_SEGMENTS);
+    auto undone = established_at(CongestionControlAlgorithm::CUBIC, BIG_WINDOW_SEGMENTS);
+    for (CongestionControl* cc : {steady.get(), undone.get()})
+    {
+        cc->on_fast_retransmit(BIG_WINDOW_SEGMENTS * MSS, 3, 0);
+        cc->on_recovery_end();
+        for (uint32_t i = 0; i < 20; i++)
+            cc->on_ack(MSS, cc->window(), 100, 1000 + uint64_t{i} * 50);
+    }
+    ASSERT_EQ(steady->window(), undone->window());
+
+    undone->save_for_undo(2000);
+    undone->on_retransmit_timeout(undone->window(), 2000);
+    undone->undo(2300);
+    for (uint32_t i = 0; i < 40; i++)
+    {
+        steady->on_ack(MSS, steady->window(), 100, 2000 + uint64_t{i} * 50);
+        undone->on_ack(MSS, undone->window(), 100, 2300 + uint64_t{i} * 50);
+    }
+    ASSERT_EQ(undone->window(), steady->window());
+}
+
 // --- the seam, from the connection's side -----------------------------------
 
 TEST(CongestionControl, TheFactoryReturnsTheAlgorithmItWasAsked)

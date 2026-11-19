@@ -45,6 +45,11 @@ void RttEstimator::on_sample(uint32_t rtt_ms)
     // A peer may hold an ack for up to 200 ms (RFC 1122 4.2.3.2), so a
     // timeout of exactly the floor races every delayed ack on a short path;
     // above SRTT + floor, the delayed ack always wins.
+    _compute_rto();
+}
+
+void RttEstimator::_compute_rto()
+{
     uint32_t variance_term = std::max({CLOCK_GRANULARITY_MS * SCALE, VARIANCE_MULTIPLIER * _rttvar_scaled,
                                        static_cast<uint32_t>(MIN_RTO_MS) * SCALE});
     uint32_t rto_scaled = _srtt_scaled + variance_term;
@@ -58,4 +63,14 @@ void RttEstimator::on_sample(uint32_t rtt_ms)
 void RttEstimator::back_off()
 {
     _rto_ms = std::min(_rto_ms * 2, MAX_RTO_MS);
+}
+
+void RttEstimator::reset_backoff()
+{
+    if (!_has_sample)
+    {
+        _rto_ms = INITIAL_RTO_MS;
+        return;
+    }
+    _compute_rto();
 }

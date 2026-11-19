@@ -78,6 +78,34 @@ void CongestionControl::on_partial_ack(uint32_t bytes_acked)
     _cwnd = std::max(_cwnd, _mss);
 }
 
+void CongestionControl::save_for_undo(uint64_t now_ms)
+{
+    _undo_valid = true;
+    _undo_cwnd = _cwnd;
+    _undo_ssthresh = _ssthresh;
+    _undo_saved_at_ms = now_ms;
+    _save_for_undo();
+}
+
+void CongestionControl::undo(uint64_t now_ms)
+{
+    if (!_undo_valid)
+    {
+        return;
+    }
+    _undo_valid = false;
+    // Never lower than now, as Linux's tcp_undo_cwnd_reduction() has it: a
+    // window that has already grown back past the snapshot owes nothing.
+    if (_cwnd >= _undo_cwnd)
+    {
+        _ssthresh = std::max(_ssthresh, _undo_ssthresh);
+        return;
+    }
+    _cwnd = _undo_cwnd;
+    _ssthresh = std::max(_ssthresh, _undo_ssthresh);
+    _restore_for_undo(now_ms >= _undo_saved_at_ms ? now_ms - _undo_saved_at_ms : 0);
+}
+
 // --- Reno -------------------------------------------------------------------
 
 void RenoCongestionControl::_on_congestion_event(uint32_t bytes_in_flight, uint64_t /*now_ms*/)
@@ -115,6 +143,30 @@ void CubicCongestionControl::_on_reset()
     _epoch_start_ms = 0;
     _epoch_running = false;
     _app_limited_since_ms = NOT_APP_LIMITED;
+}
+
+void CubicCongestionControl::_save_for_undo()
+{
+    _undo_curve = Curve{_w_max, _w_last_max, _k, _w_est, _epoch_start_ms, _epoch_running, _app_limited_since_ms};
+}
+
+void CubicCongestionControl::_restore_for_undo(uint64_t paused_ms)
+{
+    // The episode's own congestion event replaced W_max and cleared the
+    // epoch; both come back. The epoch is shifted by the episode's length,
+    // as for an application-limited stretch: the curve continues from where
+    // it stopped rather than jumping by the time it was not growing.
+    _w_max = _undo_curve.w_max;
+    _w_last_max = _undo_curve.w_last_max;
+    _k = _undo_curve.k;
+    _w_est = _undo_curve.w_est;
+    _epoch_running = _undo_curve.epoch_running;
+    _epoch_start_ms = _undo_curve.epoch_start_ms + paused_ms;
+    _app_limited_since_ms = _undo_curve.app_limited_since_ms;
+    if (_app_limited_since_ms != NOT_APP_LIMITED)
+    {
+        _app_limited_since_ms += paused_ms;
+    }
 }
 
 void CubicCongestionControl::_on_app_limited_ack(uint64_t now_ms)

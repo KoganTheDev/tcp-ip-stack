@@ -1094,7 +1094,43 @@ void TcpConnection::_begin_episode()
         return;
     }
     _episode_open = true;
+    _episode_had_rto = false;
     _in_flight.begin_episode();
+    _congestion->save_for_undo(_now_ms);
+}
+
+void TcpConnection::_try_undo_dsack()
+{
+    if (_episode_open || !_congestion->has_undo())
+    {
+        return;
+    }
+    uint32_t copies = _in_flight.episode_retransmissions();
+    if (copies == 0 || _in_flight.episode_dsacked() < copies)
+    {
+        return;
+    }
+    _undo_episode();
+    _stats.spurious_recoveries_undone += 1;
+    if (_state == TcpState::ESTABLISHED || _state == TcpState::CLOSE_WAIT)
+    {
+        _send_queued_while_window_allows();
+    }
+}
+
+void TcpConnection::_undo_episode()
+{
+    uint32_t before = _congestion->window();
+    _last_undo.cwnd_at_start = _congestion->undo_window();
+    _last_undo.cwnd_before = before;
+    _congestion->undo(_now_ms);
+    _last_undo.cwnd_after = _congestion->window();
+    if (_episode_had_rto)
+    {
+        _rtt.reset_backoff();
+    }
+    LOG_DEBUG("TcpConnection[" << _id << "] spurious episode undone: cwnd " << before << " -> "
+                               << _congestion->window());
 }
 
 void TcpConnection::_end_episode()
@@ -1297,6 +1333,7 @@ void TcpConnection::_tlp_process_ack(uint32_t ack, bool pure_dup_ack)
         // loss, which the window must answer as a fast recovery would.
         _tlp_outstanding = false;
         _stats.loss_probe_repairs += 1;
+        _congestion->forget_undo(); // a real loss since the last episode
         if (!_in_recovery && !_rto_recovery)
         {
             uint32_t flight_size = _send_next - _in_flight.snd_una_or(_send_next);
@@ -1563,6 +1600,10 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     // flight the ack answers, not about what is left after it.
     uint32_t prior_in_flight = _bytes_in_flight();
     _cwnd_limited_at_last_ack = _congestion->is_cwnd_limited(prior_in_flight);
+    if (_ecn_negotiated && segment.get_ece() && !segment.get_syn())
+    {
+        _congestion->forget_undo(); // the path marked a packet: congestion, whatever else is spurious
+    }
     // Apply the scoreboard before anything else looks at the window: what the
     // peer reports holding changes how much is genuinely outstanding, and
     // therefore how much may be sent.
@@ -2220,6 +2261,11 @@ void TcpConnection::on_segment(const Tcp& segment, Ecn ecn)
     }
 
     _handle_ack(segment);
+    if (_ecn_negotiated && segment.get_ece())
+    {
+        _congestion->forget_undo(); // again: this ack may have started an episode
+    }
+    _try_undo_dsack();
     _tune_send_capacity();
 
     // Resolved before the state check because the FIN handling at the bottom
@@ -2612,6 +2658,7 @@ void TcpConnection::_run_timers()
     {
         _begin_episode();
     }
+    _episode_had_rto = true;
     _congestion->on_retransmit_timeout(_bytes_in_flight(), _now_ms);
     // RFC 6675 5.1 (and RFC 6582's "recover"): a timeout ends any recovery,
     // and no new one starts until everything sent so far is acknowledged.

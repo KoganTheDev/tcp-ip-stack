@@ -281,3 +281,112 @@ TEST(TcpRackReoWnd, TheWiderWindowLastsSixteenRecoveries)
         ASSERT_EQ(s.c->rack_reo_wnd_mult(), recovery < 16 ? 2u : 1u) << "after recovery " << recovery;
     }
 }
+
+// --- undo after a spurious fast recovery (RFC 3708) ---
+
+namespace
+{
+    // Segment 0 of ten is reordered past three others: the first time,
+    // nothing says the path reorders, so recovery starts and resends it.
+    // Then the original arrives (the ack covers all ten, ending recovery)
+    // and, unless `report_copy` is false, the copy draws its D-SACK.
+    void spurious_fast_recovery(Sender& s, bool report_copy = true, bool ece = false)
+    {
+        s.send(10);
+        s.pass(20);
+        for (uint32_t n = 1; n <= 3; n++)
+            s.ack(s.seg(0), {{s.seg(1), s.seg(n + 1)}}, std::nullopt, ece && n == 3);
+        REQUIRE_TRUE(s.count_sent(s.seg(0)) == 2, "precondition: recovery resent segment 0");
+        s.ack(s.seg(10));
+        if (report_copy)
+            s.ack(s.seg(10), {s.block(0)});
+    }
+}
+
+// Every retransmission of the episode (one) came back as a duplicate, so it
+// answered no loss: the window it gave up is restored, in both algorithms.
+TEST(TcpUndo, AFastRecoveryWhoseRetransmissionsWereAllDuplicatesIsUndone)
+{
+    for (CongestionControlAlgorithm algorithm : {CongestionControlAlgorithm::RENO, CongestionControlAlgorithm::CUBIC})
+    {
+        Options options;
+        options.algorithm = algorithm;
+        Sender s = measured(options);
+        uint32_t cwnd = s.c->get_congestion_window();
+        spurious_fast_recovery(s, /*report_copy=*/false);
+        ASSERT_LT(s.c->get_congestion_window(), cwnd) << "precondition: recovery reduced the window";
+        s.ack(s.seg(10), {s.block(0)});
+        ASSERT_EQ(s.stats().spurious_recoveries_undone, 1u);
+        ASSERT_EQ(s.c->get_congestion_window(), cwnd);
+    }
+}
+
+// Two segments resent, only one reported duplicate: the other may have
+// repaired a real loss, so the reduction stands.
+TEST(TcpUndo, AnEpisodeIsNotUndoneWhileOneOfItsRetransmissionsIsUnreported)
+{
+    Sender s = measured();
+    s.send(10);
+    s.pass(20);
+    for (uint32_t n = 1; n <= 3; n++)
+        s.ack(s.seg(0), {{s.seg(1), s.seg(n + 1)}});
+    // 4 missing too, with 5..9 SACKed above it: IsLost(4).
+    s.ack(s.seg(0), {{s.seg(5), s.seg(10)}, {s.seg(1), s.seg(4)}});
+    ASSERT_EQ(s.count_sent(s.seg(4)), 2u) << "precondition: 4 was resent as well";
+    s.ack(s.seg(10));
+    uint32_t cwnd_reduced = s.c->get_congestion_window();
+    s.ack(s.seg(10), {s.block(0)});
+    ASSERT_EQ(s.stats().dsacks_received, 1u);
+    ASSERT_EQ(s.stats().spurious_recoveries_undone, 0u);
+    ASSERT_EQ(s.c->get_congestion_window(), cwnd_reduced);
+    s.ack(s.seg(10), {s.block(4)});
+    ASSERT_EQ(s.stats().spurious_recoveries_undone, 1u) << "now every copy is accounted for";
+}
+
+// A segment resent twice is two copies: both must come back as duplicates.
+TEST(TcpUndo, ASegmentResentTwiceNeedsTwoDsacks)
+{
+    Sender s;
+    s.send(5);
+    s.pass(1000);
+    s.pass(2000);
+    s.ack(s.seg(5));
+    s.ack(s.seg(5), {s.block(0)});
+    ASSERT_EQ(s.stats().spurious_recoveries_undone, 0u);
+    s.ack(s.seg(5), {s.block(0)});
+    ASSERT_EQ(s.stats().spurious_recoveries_undone, 1u);
+}
+
+// The loss probe's copy is part of the episode it led into: a recovery
+// whose own retransmission was a duplicate is not undone until the probe's
+// copy is reported too.
+TEST(TcpUndo, TheLossProbeCountsInTheEpisodeItLedTo)
+{
+    Sender s = measured();
+    s.send(5);
+    s.pass(20);
+    s.ack(s.seg(3)); // 3 and 4 late
+    s.pass_to_next_timer();
+    ASSERT_EQ(s.count_sent(s.seg(4)), 2u) << "precondition: the probe resent 4";
+    s.pass(20);
+    s.ack(s.seg(3), {s.block(4)});
+    ASSERT_EQ(s.count_sent(s.seg(3)), 2u) << "precondition: recovery resent 3";
+    s.ack(s.seg(5));
+    s.ack(s.seg(5), {s.block(3)});
+    ASSERT_EQ(s.stats().spurious_recoveries_undone, 0u) << "the probe's copy is not reported yet";
+    s.ack(s.seg(5), {s.block(4)});
+    ASSERT_EQ(s.stats().spurious_recoveries_undone, 1u);
+}
+
+// ECN-Echo during the episode is congestion whatever the D-SACKs say: the
+// path marked a packet. Such an episode is never undone.
+TEST(TcpUndo, AnEpisodeThatSawEceIsNeverUndone)
+{
+    Options options;
+    options.ecn = true;
+    Sender s = measured(options);
+    ASSERT_TRUE(s.c->ecn_negotiated());
+    spurious_fast_recovery(s, /*report_copy=*/true, /*ece=*/true);
+    ASSERT_EQ(s.stats().dsacks_received, 1u);
+    ASSERT_EQ(s.stats().spurious_recoveries_undone, 0u);
+}

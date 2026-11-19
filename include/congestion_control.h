@@ -160,6 +160,27 @@ public:
     // slow-start back up.
     void on_retransmit_timeout(uint32_t bytes_in_flight, uint64_t now_ms);
 
+    // --- undo (RFC 3708 for a D-SACK, RFC 4015 for a spurious timeout) ---
+    //
+    // A reduction may turn out to have answered no loss at all: the
+    // retransmissions it came with were all duplicates (D-SACK), or the
+    // timeout fired on data that had arrived (Eifel, F-RTO). The window it
+    // gave up was then the path's to keep, so it is given back. The snapshot
+    // is taken where an episode starts, before its reduction; undo() puts
+    // cwnd and ssthresh back - never lower than they are now - and the
+    // algorithm's own state (CUBIC's curve) with them. The connection
+    // decides when an undo is justified; this only keeps the numbers.
+    void save_for_undo(uint64_t now_ms);
+    bool has_undo() const { return _undo_valid; }
+    // The window the snapshot holds: the most an undo can restore.
+    uint32_t undo_window() const { return _undo_cwnd; }
+    // Restores the snapshot and discards it; nothing if there is none.
+    void undo(uint64_t now_ms);
+    // Discards the snapshot: something since (an ECN-Echo, a repaired loss)
+    // was real congestion, which no later evidence about the episode can
+    // take back.
+    void forget_undo() { _undo_valid = false; }
+
 protected:
     // Congestion detected. The implementation sets _ssthresh to whatever its
     // policy says the safe window is, and resets any internal state keyed to
@@ -189,6 +210,12 @@ protected:
     // epoch clock, for the same reason as after idle.
     virtual void _on_app_limited_ack(uint64_t /*now_ms*/) {}
 
+    // Optional hooks for undo: keep a copy of the algorithm's own state, and
+    // put it back. `paused_ms` is how long the episode lasted, for state
+    // keyed to the clock.
+    virtual void _save_for_undo() {}
+    virtual void _restore_for_undo(uint64_t /*paused_ms*/) {}
+
     // cwnd expressed in segments, which is the unit RFC 8312's constants are
     // calibrated in. Floored at one segment so it is always safe to divide by:
     // every path that sets the window keeps it at or above one MSS, but a
@@ -202,6 +229,12 @@ protected:
     uint32_t _cwnd = 0;
     uint32_t _ssthresh = 0;
     uint32_t _mss = 0;
+
+    // The undo snapshot (see save_for_undo()).
+    bool _undo_valid = false;
+    uint32_t _undo_cwnd = 0;
+    uint32_t _undo_ssthresh = 0;
+    uint64_t _undo_saved_at_ms = 0;
 
     // A ceiling on the window, purely so no growth path can wrap a uint32_t.
     // It is far above anything the peer's advertised window would ever permit
@@ -291,6 +324,8 @@ protected:
     void _on_reset() override;
     void _on_idle_restart() override { _epoch_running = false; }
     void _on_app_limited_ack(uint64_t now_ms) override;
+    void _save_for_undo() override;
+    void _restore_for_undo(uint64_t paused_ms) override;
 
 private:
     // RFC 8312's two parameters. C is the aggressiveness of the cubic term, in
@@ -330,6 +365,19 @@ private:
     // sentinel of the maximum, not 0, for the reason given above.
     static constexpr uint64_t NOT_APP_LIMITED = UINT64_MAX;
     uint64_t _app_limited_since_ms = NOT_APP_LIMITED;
+
+    // The curve as it was before the episode an undo takes back.
+    struct Curve
+    {
+        double w_max = 0.0;
+        double w_last_max = 0.0;
+        double k = 0.0;
+        double w_est = 0.0;
+        uint64_t epoch_start_ms = 0;
+        bool epoch_running = false;
+        uint64_t app_limited_since_ms = NOT_APP_LIMITED;
+    };
+    Curve _undo_curve;
 };
 
 enum class CongestionControlAlgorithm

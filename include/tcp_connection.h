@@ -656,12 +656,23 @@ public:
         uint64_t ecn_reductions = 0;         // cwnd reductions for an ECN-Echo (RFC 3168 6.1.2)
         uint64_t dsacks_sent = 0;            // acks that carried a D-SACK block (RFC 2883)
         uint64_t dsacks_received = 0;        // D-SACKs naming a retransmission of ours (RFC 2883 4)
+        uint64_t spurious_recoveries_undone = 0; // episodes undone: D-SACKs covered every copy (RFC 3708)
     };
     const Stats& stats() const { return _stats; }
     // Scoreboard entries the sender has examined, for cost tests.
     uint64_t scoreboard_visits() const { return _in_flight.visits(); }
     // The part of it spent by RACK.
     uint64_t rack_visits() const { return _in_flight.rack_visits(); }
+    // The last undo, for tests of the rule that one never raises cwnd past
+    // where its episode started: the window saved at the start, just
+    // before the undo, and just after it. All 0 if nothing was undone.
+    struct UndoRecord
+    {
+        uint32_t cwnd_at_start = 0;
+        uint32_t cwnd_before = 0;
+        uint32_t cwnd_after = 0;
+    };
+    const UndoRecord& last_undo() const { return _last_undo; }
     // RACK.reo_wnd_mult (RFC 8985 6.2 step 4): the reordering window in
     // quarters of min_RTT, grown by D-SACKs.
     uint32_t rack_reo_wnd_mult() const { return _rack_reo_wnd_mult; }
@@ -784,9 +795,31 @@ private:
     // keeps its undo state across tcp_enter_loss() from Recovery. Every
     // retransmission while one is open goes on its ledger.
     bool _episode_open = false;
+    // Starts an episode (unless one is open): a new ledger, and the
+    // congestion state before the reduction saved for an undo.
     void _begin_episode();
     // The cumulative ack reached the recovery point: the episode is over.
     void _end_episode();
+    // The episode included a timeout, so its undo also takes back the RTO
+    // back-off.
+    bool _episode_had_rto = false;
+    UndoRecord _last_undo;
+
+    // --- undo (RFC 3708, RFC 4015) ---
+    //
+    // A reduction that answered no loss is given back (see
+    // CongestionControl::save_for_undo()). By D-SACK (RFC 3708): once the
+    // episode is over and D-SACKs have reported every copy it retransmitted
+    // - loss probe and repeated copies included - as a duplicate. Never for
+    // an episode that saw ECN-Echo or a loss repaired by a probe after it:
+    // those are congestion whatever the D-SACKs say, and they forget the
+    // snapshot (CongestionControl::forget_undo()), as does the undo itself,
+    // so an episode is undone at most once.
+    // Checked after every ack; cheap unless it undoes.
+    void _try_undo_dsack();
+    // The one undo path: the snapshot back, and the RTO back-off with it if
+    // the episode had a timeout.
+    void _undo_episode();
     // What RACK needs from this ack (see SendScoreboard::AckContext).
     SendScoreboard::AckContext _rack_context(const Tcp& segment) const;
 

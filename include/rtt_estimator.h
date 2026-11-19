@@ -56,6 +56,10 @@ public:
     // and the backed-off value persists until the next sample - the estimator
     // has no valid input while only retransmitted data is outstanding.
     void back_off();
+    // Undoes every back_off() since the last sample: the RTO is computed from
+    // SRTT and RTTVAR again (or is the initial one, with no sample yet). For
+    // a timeout later shown to have been spurious.
+    void reset_backoff();
 
     // The live timeout, in whole milliseconds.
     int rto_ms() const { return _rto_ms; }
@@ -80,4 +84,6 @@ private:
     uint32_t _rttvar_scaled = 0; // RTT variation (RTTVAR), in ms * SCALE
     bool _has_sample = false;
     int _rto_ms = INITIAL_RTO_MS;
+    // RFC 6298 2.3: SRTT + max(G, K * RTTVAR), floored and capped.
+    void _compute_rto();
 };
