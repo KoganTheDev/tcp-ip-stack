@@ -211,9 +211,29 @@ std::vector<Ipv6ConfiguredAddress> NetworkStack::ipv6_addresses() const
 
 bool NetworkStack::_is_our_ipv6(const IPv6Address& address) const
 {
-    const std::vector<Ipv6ConfiguredAddress> usable = this->ipv6_addresses();
-    return std::any_of(usable.begin(), usable.end(),
-                       [&address](const Ipv6ConfiguredAddress& a) { return a.address == address; });
+    // In place, over what ipv6_addresses() would have copied: this runs on
+    // every v6 packet sent or received, and the copy was a heap vector each
+    // time. Same set - the static addresses, and autoconfigured ones that are
+    // preferred or deprecated (not tentative).
+    for (const Ipv6ConfiguredAddress& configured : this->_v6.addresses)
+    {
+        if (configured.address == address)
+        {
+            return true;
+        }
+    }
+    if (this->_v6.autoconfig)
+    {
+        for (const Ipv6ConfiguredAddress& configured : this->_v6.autoconfig->addresses())
+        {
+            if ((configured.state == Ipv6AddressState::PREFERRED || configured.state == Ipv6AddressState::DEPRECATED)
+                && configured.address == address)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 bool NetworkStack::_ipv6_group_joined(const IPv6Address& group) const
