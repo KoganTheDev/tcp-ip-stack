@@ -169,16 +169,22 @@ protected:
     uint32_t _ssthresh = 0;
     uint32_t _mss = 0;
 
-    // Effectively "no ceiling discovered yet". A connection starts in slow
-    // start and stays there until a real loss recalibrates this downwards.
-    static constexpr uint32_t INITIAL_SSTHRESH = 65536;
-
     // A ceiling on the window, purely so no growth path can wrap a uint32_t.
     // It is far above anything the peer's advertised window would ever permit
     // (min() of the two is what actually gets used), so it never binds in
     // practice - it exists to make "cwnd grew" unable to mean "cwnd became
     // tiny", which is the shape overflow bugs take here.
     static constexpr uint32_t MAX_CWND = 1u << 30;
+
+    // "No ceiling discovered yet": a connection starts in slow start and
+    // stays there until a real loss (or ECN) recalibrates this downwards.
+    // RFC 5681 3.1 asks for it "arbitrarily high (e.g., to the size of the
+    // largest possible advertised window)" and Linux uses infinity. It used
+    // to be 64 KiB, which was harmless while windows were capped near there
+    // and became the limit once window scaling and buffer autotuning let a
+    // window reach megabytes: slow start ended at 45 segments on a path that
+    // needed 860, and CUBIC's slow climb from there took seconds.
+    static constexpr uint32_t INITIAL_SSTHRESH = MAX_CWND;
 };
 
 // Classic Reno, RFC 5681. Multiplicative decrease by half, additive increase of

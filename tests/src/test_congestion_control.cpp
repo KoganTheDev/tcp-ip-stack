@@ -42,11 +42,9 @@ namespace
         }
     }
 
-    // A window large enough to be interesting that slow start can actually
-    // reach. The initial ssthresh is 64 KiB, and slow start stops there - a
-    // helper that asked for more would quietly return less, which is exactly
-    // what it did on the first run of these tests.
-    constexpr uint32_t BIG_WINDOW_SEGMENTS = 32; // 46720 bytes, comfortably under 64 KiB
+    // A window large enough to be interesting. (Slow start used to stop at a
+    // 64 KiB initial ssthresh, which is where the size came from.)
+    constexpr uint32_t BIG_WINDOW_SEGMENTS = 32; // 46720 bytes
 
     // Slow-starts a freshly established algorithm to exactly `segments` worth
     // of window (at least the 10-segment initial window). Exact, not
@@ -92,6 +90,25 @@ TEST(CongestionControl, SlowStartDoublesTheWindowEveryRoundTripInBothAlgorithms)
             acknowledge(*cc, cc->window());
             assert_near(cc->window(), expected * MSS, 0, std::string(cc->name()) + " slow start round trip");
         }
+    }
+}
+
+// RFC 5681 3.1: the initial ssthresh is arbitrarily high, so slow start runs
+// until loss says otherwise. A fixed 64 KiB used to end it at 45 segments,
+// whatever the path's bandwidth-delay product was.
+TEST(CongestionControl, SlowStartIsNotCappedBeforeTheFirstLoss)
+{
+    for (auto algorithm : {CongestionControlAlgorithm::RENO, CongestionControlAlgorithm::CUBIC})
+    {
+        auto cc = make_congestion_control(algorithm);
+        cc->on_established(MSS);
+        for (int round = 0; round < 7; round++)
+        {
+            uint32_t before = cc->window();
+            acknowledge(*cc, before, before, 100, 0);
+            ASSERT_EQ(cc->window(), 2 * before) << cc->name() << " still doubles at " << before << " bytes";
+        }
+        ASSERT_GT(cc->window(), 1000u * MSS / 2) << "hundreds of segments, without a loss to stop it";
     }
 }
 
