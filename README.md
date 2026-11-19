@@ -117,6 +117,12 @@ simultaneous close rather than folding it into `FIN_WAIT_2`. On top of that:
   missing, and a loss the probe repaired by itself still reduces cwnd. In `SimRecovery`
   a lost retransmission now completes in 230 ms instead of 490 (no RTO), a lost tail in
   430 ms instead of 930, and 5% random loss over five seeds takes 2 RTOs instead of 12
+- **Receiver D-SACK** (RFC 2883) when SACK is negotiated: a data segment the receiver
+  already has - below RCV.NXT, or inside what the reorder buffer holds - is reported once,
+  as the first SACK block of the ack that answers it (just the duplicate part, if the
+  segment was only partly old), followed by the range that contains it when it lies in
+  out-of-order data, then the usual blocks. `TcpConnection::Stats::dsacks_sent` counts
+  them. The sender does not use them yet (below).
 - **ECN** (RFC 3168): negotiated on the SYNs, ECT(0) on new data only (never on SYNs,
   pure acks, retransmissions or probes), CE echoed as ECE until the sender's CWR, and
   ECE answered like a loss - the congestion-control policy's ssthresh - at most once per
@@ -422,9 +428,11 @@ limit by a peer.
 
 These are documented decisions, not gaps that were missed:
 
-- **No PRR or RACK-TLP without SACK, and no D-SACK or F-RTO.** Without SACK, recovery
-  is NewReno's window inflation and loss is detected by duplicate counts alone; there is
-  no SACK-less pipe estimate for PRR to work from. Without D-SACK, RACK's reordering
+- **No PRR or RACK-TLP without SACK, and no sender-side D-SACK or F-RTO.** The receiver
+  side of D-SACK is done (see the feature list); the sender ignores the blocks. Without
+  SACK, recovery is NewReno's window inflation and loss is detected by duplicate counts
+  alone; there is no SACK-less pipe estimate for PRR to work from. Without reading
+  D-SACK, RACK's reordering
   window stays at min_RTT/4 (RFC 8985's reo_wnd_mult never grows), TLP judges a repaired
   loss without the D-SACK case, and a spurious retransmission or timeout is not undone.
 - **ECN is RFC 3168's, not AccECN or L4S.** One reduction per marked window, no
