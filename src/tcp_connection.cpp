@@ -92,6 +92,14 @@ void TcpConnection::_transition(TcpState new_state)
     {
         _rcv_space_init();
     }
+    if (new_state == TcpState::TIME_WAIT || new_state == TcpState::CLOSED)
+    {
+        // Nothing is buffered for or from the application from here on, so
+        // the growth goes back to the stack (the capacities stay as they are:
+        // shrinking them now would gain nothing).
+        _receive_charge.release();
+        _send_charge.release();
+    }
 
     // Iterate a copy: a subscriber is entitled to react by doing something that
     // registers another, and growing the vector mid-iteration would invalidate
@@ -607,8 +615,14 @@ void TcpConnection::_grow_receive_capacity(size_t target)
     {
         return;
     }
-    LOG_DEBUG("TcpConnection[" << _id << "] receive buffer " << _receive_capacity << " -> " << target);
-    _receive_capacity = static_cast<uint32_t>(target);
+    size_t granted = _receive_charge.grant(target - _receive_capacity);
+    if (granted == 0)
+    {
+        return; // the stack's budget is spent (see tcp_memory_budget.h)
+    }
+    LOG_DEBUG("TcpConnection[" << _id << "] receive buffer " << _receive_capacity << " -> "
+                               << _receive_capacity + granted);
+    _receive_capacity += static_cast<uint32_t>(granted);
 }
 
 void TcpConnection::reduce_effective_mss(uint16_t path_mss)
@@ -2453,14 +2467,22 @@ namespace
     }
 } // namespace
 
+void TcpConnection::set_memory_budget(std::shared_ptr<TcpMemoryBudget> budget)
+{
+    _receive_charge.attach(budget);
+    _send_charge.attach(std::move(budget));
+}
+
 void TcpConnection::set_receive_capacity(size_t bytes)
 {
+    _receive_charge.release(); // the application's choice is not autotuning's growth
     _receive_capacity = static_cast<uint32_t>(clamp_capacity(bytes, size_t{2} * _local_mss));
 }
 
 void TcpConnection::set_send_capacity(size_t bytes)
 {
     EntryScope scope(*this);
+    _send_charge.release(); // the application's choice is not autotuning's growth
     _send_capacity = clamp_capacity(bytes, size_t{2} * _local_mss);
     // A bigger limit is new room: tell a waiting writer (EPOLLOUT).
     _report_send_space();
@@ -2486,8 +2508,13 @@ void TcpConnection::_grow_send_capacity(size_t target)
     {
         return;
     }
-    LOG_DEBUG("TcpConnection[" << _id << "] send buffer " << _send_capacity << " -> " << target);
-    _send_capacity = target;
+    size_t granted = _send_charge.grant(target - _send_capacity);
+    if (granted == 0)
+    {
+        return; // the stack's budget is spent (see tcp_memory_budget.h)
+    }
+    LOG_DEBUG("TcpConnection[" << _id << "] send buffer " << _send_capacity << " -> " << _send_capacity + granted);
+    _send_capacity += granted;
     // _report_send_space() at the end of the entry point tells a waiting
     // writer about the new room.
 }

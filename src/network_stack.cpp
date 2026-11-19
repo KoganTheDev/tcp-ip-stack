@@ -751,6 +751,7 @@ void NetworkStack::_wire_connection(TcpConnection& connection)
     // (because none is due) must still see time pass, for its timestamps,
     // its RTT samples and its idle restart.
     connection.use_external_clock(&this->_now_ms);
+    connection.set_memory_budget(this->_tcp_memory);
     uint64_t connection_id = connection.get_id();
     connection.set_timer_changed_callback([this, connection_id]() { this->_schedule_connection_timer(connection_id); });
 }

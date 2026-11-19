@@ -12,6 +12,7 @@
 #include "ip.h"
 #include "ip_address.h"
 #include "reorder_buffer.h"
+#include "tcp_memory_budget.h"
 #include "rtt_estimator.h"
 #include "send_scoreboard.h"
 #include "tcp.h"
@@ -485,6 +486,14 @@ public:
     // Growth is new room, so the send-space callback (EPOLLOUT) fires.
     void set_send_capacity_locked(bool locked) { _send_capacity_locked = locked; }
     bool send_capacity_locked() const { return _send_capacity_locked; }
+    // Where growth above the defaults is drawn from (see tcp_memory_budget.h);
+    // NetworkStack passes its own. Without one, growth is limited only by
+    // MAX_BUFFER_CAPACITY. What is drawn is given back on reaching TIME_WAIT
+    // or CLOSED - nothing is buffered for the application any more - or when
+    // the application sets that capacity itself, which is not counted.
+    void set_memory_budget(std::shared_ptr<TcpMemoryBudget> budget);
+    // Bytes this connection currently draws from its budget.
+    size_t memory_charged() const { return _receive_charge.charged() + _send_charge.charged(); }
     // The window shift this stack offers in its SYN (RFC 7323). Public so
     // tests can read a scaled window without restating it.
     static constexpr uint8_t WINDOW_SCALE_SHIFT = 1;
@@ -1161,6 +1170,9 @@ private:
     size_t _send_capacity = SEND_BUFFER_CAPACITY;
     bool _receive_capacity_locked = false;
     bool _send_capacity_locked = false;
+    // Autotuning's growth, drawn from the stack's budget per buffer.
+    TcpMemoryCharge _receive_charge;
+    TcpMemoryCharge _send_charge;
     // Grows _send_capacity with cwnd (see set_send_capacity_locked()).
     void _tune_send_capacity();
     // Raises the send capacity towards `target` (never lowers it).
