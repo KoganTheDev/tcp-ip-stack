@@ -28,7 +28,7 @@ std::string LinkStats::describe() const
     std::ostringstream out;
     out << "tx=" << transmitted << " delivered=" << delivered << " lost=" << lost << " dup=" << duplicated
         << " corrupt=" << corrupted << " reorder=" << reordered << " mtu_drop=" << mtu_dropped
-        << " queue_drop=" << queue_dropped << " ce=" << ce_marked;
+        << " queue_drop=" << queue_dropped << " ce=" << ce_marked << " delayed=" << delayed;
     return out.str();
 }
 
@@ -135,12 +135,20 @@ void NetemChannel::_transmit(Side from, const Bytes& frame)
         direction.stats.ce_marked++;
     }
 
+    // Asked after the random draws above and draws none itself, so adding a
+    // filter never shifts the random stream.
+    uint32_t extra_delay_ms = direction.delay_filter ? direction.delay_filter(frame) : 0;
+    if (extra_delay_ms != 0)
+    {
+        direction.stats.delayed++;
+    }
+
     bool duplicate = _random.chance(params.duplicate);
-    _enqueue_copy(direction, sent, wire_done_us);
+    _enqueue_copy(direction, sent, wire_done_us, extra_delay_ms);
     if (duplicate)
     {
         direction.stats.duplicated++;
-        _enqueue_copy(direction, sent, wire_done_us);
+        _enqueue_copy(direction, sent, wire_done_us, extra_delay_ms);
     }
 }
 
@@ -185,7 +193,7 @@ bool NetemChannel::_exempt(const Direction& direction, const Bytes& frame)
     return direction.loss_exempt && direction.loss_exempt(frame);
 }
 
-void NetemChannel::_enqueue_copy(Direction& direction, Bytes frame, uint64_t wire_done_us)
+void NetemChannel::_enqueue_copy(Direction& direction, Bytes frame, uint64_t wire_done_us, uint32_t extra_delay_ms)
 {
     const LinkParams& params = direction.params;
     if (!frame.empty() && !_exempt(direction, frame) && _random.chance(params.corrupt))
@@ -194,7 +202,7 @@ void NetemChannel::_enqueue_copy(Direction& direction, Bytes frame, uint64_t wir
         frame[bit / 8] = static_cast<byte_t>(frame[bit / 8] ^ (1u << (bit % 8)));
         direction.stats.corrupted++;
     }
-    uint64_t delay_ms = params.delay_ms;
+    uint64_t delay_ms = params.delay_ms + extra_delay_ms;
     if (params.jitter_ms != 0)
     {
         delay_ms += _random.between(0, params.jitter_ms);

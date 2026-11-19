@@ -84,7 +84,36 @@ public:
     // the same reason: CUBIC's window is a function of real time since the last
     // congestion event, which is a quantity this stack could not express at all
     // until timers stopped being denominated in the caller's polling cycles.
-    void on_ack(uint32_t bytes_acked, uint32_t bytes_in_flight, uint32_t srtt_ms, uint64_t now_ms);
+    //
+    // prior_in_flight is what was outstanding when this ack arrived, before it
+    // retired anything (Linux's prior_in_flight). The window only grows if
+    // that shows the sender was using it - see is_cwnd_limited().
+    void on_ack(uint32_t bytes_acked, uint32_t prior_in_flight, uint32_t srtt_ms, uint64_t now_ms);
+
+    // Whether a sender with prior_in_flight outstanding was limited by cwnd,
+    // rather than by the application (or the peer's window). RFC 7661's
+    // point, and Linux's tcp_is_cwnd_limited(): an ack only proves the path
+    // can carry what was actually sent, so growing a window the sender was
+    // not filling is growing it on no evidence. With ssthresh uncapped and no
+    // loss to stop it, a request/response connection's cwnd would otherwise
+    // double every round trip forever - and the send buffer, sized from cwnd,
+    // with it.
+    //
+    // In slow start, in flight * 2 >= cwnd: slow start doubles per round
+    // trip, so a flight of half the window is enough to justify the next
+    // doubling (Linux: cwnd < 2 * max_packets_out). Past ssthresh, in flight
+    // must reach cwnd less one MSS - the sender sends whole segments, so a
+    // full window can sit up to one segment short of cwnd. Linux tracks the
+    // largest flight over a window instead of the flight at each ack; the
+    // per-ack reading is simpler and errs the same way, towards not growing.
+    bool is_cwnd_limited(uint32_t prior_in_flight) const
+    {
+        if (_cwnd < _ssthresh)
+        {
+            return uint64_t{prior_in_flight} * 2 >= _cwnd;
+        }
+        return uint64_t{prior_in_flight} + _mss >= _cwnd;
+    }
 
     // Three duplicate acks: a segment was probably lost, but acks are still
     // arriving, so the path is still carrying traffic. The gentler of the two
@@ -130,6 +159,34 @@ public:
     // statement than "one segment went missing". Collapse to one segment and
     // slow-start back up.
     void on_retransmit_timeout(uint32_t bytes_in_flight, uint64_t now_ms);
+    // Another timeout before the last one's recovery is over: one segment
+    // again, but ssthresh (and CUBIC's curve) held - RFC 5681 3.1, for a
+    // segment the timer already resent, as Linux's tcp_enter_loss() keeps
+    // its threshold in the Loss state. The window that timed out is the
+    // slow start after the first timeout, which says nothing about the
+    // path; the first timeout's reduction stands.
+    void on_repeated_retransmit_timeout() { _cwnd = _mss; }
+
+    // --- undo (RFC 3708 for a D-SACK, RFC 4015 for a spurious timeout) ---
+    //
+    // A reduction may turn out to have answered no loss at all: the
+    // retransmissions it came with were all duplicates (D-SACK), or the
+    // timeout fired on data that had arrived (Eifel, F-RTO). The window it
+    // gave up was then the path's to keep, so it is given back. The snapshot
+    // is taken where an episode starts, before its reduction; undo() puts
+    // cwnd and ssthresh back - never lower than they are now - and the
+    // algorithm's own state (CUBIC's curve) with them. The connection
+    // decides when an undo is justified; this only keeps the numbers.
+    void save_for_undo(uint64_t now_ms);
+    bool has_undo() const { return _undo_valid; }
+    // The window the snapshot holds: the most an undo can restore.
+    uint32_t undo_window() const { return _undo_cwnd; }
+    // Restores the snapshot and discards it; nothing if there is none.
+    void undo(uint64_t now_ms);
+    // Discards the snapshot: something since (an ECN-Echo, a repaired loss)
+    // was real congestion, which no later evidence about the episode can
+    // take back.
+    void forget_undo() { _undo_valid = false; }
 
 protected:
     // Congestion detected. The implementation sets _ssthresh to whatever its
@@ -141,8 +198,8 @@ protected:
     virtual void _on_congestion_event(uint32_t bytes_in_flight, uint64_t now_ms) = 0;
 
     // Grow _cwnd past ssthresh. Called once per acknowledgement, only when
-    // _cwnd >= _ssthresh - slow start is handled by the base and is identical
-    // in both algorithms.
+    // _cwnd >= _ssthresh and the sender was cwnd-limited - slow start and the
+    // cwnd-limited check are handled by the base and identical in both.
     virtual void _grow_in_congestion_avoidance(uint32_t bytes_acked, uint32_t bytes_in_flight, uint32_t srtt_ms,
                                                uint64_t now_ms) = 0;
 
@@ -154,6 +211,17 @@ protected:
     // Optional hook for the restart after idle. CUBIC clears its epoch so its
     // curve does not count the idle time as time spent growing.
     virtual void _on_idle_restart() {}
+
+    // Optional hook for an ack that did not grow the window because the
+    // sender was not cwnd-limited (see is_cwnd_limited()). CUBIC pauses its
+    // epoch clock, for the same reason as after idle.
+    virtual void _on_app_limited_ack(uint64_t /*now_ms*/) {}
+
+    // Optional hooks for undo: keep a copy of the algorithm's own state, and
+    // put it back. `paused_ms` is how long the episode lasted, for state
+    // keyed to the clock.
+    virtual void _save_for_undo() {}
+    virtual void _restore_for_undo(uint64_t /*paused_ms*/) {}
 
     // cwnd expressed in segments, which is the unit RFC 8312's constants are
     // calibrated in. Floored at one segment so it is always safe to divide by:
@@ -169,9 +237,11 @@ protected:
     uint32_t _ssthresh = 0;
     uint32_t _mss = 0;
 
-    // Effectively "no ceiling discovered yet". A connection starts in slow
-    // start and stays there until a real loss recalibrates this downwards.
-    static constexpr uint32_t INITIAL_SSTHRESH = 65536;
+    // The undo snapshot (see save_for_undo()).
+    bool _undo_valid = false;
+    uint32_t _undo_cwnd = 0;
+    uint32_t _undo_ssthresh = 0;
+    uint64_t _undo_saved_at_ms = 0;
 
     // A ceiling on the window, purely so no growth path can wrap a uint32_t.
     // It is far above anything the peer's advertised window would ever permit
@@ -179,6 +249,18 @@ protected:
     // practice - it exists to make "cwnd grew" unable to mean "cwnd became
     // tiny", which is the shape overflow bugs take here.
     static constexpr uint32_t MAX_CWND = 1u << 30;
+
+    // "No ceiling discovered yet": a connection starts in slow start and
+    // stays there until a real loss (or ECN) recalibrates this downwards.
+    // RFC 5681 3.1 asks for it "arbitrarily high (e.g., to the size of the
+    // largest possible advertised window)" and Linux uses infinity. It used
+    // to be 64 KiB, which was harmless while windows were capped near there
+    // and became the limit once window scaling and buffer autotuning let a
+    // window reach megabytes: slow start ended at 45 segments on a path that
+    // needed 860, and CUBIC's slow climb from there took seconds. What stops
+    // a connection that never sees a loss from growing forever is
+    // is_cwnd_limited(): without a full window there is no growth at all.
+    static constexpr uint32_t INITIAL_SSTHRESH = MAX_CWND;
 };
 
 // Classic Reno, RFC 5681. Multiplicative decrease by half, additive increase of
@@ -248,6 +330,9 @@ protected:
                                        uint64_t now_ms) override;
     void _on_reset() override;
     void _on_idle_restart() override { _epoch_running = false; }
+    void _on_app_limited_ack(uint64_t now_ms) override;
+    void _save_for_undo() override;
+    void _restore_for_undo(uint64_t paused_ms) override;
 
 private:
     // RFC 8312's two parameters. C is the aggressiveness of the cubic term, in
@@ -282,6 +367,24 @@ private:
     // acknowledgement, silently resetting the Reno-equivalent window each time.
     uint64_t _epoch_start_ms = 0;
     bool _epoch_running = false;
+    // When the current application-limited stretch began, so the epoch can
+    // be shifted past it on the next growth (see _on_app_limited_ack()). A
+    // sentinel of the maximum, not 0, for the reason given above.
+    static constexpr uint64_t NOT_APP_LIMITED = UINT64_MAX;
+    uint64_t _app_limited_since_ms = NOT_APP_LIMITED;
+
+    // The curve as it was before the episode an undo takes back.
+    struct Curve
+    {
+        double w_max = 0.0;
+        double w_last_max = 0.0;
+        double k = 0.0;
+        double w_est = 0.0;
+        uint64_t epoch_start_ms = 0;
+        bool epoch_running = false;
+        uint64_t app_limited_since_ms = NOT_APP_LIMITED;
+    };
+    Curve _undo_curve;
 };
 
 enum class CongestionControlAlgorithm

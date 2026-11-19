@@ -2,6 +2,7 @@
 #include "sim/sim_fixture.h"
 #include "sim/sim_network.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <random>
@@ -216,9 +217,27 @@ protected:
                     client.received |= c->read();
             });
 
+        // Undo safety (RFC 3708 / RFC 4015): an undo gives back at most the
+        // window its episode started with - it may find cwnd already grown
+        // past that and leave it, but it never raises it further. Checked on
+        // every tick, for both sides (the echo makes the server a sender).
+        std::string undo_violation;
+        auto check_undo = [&undo_violation](const TcpConnection* c, const char* side)
+        {
+            const TcpConnection::UndoRecord& u = c->last_undo();
+            if (undo_violation.empty() && u.cwnd_after > std::max(u.cwnd_at_start, u.cwnd_before))
+                undo_violation = std::string(side) + ": undo raised cwnd from " + std::to_string(u.cwnd_before) + " to "
+                                 + std::to_string(u.cwnd_after) + ", above the episode's start "
+                                 + std::to_string(u.cwnd_at_start);
+        };
+
         net->add_tick_hook(
             [&]()
             {
+                if (TcpConnection* c = client_stack.find_connection(client.id))
+                    check_undo(c, "client");
+                if (TcpConnection* c = server.have_connection ? server_stack.find_connection(server.id) : nullptr)
+                    check_undo(c, "server");
                 if (!server.have_connection)
                 {
                     if (TcpConnection* accepted = server_stack.accept(SERVER_PORT))
@@ -286,6 +305,7 @@ protected:
         if (std::getenv("SIM_VERBOSE") != nullptr)
             std::cerr << scenario.describe() << "\n  " << where.str();
 
+        ASSERT_TRUE(undo_violation.empty()) << undo_violation << "; " << where.str();
         ASSERT_TRUE(finished) << "both connections should reach CLOSED; " << where.str();
         ASSERT_TRUE(server.received == payload)
             << "server must receive the payload intact and in order: " << first_difference(payload, server.received)

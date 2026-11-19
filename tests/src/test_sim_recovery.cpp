@@ -45,6 +45,11 @@ namespace
         // already received: retransmissions that were not needed.
         uint64_t spurious = 0;
         uint64_t ce_marked = 0; // client frames the link marked CE
+        // The client's congestion window (bytes) in the last tick before and in
+        // the first tick after its first RTO; 0 if it never timed out.
+        uint32_t cwnd_before_rto = 0;
+        uint32_t cwnd_after_rto = 0;
+        TcpConnection::UndoRecord undo; // the client's last undo
 
         std::string describe() const
         {
@@ -64,19 +69,28 @@ protected:
     // so "segment 60" means the same bytes whatever the recovery code
     // resends) and which transmission of it this is (1 for the first). True
     // loses it. Null for none (random loss comes from `wire`).
+    // ack_delay: a delay spike on the ACK path. Called with the virtual time
+    // (ms) for every frame the server sends (pure ACKs: the server only reads),
+    // returns extra delay in ms for it. Null for none.
     Result transfer(uint64_t seed, const LinkParams& wire, size_t size,
                     const std::function<bool(int index, int transmission)>& drop = nullptr,
                     CongestionControlAlgorithm algorithm = CongestionControlAlgorithm::CUBIC,
-                    TcpEcnMode client_ecn = TcpEcnMode::PASSIVE)
+                    TcpEcnMode client_ecn = TcpEcnMode::PASSIVE,
+                    const std::function<uint32_t(uint64_t now_ms)>& ack_delay = nullptr, bool client_timestamps = true)
     {
         net = std::make_unique<SimNetwork>(seed);
         NetemChannel& link = net->add_link(wire, wire);
         NetworkStack& client_stack = net->add_stack(link.take_endpoint(NetemChannel::A), CLIENT_MAC, CLIENT_IP);
         client_stack.set_tcp_ecn(client_ecn);
+        client_stack.set_tcp_timestamps(client_timestamps);
         NetworkStack& server_stack = net->add_stack(link.take_endpoint(NetemChannel::B), SERVER_MAC, SERVER_IP);
         client_stack.add_static_arp_entry(SERVER_IP, SERVER_MAC);
         server_stack.add_static_arp_entry(CLIENT_IP, CLIENT_MAC);
         server_stack.listen(SERVER_PORT);
+
+        if (ack_delay)
+            link.set_delay_filter(NetemChannel::B,
+                                  [this, ack_delay](const Bytes&) { return ack_delay(net->now_ms()); });
 
         int data_segments = 0;
         std::map<uint32_t, std::pair<int, int>> seen; // seq -> (index, transmissions so far)
@@ -105,6 +119,8 @@ protected:
         REQUIRE_TRUE(client != nullptr, "connect() should create a connection");
         client->set_congestion_control(algorithm);
         uint64_t client_id = client->get_id();
+        Result result;
+        uint32_t last_cwnd = 0;
         net->add_tick_hook(
             [&]()
             {
@@ -116,6 +132,15 @@ protected:
                 if (TcpConnection* s = server_id != 0 ? server_stack.find_connection(server_id) : nullptr)
                     received |= s->read();
                 TcpConnection* c = client_stack.find_connection(client_id);
+                if (c != nullptr)
+                {
+                    if (c->stats().retransmit_timeouts > 0 && result.cwnd_before_rto == 0)
+                    {
+                        result.cwnd_before_rto = last_cwnd;
+                        result.cwnd_after_rto = c->get_congestion_window();
+                    }
+                    last_cwnd = c->get_congestion_window();
+                }
                 if (c != nullptr && c->get_state() == TcpState::ESTABLISHED)
                 {
                     while (sent < payload.size())
@@ -128,13 +153,15 @@ protected:
                 }
             });
 
-        Result result;
         uint64_t start = net->now_ms();
         result.completed = net->run_until([&] { return received.size() >= payload.size(); }, MAX_VIRTUAL_MS);
         result.completion_ms = net->now_ms() - start;
         result.intact = received == payload;
         if (TcpConnection* c = client_stack.find_connection(client_id))
+        {
             result.stats = c->stats();
+            result.undo = c->last_undo();
+        }
         result.ce_marked = link.stats(NetemChannel::A).ce_marked;
 
         std::set<uint32_t> delivered;
@@ -297,4 +324,126 @@ TEST_F(SimRecovery, AQueueThresholdMarkerKeepsTheQueueFromOverflowing)
     ASSERT_GT(plain.stats.retransmitted_segments, 0u) << "precondition: without ECN the queue overflows";
     ASSERT_GT(ecn.ce_marked, 0u);
     ASSERT_EQ(ecn.stats.retransmitted_segments, 0u) << ecn.describe();
+}
+
+// --- Delay spikes on the ACK path ---
+
+// A delay spike on the ACK path: every ACK the receiver sends between
+// 150 ms and 700 ms gets 1 s extra, past the RTO, so the sender hears
+// nothing for longer than its timer allows although nothing was lost. The
+// timer fires (at 655 ms), cuts cwnd to the loss window and resends a
+// segment the receiver already holds - that much is unavoidable. What
+// follows is not: the first ACKs after it show the timeout was spurious and
+// the cut is undone - with timestamps because the first one echoes the
+// original's TSval (Eifel), without them because F-RTO's two new segments
+// are followed by another ACK for data never resent. The spike ends after
+// the retransmission reached the receiver, so its ACK queues behind the
+// delayed ones, and lasts less than the backed-off RTO, so there is one
+// timeout: the case both detectors are for. Before D2 the cwnd stayed at
+// one segment (46456 -> 1460 bytes) and slow-started back.
+TEST_F(SimRecovery, ADelaySpikeTimeoutIsUndone)
+{
+    // 300 bytes/ms: the window, not the queue, limits what is in flight when the spike hits.
+    LinkParams slow = wire();
+    slow.bytes_per_ms = 300;
+    for (bool timestamps : {true, false})
+    {
+        Result r = transfer(
+            1, slow, 400000, nullptr, CongestionControlAlgorithm::CUBIC, TcpEcnMode::PASSIVE,
+            [](uint64_t now_ms) { return now_ms >= 150 && now_ms < 700 ? 1000u : 0u; }, timestamps);
+        report(timestamps ? "1 s ACK delay spike, timestamps (Eifel)" : "1 s ACK delay spike, SACK only (F-RTO)", r);
+        std::cout << "[ RECOVERY ]   cwnd " << r.cwnd_before_rto << " -> " << r.cwnd_after_rto
+                  << " bytes at the first RTO, " << r.undo.cwnd_after << " after the undo\n";
+        ASSERT_TRUE(r.completed && r.intact) << r.describe();
+        ASSERT_EQ(r.stats.retransmit_timeouts, 1u) << "precondition: the spike costs a timeout: " << r.describe();
+        ASSERT_GT(r.cwnd_before_rto, r.cwnd_after_rto) << "precondition: and the window is cut for it";
+        ASSERT_EQ(r.stats.spurious_rtos_undone, 1u) << r.describe();
+        ASSERT_EQ(r.undo.cwnd_after, r.cwnd_before_rto) << "the undo restores the window from before the timeout";
+        ASSERT_EQ(r.stats.retransmitted_segments, 1u) << "and nothing else is resent: " << r.describe();
+    }
+}
+
+// The same spike, 3 s long but over by 600 ms, without timestamps: the
+// retransmission reaches the receiver after it, and the ACK it draws
+// overtakes the delayed ones, covering the whole flight. To F-RTO that ACK
+// cannot say which copy arrived (RFC 5682 step 2a), but it carries the
+// receiver's D-SACK for the copy - the episode's only retransmission - and
+// that undoes it.
+TEST_F(SimRecovery, ADelaySpikeTheRetransmissionOvertakesIsUndoneByDsack)
+{
+    LinkParams slow = wire();
+    slow.bytes_per_ms = 300;
+    Result r = transfer(
+        1, slow, 400000, nullptr, CongestionControlAlgorithm::CUBIC, TcpEcnMode::PASSIVE,
+        [](uint64_t now_ms) { return now_ms >= 150 && now_ms < 600 ? 3000u : 0u; }, false);
+    report("3 s ACK delay spike, retransmission overtakes, SACK only", r);
+    ASSERT_TRUE(r.completed && r.intact) << r.describe();
+    ASSERT_EQ(r.stats.retransmit_timeouts, 1u) << r.describe();
+    ASSERT_EQ(r.stats.spurious_rtos_undone, 0u) << r.describe();
+    ASSERT_EQ(r.stats.spurious_recoveries_undone, 1u) << r.describe();
+    ASSERT_EQ(r.undo.cwnd_at_start, r.cwnd_before_rto);
+}
+
+// --- what must never be undone ---
+
+// Real losses, of every shape the tests above repair - several in one
+// flight, a lost retransmission, the tail, and a blackout of the whole
+// flight that only the RTO can repair - with and without timestamps. The
+// retransmissions they draw repair data the receiver did not have, so no
+// D-SACK can report them, Eifel sees its retransmission's TSval echoed, and
+// F-RTO a duplicate or an ack for everything: nothing is undone.
+TEST_F(SimRecovery, ARealLossIsNeverUndone)
+{
+    uint64_t timeouts = 0;
+    for (bool timestamps : {true, false})
+    {
+        // Segments carry 1448 bytes with timestamps, 1460 without.
+        const int tail = static_cast<int>((400000 + (timestamps ? 1447 : 1459)) / (timestamps ? 1448 : 1460));
+        const std::vector<std::pair<const char*, std::function<bool(int, int)>>> losses = {
+            {"3 drops in one flight", [](int index, int transmission)
+             { return transmission == 1 && (index == 60 || index == 63 || index == 66); }},
+            {"a lost retransmission", [](int index, int transmission) { return index == 60 && transmission <= 2; }},
+            {"tail loss", [tail](int index, int transmission)
+             { return transmission == 1 && (index == tail - 2 || index == tail - 1); }},
+            // Every first transmission from segment 100 on: nothing above the
+            // hole arrives to be SACKed, so only the RTO notices.
+            {"blackout", [](int index, int transmission) { return transmission == 1 && index >= 100; }},
+        };
+        for (const auto& [what, drop] : losses)
+        {
+            Result r = transfer(1, wire(), 400000, drop, CongestionControlAlgorithm::CUBIC, TcpEcnMode::PASSIVE,
+                                nullptr, timestamps);
+            report(std::string(what) + (timestamps ? ", timestamps" : ", SACK only"), r);
+            ASSERT_TRUE(r.completed && r.intact) << what << ": " << r.describe();
+            ASSERT_GT(r.stats.retransmitted_segments, 0u) << "precondition: " << what << ": " << r.describe();
+            ASSERT_EQ(r.stats.spurious_rtos_undone, 0u) << what << ": " << r.describe();
+            ASSERT_EQ(r.stats.spurious_recoveries_undone, 0u) << what << ": " << r.describe();
+            timeouts += r.stats.retransmit_timeouts;
+        }
+    }
+    ASSERT_GT(timeouts, 0u) << "precondition: the blackout costs a timeout, so the RTO detectors were tried";
+}
+
+// The delay spike that is undone above, on a path that also marks CE: the
+// ECN-Echo the sender sees during the episode is congestion, so the episode
+// is not undone, whatever Eifel, F-RTO or a D-SACK would say.
+TEST_F(SimRecovery, CeMarksDuringASpuriousTimeoutKeepItsReduction)
+{
+    LinkParams slow = wire();
+    slow.bytes_per_ms = 300;
+    slow.ecn_mark = 0.2;
+    for (bool timestamps : {true, false})
+    {
+        Result r = transfer(
+            1, slow, 400000, nullptr, CongestionControlAlgorithm::CUBIC, TcpEcnMode::ON,
+            [](uint64_t now_ms) { return now_ms >= 150 && now_ms < 700 ? 1000u : 0u; }, timestamps);
+        report(timestamps ? "1 s ACK delay spike with CE marks, timestamps"
+                          : "1 s ACK delay spike with CE marks, SACK only",
+               r);
+        ASSERT_TRUE(r.completed && r.intact) << r.describe();
+        ASSERT_GT(r.ce_marked, 0u) << "precondition: the link marked";
+        ASSERT_GE(r.stats.retransmit_timeouts, 1u) << "precondition: the spike still costs a timeout";
+        ASSERT_EQ(r.stats.spurious_rtos_undone, 0u) << r.describe();
+        ASSERT_EQ(r.stats.spurious_recoveries_undone, 0u) << r.describe();
+    }
 }

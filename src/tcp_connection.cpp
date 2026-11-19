@@ -88,6 +88,16 @@ void TcpConnection::_transition(TcpState new_state)
 {
     LOG_DEBUG("TcpConnection[" << _id << "] " << state_name(_state) << " -> " << state_name(new_state));
     _state = new_state;
+    if (new_state == TcpState::ESTABLISHED)
+    {
+        _rcv_space_init();
+    }
+    if (new_state == TcpState::TIME_WAIT || new_state == TcpState::CLOSED)
+    {
+        // No more growth can be used from here on, so it goes back to the
+        // stack - except what bytes still sitting in the buffers occupy.
+        _trim_memory_charges();
+    }
 
     // Iterate a copy: a subscriber is entitled to react by doing something that
     // registers another, and growing the vector mid-iteration would invalidate
@@ -110,13 +120,47 @@ std::vector<Tcp::SackBlock> TcpConnection::_sack_blocks_to_report() const
     // timestamp. The ones dropped are the oldest, which the peer has most
     // likely already heard.
     size_t limit = _timestamps_negotiated ? Tcp::MAX_SACK_BLOCKS_WITH_TIMESTAMP : Tcp::MAX_SACK_BLOCKS;
-    return _reorder_buffer.sack_blocks(limit, _recv_next_unwrapped);
+    std::vector<Tcp::SackBlock> normal = _reorder_buffer.sack_blocks(limit, _recv_next_unwrapped);
+    if (!_pending_dsack)
+    {
+        return normal;
+    }
+
+    // RFC 2883 section 4: the D-SACK block first, then - when the duplicate
+    // lies inside an out-of-order range - that range, then the usual blocks.
+    std::vector<Tcp::SackBlock> blocks;
+    blocks.push_back({static_cast<uint32_t>(_pending_dsack->start), static_cast<uint32_t>(_pending_dsack->end)});
+    std::optional<Tcp::SackBlock> holder = _reorder_buffer.range_containing(_pending_dsack->start);
+    if (holder)
+    {
+        blocks.push_back(*holder);
+    }
+    for (const Tcp::SackBlock& block : normal)
+    {
+        if (blocks.size() >= limit)
+        {
+            break;
+        }
+        if (!holder || block.start != holder->start)
+        {
+            blocks.push_back(block);
+        }
+    }
+    return blocks;
+}
+
+void TcpConnection::_note_duplicate(uint64_t start, uint64_t end)
+{
+    if (_sack_permitted && end > start)
+    {
+        _pending_dsack = PendingDsack{start, end};
+    }
 }
 
 uint32_t TcpConnection::_advertised_window() const
 {
     uint32_t occupied = _receive_buffer_occupied();
-    uint32_t free_space = occupied < RECEIVE_BUFFER_CAPACITY ? RECEIVE_BUFFER_CAPACITY - occupied : 0;
+    uint32_t free_space = occupied < _receive_capacity ? _receive_capacity - occupied : 0;
     // Never shrink the window: RFC 1122 4.2.2.16 and RFC 9293 3.8.6 say a
     // receiver SHOULD NOT move the right edge (RCV.NXT + RCV.WND) left.
     // Out-of-order data lands inside the window already offered, so taking it
@@ -204,7 +248,38 @@ void TcpConnection::_transmit(uint8_t flags, uint32_t seq, const Bytes& payload,
     // open _window_scaling_negotiated is already true when the SYN-ACK is
     // built, so it is not enough on its own.
     uint8_t our_shift = (_window_scaling_negotiated && !(flags & FLAG_SYN)) ? WINDOW_SCALE_SHIFT : 0;
-    uint32_t window_value = std::min<uint32_t>(available >> our_shift, 0xFFFFu);
+    // What may be promised: the window rounded down to whole units of
+    // 2^shift, so never more than the free space (or the edge already
+    // promised) covers.
+    uint32_t promise_value = std::min<uint32_t>(available >> our_shift, 0xFFFFu);
+    uint32_t window_value = promise_value;
+    // Rounding down could pull the right edge back from where it was offered
+    // once RCV.NXT has moved by something other than a whole unit. The field
+    // is rounded up to keep it instead (Linux's tcp_select_window does the
+    // same) - but only on the wire: the rounded-up edge is NOT recorded as a
+    // new promise. Recording it would let the next ack round up from there,
+    // and a peer sending exactly to each advertised edge would walk it
+    // forward by up to a unit per ack, past the buffer without bound.
+    //
+    // Nor does the rounded-up part widen what is accepted: data is taken up
+    // to the window in force now (_advertised_window(), the free space or
+    // the promised edge), never past the buffer. RFC 7323 2.4's tolerance -
+    // accept data sent before a retreat of less than one unit - is honoured
+    // as far as the buffer has room for it, which is whenever the
+    // application has read since; otherwise those few bytes are trimmed and
+    // the peer resends them, as it would any data past the window. Once the
+    // promised edge is reached and the window is 0, nothing past RCV.NXT is
+    // queued at all, so a zero-window probe is acknowledged (with window 0)
+    // and dropped, as RFC 9293 3.8.6.1 has it. Accepting up to the highest
+    // edge the field ever carried used to let that probe byte in, one past
+    // the capacity.
+    uint64_t offered =
+        _rcv_right_edge_unwrapped > _recv_next_unwrapped ? _rcv_right_edge_unwrapped - _recv_next_unwrapped : 0;
+    if ((static_cast<uint64_t>(window_value) << our_shift) < offered)
+    {
+        window_value =
+            static_cast<uint32_t>(std::min<uint64_t>((offered + (uint64_t{1} << our_shift) - 1) >> our_shift, 0xFFFFu));
+    }
 
     Tcp header(_local_port, _remote_port, seq, _recv_next, 5, flags, static_cast<uint16_t>(window_value), 0, 0);
     _add_options(header, flags, payload.size());
@@ -212,9 +287,10 @@ void TcpConnection::_transmit(uint8_t flags, uint32_t seq, const Bytes& payload,
     if (flags & FLAG_ACK)
     {
         _last_ack_sent = _recv_next;
-        // The right edge just offered, as the peer will compute it - from the
-        // scaled-down value actually sent.
-        uint64_t edge = _recv_next_unwrapped + (static_cast<uint64_t>(window_value) << our_shift);
+        // The promise is the rounded-down edge (see above); the edge the
+        // peer actually computes, which may be up to a unit beyond it,
+        // widens neither what is offered next nor what is accepted.
+        uint64_t edge = _recv_next_unwrapped + (static_cast<uint64_t>(promise_value) << our_shift);
         _rcv_right_edge_unwrapped = std::max(_rcv_right_edge_unwrapped, edge);
     }
 }
@@ -240,7 +316,7 @@ void TcpConnection::_update_ts_recent(const Tcp& segment)
     }
 }
 
-void TcpConnection::_add_options(Tcp& header, uint8_t flags, size_t payload_size) const
+void TcpConnection::_add_options(Tcp& header, uint8_t flags, size_t payload_size)
 {
     if (flags & FLAG_SYN)
     {
@@ -259,7 +335,7 @@ void TcpConnection::_add_options(Tcp& header, uint8_t flags, size_t payload_size
         {
             header.set_window_scale_option(WINDOW_SCALE_SHIFT);
         }
-        if (!is_syn_ack || _timestamps_negotiated)
+        if (is_syn_ack ? _timestamps_negotiated : _timestamps_enabled)
         {
             header.set_timestamp_option(_ts_clock(), _have_ts_recent ? _ts_recent : 0);
         }
@@ -291,6 +367,17 @@ void TcpConnection::_add_options(Tcp& header, uint8_t flags, size_t payload_size
         if (blocks.size() > fit)
         {
             blocks.resize(fit);
+        }
+        if (_pending_dsack)
+        {
+            // Reported once (RFC 2883): whatever ack goes out next either
+            // carries it or had no room for any block, and a late D-SACK
+            // would only mislead the sender about a newer duplicate.
+            if (fit > 0)
+            {
+                _stats.dsacks_sent++;
+            }
+            _pending_dsack.reset();
         }
         if (!blocks.empty())
         {
@@ -387,7 +474,7 @@ void TcpConnection::_take_peer_syn_options(const Tcp& segment)
     _window_scaling_negotiated = segment.has_window_scale_option();
     _peer_window_scale = _window_scaling_negotiated ? segment.get_window_scale_option() : 0;
     _sack_permitted = segment.has_sack_permitted_option();
-    _timestamps_negotiated = segment.has_timestamp_option();
+    _timestamps_negotiated = _timestamps_enabled && segment.has_timestamp_option();
     if (_timestamps_negotiated)
     {
         _ts_recent = segment.get_timestamp_value();
@@ -405,7 +492,7 @@ bool TcpConnection::_matches_recorded_syn_options(const Tcp& segment) const
         segment.has_window_scale_option() == _window_scaling_negotiated
         && (!_window_scaling_negotiated || segment.get_window_scale_option() == _peer_window_scale);
     return mss == _peer_mss && window_scale_agrees && segment.has_sack_permitted_option() == _sack_permitted
-           && segment.has_timestamp_option() == _timestamps_negotiated;
+           && (_timestamps_enabled && segment.has_timestamp_option()) == _timestamps_negotiated;
 }
 
 void TcpConnection::_send_pure_ack()
@@ -451,8 +538,8 @@ void TcpConnection::accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss, bo
     _window_scaling_negotiated =
         peer_supports_window_scaling; // we always send our own option, so it comes down to the peer's
     _peer_window_scale = peer_window_scale;
-    _timestamps_negotiated = peer_supports_timestamps;
-    if (peer_supports_timestamps)
+    _timestamps_negotiated = _timestamps_enabled && peer_supports_timestamps;
+    if (_timestamps_negotiated)
     {
         _ts_recent = peer_timestamp;
         _have_ts_recent = true;
@@ -521,6 +608,13 @@ Bytes TcpConnection::read(size_t max_bytes)
     }
 
     _receive_queued_bytes -= taken.size();
+    _bytes_read_total += taken.size();
+    _trim_memory_charges();
+    uint32_t capacity_before = _receive_capacity;
+    if (!taken.empty())
+    {
+        _rcv_space_adjust();
+    }
 
     // Reading is what reopens the window, so the peer has to be told. Without
     // this it would sit blocked until its own persist probe happened to ask -
@@ -529,10 +623,17 @@ Bytes TcpConnection::read(size_t max_bytes)
     // RFC 1122 4.2.3.3: a window that had fallen below one segment is as
     // useless to the sender as a shut one, so reopening it past one segment
     // (min(RCV.BUFF / 2, MSS)) is announced too.
-    uint32_t useful = std::min<uint32_t>(RECEIVE_BUFFER_CAPACITY / 2, _effective_mss);
+    uint32_t useful = std::min<uint32_t>(_receive_capacity / 2, _effective_mss);
     bool reopened =
         (window_before == 0 && _advertised_window() > 0) || (window_before < useful && _advertised_window() >= useful);
-    if (reopened
+    // Autotuning just grew the buffer: if that at least doubles the window
+    // the peer was last offered, say so now rather than on the next ack - a
+    // sender in slow start is about to need it (Linux's tcp_cleanup_rbuf
+    // sends the same update).
+    uint64_t offered =
+        _rcv_right_edge_unwrapped > _recv_next_unwrapped ? _rcv_right_edge_unwrapped - _recv_next_unwrapped : 0;
+    bool grew = _receive_capacity > capacity_before && _advertised_window() >= 2 * offered;
+    if ((reopened || grew)
         && (_state == TcpState::ESTABLISHED || _state == TcpState::FIN_WAIT_1 || _state == TcpState::FIN_WAIT_2))
     {
         LOG_DEBUG("TcpConnection[" << _id << "] window reopened to " << _advertised_window()
@@ -541,6 +642,63 @@ Bytes TcpConnection::read(size_t max_bytes)
     }
 
     return taken;
+}
+
+void TcpConnection::_rcv_space_init()
+{
+    _rcv_space = std::min<uint64_t>(_receive_capacity, uint64_t{INITIAL_RCV_SPACE_SEGMENTS} * _effective_mss);
+    _rcv_space_read_at = _bytes_read_total;
+    _rcv_space_time_ms = _now_ms;
+}
+
+void TcpConnection::_rcv_space_adjust()
+{
+    if (_rcv_space == 0)
+    {
+        _rcv_space_init(); // read before ever being ESTABLISHED: nothing to compare with yet
+        return;
+    }
+    uint64_t interval = receiver_rtt_ms() != 0 ? receiver_rtt_ms() : RCV_SPACE_FALLBACK_MS;
+    if (_now_ms - _rcv_space_time_ms < interval)
+    {
+        return;
+    }
+    uint64_t read = _bytes_read_total - _rcv_space_read_at;
+    if (read > _rcv_space)
+    {
+        bool receiving =
+            _state == TcpState::ESTABLISHED || _state == TcpState::FIN_WAIT_1 || _state == TcpState::FIN_WAIT_2;
+        if (receiving && !_receive_capacity_locked && _window_scaling_negotiated)
+        {
+            // tcp_rcv_space_adjust(): 2 * read + 16 segments, and while the
+            // rate is still climbing, twice the relative growth on top - in
+            // slow start the next round trip carries twice this one.
+            uint64_t target = 2 * read + 16 * uint64_t{_effective_mss};
+            uint64_t growth = target * (read - _rcv_space) / _rcv_space;
+            target += 2 * growth;
+            _grow_receive_capacity(static_cast<size_t>(std::min<uint64_t>(target, MAX_BUFFER_CAPACITY)));
+        }
+        _rcv_space = read;
+    }
+    _rcv_space_read_at = _bytes_read_total;
+    _rcv_space_time_ms = _now_ms;
+}
+
+void TcpConnection::_grow_receive_capacity(size_t target)
+{
+    target = std::min(target, MAX_BUFFER_CAPACITY);
+    if (target <= _receive_capacity)
+    {
+        return;
+    }
+    size_t granted = _receive_charge.grant(target - _receive_capacity);
+    if (granted == 0)
+    {
+        return; // the stack's budget is spent (see tcp_memory_budget.h)
+    }
+    LOG_DEBUG("TcpConnection[" << _id << "] receive buffer " << _receive_capacity << " -> "
+                               << _receive_capacity + granted);
+    _receive_capacity += static_cast<uint32_t>(granted);
 }
 
 void TcpConnection::reduce_effective_mss(uint16_t path_mss)
@@ -636,6 +794,18 @@ void TcpConnection::_restart_after_idle()
 void TcpConnection::_send_queued_while_window_allows()
 {
     _restart_after_idle();
+    if (_frto == Frto::SEND_NEW)
+    {
+        // RFC 5682 3.1 step 2b: up to two new segments instead of the
+        // retransmissions the timeout queued up - unless there are none to
+        // send, in which case conventional recovery it is.
+        _frto = _frto_send_new_data() ? Frto::AWAIT_SECOND_ACK : Frto::OFF;
+    }
+    if (_frto != Frto::OFF)
+    {
+        _arm_or_disarm_persist(); // nothing goes until F-RTO has decided
+        return;
+    }
     if (_in_recovery && _sack_permitted)
     {
         // During SACK recovery only the ack clock sends (RFC 6675 step C).
@@ -814,14 +984,330 @@ void TcpConnection::_take_rtt_sample(uint32_t rtt_ms)
                                << _rtt.rttvar_ms() << " rto " << _rtt.rto_ms());
 }
 
+void TcpConnection::_rcv_rtt_update(uint32_t sample_ms, bool window_dependent)
+{
+    uint32_t sample_x8 = std::max<uint32_t>(sample_ms, 1) << 3; // a 0 ms sample on a ms clock is "under 1 ms"
+    if (_rcv_rtt_x8 == 0)
+    {
+        _rcv_rtt_x8 = sample_x8;
+    }
+    else if (window_dependent)
+    {
+        _rcv_rtt_x8 = std::min(_rcv_rtt_x8, sample_x8);
+    }
+    else
+    {
+        // srtt += (sample - srtt) / 8, in the x8 domain
+        _rcv_rtt_x8 = _rcv_rtt_x8 - (_rcv_rtt_x8 >> 3) + (sample_x8 >> 3);
+    }
+}
+
+void TcpConnection::_rcv_rtt_measure(const Tcp& segment, uint32_t payload_size)
+{
+    if (_timestamps_negotiated)
+    {
+        if (!segment.has_timestamp_option())
+        {
+            return;
+        }
+        uint32_t echo = segment.get_timestamp_echo();
+        if (echo == 0 || echo == _rcv_rtt_last_tsecr)
+        {
+            return; // nothing echoed yet, or this echo was already sampled
+        }
+        _rcv_rtt_last_tsecr = echo;
+        // Only a full-sized segment: a small one may have waited for the
+        // application (or Nagle) after the echoed ack arrived, which says
+        // nothing about the path.
+        if (payload_size < _max_segment_payload())
+        {
+            return;
+        }
+        // _ts_clock() - echo is now minus the moment that TSval was sent, on
+        // this connection's clock, modulo 2^32. An echo from the future
+        // (a confused or hostile peer) would be a huge unsigned value.
+        uint32_t delta = _ts_clock() - echo;
+        if (delta < (1u << 31))
+        {
+            _rcv_rtt_update(delta, false);
+        }
+        return;
+    }
+
+    if (_rcv_rtt_time_ms != 0)
+    {
+        if (_recv_next_unwrapped < _rcv_rtt_seq)
+        {
+            return; // the noted point is not reached yet
+        }
+        _rcv_rtt_update(static_cast<uint32_t>(_now_ms - _rcv_rtt_time_ms), true);
+    }
+    _rcv_rtt_seq = _recv_next_unwrapped + _advertised_window();
+    _rcv_rtt_time_ms = _now_ms;
+}
+
 bool TcpConnection::_apply_sack_blocks(const Tcp& segment)
 {
-    if (!_sack_permitted || segment.get_sack_blocks().empty())
+    const std::vector<Tcp::SackBlock>& blocks = segment.get_sack_blocks();
+    if (!_sack_permitted || blocks.empty())
     {
         return false;
     }
     SendScoreboard::AckContext rack = _rack_context(segment);
-    return _in_flight.apply_sack(segment.get_sack_blocks(), &rack);
+    if (!_is_dsack(blocks, segment.get_acknowledgement_number()))
+    {
+        return _in_flight.apply_sack(blocks, &rack);
+    }
+    _on_dsack(blocks.front());
+    std::vector<Tcp::SackBlock> rest(blocks.begin() + 1, blocks.end());
+    return !rest.empty() && _in_flight.apply_sack(rest, &rack);
+}
+
+bool TcpConnection::_is_dsack(const std::vector<Tcp::SackBlock>& blocks, uint32_t ack)
+{
+    // Linux's tcp_check_dsack() makes the same two tests.
+    const Tcp::SackBlock& first = blocks.front();
+    if (seq_before(first.start, ack))
+    {
+        return true;
+    }
+    return blocks.size() > 1 && seq_at_or_before(blocks[1].start, first.start)
+           && seq_at_or_before(first.end, blocks[1].end);
+}
+
+void TcpConnection::_on_dsack(const Tcp::SackBlock& block)
+{
+    if (!seq_before(block.start, block.end))
+    {
+        return;
+    }
+    bool counted = _in_flight.match_dsack(block) != SendScoreboard::DsackMatch::NONE;
+    if (!counted && _tlp_outstanding && _tlp_is_retrans && !_tlp_dsacked && block.start == _tlp_probe_seq
+        && block.end == _tlp_probe_end)
+    {
+        _tlp_dsacked = true;
+        counted = true;
+    }
+    if (!counted)
+    {
+        return;
+    }
+    _stats.dsacks_received += 1;
+    _in_flight.note_reordering();
+    _rack_grow_reo_wnd();
+    LOG_DEBUG("TcpConnection[" << _id << "] D-SACK " << block.start << ":" << block.end
+                               << " reports a spurious retransmission");
+}
+
+void TcpConnection::_begin_episode()
+{
+    if (_episode_open)
+    {
+        return;
+    }
+    _episode_open = true;
+    _episode_had_rto = false;
+    _in_flight.begin_episode();
+    _congestion->save_for_undo(_now_ms);
+}
+
+void TcpConnection::_try_undo_dsack()
+{
+    if (_episode_open || !_congestion->has_undo())
+    {
+        return;
+    }
+    if (_now_ms > _undo_expires_ms)
+    {
+        // The D-SACKs a finished episode's copies draw come back within a
+        // round trip of its end; evidence later than an RTO after it is
+        // about a window the path has since moved on from (Linux likewise
+        // drops undo_marker once the episode is over).
+        _congestion->forget_undo();
+        return;
+    }
+    uint32_t copies = _in_flight.episode_retransmissions();
+    if (copies == 0 || _in_flight.episode_dsacked() < copies)
+    {
+        return;
+    }
+    _undo_episode();
+    _stats.spurious_recoveries_undone += 1;
+    if (_state == TcpState::ESTABLISHED || _state == TcpState::CLOSE_WAIT)
+    {
+        _send_queued_while_window_allows();
+    }
+}
+
+void TcpConnection::_arm_spurious_rto_detection(bool starts_episode, bool probe_outstanding)
+{
+    if (!starts_episode)
+    {
+        // A timeout inside an episode (a repeated one, or one during fast
+        // recovery): F-RTO stops (RFC 5682 3.1 step 1, "already in RTO
+        // recovery"); Eifel keeps the TSval of the episode's first timeout
+        // retransmission, as Linux keeps retrans_stamp.
+        _frto = Frto::OFF;
+        return;
+    }
+    _eifel_armed = false;
+    _frto = Frto::OFF;
+    if (_timestamps_negotiated)
+    {
+        // RFC 3522 compares against the first retransmission, and that is
+        // the earliest still outstanding of any kind - a loss probe's
+        // included (Linux's retrans_stamp) - not necessarily the one this
+        // timeout is about to send. Against the timeout's own, the ack of a
+        // probe that repaired a real loss would echo an older TSval and
+        // look like the original's.
+        _eifel_armed = true;
+        _eifel_tsval = _retrans_stamp_valid ? _retrans_stamp : _ts_clock();
+    }
+    else if (_sack_permitted && !probe_outstanding)
+    {
+        // Not while a loss probe that resent the tail is outstanding: an
+        // ack covering the tail could then be for either copy, and F-RTO's
+        // evidence is data acknowledged that was sent only once. (A probe
+        // of new data is just more of that data.)
+        _frto = Frto::AWAIT_FIRST_ACK;
+        _frto_recover = _send_next;
+    }
+}
+
+void TcpConnection::_detect_spurious_rto(const Tcp& segment, uint32_t ack, uint32_t snd_una, bool duplicate)
+{
+    bool advances = seq_before(snd_una, ack) && seq_at_or_before(ack, _send_next);
+    if (_eifel_armed && advances)
+    {
+        // RFC 3522: the first ack for new data after the retransmission. An
+        // echo older than the retransmission's TSval was the original's,
+        // so the original arrived and the timeout was spurious.
+        _eifel_armed = false;
+        uint32_t echo = segment.get_timestamp_echo();
+        if (segment.has_timestamp_option() && echo != 0 && seq_before(echo, _eifel_tsval))
+        {
+            _undo_spurious_rto("Eifel");
+        }
+        return;
+    }
+    switch (_frto)
+    {
+    case Frto::AWAIT_FIRST_ACK:
+        // RFC 5682 3.1 step 2. An ack that covers everything outstanding at
+        // the timeout cannot tell the copies apart, one that stops inside the
+        // retransmitted segment has not acknowledged all of it, and a
+        // duplicate says a hole is still there (2a): conventional recovery.
+        // One that covers the retransmission and part of the rest of the
+        // flight sends new data instead (2b).
+        if (duplicate || (advances && (seq_at_or_before(_frto_recover, ack) || seq_before(ack, _frto_rxt_end))))
+        {
+            _frto = Frto::OFF;
+        }
+        else if (advances)
+        {
+            _frto = Frto::SEND_NEW;
+        }
+        break;
+    case Frto::SEND_NEW:
+        _frto = Frto::OFF; // the new data never went out
+        break;
+    case Frto::AWAIT_SECOND_ACK:
+        // Step 3: data that was never retransmitted - above the timeout's
+        // retransmission - is acknowledged again, so the flight was not lost
+        // (3b); anything else, a duplicate included, means it was (3a).
+        if (advances && seq_before(_frto_rxt_end, ack))
+        {
+            _undo_spurious_rto("F-RTO");
+        }
+        else if (duplicate || advances)
+        {
+            _frto = Frto::OFF;
+        }
+        break;
+    case Frto::OFF:
+        break;
+    }
+}
+
+bool TcpConnection::_frto_send_new_data()
+{
+    // Whatever cwnd says (it is one segment after the timeout), as the RFC
+    // has it; the peer's window still bounds it.
+    int sent = 0;
+    while (sent < 2 && !_send_queue.empty())
+    {
+        uint32_t snd_una = _in_flight.snd_una_or(_send_next);
+        if ((_send_next - snd_una) + _send_queue.front().size() > _peer_window)
+        {
+            break;
+        }
+        Bytes chunk = std::move(_send_queue.front());
+        _send_queue.pop_front();
+        _send_queued_bytes -= chunk.size();
+        _send_chunk(chunk);
+        sent++;
+    }
+    return sent > 0;
+}
+
+void TcpConnection::_undo_spurious_rto(const char* detector)
+{
+    if (!_congestion->has_undo())
+    {
+        // ECN-Echo (or a probe-repaired loss) since the episode began: real
+        // congestion, so the timeout's reduction and recovery stand.
+        _eifel_armed = false;
+        _frto = Frto::OFF;
+        return;
+    }
+    _undo_episode();
+    // Leave RTO recovery: the flight it presumed lost was not, so nothing
+    // more is resent, and a new loss may start a recovery of its own.
+    _rto_recovery = false;
+    _in_recovery = false;
+    _recovery_point_valid = false;
+    _in_flight.undo_loss_marks();
+    _end_episode();
+    _stats.spurious_rtos_undone += 1;
+    // The timer for what is now oldest restarts from the un-backed-off RTO.
+    if (SentSegment* oldest = _in_flight.oldest_unsacked())
+    {
+        oldest->retransmit_ms_remaining = _rtt.rto_ms();
+        oldest->retransmit_deadline_ms = _now_ms + static_cast<uint64_t>(_rtt.rto_ms());
+    }
+    LOG_DEBUG("TcpConnection[" << _id << "] " << detector << ": the timeout was spurious");
+}
+
+void TcpConnection::_undo_episode()
+{
+    uint32_t before = _congestion->window();
+    _last_undo.cwnd_at_start = _congestion->undo_window();
+    _last_undo.cwnd_before = before;
+    _congestion->undo(_now_ms);
+    _last_undo.cwnd_after = _congestion->window();
+    if (_episode_had_rto)
+    {
+        _rtt.reset_backoff();
+    }
+    LOG_DEBUG("TcpConnection[" << _id << "] spurious episode undone: cwnd " << before << " -> "
+                               << _congestion->window());
+}
+
+void TcpConnection::_end_episode()
+{
+    _episode_open = false; // its ledger stays, for the D-SACKs still to come
+    _undo_expires_ms = _now_ms + static_cast<uint64_t>(_rtt.rto_ms());
+    _eifel_armed = false;
+    _frto = Frto::OFF;
+    // RFC 8985 6.2 step 4: one recovery fewer for a widened window to last.
+    if (_rack_reo_wnd_persist > 0)
+    {
+        _rack_reo_wnd_persist -= 1;
+        if (_rack_reo_wnd_persist == 0)
+        {
+            _rack_reo_wnd_mult = 1;
+        }
+    }
 }
 
 SendScoreboard::AckContext TcpConnection::_rack_context(const Tcp& segment) const
@@ -845,7 +1331,24 @@ uint64_t TcpConnection::_rack_reo_wnd_ms() const
     {
         return 0;
     }
-    return std::min<uint64_t>(_rack_min_rtt_ms / 4, _rtt.srtt_ms());
+    return std::min<uint64_t>(uint64_t{_rack_reo_wnd_mult} * _rack_min_rtt_ms / 4, _rtt.srtt_ms());
+}
+
+void TcpConnection::_rack_grow_reo_wnd()
+{
+    uint32_t snd_una = _in_flight.snd_una_or(_send_next);
+    if (_rack_dsack_round_valid && seq_at_or_before(_rack_dsack_round, snd_una))
+    {
+        _rack_dsack_round_valid = false;
+    }
+    if (_rack_dsack_round_valid)
+    {
+        return;
+    }
+    _rack_dsack_round = _send_next;
+    _rack_dsack_round_valid = true;
+    _rack_reo_wnd_mult = std::min(_rack_reo_wnd_mult + 1, RACK_REO_WND_MAX_MULT);
+    _rack_reo_wnd_persist = RACK_REO_WND_PERSIST;
 }
 
 uint32_t TcpConnection::_rack_detect_loss()
@@ -959,6 +1462,9 @@ void TcpConnection::_send_loss_probe()
         }
         _retransmit(*last, /*rescue=*/true); // not a NextSeg() retransmission: HighRxt stays
         _tlp_is_retrans = true;
+        _tlp_probe_seq = last->seq;
+        _tlp_probe_end = last->end_seq;
+        _tlp_dsacked = false;
     }
     LOG_DEBUG("TcpConnection[" << _id << "] tail loss probe (" << (sent_new ? "new data" : "retransmission")
                                << "), end_seq " << _send_next);
@@ -975,14 +1481,15 @@ void TcpConnection::_send_loss_probe()
 
 void TcpConnection::_tlp_process_ack(uint32_t ack, bool pure_dup_ack)
 {
-    // RFC 8985 7.4.2, without D-SACK (which this stack does not parse).
+    // RFC 8985 7.4.2.
     if (!_tlp_outstanding || !seq_at_or_before(_tlp_end_seq, ack))
     {
         return;
     }
-    // A probe of new data was delivered, or (a duplicate ack without SACK)
-    // both copies of a retransmitted one arrived: either way, no loss.
-    if (!_tlp_is_retrans || pure_dup_ack)
+    // A probe of new data was delivered, or (a duplicate ack without SACK,
+    // or a D-SACK for the probe) both copies of a retransmitted one
+    // arrived: either way, no loss.
+    if (!_tlp_is_retrans || pure_dup_ack || _tlp_dsacked)
     {
         _tlp_outstanding = false;
     }
@@ -993,6 +1500,7 @@ void TcpConnection::_tlp_process_ack(uint32_t ack, bool pure_dup_ack)
         // loss, which the window must answer as a fast recovery would.
         _tlp_outstanding = false;
         _stats.loss_probe_repairs += 1;
+        _congestion->forget_undo(); // a real loss since the last episode
         if (!_in_recovery && !_rto_recovery)
         {
             uint32_t flight_size = _send_next - _in_flight.snd_una_or(_send_next);
@@ -1041,6 +1549,20 @@ bool TcpConnection::_on_ecn_echo(const Tcp& segment, uint32_t ack)
 
 void TcpConnection::_retransmit(SentSegment& segment, bool rescue)
 {
+    if (_episode_open)
+    {
+        _in_flight.note_episode_retransmission(segment);
+    }
+    if (!_retrans_stamp_valid)
+    {
+        _retrans_stamp = _ts_clock(); // the TSval this copy carries
+        _retrans_stamp_valid = true;
+        _retrans_stamp_end = segment.end_seq;
+    }
+    else if (seq_before(_retrans_stamp_end, segment.end_seq))
+    {
+        _retrans_stamp_end = segment.end_seq;
+    }
     _transmit(segment.flags, segment.seq, segment.payload);
     _in_flight.note_transmit(segment, _now_ms); // RFC 8985 6.1
     if (!rescue)
@@ -1071,6 +1593,7 @@ void TcpConnection::_enter_recovery(uint32_t delivered)
         return; // everything outstanding is already held by the peer
     }
     uint32_t cwnd_before = _congestion->window();
+    _begin_episode();
     _in_recovery = true;
     _tlp_reset();
     _note_window_reduced();
@@ -1249,13 +1772,29 @@ uint32_t TcpConnection::_send_by_next_seg(uint32_t pipe, uint32_t window, bool i
 
 void TcpConnection::_handle_ack(const Tcp& segment)
 {
+    // What was outstanding as this ack arrived, before it retires or SACKs
+    // anything: whether the sender was filling cwnd is a question about the
+    // flight the ack answers, not about what is left after it.
+    uint32_t prior_in_flight = _bytes_in_flight();
+    _cwnd_limited_at_last_ack = _congestion->is_cwnd_limited(prior_in_flight);
+    if (_ecn_negotiated && segment.get_ece() && !segment.get_syn())
+    {
+        _congestion->forget_undo(); // the path marked a packet: congestion, whatever else is spurious
+    }
     // Apply the scoreboard before anything else looks at the window: what the
     // peer reports holding changes how much is genuinely outstanding, and
     // therefore how much may be sent.
     uint32_t sacked_before = _in_flight.sacked_bytes();
     _in_flight.rack_begin_ack();
     bool sack_advanced = _apply_sack_blocks(segment);
-    if (_sack_permitted)
+    // Once this path is known to reorder, RACK alone decides what is lost,
+    // as in Linux (tcp_time_to_recover() skips the DupThresh rule when RACK
+    // is on): three segments SACKed above a hole is exactly what reordering
+    // looks like, and RACK's reordering window is the part that adapts to
+    // how much of it the path does. Until then DupThresh stays - with no
+    // reordering seen RACK's window is zero there anyway (6.2 step 4).
+    bool dup_thresh = !_sack_permitted || !_in_flight.reordering_seen() || !_have_rack_min_rtt;
+    if (_sack_permitted && dup_thresh)
     {
         _in_flight.mark_losses(DUP_ACK_FAST_RETRANSMIT_THRESHOLD, static_cast<uint32_t>(_max_segment_payload()));
     }
@@ -1286,6 +1825,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     // signal itself. Counted too, so a peer that shrinks its window as it
     // buffers out-of-order data cannot keep fast retransmit from firing.
     is_duplicate_ack = is_duplicate_ack || (!_in_flight.empty() && ack == snd_una && sack_advanced);
+    _detect_spurious_rto(segment, ack, snd_una, is_duplicate_ack);
     // TLP's "DupAck without any SACK option" (RFC 8985 7.4.2): the copy that
     // arrived second drew it, possibly with nothing left outstanding, which
     // RFC 5681's definition above would not count.
@@ -1310,7 +1850,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         // carrying them were lost. RACK finding a loss starts it too (RFC
         // 8985 3.4): with timing on its side it need not wait for three.
         bool loss_signalled =
-            _dup_ack_count >= DUP_ACK_FAST_RETRANSMIT_THRESHOLD || rack_lost
+            (dup_thresh && _dup_ack_count >= DUP_ACK_FAST_RETRANSMIT_THRESHOLD) || rack_lost
             || (_sack_permitted && _in_flight.oldest_unsacked() != nullptr && _in_flight.oldest_unsacked()->lost);
         if (_in_recovery && _sack_permitted)
         {
@@ -1410,6 +1950,14 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     {
         _rto_recovery = false; // everything outstanding at the timeout is acknowledged
     }
+    if (_retrans_stamp_valid && !_eifel_armed && seq_at_or_before(_retrans_stamp_end, ack))
+    {
+        _retrans_stamp_valid = false; // every retransmitted byte is acknowledged
+    }
+    if (_episode_open && _recovery_point_valid && seq_at_or_before(_recovery_point, ack))
+    {
+        _end_episode();
+    }
     _schedule_loss_probe(); // RFC 8985 7.2: on an ack that acknowledges new data
 
     // RFC 8985 6.2 step 5 on an ack that moved SND.UNA: a partial ack in
@@ -1480,7 +2028,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         uint32_t srtt_ms = _rtt.srtt_ms();
         if (!ecn_reduced) // RFC 3168 6.1.2: an ECE ack does not grow the window
         {
-            _congestion->on_ack(bytes_acked, _bytes_in_flight(), srtt_ms, _now_ms);
+            _congestion->on_ack(bytes_acked, prior_in_flight, srtt_ms, _now_ms);
         }
     }
 
@@ -1857,6 +2405,16 @@ void TcpConnection::on_segment(const Tcp& segment, Ecn ecn)
             _handle_fin(segment.get_sequence_number() + payload_size); // re-ack it and restart 2*MSL
             return;
         }
+        // Data entirely below RCV.NXT is a duplicate of what was delivered:
+        // the ack that answers it carries that range as a D-SACK block (RFC
+        // 2883 section 4.1). The partly-old case is not caught here - its new
+        // tail makes it acceptable - and is noted at the data path below.
+        if (payload_size > 0 && seq_at_or_before(segment.get_sequence_number() + payload_size, _recv_next)
+            && (_state == TcpState::ESTABLISHED || _state == TcpState::FIN_WAIT_1 || _state == TcpState::FIN_WAIT_2))
+        {
+            uint32_t behind = _recv_next - segment.get_sequence_number();
+            _note_duplicate(_recv_next_unwrapped - behind, _recv_next_unwrapped - behind + payload_size);
+        }
         _send_pure_ack();
         return;
     }
@@ -1885,6 +2443,12 @@ void TcpConnection::on_segment(const Tcp& segment, Ecn ecn)
     }
 
     _handle_ack(segment);
+    if (_ecn_negotiated && segment.get_ece())
+    {
+        _congestion->forget_undo(); // again: this ack may have started an episode
+    }
+    _try_undo_dsack();
+    _tune_send_capacity();
 
     // Resolved before the state check because the FIN handling at the bottom
     // needs the payload's length too: a segment carrying both data and FIN
@@ -1918,10 +2482,25 @@ void TcpConnection::on_segment(const Tcp& segment, Ecn ecn)
                 // of) a gap - RFC 5681 4.2 wants that acked at once, since a
                 // sender in recovery is waiting on exactly this ack.
                 bool fills_gap = !_reorder_buffer.empty();
+                uint32_t room = _advertised_window();
+                if (payload.size() > room)
+                {
+                    // RFC 9293 3.10.7.4: a segment is trimmed to the window.
+                    // Taken whole, a peer ignoring the window (or a zero-
+                    // window probe) would grow the queue past the buffer.
+                    if (room > 0)
+                    {
+                        _deliver(payload.slice(0, room));
+                        _drain_reorder_buffer();
+                    }
+                    _send_pure_ack();
+                    return; // a FIN on it lies beyond the window too
+                }
                 _deliver(payload);
 
                 // drain any buffered segments the gap-filler just unblocked
                 _drain_reorder_buffer();
+                _rcv_rtt_measure(segment, payload_size);
 
                 if (fills_gap || ce_marked_data)
                 {
@@ -1945,6 +2524,16 @@ void TcpConnection::on_segment(const Tcp& segment, Ecn ecn)
                 // sent *immediately*, never delayed
                 if (_seq_in_receive_window(seq))
                 {
+                    // Before the insert: afterwards the segment's own bytes are
+                    // held. Whole or partial, what was held already is the
+                    // duplicate (RFC 2883 section 4.1).
+                    uint64_t start = _recv_next_unwrapped + static_cast<uint32_t>(seq - _recv_next);
+                    uint64_t held_start = 0;
+                    uint64_t held_end = 0;
+                    if (_reorder_buffer.held_part(start, start + payload_size, held_start, held_end))
+                    {
+                        _note_duplicate(held_start, held_end);
+                    }
                     _buffer_out_of_order(seq, payload);
                 }
                 _send_pure_ack();
@@ -1954,12 +2543,19 @@ void TcpConnection::on_segment(const Tcp& segment, Ecn ecn)
                 // seq < _recv_next: fully or partially already seen. A
                 // partial overlap's new tail is still worth delivering
                 uint32_t already_seen = _recv_next - seq;
+                // The part below RCV.NXT is the duplicate, whole segment or
+                // just its head (RFC 2883 section 4.1); noted before the new
+                // tail is delivered moves RCV.NXT.
+                _note_duplicate(_recv_next_unwrapped - already_seen,
+                                _recv_next_unwrapped - already_seen + std::min<uint32_t>(already_seen, payload_size));
                 if (already_seen < payload.size())
                 {
-                    Bytes new_part = payload.slice(static_cast<size_t>(already_seen));
+                    size_t new_bytes = std::min<size_t>(payload.size() - already_seen, _advertised_window());
+                    Bytes new_part = payload.slice(static_cast<size_t>(already_seen), new_bytes);
                     _deliver(new_part);
 
                     _drain_reorder_buffer();
+                    _rcv_rtt_measure(segment, payload_size);
                 }
                 // a duplicate/overlap of already-seen data: ack now, don't delay
                 _send_pure_ack();
@@ -2240,7 +2836,24 @@ void TcpConnection::_run_timers()
     // algorithms treat that as the harsher signal; how much harsher is theirs
     // to decide.
     uint32_t cwnd_before = _congestion->window();
-    _congestion->on_retransmit_timeout(_bytes_in_flight(), _now_ms);
+    bool starts_episode = (oldest.flags & FLAG_SYN) == 0 && !_episode_open;
+    bool probe_outstanding = _tlp_outstanding && _tlp_is_retrans;
+    bool repeated = _episode_open && _episode_had_rto;
+    if ((oldest.flags & FLAG_SYN) == 0)
+    {
+        _begin_episode();
+    }
+    _episode_had_rto = true;
+    _arm_spurious_rto_detection(starts_episode, probe_outstanding);
+    _frto_rxt_end = oldest.end_seq;
+    if (repeated)
+    {
+        _congestion->on_repeated_retransmit_timeout();
+    }
+    else
+    {
+        _congestion->on_retransmit_timeout(_bytes_in_flight(), _now_ms);
+    }
     // RFC 6675 5.1 (and RFC 6582's "recover"): a timeout ends any recovery,
     // and no new one starts until everything sent so far is acknowledged.
     _in_recovery = false;
@@ -2308,7 +2921,96 @@ void TcpConnection::set_congestion_control(CongestionControlAlgorithm algorithm)
 
 size_t TcpConnection::send_space_available() const
 {
-    return _send_queued_bytes < SEND_BUFFER_CAPACITY ? SEND_BUFFER_CAPACITY - _send_queued_bytes : 0;
+    return _send_queued_bytes < _send_capacity ? _send_capacity - _send_queued_bytes : 0;
+}
+
+namespace
+{
+    size_t clamp_capacity(size_t bytes, size_t floor)
+    {
+        return std::clamp(bytes, std::max(TcpConnection::MIN_BUFFER_CAPACITY, floor),
+                          TcpConnection::MAX_BUFFER_CAPACITY);
+    }
+} // namespace
+
+void TcpConnection::_trim_memory_charges()
+{
+    if (_state != TcpState::TIME_WAIT && _state != TcpState::CLOSED)
+    {
+        return; // the capacity is still in use, whatever is buffered right now
+    }
+    // Growth is what lies above the defaults, so only bytes held beyond a
+    // default-sized buffer are growth's. Unread data can outlive the
+    // connection's state machine: an application may close() without
+    // reading, or read after the peer's FIN and TIME_WAIT.
+    size_t received = _receive_buffer_occupied();
+    _receive_charge.release_above(received > RECEIVE_BUFFER_CAPACITY ? received - RECEIVE_BUFFER_CAPACITY : 0);
+    size_t unsent = bytes_unacked();
+    _send_charge.release_above(unsent > SEND_BUFFER_CAPACITY ? unsent - SEND_BUFFER_CAPACITY : 0);
+}
+
+void TcpConnection::set_memory_budget(std::shared_ptr<TcpMemoryBudget> budget)
+{
+    _receive_charge.attach(budget);
+    _send_charge.attach(std::move(budget));
+}
+
+void TcpConnection::set_receive_capacity(size_t bytes)
+{
+    _receive_charge.release(); // the application's choice is not autotuning's growth
+    _receive_capacity = static_cast<uint32_t>(clamp_capacity(bytes, size_t{2} * _local_mss));
+}
+
+void TcpConnection::set_send_capacity(size_t bytes)
+{
+    EntryScope scope(*this);
+    _send_charge.release(); // the application's choice is not autotuning's growth
+    _send_capacity = clamp_capacity(bytes, size_t{2} * _local_mss);
+    // A bigger limit is new room: tell a waiting writer (EPOLLOUT).
+    _report_send_space();
+}
+
+void TcpConnection::_tune_send_capacity()
+{
+    if (_send_capacity_locked || (_state != TcpState::ESTABLISHED && _state != TcpState::CLOSE_WAIT))
+    {
+        return;
+    }
+    // Only a sender that was filling its window has a use for more buffer.
+    // cwnd itself no longer grows without that (CongestionControl::
+    // is_cwnd_limited()), but a window grown earlier - a bulk phase, then
+    // request/response - would still pull the buffer up to 2 * cwnd on every
+    // ack, charging the stack's budget for room nothing will fill. Linux's
+    // tcp_should_expand_sndbuf() gates on the same question from the other
+    // side: it expands when the writer ran out of buffer with cwnd not full,
+    // where here the buffer is sized ahead of cwnd and so follows it instead.
+    if (!_cwnd_limited_at_last_ack)
+    {
+        return;
+    }
+    size_t target = std::max(SEND_BUFFER_CAPACITY, size_t{2} * _congestion->window());
+    if (target > _send_capacity)
+    {
+        _grow_send_capacity(target);
+    }
+}
+
+void TcpConnection::_grow_send_capacity(size_t target)
+{
+    target = std::min(target, MAX_BUFFER_CAPACITY);
+    if (target <= _send_capacity)
+    {
+        return;
+    }
+    size_t granted = _send_charge.grant(target - _send_capacity);
+    if (granted == 0)
+    {
+        return; // the stack's budget is spent (see tcp_memory_budget.h)
+    }
+    LOG_DEBUG("TcpConnection[" << _id << "] send buffer " << _send_capacity << " -> " << _send_capacity + granted);
+    _send_capacity += granted;
+    // _report_send_space() at the end of the entry point tells a waiting
+    // writer about the new room.
 }
 
 bool TcpConnection::has_sent_unacknowledged(uint32_t seq) const

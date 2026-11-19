@@ -1805,10 +1805,11 @@ TEST(TcpConnection, ACoalescedRetransmissionDrainsTheOutOfOrderSegmentsItCovers)
     size_t delivered = 0;
     connection->set_data_ready_callback([&delivered, &connection]() { delivered += connection->read().size(); });
 
-    // 70 KB arrives out of order, one 1000-byte segment at a time, leaving the
-    // first 1000 bytes missing.
+    // 60 KB arrives out of order, one 1000-byte segment at a time, leaving the
+    // first 1000 bytes missing - all of it inside the 64 KiB unscaled window,
+    // since anything past the window's edge is trimmed off.
     const uint32_t chunk = 1000;
-    const uint32_t chunks = 70;
+    const uint32_t chunks = 60;
     for (uint32_t i = 1; i <= chunks; i++)
     {
         connection->on_segment(*make_incoming_segment(501 + i * chunk, 1001, FLAG_ACK, Bytes(chunk)));
@@ -2582,8 +2583,8 @@ namespace
         return bytes;
     }
 
-    // An established connection with SACK and window scaling (shift 1, so the
-    // advertised window has 2-byte resolution) that records the last SACK
+    // An established connection with SACK and window scaling (this stack's
+    // shift, so the advertised window has 2^WINDOW_SCALE_SHIFT-byte resolution) that records the last SACK
     // report and window it sent, and collects everything it delivers.
     struct ReorderHarness
     {
@@ -2598,7 +2599,8 @@ namespace
                                                          [this](const Tcp& header, const Bytes&)
                                                          {
                                                              sack = header.get_sack_blocks();
-                                                             window = static_cast<uint32_t>(header.get_window()) << 1;
+                                                             window = static_cast<uint32_t>(header.get_window())
+                                                                      << TcpConnection::WINDOW_SCALE_SHIFT;
                                                          });
             connection->accept_incoming_syn(peer_isn, 1460, true, 0, false, 0, true);
             connection->on_segment(*make_incoming_segment(peer_isn + 1, 1001, FLAG_ACK));
@@ -2625,22 +2627,25 @@ TEST(TcpConnection, ALongerSegmentAtABufferedStartKeepsItsNewBytes)
     ASSERT_TRUE(h.delivered.to_hex() == stream(501, 540).to_hex()) << "every byte through 540 is delivered, in order";
 }
 
-// Overlapping ranges are held once: one SACK block for the union, and the
-// buffer holds the bytes actually received rather than the sum of the
-// segments that brought them.
+// Overlapping ranges are held once: one range (one SACK block) for the union,
+// and the buffer holds the bytes actually received rather than the sum of the
+// segments that brought them. Each overlap is also a duplicate, so the ack
+// that answers it leads with a D-SACK block (RFC 2883) for the overlap and
+// the union follows it as the second block.
 TEST(TcpConnection, OverlappingOutOfOrderSegmentsAreHeldOnce)
 {
     ReorderHarness h(500);
 
     h.arrive(510, 520);
     h.arrive(506, 530); // contains the first
-    ASSERT_TRUE(h.sack.size() == 1 && h.sack[0].start == 506 && h.sack[0].end == 530) << "one block for the union";
+    ASSERT_TRUE(h.sack.size() == 2 && h.sack[0].start == 510 && h.sack[0].end == 520) << "D-SACK for the overlap";
+    ASSERT_TRUE(h.sack[1].start == 506 && h.sack[1].end == 530) << "then one block for the union";
     ASSERT_TRUE(h.connection->bytes_out_of_order() == 24)
         << "24 bytes held, counted once; held " << h.connection->bytes_out_of_order();
 
     h.arrive(526, 540); // overlaps the tail
     h.arrive(502, 508); // overlaps the head, leaving 501 as the only gap
-    ASSERT_TRUE(h.sack.size() == 1 && h.sack[0].start == 502 && h.sack[0].end == 540) << "still one block";
+    ASSERT_TRUE(h.sack.size() == 2 && h.sack[1].start == 502 && h.sack[1].end == 540) << "still one range";
     ASSERT_TRUE(h.connection->bytes_out_of_order() == 38)
         << "38 bytes held; held " << h.connection->bytes_out_of_order();
 
@@ -2656,8 +2661,9 @@ TEST(TcpConnection, OverlappingSegmentsAcrossTheSequenceWrapAreMerged)
     h.arrive(0xFFFFFFF0u, 0x00000008u);
     h.arrive(0xFFFFFFF8u, 0x00000020u);
     h.arrive(0xFFFFFFE8u, 0xFFFFFFF4u);
-    ASSERT_TRUE(h.sack.size() == 1 && h.sack[0].start == 0xFFFFFFE8u && h.sack[0].end == 0x00000020u)
-        << "one block spanning the wrap";
+    ASSERT_TRUE(h.sack.size() == 2 && h.sack[0].start == 0xFFFFFFF0u && h.sack[0].end == 0xFFFFFFF4u)
+        << "D-SACK for the overlap";
+    ASSERT_TRUE(h.sack[1].start == 0xFFFFFFE8u && h.sack[1].end == 0x00000020u) << "one range spanning the wrap";
     h.arrive(0xFFFFFFE1u, 0xFFFFFFE8u);
     ASSERT_TRUE(h.delivered.to_hex() == stream(0xFFFFFFE1u, 0x00000020u).to_hex()) << "delivered whole, in order";
 }
@@ -2830,8 +2836,9 @@ TEST(TcpConnection, APieceJoiningHeldRangesIsAcceptedAtTheCap)
 // retransmit could ever fire.
 TEST(TcpConnection, DuplicateAcksForOutOfOrderDataCarryAnUnchangedWindow)
 {
-    // Window scaling on (shift 1), so the 128 KiB window is not capped at
-    // 65535 and a change in it shows.
+    // Window scaling on, so the 128 KiB window is not capped at 65535, and
+    // segments of several scale units each, so a window shrunk by them would
+    // show in the scaled field.
     std::vector<RecordedSegment> sent;
     auto connection = std::make_unique<TcpConnection>(
         8080, IPv4Address("10.0.0.1"), 12345, 1000,
@@ -2847,13 +2854,13 @@ TEST(TcpConnection, DuplicateAcksForOutOfOrderDataCarryAnUnchangedWindow)
     sent.clear();
 
     for (uint32_t i = 1; i <= 3; i++)
-        connection->on_segment(*make_incoming_segment(511 + 100 * i, 1001, FLAG_ACK, Bytes(100)));
+        connection->on_segment(*make_incoming_segment(511 + 2000 * i, 1001, FLAG_ACK, Bytes(1000)));
     ASSERT_TRUE(sent.size() == 3) << "each out-of-order segment draws an immediate duplicate ack";
     ASSERT_TRUE(sent[0].ack == 511 && sent[1].ack == 511 && sent[2].ack == 511) << "all acking RCV.NXT";
     ASSERT_TRUE(sent[0].window == sent[1].window && sent[1].window == sent[2].window)
         << "and all advertising the same window: " << sent[0].window << ", " << sent[1].window << ", "
         << sent[2].window;
-    ASSERT_TRUE(connection->bytes_out_of_order() == 300) << "while the 300 bytes are held";
+    ASSERT_TRUE(connection->bytes_out_of_order() == 3000) << "while the 3000 bytes are held";
 }
 
 // RFC 6675 section 2: with SACK, a duplicate acknowledgment is one whose SACK
@@ -3047,4 +3054,93 @@ TEST(TcpConnection, FinIsPiggybackedOnTheLastQueuedSegment)
     ASSERT_TRUE(sent[10].flags & FLAG_FIN) << "piggybacked on the last data segment";
     ASSERT_TRUE(connection->get_state() == TcpState::FIN_WAIT_1);
     ASSERT_EQ(connection->send(Bytes(1u)), 0u) << "nothing more may be sent after close()";
+}
+
+// --- per-connection buffer capacities (SO_RCVBUF / SO_SNDBUF plumbing) ---
+
+TEST(TcpConnection, BufferCapacitiesDefaultToTheConstantsAndClamp)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    ASSERT_TRUE(connection->receive_capacity() == TcpConnection::RECEIVE_BUFFER_CAPACITY) << "default receive";
+    ASSERT_TRUE(connection->send_capacity() == TcpConnection::SEND_BUFFER_CAPACITY) << "default send";
+    ASSERT_TRUE(!connection->receive_capacity_locked()) << "not locked until an application asks";
+
+    connection->set_receive_capacity(1);
+    connection->set_send_capacity(1);
+    ASSERT_TRUE(connection->receive_capacity() == TcpConnection::MIN_BUFFER_CAPACITY) << "receive floor";
+    ASSERT_TRUE(connection->send_capacity() == TcpConnection::MIN_BUFFER_CAPACITY) << "send floor";
+
+    connection->set_receive_capacity(size_t{1} << 40);
+    connection->set_send_capacity(size_t{1} << 40);
+    ASSERT_TRUE(connection->receive_capacity() == TcpConnection::MAX_BUFFER_CAPACITY) << "receive ceiling";
+    ASSERT_TRUE(connection->send_capacity() == TcpConnection::MAX_BUFFER_CAPACITY) << "send ceiling";
+}
+
+TEST(TcpConnection, SmallReceiveCapacityAdvertisesASmallWindow)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->set_data_ready_callback([]() {});
+    connection->set_receive_capacity(8192);
+
+    // The handshake already offered a 64 KiB window, and that edge is kept
+    // (see ShrinkingReceiveCapacity...), so consume it first: only past it is
+    // the window the new capacity's.
+    uint32_t seq = 501;
+    for (int i = 0; i < 65; i += 1)
+    {
+        connection->on_segment(*make_incoming_segment(seq, 1001, FLAG_ACK, Bytes(1000)));
+        seq += 1000;
+    }
+    static_cast<void>(connection->read());
+    connection->on_segment(*make_incoming_segment(seq, 1001, FLAG_ACK, Bytes(1000)));
+    connection->on_time_passed(TEST_TICK_MS);
+
+    ASSERT_TRUE(!sent.empty()) << "the data should be acknowledged";
+    ASSERT_TRUE(sent.back().window > 0 && sent.back().window <= 8192)
+        << "an 8 KiB buffer cannot advertise more than 8 KiB, got " << sent.back().window;
+}
+
+TEST(TcpConnection, ShrinkingReceiveCapacityNeverMovesTheRightEdgeLeft)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->set_data_ready_callback([]() {});
+
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes(1000)));
+    connection->on_time_passed(TEST_TICK_MS);
+    ASSERT_TRUE(!sent.empty()) << "precondition: an ack went out";
+    // The right edge is the acked RCV.NXT plus the window just offered.
+    uint32_t edge_before = sent.back().ack + sent.back().window;
+    connection->set_receive_capacity(TcpConnection::MIN_BUFFER_CAPACITY);
+    ASSERT_TRUE(connection->receive_capacity() == TcpConnection::MIN_BUFFER_CAPACITY) << "the new limit is recorded";
+
+    connection->on_segment(*make_incoming_segment(1501, 1001, FLAG_ACK, Bytes(1000)));
+    connection->on_time_passed(TEST_TICK_MS);
+    uint32_t edge_after = sent.back().ack + sent.back().window;
+    ASSERT_TRUE(static_cast<int32_t>(edge_after - edge_before) >= 0)
+        << "the advertised right edge moved left: " << edge_before << " -> " << edge_after;
+}
+
+TEST(TcpConnection, SmallSendCapacityLimitsSpaceAndNotifiesWhenItGrows)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    int notified = 0;
+    connection->set_send_space_callback([&notified]() { notified += 1; });
+    connection->set_send_capacity(TcpConnection::MIN_BUFFER_CAPACITY);
+    connection->set_send_capacity_locked(true); // as SO_SNDBUF does: no growth with cwnd
+
+    // a zero peer window keeps everything queued
+    connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 0));
+    ASSERT_TRUE(connection->send_space_available() == TcpConnection::MIN_BUFFER_CAPACITY) << "limited to the new cap";
+    size_t accepted = connection->send(Bytes(static_cast<unsigned int>(TcpConnection::MIN_BUFFER_CAPACITY * 2)));
+    ASSERT_TRUE(accepted == TcpConnection::MIN_BUFFER_CAPACITY) << "send() accepts only the capacity, got " << accepted;
+    ASSERT_TRUE(!connection->writable()) << "full at the small capacity";
+
+    int before = notified;
+    connection->set_send_capacity(TcpConnection::SEND_BUFFER_CAPACITY);
+    ASSERT_TRUE(connection->send_space_available() > 0) << "raising the cap makes room";
+    ASSERT_TRUE(notified > before) << "and tells a waiting writer";
 }

@@ -64,6 +64,7 @@ struct LinkStats
     uint64_t mtu_dropped = 0;
     uint64_t queue_dropped = 0;
     uint64_t ce_marked = 0;
+    uint64_t delayed = 0; // frames the delay filter held back
 
     std::string describe() const;
 };
@@ -134,6 +135,16 @@ public:
     using DropFilter = std::function<bool(const Bytes& frame)>;
     void set_drop_filter(Side from, DropFilter filter) { _directions[from].drop_filter = std::move(filter); }
 
+    // A deterministic delay spike, the counterpart of the drop filter: called
+    // with every frame written from `from` (that survived the drop filter), it
+    // returns extra one-way delay in ms on top of delay/jitter/reorder; 0 means
+    // none. Later, undelayed frames overtake a delayed one - that reordering
+    // is the point (an ACK path whose delay jumps past the sender's RTO). The
+    // filter draws no random numbers, so it keeps every seed reproducible. A
+    // duplicated frame has both copies delayed. Unset (the default) delays nothing.
+    using DelayFilter = std::function<uint32_t(const Bytes& frame)>;
+    void set_delay_filter(Side from, DelayFilter filter) { _directions[from].delay_filter = std::move(filter); }
+
     // Frames the random loss and corruption leave alone: called with every
     // frame written from `from`, and a frame for which it returns true is
     // neither lost nor corrupted by the link's `loss` / `corrupt` (delay, jitter,
@@ -176,13 +187,14 @@ private:
         std::deque<uint64_t> waiting_starts_us;
         DropFilter drop_filter;
         DropFilter loss_exempt;
+        DelayFilter delay_filter;
     };
 
     void _transmit(Side from, const Bytes& frame);
     // Sets CE on an ECN-capable IPv4 frame; false if it is not one.
     static bool _mark_ce(Bytes& frame);
     static bool _exempt(const Direction& direction, const Bytes& frame);
-    void _enqueue_copy(Direction& direction, Bytes frame, uint64_t wire_done_us);
+    void _enqueue_copy(Direction& direction, Bytes frame, uint64_t wire_done_us, uint32_t extra_delay_ms);
     Bytes _receive(Side at);
     bool _due(const Direction& direction) const;
 

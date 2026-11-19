@@ -1,0 +1,25 @@
+# Receiver D-SACK (RFC 2883 section 4): a data segment the receiver already
+# has is answered at once, and that ACK's FIRST SACK block is the duplicate
+# range. The peer's ISN is 0, so its first data byte is 1.
+0      listen 8080
++0     < S 0:0(0) win 65535 <mss 1460,sackOK>
++0     > S. 0:0(0) ack 1 <mss 1460,sackOK>
++0.010 < . 1:1(0) ack 1 win 65535
++0     accept
+
+# In order, so its ack is delayed (the first ack after it is the next one).
++0     < . 1:1001(1000) ack 1 win 65535
++0     read 1000
+
+# The same 1000 bytes again, as a spurious retransmission would arrive. The
+# ack repeats RCV.NXT and names 1:1001 as the duplicate.
++0.001 < . 1:1001(1000) ack 1 win 65535
++0     > . 1:1(0) ack 1001 <sack 1:1001>
+
+# Out of order: a normal SACK block, no D-SACK - the report was made once.
++0.001 < . 2001:3001(1000) ack 1 win 65535
++0     > . 1:1(0) ack 1001 <sack 2001:3001>
+
+# A duplicate of that out-of-order range: D-SACK first, then the range itself.
++0.001 < . 2001:3001(1000) ack 1 win 65535
++0     > . 1:1(0) ack 1001 <sack 2001:3001 2001:3001>

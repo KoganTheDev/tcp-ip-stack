@@ -244,6 +244,129 @@ TEST_F(UstackSocket, SocketOptions)
     EXPECT_EQ(value, 5000);
 }
 
+// --- SO_RCVBUF / SO_SNDBUF ---
+
+namespace
+{
+    int buffer_option(ustack::Stack& stack, int fd, int optname)
+    {
+        int value = -1;
+        socklen_t length = sizeof(value);
+        REQUIRE_TRUE(stack.getsockopt(fd, SOL_SOCKET, optname, &value, &length) == 0, std::strerror(errno));
+        return value;
+    }
+
+    int set_buffer_option(ustack::Stack& stack, int fd, int optname, int value)
+    {
+        return stack.setsockopt(fd, SOL_SOCKET, optname, &value, sizeof(value));
+    }
+} // namespace
+
+TEST_F(UstackSocket, BufferOptionsRoundTripDoubledAndClamp)
+{
+    int fd = client->socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    ASSERT_EQ(buffer_option(*client, fd, SO_RCVBUF), 2 * static_cast<int>(TcpConnection::RECEIVE_BUFFER_CAPACITY));
+    ASSERT_EQ(buffer_option(*client, fd, SO_SNDBUF), 2 * static_cast<int>(TcpConnection::SEND_BUFFER_CAPACITY));
+
+    ASSERT_EQ(set_buffer_option(*client, fd, SO_RCVBUF, 65536), 0);
+    ASSERT_EQ(set_buffer_option(*client, fd, SO_SNDBUF, 32768), 0);
+    EXPECT_EQ(buffer_option(*client, fd, SO_RCVBUF), 131072) << "getsockopt returns double, as Linux does";
+    EXPECT_EQ(buffer_option(*client, fd, SO_SNDBUF), 65536);
+
+    ASSERT_EQ(set_buffer_option(*client, fd, SO_RCVBUF, 1), 0);
+    EXPECT_EQ(buffer_option(*client, fd, SO_RCVBUF), 2 * static_cast<int>(TcpConnection::MIN_BUFFER_CAPACITY));
+    ASSERT_EQ(set_buffer_option(*client, fd, SO_RCVBUF, -5), 0);
+    EXPECT_EQ(buffer_option(*client, fd, SO_RCVBUF), 2 * static_cast<int>(TcpConnection::MIN_BUFFER_CAPACITY));
+    ASSERT_EQ(set_buffer_option(*client, fd, SO_SNDBUF, 0x7fffffff), 0);
+    EXPECT_EQ(buffer_option(*client, fd, SO_SNDBUF), 2 * static_cast<int>(TcpConnection::MAX_BUFFER_CAPACITY));
+}
+
+// Linux's getsockopt reports the buffer as it is now, autotuning included
+// (sk_rcvbuf / sk_sndbuf grow), doubled like everything else it reports.
+TEST_F(UstackSocket, BufferOptionsReportTheAutotunedSize)
+{
+    auto [client_fd, server_fd] = connected_pair();
+    std::string chunk(65536, 'x');
+    size_t sent = 0;
+    size_t received = 0;
+    constexpr size_t TOTAL = size_t{4} * 1024 * 1024;
+    ASSERT_TRUE(net.run_until(
+        [&]
+        {
+            while (sent < TOTAL)
+            {
+                ssize_t n = client->send(client_fd, chunk.data(), chunk.size(), MSG_NOSIGNAL);
+                if (n <= 0)
+                    break;
+                sent += static_cast<size_t>(n);
+            }
+            received += recv_string(*server, server_fd, 1 << 20).size();
+            return received >= TOTAL;
+        },
+        60000))
+        << "the transfer completes; received " << received;
+    EXPECT_GT(buffer_option(*server, server_fd, SO_RCVBUF),
+              2 * static_cast<int>(TcpConnection::RECEIVE_BUFFER_CAPACITY))
+        << "the receive buffer grew, and getsockopt says so";
+    EXPECT_GT(buffer_option(*client, client_fd, SO_SNDBUF), 2 * static_cast<int>(TcpConnection::SEND_BUFFER_CAPACITY))
+        << "so did the send buffer";
+}
+
+TEST_F(UstackSocket, BufferOptionsOnAUdpSocketAreStoredNotApplied)
+{
+    int fd = client->socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(set_buffer_option(*client, fd, SO_RCVBUF, 65536), 0);
+    EXPECT_EQ(buffer_option(*client, fd, SO_RCVBUF), 131072);
+}
+
+TEST_F(UstackSocket, BufferOptionsAreInheritedFromTheListener)
+{
+    listen_fd = listen_on(SERVER_PORT);
+    ASSERT_EQ(set_buffer_option(*server, listen_fd, SO_RCVBUF, 16384), 0);
+    ASSERT_EQ(set_buffer_option(*server, listen_fd, SO_SNDBUF, 8192), 0);
+    start_connect(SERVER_PORT);
+    int accepted = accept_within(listen_fd);
+    ASSERT_GE(accepted, 0);
+    EXPECT_EQ(buffer_option(*server, accepted, SO_RCVBUF), 32768);
+    EXPECT_EQ(buffer_option(*server, accepted, SO_SNDBUF), 16384);
+}
+
+TEST_F(UstackSocket, SmallSendBufferLimitsWhatSendTakesAndEpolloutFollows)
+{
+    auto [client_fd, server_fd] = connected_pair();
+    static_cast<void>(server_fd);
+    ASSERT_EQ(set_buffer_option(*client, client_fd, SO_SNDBUF, 4096), 0);
+    int ep = client->epoll_create1(0);
+    ASSERT_EQ(add(*client, ep, client_fd, EPOLLOUT), 0);
+
+    // Peer window is far above 4 KiB, so what is taken is bounded by the
+    // peer's window plus the send queue; fill past it and it blocks.
+    std::string chunk(1000, 'x');
+    size_t small = 0;
+    // No simulated time passes while filling, so nothing is acknowledged and
+    // the queue stays full when send() first reports EAGAIN.
+    ssize_t n = 0;
+    while ((n = client->send(client_fd, chunk.data(), chunk.size(), MSG_NOSIGNAL)) > 0)
+    {
+        small += static_cast<size_t>(n);
+    }
+    ASSERT_TRUE(n == -1 && errno == EAGAIN) << std::strerror(errno);
+    EXPECT_LT(small, 2 * 4096U) << "a 4 KiB send buffer must not take 64 KiB+";
+    EXPECT_EQ(events_for(wait_events(*client, ep, 0), static_cast<uint64_t>(client_fd)) & EPOLLOUT, 0U)
+        << "a full send queue is not writable";
+
+    // Reading at the server reopens the window, drains the queue, and EPOLLOUT follows.
+    ASSERT_TRUE(net.run_until(
+        [&]
+        {
+            static_cast<void>(recv_string(*server, server_fd));
+            return (events_for(wait_events(*client, ep, 0), static_cast<uint64_t>(client_fd)) & EPOLLOUT) != 0;
+        },
+        2000))
+        << "EPOLLOUT never came back after the peer read (sent " << small << " bytes)";
+}
+
 // A client that reconnects from one fixed port.
 class UstackTimeWait : public UstackFixture
 {

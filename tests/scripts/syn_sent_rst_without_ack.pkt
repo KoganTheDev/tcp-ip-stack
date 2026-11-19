@@ -3,7 +3,7 @@
 # off, drop the segment and return". A blind RST without ACK must not abort
 # the open, so the real SYN-ACK that follows still completes it.
 0      connect 9000
-+0     > S 0:0(0) win 65535 <mss 1460,sackOK,TS val * ecr 0,wscale 1>
++0     > S 0:0(0) win 65535 <mss 1460,sackOK,TS val * ecr 0,wscale 9>
 +0.005 < R 0:0(0) win 0
 +0     state SYN_SENT
 +0.005 < S. 0:0(0) ack 1 win 65535 <mss 1460>

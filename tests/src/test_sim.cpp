@@ -132,6 +132,72 @@ TEST(SimLink, ReorderedFrameIsOvertakenByLaterOnes)
     ASSERT_EQ(bench.drain_b(), std::vector<Bytes>{frame_of(60, 1)});
 }
 
+TEST(SimLink, DelayFilterAddsExtraDelayToTheFramesItPicks)
+{
+    LinkParams params;
+    params.delay_ms = 5;
+    Bench bench{params};
+    bench.link.set_delay_filter(NetemChannel::A, [](const Bytes& frame) { return frame[0] == 1 ? 20u : 0u; });
+    bench.a->write(frame_of(60, 1)); // 5 + 20 ms
+    bench.a->write(frame_of(60, 2)); // 5 ms
+    bench.clock.advance(5);
+    ASSERT_EQ(bench.drain_b(), std::vector<Bytes>{frame_of(60, 2)});
+    bench.clock.advance(19);
+    ASSERT_TRUE(bench.drain_b().empty()) << "the picked frame is not due until 25 ms";
+    bench.clock.advance(1);
+    ASSERT_EQ(bench.drain_b(), std::vector<Bytes>{frame_of(60, 1)});
+    ASSERT_EQ(bench.link.stats(NetemChannel::A).delayed, 1u);
+}
+
+TEST(SimLink, DelayFilterLetsLaterFramesOvertakeTheDelayedOne)
+{
+    Bench bench{LinkParams()};
+    bench.link.set_delay_filter(NetemChannel::A, [](const Bytes& frame) { return frame[0] == 1 ? 10u : 0u; });
+    for (byte_t fill : {1, 2, 3})
+        bench.a->write(frame_of(60, fill));
+    ASSERT_EQ(bench.drain_b(), (std::vector<Bytes>{frame_of(60, 2), frame_of(60, 3)}));
+    bench.clock.advance(10);
+    ASSERT_EQ(bench.drain_b(), std::vector<Bytes>{frame_of(60, 1)});
+}
+
+TEST(SimLink, DelayFilterOnlyAffectsItsOwnDirection)
+{
+    Bench bench{LinkParams()};
+    bench.link.set_delay_filter(NetemChannel::B, [](const Bytes&) { return 50u; });
+    bench.a->write(frame_of(60, 1));
+    ASSERT_EQ(bench.drain_b().size(), 1u);
+}
+
+// The filter draws no random numbers, so a run with one is as reproducible
+// as one without: same seed, same deliveries, microsecond for microsecond.
+TEST(SimLink, DelayFilterRunsAreDeterministicWithTheSeed)
+{
+    LinkParams params;
+    params.loss = 0.2;
+    params.jitter_ms = 5;
+    params.reorder = 0.2;
+    params.reorder_delay_ms = 7;
+
+    auto run = [&](uint64_t seed)
+    {
+        Bench bench{params, seed};
+        bench.link.set_delay_filter(NetemChannel::A, [](const Bytes& frame) { return frame[0] % 3 == 0 ? 15u : 0u; });
+        PcapWriter delivered;
+        bench.link.set_capture(&delivered, nullptr);
+        for (int i = 0; i < 100; i++)
+        {
+            bench.a->write(frame_of(60, static_cast<byte_t>(i)));
+            bench.clock.advance(1);
+            bench.drain_b();
+        }
+        bench.clock.advance(1000);
+        bench.drain_b();
+        return delivered.to_bytes();
+    };
+    ASSERT_EQ(run(7), run(7));
+    ASSERT_NE(run(7), run(8));
+}
+
 TEST(SimLink, BandwidthSerializesFramesBehindEachOther)
 {
     LinkParams params;

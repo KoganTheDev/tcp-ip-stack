@@ -102,6 +102,30 @@ TEST(TcpSegmentOptions, ARetransmittedSynAckCarriesTheNegotiatedOptions)
     ASSERT_TRUE(sent[1].has_timestamp && sent[1].ts_echo == 5000) << "and echo the SYN's TSval";
 }
 
+// Timestamps can be switched off, as Linux's net.ipv4.tcp_timestamps = 0: no
+// TSopt is offered on a SYN, none is accepted from a peer's SYN, and every
+// segment after goes without one.
+TEST(TcpSegmentOptions, TimestampsSwitchedOffAreNeitherOfferedNorAccepted)
+{
+    std::vector<Sent> sent;
+    TcpConnection active(54321, IPv4Address("10.0.0.2"), 8080, 2000, recorder(sent));
+    active.set_timestamps_enabled(false);
+    active.initiate_connect();
+    ASSERT_TRUE(sent.size() == 1 && sent[0].has_mss && sent[0].sack_permitted);
+    ASSERT_FALSE(sent[0].has_timestamp) << "the SYN offers no timestamp";
+
+    sent.clear();
+    TcpConnection passive(8080, IPv4Address("10.0.0.1"), 12345, 1000, recorder(sent));
+    passive.set_timestamps_enabled(false);
+    passive.accept_incoming_syn(500, 1460, true, 7, true, 5000, true);
+    ASSERT_TRUE(sent.size() == 1 && sent[0].sack_permitted);
+    ASSERT_FALSE(sent[0].has_timestamp) << "the SYN-ACK declines the peer's";
+    passive.on_segment(*peer_segment(501, 1001, FLAG_ACK, 5001, 0));
+    ASSERT_EQ(passive.get_state(), TcpState::ESTABLISHED);
+    passive.send(Bytes(100));
+    ASSERT_FALSE(sent.back().has_timestamp);
+}
+
 TEST(TcpSegmentOptions, ADataRetransmissionAfterATimeoutCarriesATimestamp)
 {
     std::vector<Sent> sent;

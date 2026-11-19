@@ -257,6 +257,16 @@ namespace ustack
     {
         connection.set_keepalive(socket.keepalive);
         connection.set_nodelay(socket.nodelay);
+        if (socket.receive_capacity_locked)
+        {
+            connection.set_receive_capacity(socket.receive_capacity);
+            connection.set_receive_capacity_locked(true);
+        }
+        if (socket.send_capacity_set)
+        {
+            connection.set_send_capacity(socket.send_capacity);
+            connection.set_send_capacity_locked(true);
+        }
         connection.set_user_timeout(socket.user_timeout_ms == 0 ? TcpConnection::DEFAULT_USER_TIMEOUT_MS
                                                                 : socket.user_timeout_ms);
         if (std::strcmp(connection.get_congestion_control_name(), congestion_name(socket.congestion)) != 0)
@@ -625,6 +635,10 @@ namespace ustack
         socket->v6only = listener->v6only;
         socket->keepalive = listener->keepalive;
         socket->nodelay = listener->nodelay;
+        socket->receive_capacity = listener->receive_capacity;
+        socket->send_capacity = listener->send_capacity;
+        socket->receive_capacity_locked = listener->receive_capacity_locked;
+        socket->send_capacity_set = listener->send_capacity_set;
         socket->reuseaddr = listener->reuseaddr;
         socket->linger = listener->linger;
         socket->user_timeout_ms = listener->user_timeout_ms;
@@ -1063,6 +1077,33 @@ namespace ustack
                     connection->set_keepalive(socket->keepalive);
                 }
                 return 0;
+            case SO_RCVBUF:
+            case SO_SNDBUF:
+            {
+                if (int error = read_int_option(optval, optlen, value); error != 0)
+                {
+                    return fail(error);
+                }
+                // Negative values clamp to the floor, as Linux's do.
+                size_t asked = value < 0 ? 0 : static_cast<size_t>(value);
+                size_t clamped =
+                    std::clamp(asked, TcpConnection::MIN_BUFFER_CAPACITY, TcpConnection::MAX_BUFFER_CAPACITY);
+                if (optname == SO_RCVBUF)
+                {
+                    socket->receive_capacity = clamped;
+                    socket->receive_capacity_locked = true;
+                }
+                else
+                {
+                    socket->send_capacity = clamped;
+                    socket->send_capacity_set = true;
+                }
+                if (connection != nullptr)
+                {
+                    _apply_options(*socket, *connection);
+                }
+                return 0;
+            }
             case SO_REUSEADDR:
                 if (int error = read_int_option(optval, optlen, value); error != 0)
                 {
@@ -1198,6 +1239,21 @@ namespace ustack
             case SO_KEEPALIVE:
                 error = write_int_option(optval, optlen, socket->keepalive ? 1 : 0);
                 break;
+            case SO_RCVBUF:
+            case SO_SNDBUF:
+            {
+                // Doubled as Linux does; see the comment on setsockopt in stack.h.
+                // A connected TCP socket reports its connection's capacity as
+                // it is now, autotuning's growth included, as Linux reports
+                // sk_rcvbuf / sk_sndbuf.
+                size_t capacity = optname == SO_RCVBUF ? socket->receive_capacity : socket->send_capacity;
+                if (const TcpConnection* connection = _connection(*socket))
+                {
+                    capacity = optname == SO_RCVBUF ? connection->receive_capacity() : connection->send_capacity();
+                }
+                error = write_int_option(optval, optlen, static_cast<int>(capacity * 2));
+                break;
+            }
             case SO_REUSEADDR:
                 error = write_int_option(optval, optlen, socket->reuseaddr ? 1 : 0);
                 break;

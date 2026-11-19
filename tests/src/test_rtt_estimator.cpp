@@ -69,6 +69,24 @@ TEST(RttEstimator, AFreshSampleReplacesABackedOffRto)
     ASSERT_LT(rtt.rto_ms(), 2400) << "Karn: the backed-off value lasts only until an unambiguous sample";
 }
 
+// A timeout found to be spurious takes its back-off with it (Linux resets
+// icsk_backoff on undo): the RTO is what the estimator says again.
+TEST(RttEstimator, ResettingTheBackOffReturnsToTheEstimatorsRto)
+{
+    RttEstimator rtt;
+    rtt.on_sample(400);
+    int rto = rtt.rto_ms();
+    rtt.back_off();
+    rtt.back_off();
+    rtt.reset_backoff();
+    ASSERT_EQ(rtt.rto_ms(), rto);
+
+    RttEstimator fresh;
+    fresh.back_off();
+    fresh.reset_backoff();
+    ASSERT_EQ(fresh.rto_ms(), RttEstimator::INITIAL_RTO_MS) << "with no sample, the initial RTO";
+}
+
 TEST(RttEstimator, ASampleBelowTheMeanDoesNotWrapTheUnsignedFilters)
 {
     RttEstimator rtt;

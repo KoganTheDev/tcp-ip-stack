@@ -174,7 +174,20 @@ public:
     // middlebox that drops ECN-setup SYNs. Applies to connections opened or
     // accepted after the call.
     void set_tcp_ecn(TcpEcnMode mode) { _tcp_ecn = mode; }
+
+    // The cap on what buffer autotuning may add across every TCP connection
+    // of this stack, like Linux's tcp_mem (see tcp_memory_budget.h). Growth
+    // stops at the limit; nothing is shrunk to stay under it. Defaults to
+    // TcpMemoryBudget::DEFAULT_LIMIT (64 MiB). tcp_memory_in_use() is what
+    // the connections currently draw from it.
+    void set_tcp_memory_limit(size_t bytes) { _tcp_memory->set_limit(bytes); }
+    size_t tcp_memory_limit() const { return _tcp_memory->limit(); }
+    size_t tcp_memory_in_use() const { return _tcp_memory->in_use(); }
     TcpEcnMode tcp_ecn() const { return _tcp_ecn; }
+    // TCP timestamps (RFC 7323) on or off, like Linux's
+    // net.ipv4.tcp_timestamps (1 or 0). On by default. Applies to
+    // connections opened or accepted after the call.
+    void set_tcp_timestamps(bool enabled) { _tcp_timestamps = enabled; }
 
     // Routes beyond the two derived from the interface. Use this for a route
     // to a network reachable through some router other than the default.
@@ -815,6 +828,11 @@ private:
     // net.ipv4.ip_forward.
     bool _forwarding_enabled = false;
     TcpEcnMode _tcp_ecn = TcpEcnMode::PASSIVE;
+    bool _tcp_timestamps = true;
+    // Shared with every connection (see set_tcp_memory_limit()); shared
+    // ownership so a connection destroyed after the stack's other members
+    // still has somewhere to give its share back to.
+    std::shared_ptr<TcpMemoryBudget> _tcp_memory = std::make_shared<TcpMemoryBudget>();
     // False until the constructor has finished: configure_interface() does
     // not announce the address it is given at construction.
     bool _constructed = false;

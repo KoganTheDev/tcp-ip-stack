@@ -36,6 +36,7 @@
 #include "logger.h"
 #include "network_stack.h"
 #include "sim/tcp_frame.h"
+#include "stack_seed.h"
 #include "utils.h"
 
 namespace
@@ -142,6 +143,7 @@ namespace
             auto owned = std::make_unique<FakePacketChannel>();
             channel = owned.get();
             stack = std::make_unique<NetworkStack>(std::move(owned), LOCAL_MAC, LOCAL_IP);
+            stack->set_secret_seed(STACK_HARNESS_SECRET_SEED); // see stack_seed.h
             stack->add_static_arp_entry(PEER_IP, PEER_MAC);
             // Dual stack: a static v6 address, so v6 TCP/UDP/echo reach the
             // transports at once, and SLAAC running, so NS/NA/RA reach the

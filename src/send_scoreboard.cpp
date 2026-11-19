@@ -23,6 +23,8 @@ SendScoreboard::SendScoreboard(SendScoreboard&& other) noexcept
       _reordering_seen(other._reordering_seen), _sacked_segments(other._sacked_segments),
       _unsacked_bytes(other._unsacked_bytes), _sacked_bytes(other._sacked_bytes)
 {
+    _ledgers[0] = std::move(other._ledgers[0]);
+    _ledgers[1] = std::move(other._ledgers[1]);
     other.clear();
 }
 
@@ -63,6 +65,8 @@ void SendScoreboard::clear()
     _lost_cursor_valid = false;
     _rack_head = nullptr;
     _rack_tail = nullptr;
+    _ledgers[0] = Ledger{};
+    _ledgers[1] = Ledger{};
 }
 
 void SendScoreboard::_rack_link(SentSegment& segment)
@@ -424,6 +428,13 @@ const SentSegment* SendScoreboard::oldest_unsacked() const
 
 void SendScoreboard::mark_losses(uint32_t dup_thresh, uint32_t smss)
 {
+    if (_sacked_bytes == 0)
+    {
+        // Both rules need SACKed data above a segment, so with none there is
+        // nothing to mark - and this runs on every ack, so the walk would be
+        // O(flight) per ack on a lossless path.
+        return;
+    }
     uint32_t sacked_segments_above = 0;
     uint32_t sacked_bytes_above = 0;
     for (auto it = _segments.rbegin(); it != _segments.rend(); ++it)
@@ -499,6 +510,35 @@ void SendScoreboard::mark_all_lost()
     _rack_head = nullptr;
     _rack_tail = nullptr;
     _reset_high_rxt();
+}
+
+void SendScoreboard::undo_loss_marks()
+{
+    std::vector<SentSegment*> candidates;
+    for (SentSegment& entry : _segments)
+    {
+        _visits++;
+        _rack_unlink(entry);
+        if (!entry.sacked)
+        {
+            entry.lost = false;
+            entry.rexmit_in_recovery = false;
+            candidates.push_back(&entry);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const SentSegment* a, const SentSegment* b) { return a->xmit_order < b->xmit_order; });
+    for (SentSegment* entry : candidates)
+    {
+        _rack_link(*entry);
+    }
+    _lost_cursor_valid = false;
+    // RACK.segment is most likely the timeout's retransmission, its delivery
+    // inferred from an ack that was in fact for the original - the very
+    // ambiguity the undo has just resolved. Kept, it would make every
+    // segment sent before the retransmission look overdue. The next
+    // delivery sets it afresh.
+    _rack_valid = false;
 }
 
 void SendScoreboard::start_recovery()
@@ -616,4 +656,92 @@ SentSegment* SendScoreboard::highest_unsacked()
         }
     }
     return nullptr;
+}
+
+void SendScoreboard::begin_episode()
+{
+    _ledgers[1] = std::move(_ledgers[0]);
+    _ledgers[0] = Ledger{};
+    Ledger& ledger = _ledgers[0];
+    ledger.valid = true;
+    ledger.base = _segments.empty() ? 0 : _segments.front().seq;
+    for (const SentSegment& entry : _segments)
+    {
+        _visits++;
+        if (entry.retransmitted && (entry.flags & FLAG_SYN) == 0)
+        {
+            note_episode_retransmission(entry);
+        }
+    }
+}
+
+void SendScoreboard::note_episode_retransmission(const SentSegment& segment)
+{
+    Ledger& ledger = _ledgers[0];
+    uint32_t length = segment.end_seq - segment.seq;
+    if (!ledger.valid || length == 0)
+    {
+        return;
+    }
+    ledger.copies += 1;
+    LedgerEntry& entry = ledger.entries[segment.seq - ledger.base];
+    if (entry.length != 0 && entry.length != length)
+    {
+        // The front segment was trimmed by a partial ack and resent shorter:
+        // the same start, a different range. This copy is counted but can
+        // never be matched, so the episode can never be fully reported -
+        // the safe direction for something this rare.
+        return;
+    }
+    entry.length = length;
+    entry.copies += 1;
+}
+
+bool SendScoreboard::_match_in(Ledger& ledger, const Tcp::SackBlock& block)
+{
+    if (!ledger.valid)
+    {
+        return false;
+    }
+    uint32_t start = block.start - ledger.base;
+    uint32_t end = block.end - ledger.base;
+    // Below the ledger's base (or wrapped) cannot be one of its entries.
+    if (start >= (1u << 31) || end >= (1u << 31) || end <= start)
+    {
+        return false;
+    }
+    // The block must be one entry, or consecutive entries, exactly - and each
+    // must still have a copy not yet reported. Checked before anything is
+    // counted, so a block that fails half way counts nothing.
+    std::vector<LedgerEntry*> covered;
+    uint32_t at = start;
+    while (at < end)
+    {
+        auto it = ledger.entries.find(at);
+        if (it == ledger.entries.end() || it->second.dsacked >= it->second.copies || end - at < it->second.length)
+        {
+            return false;
+        }
+        covered.push_back(&it->second);
+        at += it->second.length;
+    }
+    for (LedgerEntry* entry : covered)
+    {
+        entry->dsacked += 1;
+        ledger.dsacked += 1;
+    }
+    return true;
+}
+
+SendScoreboard::DsackMatch SendScoreboard::match_dsack(const Tcp::SackBlock& block)
+{
+    if (_match_in(_ledgers[0], block))
+    {
+        return DsackMatch::CURRENT;
+    }
+    if (_match_in(_ledgers[1], block))
+    {
+        return DsackMatch::LAST;
+    }
+    return DsackMatch::NONE;
 }

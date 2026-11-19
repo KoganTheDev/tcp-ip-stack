@@ -282,6 +282,43 @@ std::vector<Tcp::SackBlock> ReorderBuffer::sack_blocks(size_t limit, uint64_t rc
     return blocks;
 }
 
+bool ReorderBuffer::held_part(uint64_t start, uint64_t end, uint64_t& held_start, uint64_t& held_end) const
+{
+    // The range that could cover `start` begins at or before it; otherwise
+    // the first one after it may begin inside [start, end).
+    auto it = _ranges.upper_bound(start);
+    if (it != _ranges.begin())
+    {
+        auto before = std::prev(it);
+        if (before->second.end > start)
+        {
+            it = before;
+        }
+    }
+    if (it == _ranges.end() || it->first >= end)
+    {
+        return false;
+    }
+    held_start = std::max(start, it->first);
+    held_end = std::min(end, it->second.end);
+    return true;
+}
+
+std::optional<Tcp::SackBlock> ReorderBuffer::range_containing(uint64_t pos) const
+{
+    auto it = _ranges.upper_bound(pos);
+    if (it == _ranges.begin())
+    {
+        return std::nullopt;
+    }
+    --it;
+    if (pos >= it->second.end)
+    {
+        return std::nullopt;
+    }
+    return Tcp::SackBlock{static_cast<uint32_t>(it->first), static_cast<uint32_t>(it->second.end)};
+}
+
 void ReorderBuffer::clear()
 {
     _ranges.clear();

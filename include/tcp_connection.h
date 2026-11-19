@@ -12,6 +12,7 @@
 #include "ip.h"
 #include "ip_address.h"
 #include "reorder_buffer.h"
+#include "tcp_memory_budget.h"
 #include "rtt_estimator.h"
 #include "send_scoreboard.h"
 #include "tcp.h"
@@ -82,6 +83,19 @@ enum class TcpEcnMode
 //
 // Still deliberately out of scope (documented, not accidental): PRR without
 // SACK, D-SACK and F-RTO - see the README.
+// The smallest window shift with which a 16-bit window field can describe
+// `bytes` (RFC 7323 2.2), as Linux's tcp_select_initial_window() computes it.
+constexpr uint8_t tcp_window_scale_covering(size_t bytes)
+{
+    uint8_t shift = 0;
+    while (bytes > 0xFFFF && shift < 14)
+    {
+        bytes >>= 1;
+        shift++;
+    }
+    return shift;
+}
+
 class TcpConnection
 {
 public:
@@ -145,6 +159,10 @@ public:
     // the clock from being shared across peers, where it would leak uptime
     // and link one host's connections together.
     void set_timestamp_offset(uint32_t offset) { _ts_offset = offset; }
+    // Whether to offer and accept timestamps (RFC 7323), like Linux's
+    // net.ipv4.tcp_timestamps. On by default. Set before the SYN is sent or
+    // answered.
+    void set_timestamps_enabled(bool enabled) { _timestamps_enabled = enabled; }
 
     // Drives every timer on the connection. The caller reports how much real
     // time has passed since it last called, in milliseconds.
@@ -439,13 +457,129 @@ public:
     // starts accepting less than it is offered. The application's writes are
     // bounded by this, the network's pace by the peer's window - the two are
     // deliberately separate.
+    // This is the DEFAULT; the working limit is the per-connection
+    // send_capacity() (see set_send_capacity()).
     static constexpr size_t SEND_BUFFER_CAPACITY = 131072; // 128 KiB
 
     // How much this connection will hold on the receive side before the
     // advertised window reaches zero and the peer is told to stop. Public
     // because it is the number an application needs to reason about how much
     // it can afford not to read.
+    // Likewise the DEFAULT; the working limit is receive_capacity().
     static constexpr uint32_t RECEIVE_BUFFER_CAPACITY = 131072; // 128 KiB
+
+    // Bounds for the per-connection capacities. The floor keeps a window that
+    // can still carry a couple of segments (a smaller buffer would stall on
+    // silly-window avoidance); the ceiling keeps one connection from being
+    // told to pin unbounded memory.
+    static constexpr size_t MIN_BUFFER_CAPACITY = 4096;
+    static constexpr size_t MAX_BUFFER_CAPACITY = size_t{16} * 1024 * 1024; // 16 MiB
+
+    // The working limits (SO_RCVBUF / SO_SNDBUF). Both clamp the request to
+    // [max(MIN_BUFFER_CAPACITY, 2 * MSS), MAX_BUFFER_CAPACITY].
+    //
+    // Shrinking the receive capacity never moves the advertised right edge
+    // (RCV.NXT + RCV.WND) left: _advertised_window() keeps whatever was already
+    // offered (RFC 9293 3.8.6), so a smaller capacity only stops NEW window
+    // from being offered; the old window drains as data arrives and is read.
+    // Shrinking the send capacity below what is queued just makes
+    // send_space_available() zero until the queue drains - nothing is dropped.
+    void set_receive_capacity(size_t bytes);
+    void set_send_capacity(size_t bytes);
+    uint32_t receive_capacity() const { return _receive_capacity; }
+    size_t send_capacity() const { return _send_capacity; }
+    // True once an application chose the receive capacity explicitly. A later
+    // autotuning step must leave a locked capacity alone, as Linux does for
+    // SO_RCVBUF (SOCK_RCVBUF_LOCK).
+    void set_receive_capacity_locked(bool locked) { _receive_capacity_locked = locked; }
+    bool receive_capacity_locked() const { return _receive_capacity_locked; }
+    // The same for the send capacity (SO_SNDBUF, Linux's SOCK_SNDBUF_LOCK):
+    // while unlocked it grows with the congestion window, to
+    // max(SEND_BUFFER_CAPACITY, 2 * cwnd) bounded by MAX_BUFFER_CAPACITY,
+    // checked on every ack in ESTABLISHED and CLOSE_WAIT (the states that
+    // still accept send()). Twice cwnd because a full window is in flight
+    // while the next one has to be queued already, or the sender runs dry
+    // for a round trip each time the application is slow to refill it.
+    // Growth is new room, so the send-space callback (EPOLLOUT) fires.
+    void set_send_capacity_locked(bool locked) { _send_capacity_locked = locked; }
+    bool send_capacity_locked() const { return _send_capacity_locked; }
+    // Where growth above the defaults is drawn from (see tcp_memory_budget.h);
+    // NetworkStack passes its own. Without one, growth is limited only by
+    // MAX_BUFFER_CAPACITY. What is drawn is given back once the connection
+    // can no longer use it: in TIME_WAIT or CLOSED, all of it except what
+    // the bytes still buffered there (unread data, unacked data) occupy
+    // beyond the default capacity - that part goes as they are read, or when
+    // the connection is destroyed. Also when the application sets that
+    // capacity itself, which is not counted.
+    void set_memory_budget(std::shared_ptr<TcpMemoryBudget> budget);
+    // Bytes this connection currently draws from its budget.
+    size_t memory_charged() const { return _receive_charge.charged() + _send_charge.charged(); }
+    // The window shift this stack offers in its SYN (RFC 7323): the smallest
+    // that lets the 16-bit window field describe the largest receive buffer
+    // there can be, MAX_BUFFER_CAPACITY - Linux's tcp_select_initial_window()
+    // picks it the same way, from tcp_rmem[2]. For 16 MiB that is 9:
+    // 0xFFFF << 8 falls 256 bytes short. Linux's default of 7 comes from its
+    // 6 MiB tcp_rmem[2]; a shift of 7 here would cap autotuning at 8 MiB.
+    //
+    // The price of a larger shift is resolution: the window is advertised in
+    // 512-byte units, so the last few hundred bytes of free space round down
+    // to nothing - which is never more than a sliver of a 4 KiB minimum
+    // buffer - and an edge already promised is rounded up to rather than
+    // pulled back, while the rounding itself is never promised (see
+    // _transmit()). The shift is fixed for the connection at the
+    // SYN, so it has to cover what the buffer may grow to later, not what it
+    // is now. Public so tests can read a scaled window without restating it.
+    static constexpr uint8_t WINDOW_SCALE_SHIFT = tcp_window_scale_covering(MAX_BUFFER_CAPACITY);
+    static_assert(WINDOW_SCALE_SHIFT <= 14, "RFC 7323 2.3: the shift is at most 14");
+
+    // --- receiver-side RTT (Linux's rcv_rtt_est) ---
+    //
+    // get_rto_ms() is the sender's estimate, built from acks of data this side
+    // sent, so a connection that only receives has none. Receive autotuning
+    // needs one anyway: it measures how much the application read once per
+    // round trip. Measured as Linux's tcp_rcv_rtt_measure_ts() and
+    // tcp_rcv_rtt_measure() do:
+    //
+    //   - with timestamps, on a full-sized data segment that advances RCV.NXT:
+    //     now minus its TSecr, which is a TSval of ours (an ack the sender had
+    //     heard before sending this) turned back into this connection's clock.
+    //     Each echoed value is used once. Smoothed with gain 1/8.
+    //   - without, the sequence-space round trip: note RCV.NXT + RCV.WND and
+    //     the time, and the sample is how long RCV.NXT takes to reach that
+    //     point - the sender cannot send there before it has heard the ack
+    //     that offered it. A sender that is not window-limited takes longer
+    //     than one RTT, so in this mode only a smaller sample is ever taken
+    //     (a running minimum), as Linux does.
+    //
+    // Milliseconds; 0 until the first sample.
+    uint32_t receiver_rtt_ms() const { return _rcv_rtt_x8 >> 3; }
+
+    // --- receive buffer autotuning (Linux's tcp_rcv_space_adjust, "DRS") ---
+    //
+    // A fixed receive buffer caps a connection at capacity / RTT: 128 KiB
+    // over a 100 ms path is about 10 Mbit/s however fast the link is. Asking
+    // every application to size SO_RCVBUF for its path does not work - it
+    // does not know the path - so the receiver sizes it itself, from the one
+    // thing it can see: how fast the application actually reads.
+    //
+    // Once per receiver RTT (receiver_rtt_ms(); every RCV_SPACE_FALLBACK_MS
+    // until there is a sample), read() compares the bytes read in that
+    // interval with the largest such count so far (the space estimate). If
+    // it is larger the application is keeping up with a sender that is still
+    // speeding up, so the capacity grows to what the next round trip may
+    // need, as Linux computes it: twice what was read (the sender may double
+    // in slow start) plus 16 segments of slack, plus twice the relative
+    // growth again on top while the rate is rising quickly. Bounded by
+    // MAX_BUFFER_CAPACITY. Never when the capacity is locked (SO_RCVBUF), and
+    // never without window scaling, where the window cannot exceed 64 KiB
+    // anyway. A slow reader never grows the buffer: what it reads per round
+    // trip stays under the estimate. Growth only ever adds window, so it
+    // never moves the advertised edge left.
+    static constexpr uint64_t RCV_SPACE_FALLBACK_MS = 200;
+    // The space estimate's starting point: the initial window the sender
+    // starts slow start with (Linux's TCP_INIT_CWND segments).
+    static constexpr uint32_t INITIAL_RCV_SPACE_SEGMENTS = 10;
+
     // How many disjoint ranges the reorder buffer may hold (see
     // ReorderBuffer::MAX_RANGES).
     static constexpr uint32_t MAX_REORDER_SEGMENTS = ReorderBuffer::MAX_RANGES;
@@ -524,12 +658,29 @@ public:
         uint64_t loss_probes = 0;            // tail loss probes sent (RFC 8985 7.3)
         uint64_t loss_probe_repairs = 0;     // losses a probe repaired by itself (7.4.2)
         uint64_t ecn_reductions = 0;         // cwnd reductions for an ECN-Echo (RFC 3168 6.1.2)
+        uint64_t dsacks_sent = 0;            // acks that carried a D-SACK block (RFC 2883)
+        uint64_t dsacks_received = 0;        // D-SACKs naming a retransmission of ours (RFC 2883 4)
+        uint64_t spurious_recoveries_undone = 0; // episodes undone: D-SACKs covered every copy (RFC 3708)
+        uint64_t spurious_rtos_undone = 0;       // timeouts undone by Eifel (RFC 3522) or F-RTO (RFC 5682)
     };
     const Stats& stats() const { return _stats; }
     // Scoreboard entries the sender has examined, for cost tests.
     uint64_t scoreboard_visits() const { return _in_flight.visits(); }
     // The part of it spent by RACK.
     uint64_t rack_visits() const { return _in_flight.rack_visits(); }
+    // The last undo, for tests of the rule that one never raises cwnd past
+    // where its episode started: the window saved at the start, just
+    // before the undo, and just after it. All 0 if nothing was undone.
+    struct UndoRecord
+    {
+        uint32_t cwnd_at_start = 0;
+        uint32_t cwnd_before = 0;
+        uint32_t cwnd_after = 0;
+    };
+    const UndoRecord& last_undo() const { return _last_undo; }
+    // RACK.reo_wnd_mult (RFC 8985 6.2 step 4): the reordering window in
+    // quarters of min_RTT, grown by D-SACKs.
+    uint32_t rack_reo_wnd_mult() const { return _rack_reo_wnd_mult; }
 
 private:
     void _transition(TcpState new_state);
@@ -554,7 +705,7 @@ private:
     void _transmit(uint8_t flags, uint32_t seq, const Bytes& payload, Ecn ecn = Ecn::NOT_ECT);
     // The options for a segment with these flags and this much payload: the
     // SYN's negotiation options, or a timestamp and whatever SACK blocks fit.
-    void _add_options(Tcp& header, uint8_t flags, size_t payload_size) const;
+    void _add_options(Tcp& header, uint8_t flags, size_t payload_size);
     // include_ack is false only for the very first segment of an active
     // open: every other segment this stack ever sends acks something.
     void _send_flags(uint8_t flags, const Bytes& payload = Bytes(), bool include_ack = true);
@@ -628,20 +779,142 @@ private:
 
     // Applies the peer's SACK blocks (if SACK is in use) to the scoreboard. Returns true if
     // anything was newly marked, which is what makes a duplicate ack
-    // informative rather than merely repeated.
+    // informative rather than merely repeated. A D-SACK block is taken out
+    // first and handed to _on_dsack(), never to the scoreboard: it reports a
+    // duplicate, not data held above a hole.
     bool _apply_sack_blocks(const Tcp& segment);
+    // RFC 2883 section 4: the first block is a D-SACK if it lies below the
+    // cumulative ack, or inside the second block.
+    static bool _is_dsack(const std::vector<Tcp::SackBlock>& blocks, uint32_t ack);
+    // A D-SACK block: counted (Stats::dsacks_received) only if it names
+    // exactly what this side retransmitted - in the current or last loss
+    // episode (see SendScoreboard::match_dsack()), or the loss probe - with a
+    // copy not yet reported. Anything else is ignored.
+    void _on_dsack(const Tcp::SackBlock& block);
+
+    // --- loss episodes (for D-SACK accounting) ---
+    //
+    // An episode is a fast recovery or an RTO recovery, from its start until
+    // the cumulative ack reaches the recovery point. A timeout inside a
+    // recovery joins that episode rather than starting another, as Linux
+    // keeps its undo state across tcp_enter_loss() from Recovery. Every
+    // retransmission while one is open goes on its ledger.
+    bool _episode_open = false;
+    // Starts an episode (unless one is open): a new ledger, and the
+    // congestion state before the reduction saved for an undo.
+    void _begin_episode();
+    // The cumulative ack reached the recovery point: the episode is over.
+    void _end_episode();
+    // The episode included a timeout, so its undo also takes back the RTO
+    // back-off.
+    bool _episode_had_rto = false;
+    UndoRecord _last_undo;
+
+    // --- undo (RFC 3708, RFC 4015) ---
+    //
+    // A reduction that answered no loss is given back (see
+    // CongestionControl::save_for_undo()). By D-SACK (RFC 3708): once the
+    // episode is over and D-SACKs have reported every copy it retransmitted
+    // - loss probe and repeated copies included - as a duplicate. Never for
+    // an episode that saw ECN-Echo or a loss repaired by a probe after it:
+    // those are congestion whatever the D-SACKs say, and they forget the
+    // snapshot (CongestionControl::forget_undo()), as does the undo itself,
+    // so an episode is undone at most once.
+    // Checked after every ack; cheap unless it undoes.
+    void _try_undo_dsack();
+    // A finished episode can be undone by D-SACK until this moment - one RTO
+    // after it ended - and not after an idle restart
+    // (CongestionControl::on_idle_restart() forgets the snapshot).
+    uint64_t _undo_expires_ms = 0;
+    // The one undo path: the snapshot back, and the RTO back-off with it if
+    // the episode had a timeout.
+    void _undo_episode();
+
+    // --- spurious timeouts (RFC 3522 Eifel, RFC 5682 F-RTO) ---
+    //
+    // A timeout whose flight had in fact arrived - the acks were delayed,
+    // not the data lost - is detected on the acks right after it, and
+    // undone through _undo_episode(); it also leaves RTO recovery, so the
+    // rest of the flight is not resent. With timestamps, Eifel: the first
+    // ack for new data echoes a TSval older than the retransmission's, so
+    // the original is what arrived (Linux's tcp_packet_delayed()). Without
+    // timestamps but with SACK, F-RTO (SACK-enhanced, RFC 5682 3.1; Linux's
+    // tcp_frto = 2): after a first ack for part of the flight, two new
+    // segments go out instead of retransmissions, and a second ack for new
+    // data shows the flight was not lost. Without either, D-SACK alone (see
+    // _try_undo_dsack()). Only a timeout that starts an episode is checked:
+    // one inside a recovery keeps that recovery's evidence.
+    bool _eifel_armed = false;
+    uint32_t _eifel_tsval = 0; // the retransmission stamp when armed (the per-pair clock)
+    // Linux's retrans_stamp: the TSval of the earliest retransmission (of
+    // any kind, loss probes included) whose data is not yet all
+    // acknowledged - up to _retrans_stamp_end, the highest byte retransmitted
+    // since. What Eifel compares an echo against.
+    uint32_t _retrans_stamp = 0;
+    bool _retrans_stamp_valid = false;
+    uint32_t _retrans_stamp_end = 0;
+    enum class Frto
+    {
+        OFF,
+        AWAIT_FIRST_ACK,  // step 2: the first ack after the timeout
+        SEND_NEW,         // step 2b decided; the new data goes out on this ack
+        AWAIT_SECOND_ACK, // step 3
+    };
+    Frto _frto = Frto::OFF;
+    uint32_t _frto_recover = 0; // SND.NXT at the timeout (RFC 5682 "recover")
+    uint32_t _frto_rxt_end = 0; // end of the segment the timeout resent
+    // At a timeout: Eifel with timestamps, else F-RTO with SACK unless a
+    // loss probe retransmission is outstanding.
+    void _arm_spurious_rto_detection(bool starts_episode, bool probe_outstanding);
+    // Runs on each ack, before it retires anything; `duplicate` is RFC 5681's
+    // (or RFC 6675's) duplicate ack - a window update is neither.
+    void _detect_spurious_rto(const Tcp& segment, uint32_t ack, uint32_t snd_una, bool duplicate);
+    // Up to two new segments, past cwnd (RFC 5682 step 2b). False if none.
+    bool _frto_send_new_data();
+    void _undo_spurious_rto(const char* detector);
     // What RACK needs from this ack (see SendScoreboard::AckContext).
     SendScoreboard::AckContext _rack_context(const Tcp& segment) const;
 
     // Bytes occupying the receive buffer: out-of-order segments waiting for a
     // gap to fill, plus in-order data the application has not read yet. What is
-    // left of RECEIVE_BUFFER_CAPACITY after subtracting this is the window.
+    // left of _receive_capacity after subtracting this is the window.
     uint32_t _receive_buffer_occupied() const;
     // The window this side would advertise right now: the free buffer space,
     // but never less than what keeps the last offered right edge in place.
+    // Also exactly what is accepted past RCV.NXT - not the scaled field's
+    // rounded-up edge (see _transmit()), so never more than the buffer holds.
     uint32_t _advertised_window() const;
     // Feeds one unambiguous round-trip measurement to _rtt, logging it.
     void _take_rtt_sample(uint32_t rtt_ms);
+
+    // --- receive autotuning (see RCV_SPACE_FALLBACK_MS) ---
+    uint64_t _bytes_read_total = 0;  // every byte read() has returned (Linux's copied_seq)
+    uint64_t _rcv_space = 0;         // largest count read in one interval so far (rcvq_space.space)
+    uint64_t _rcv_space_read_at = 0; // _bytes_read_total when the interval started
+    uint64_t _rcv_space_time_ms = 0; // when it started
+    // Starts the first interval, on entering ESTABLISHED.
+    void _rcv_space_init();
+    // Called by read(): closes an interval that has lasted a receiver RTT,
+    // growing the capacity if the application read more than ever before.
+    void _rcv_space_adjust();
+    // Raises the receive capacity towards `target` (never lowers it).
+    void _grow_receive_capacity(size_t target);
+
+    // --- receiver RTT (see receiver_rtt_ms()) ---
+    // The estimate in milliseconds, times 8 (Linux keeps rcv_rtt_est.rtt_us
+    // scaled the same way, so the 1/8 gain keeps its fraction); 0 = none.
+    uint32_t _rcv_rtt_x8 = 0;
+    // The sequence-space measurement: the unwrapped point RCV.NXT has to
+    // reach, and when it was noted (0 = none running).
+    uint64_t _rcv_rtt_seq = 0;
+    uint64_t _rcv_rtt_time_ms = 0;
+    // The last TSecr sampled, so one echo is not sampled again.
+    uint32_t _rcv_rtt_last_tsecr = 0;
+    // tcp_rcv_rtt_update(): EWMA for a timestamp sample, minimum for a
+    // window-dependent one.
+    void _rcv_rtt_update(uint32_t sample_ms, bool window_dependent);
+    // Called once a data segment has advanced RCV.NXT.
+    void _rcv_rtt_measure(const Tcp& segment, uint32_t payload_size);
 
     // --- RACK (RFC 8985 section 6), with SACK only ---
     //
@@ -658,9 +931,24 @@ private:
     uint64_t _rack_min_rtt_at_ms = 0;
     bool _have_rack_min_rtt = false;
     static constexpr uint64_t MIN_RTT_WINDOW_MS = 300000; // Linux's tcp_min_rtt_wlen
-    // RFC 8985 6.2 step 4, RACK_update_reo_wnd() with reo_wnd_mult fixed at
-    // 1: the window grows only on D-SACK, which this stack does not parse.
+    // RFC 8985 6.2 step 4, RACK_update_reo_wnd(): reo_wnd_mult quarters of
+    // min_RTT, at most SRTT - or no wait at all, see the definition.
     uint64_t _rack_reo_wnd_ms() const;
+    // The multiplier grows by one for a D-SACK that counted (_on_dsack()),
+    // at most once per round trip: not again until SND.UNA passes what was
+    // SND.NXT at the last step (RACK.dsack_round). A spurious retransmission
+    // means the window was too narrow for this path; one round's D-SACKs
+    // all report the same mistake. It stays for RACK_REO_WND_PERSIST
+    // episodes (RACK.reo_wnd_persist), then falls back to one quarter.
+    uint32_t _rack_reo_wnd_mult = 1;
+    uint32_t _rack_reo_wnd_persist = 0;
+    uint32_t _rack_dsack_round = 0;
+    bool _rack_dsack_round_valid = false;
+    static constexpr uint32_t RACK_REO_WND_PERSIST = 16;
+    // Linux caps reo_wnd_steps at 0xFF; past min_RTT * 4 the SRTT cap has
+    // long taken over anyway.
+    static constexpr uint32_t RACK_REO_WND_MAX_MULT = 255;
+    void _rack_grow_reo_wnd();
     // Runs RACK_detect_loss() and arms or disarms the reordering timer.
     // Returns how many segments it marked lost.
     uint32_t _rack_detect_loss();
@@ -686,6 +974,11 @@ private:
     bool _tlp_outstanding = false;
     uint32_t _tlp_end_seq = 0;
     bool _tlp_is_retrans = false;
+    // The range a retransmitted probe resent, and whether a D-SACK has
+    // reported it: both copies arrived, so there was no loss (7.4.2).
+    uint32_t _tlp_probe_seq = 0;
+    uint32_t _tlp_probe_end = 0;
+    bool _tlp_dsacked = false;
     // RFC 8985 7.3 condition 2: a fresh RTT sample since the last probe (or
     // the start of the connection) - without one there is no SRTT to time a
     // probe by, and probes must not keep the estimator from adapting.
@@ -701,7 +994,8 @@ private:
     // TLP_send_probe() (7.3).
     void _send_loss_probe();
     // TLP_process_ack() (7.4.2); `pure_dup_ack` is a duplicate ack without
-    // SACK blocks - the sign, without D-SACK, that both copies arrived.
+    // SACK blocks - the sign, besides a D-SACK for the probe, that both
+    // copies arrived.
     void _tlp_process_ack(uint32_t ack, bool pure_dup_ack);
     // TLP_init() (7.1): on entering fast or RTO recovery.
     void _tlp_reset()
@@ -851,7 +1145,22 @@ private:
     // The out-of-order ranges this side currently holds, as they would be
     // reported to the peer. One block per _reorder_buffer range, the range that
     // arrived last first.
+    // With a D-SACK pending (below) it comes first, RFC 2883 section 4.
     std::vector<Tcp::SackBlock> _sack_blocks_to_report() const;
+    // Receiver D-SACK (RFC 2883): the last duplicate range received, in
+    // unwrapped sequence space, until an ack that can carry it goes out. One
+    // slot is enough: every duplicate is acked at once, so a second one
+    // replaces a first only if that ack never left, and the first ack after
+    // a duplicate is the one the sender needs.
+    struct PendingDsack
+    {
+        uint64_t start;
+        uint64_t end;
+    };
+    std::optional<PendingDsack> _pending_dsack;
+    // Notes [start, end) (unwrapped) as a duplicate for the next ack; only
+    // when SACK was negotiated.
+    void _note_duplicate(uint64_t start, uint64_t end);
 
     // --- timestamps and PAWS (RFC 7323) ---
     //
@@ -880,6 +1189,7 @@ private:
     // See set_timestamp_offset(). TSval is _ts_clock(); an echo is turned
     // back into this connection's clock by subtracting the offset.
     uint32_t _ts_offset = 0;
+    bool _timestamps_enabled = true; // see set_timestamps_enabled()
     uint32_t _ts_clock() const { return static_cast<uint32_t>(_now_ms) + _ts_offset; }
     // Last.ACK.sent (RFC 7323 4.3): the ACK field of the last segment sent.
     // TS.Recent only takes the TSval of a segment at or before it, which is
@@ -1036,6 +1346,26 @@ private:
     SendSpaceFn _on_send_space;
     // send_space_available() as of the last _report_send_space().
     size_t _reported_send_space = SEND_BUFFER_CAPACITY;
+    // Working buffer limits; see set_receive_capacity() / set_send_capacity().
+    uint32_t _receive_capacity = RECEIVE_BUFFER_CAPACITY;
+    size_t _send_capacity = SEND_BUFFER_CAPACITY;
+    bool _receive_capacity_locked = false;
+    bool _send_capacity_locked = false;
+    // Autotuning's growth, drawn from the stack's budget per buffer.
+    TcpMemoryCharge _receive_charge;
+    TcpMemoryCharge _send_charge;
+    // In TIME_WAIT or CLOSED, cuts both charges down to what the bytes still
+    // held occupy beyond the defaults (see set_memory_budget()). Run on
+    // entering those states and after every read().
+    void _trim_memory_charges();
+    // Grows _send_capacity with cwnd (see set_send_capacity_locked()), but
+    // only after an ack that found the sender cwnd-limited.
+    void _tune_send_capacity();
+    // Whether the last ack processed arrived with the sender cwnd-limited
+    // (CongestionControl::is_cwnd_limited() on the flight before it).
+    bool _cwnd_limited_at_last_ack = false;
+    // Raises the send capacity towards `target` (never lowers it).
+    void _grow_send_capacity(size_t target);
 
     // --- clock and deadline bookkeeping ---
     //
@@ -1098,7 +1428,6 @@ private:
     // per-byte one; a smaller option is taken as 48.
     static constexpr uint16_t MIN_PEER_MSS = 48;
     static constexpr uint16_t DEFAULT_PEER_MSS = 536; // RFC 793's fallback when a peer's SYN carries no MSS option
-    static constexpr uint8_t WINDOW_SCALE_SHIFT = 1; // this stack's advertised shift
     // Option sizes as Tcp serializes them: timestamps are two NOPs + 10
     // bytes; SACK is two NOPs + kind + length, then 8 bytes per block.
     static constexpr size_t TIMESTAMP_OPTION_BYTES = 12;

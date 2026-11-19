@@ -26,27 +26,34 @@ namespace
                      what + ": expected about " + std::to_string(expected) + " but got " + std::to_string(actual));
     }
 
+    // Passed as in_flight: the sender has the whole window outstanding as
+    // each ack arrives, i.e. it is cwnd-limited, which a window only grows
+    // when (CongestionControl::is_cwnd_limited()).
+    constexpr uint32_t FULL_WINDOW = UINT32_MAX;
+
     // Acknowledges `bytes` in MSS-sized pieces without any time passing, which
     // is the shape of a real ack clock: one ack per segment.
-    void acknowledge(CongestionControl& cc, uint32_t bytes, uint32_t in_flight = 0, uint32_t srtt_ms = 0,
+    void acknowledge(CongestionControl& cc, uint32_t bytes, uint32_t in_flight = FULL_WINDOW, uint32_t srtt_ms = 0,
                      uint64_t now_ms = 0)
     {
+        auto flight = [&cc, in_flight]()
+        {
+            return in_flight == FULL_WINDOW ? cc.window() : in_flight;
+        };
         while (bytes >= MSS)
         {
-            cc.on_ack(MSS, in_flight, srtt_ms, now_ms);
+            cc.on_ack(MSS, flight(), srtt_ms, now_ms);
             bytes -= MSS;
         }
         if (bytes > 0)
         {
-            cc.on_ack(bytes, in_flight, srtt_ms, now_ms);
+            cc.on_ack(bytes, flight(), srtt_ms, now_ms);
         }
     }
 
-    // A window large enough to be interesting that slow start can actually
-    // reach. The initial ssthresh is 64 KiB, and slow start stops there - a
-    // helper that asked for more would quietly return less, which is exactly
-    // what it did on the first run of these tests.
-    constexpr uint32_t BIG_WINDOW_SEGMENTS = 32; // 46720 bytes, comfortably under 64 KiB
+    // A window large enough to be interesting. (Slow start used to stop at a
+    // 64 KiB initial ssthresh, which is where the size came from.)
+    constexpr uint32_t BIG_WINDOW_SEGMENTS = 32; // 46720 bytes
 
     // Slow-starts a freshly established algorithm to exactly `segments` worth
     // of window (at least the 10-segment initial window). Exact, not
@@ -95,6 +102,25 @@ TEST(CongestionControl, SlowStartDoublesTheWindowEveryRoundTripInBothAlgorithms)
     }
 }
 
+// RFC 5681 3.1: the initial ssthresh is arbitrarily high, so slow start runs
+// until loss says otherwise. A fixed 64 KiB used to end it at 45 segments,
+// whatever the path's bandwidth-delay product was.
+TEST(CongestionControl, SlowStartIsNotCappedBeforeTheFirstLoss)
+{
+    for (auto algorithm : {CongestionControlAlgorithm::RENO, CongestionControlAlgorithm::CUBIC})
+    {
+        auto cc = make_congestion_control(algorithm);
+        cc->on_established(MSS);
+        for (int round = 0; round < 7; round++)
+        {
+            uint32_t before = cc->window();
+            acknowledge(*cc, before, before, 100, 0);
+            ASSERT_EQ(cc->window(), 2 * before) << cc->name() << " still doubles at " << before << " bytes";
+        }
+        ASSERT_GT(cc->window(), 1000u * MSS / 2) << "hundreds of segments, without a loss to stop it";
+    }
+}
+
 TEST(CongestionControl, SlowStartStopsAtTheThresholdAndCongestionAvoidanceTakesOver)
 {
     for (auto algorithm : {CongestionControlAlgorithm::RENO, CongestionControlAlgorithm::CUBIC})
@@ -118,6 +144,75 @@ TEST(CongestionControl, SlowStartStopsAtTheThresholdAndCongestionAvoidanceTakesO
     }
 }
 
+// RFC 7661 / Linux tcp_is_cwnd_limited: an ack only grows the window when the
+// sender was actually using it. A request/response or trickle connection
+// never loses a packet, so with ssthresh uncapped nothing else would stop
+// its cwnd - and the send buffer sized from it - doubling every round trip.
+TEST(CongestionControl, AnAppLimitedSenderDoesNotGrowTheWindow)
+{
+    for (auto algorithm : {CongestionControlAlgorithm::RENO, CongestionControlAlgorithm::CUBIC})
+    {
+        // Slow start: limited means in flight * 2 >= cwnd.
+        auto cc = make_congestion_control(algorithm);
+        cc->on_established(MSS);
+        uint32_t initial = cc->window();
+        for (int i = 0; i < 1000; i++)
+        {
+            cc->on_ack(2 * MSS, 2 * MSS, 100, uint64_t(i) * 100); // a two-segment response per round trip
+        }
+        ASSERT_EQ(cc->window(), initial) << cc->name() << ": slow start with the window a fifth used";
+        cc->on_ack(MSS, initial / 2, 100, 100000);
+        ASSERT_EQ(cc->window(), initial + MSS) << cc->name() << ": half the window in flight is enough to grow";
+
+        // Congestion avoidance: limited means in flight >= cwnd - one MSS.
+        auto ca = established_at(algorithm, BIG_WINDOW_SEGMENTS);
+        ca->on_fast_retransmit(BIG_WINDOW_SEGMENTS * MSS, 3, 0);
+        ca->on_recovery_end();
+        uint32_t threshold = ca->window();
+        for (int i = 1; i <= 1000; i++)
+        {
+            ca->on_ack(MSS, threshold - 2 * MSS, 100, uint64_t(i) * 100);
+        }
+        ASSERT_EQ(ca->window(), threshold) << ca->name() << ": two segments short of the window is app-limited";
+        for (int i = 1; i <= 100; i++)
+        {
+            ca->on_ack(MSS, ca->window() - MSS, 100, 100000 + uint64_t(i) * 100);
+        }
+        ASSERT_GT(ca->window(), threshold) << ca->name() << ": within one segment of the window grows";
+    }
+}
+
+// CUBIC's window is a function of time since the last loss. Time spent
+// application-limited, when the window could not grow, must not count: the
+// curve would otherwise be far ahead when the sender filled its window again,
+// and the next round trip would close that whole gap in one burst.
+TEST(CongestionControl, CubicDoesNotCountAnAppLimitedStretchAsGrowthTime)
+{
+    auto paused = established_at(CongestionControlAlgorithm::CUBIC, BIG_WINDOW_SEGMENTS);
+    auto steady = established_at(CongestionControlAlgorithm::CUBIC, BIG_WINDOW_SEGMENTS);
+    for (auto* cc : {paused.get(), steady.get()})
+    {
+        cc->on_fast_retransmit(BIG_WINDOW_SEGMENTS * MSS, 3, 0);
+        cc->on_recovery_end();
+    }
+    constexpr uint64_t PAUSE_MS = 10000;
+    for (uint64_t i = 1; i <= 10; i++)
+    {
+        paused->on_ack(MSS, paused->window(), 100, i * 10); // the epoch starts
+        steady->on_ack(MSS, steady->window(), 100, i * 10);
+    }
+    for (uint64_t t = 100; t < 100 + PAUSE_MS; t += 100)
+    {
+        paused->on_ack(MSS, MSS, 100, t); // ten seconds of one-segment requests
+    }
+    for (uint64_t i = 1; i <= 40; i++)
+    {
+        paused->on_ack(MSS, paused->window(), 100, PAUSE_MS + 100 + i * 10);
+        steady->on_ack(MSS, steady->window(), 100, 100 + i * 10);
+    }
+    assert_near(paused->window(), steady->window(), MSS, "cubic after an app-limited stretch");
+}
+
 TEST(CongestionControl, RetransmitTimeoutCollapsesBothAlgorithmsToOneSegment)
 {
     for (auto algorithm : {CongestionControlAlgorithm::RENO, CongestionControlAlgorithm::CUBIC})
@@ -128,6 +223,25 @@ TEST(CongestionControl, RetransmitTimeoutCollapsesBothAlgorithmsToOneSegment)
         ASSERT_TRUE(cc->window() == MSS) << std::string(cc->name()) + " should collapse to one segment on a timeout";
         ASSERT_TRUE(cc->slow_start_threshold() < BIG_WINDOW_SEGMENTS * MSS)
             << std::string(cc->name()) + " should lower the threshold on a timeout";
+    }
+}
+
+// RFC 5681 3.1: a timeout while the last one's recovery is still under way
+// holds ssthresh. The window at the second timeout is the slow start that
+// followed the first - nothing to do with the path's capacity - and halving
+// it again would leave ssthresh at two segments, so the repair would crawl
+// in congestion avoidance from there.
+TEST(CongestionControl, ARepeatedTimeoutHoldsTheThreshold)
+{
+    for (auto algorithm : {CongestionControlAlgorithm::RENO, CongestionControlAlgorithm::CUBIC})
+    {
+        auto cc = established_at(algorithm, BIG_WINDOW_SEGMENTS);
+        cc->on_retransmit_timeout(BIG_WINDOW_SEGMENTS * MSS, 5000);
+        uint32_t ssthresh = cc->slow_start_threshold();
+        acknowledge(*cc, MSS);
+        cc->on_repeated_retransmit_timeout();
+        ASSERT_EQ(cc->window(), MSS) << cc->name();
+        ASSERT_EQ(cc->slow_start_threshold(), ssthresh) << cc->name();
     }
 }
 
@@ -205,15 +319,14 @@ TEST(CongestionControl, CubicGrowthIsDrivenByElapsedTimeNotByHowManyAcksArrived)
     fast_path->on_recovery_end();
 
     ASSERT_TRUE(slow_path->window() == fast_path->window()) << "the two should start identical";
-    uint32_t started_at = slow_path->window();
 
     // Identical acknowledgements - same count, same sizes - differing only in
     // how much of the clock went by while they arrived.
     constexpr uint32_t ACK_COUNT = 40;
     for (uint32_t i = 1; i <= ACK_COUNT; i++)
     {
-        slow_path->on_ack(MSS, started_at, 100, i * 100);  // 4 seconds in total
-        fast_path->on_ack(MSS, started_at, 100, i);        // 40 ms in total
+        slow_path->on_ack(MSS, slow_path->window(), 100, uint64_t{i} * 100); // 4 seconds in total
+        fast_path->on_ack(MSS, fast_path->window(), 100, i);                 // 40 ms in total
     }
 
     ASSERT_TRUE(slow_path->window() > fast_path->window())
@@ -236,11 +349,10 @@ TEST(CongestionControl, RenoGrowthIgnoresElapsedTimeEntirely)
     fast_path->on_fast_retransmit(BIG_WINDOW_SEGMENTS * MSS, 3, 0);
     fast_path->on_recovery_end();
 
-    uint32_t started_at = slow_path->window();
     for (uint32_t i = 1; i <= 40; i++)
     {
-        slow_path->on_ack(MSS, started_at, 100, i * 100);
-        fast_path->on_ack(MSS, started_at, 100, i);
+        slow_path->on_ack(MSS, slow_path->window(), 100, uint64_t{i} * 100);
+        fast_path->on_ack(MSS, fast_path->window(), 100, i);
     }
 
     ASSERT_TRUE(slow_path->window() == fast_path->window()) << "reno's window is a function of acks alone";
@@ -265,7 +377,7 @@ TEST(CongestionControl, TheTcpFriendlyRegionKeepsCubicGrowingWhereItsCurveIsFlat
     uint32_t started_at = cc->window();
     for (uint32_t i = 0; i < 100; i++)
     {
-        cc->on_ack(MSS, started_at, 0, 0); // no RTT, no elapsed time: curve is flat
+        cc->on_ack(MSS, cc->window(), 0, 0); // no RTT, no elapsed time: curve is flat
     }
 
     ASSERT_TRUE(cc->window() > started_at + MSS)
@@ -300,18 +412,93 @@ TEST(CongestionControl, FastConvergenceAimsLowerWhenTheSecondLossComesBelowTheFi
     ASSERT_TRUE(shrinking->window() == steady->window()) << "and at the same window";
 
     uint32_t threshold = steady->slow_start_threshold();
-    acknowledge(*shrinking, threshold - MSS, 0, 100, 1000);
-    acknowledge(*steady, threshold - MSS, 0, 100, 1000);
+    acknowledge(*shrinking, threshold - MSS, FULL_WINDOW, 100, 1000);
+    acknowledge(*steady, threshold - MSS, FULL_WINDOW, 100, 1000);
 
     for (uint32_t i = 1; i <= 40; i++)
     {
-        shrinking->on_ack(MSS, threshold, 100, 1000 + i * 50);
-        steady->on_ack(MSS, threshold, 100, 1000 + i * 50);
+        shrinking->on_ack(MSS, shrinking->window(), 100, 1000 + uint64_t{i} * 50);
+        steady->on_ack(MSS, steady->window(), 100, 1000 + uint64_t{i} * 50);
     }
 
     ASSERT_TRUE(shrinking->window() < steady->window())
         << "fast convergence should hold the shrinking flow below the steady one, got "
                + std::to_string(shrinking->window()) + " vs " + std::to_string(steady->window());
+}
+
+// --- undo (RFC 3708 / RFC 4015) ---------------------------------------------
+
+// A reduction later shown to have been spurious is taken back: cwnd and
+// ssthresh return to what they were when the snapshot was taken, whichever
+// reduction (fast recovery or timeout) came in between.
+TEST(CongestionControl, AnUndoRestoresTheWindowAndThresholdInBothAlgorithms)
+{
+    for (CongestionControlAlgorithm algorithm : {CongestionControlAlgorithm::RENO, CongestionControlAlgorithm::CUBIC})
+    {
+        auto cc = established_at(algorithm, BIG_WINDOW_SEGMENTS);
+        cc->on_fast_retransmit(BIG_WINDOW_SEGMENTS * MSS, 3, 0);
+        cc->on_recovery_end();
+        acknowledge(*cc, 20 * MSS, FULL_WINDOW, 100, 500);
+        uint32_t cwnd = cc->window();
+        uint32_t ssthresh = cc->slow_start_threshold();
+        ASSERT_FALSE(cc->has_undo());
+
+        cc->save_for_undo(1000);
+        cc->on_retransmit_timeout(cwnd, 1000);
+        ASSERT_TRUE(cc->has_undo());
+        ASSERT_EQ(cc->undo_window(), cwnd);
+        cc->undo(1300);
+        ASSERT_EQ(cc->window(), cwnd) << cc->name();
+        ASSERT_EQ(cc->slow_start_threshold(), ssthresh) << cc->name();
+        ASSERT_FALSE(cc->has_undo()) << "a snapshot is used once";
+
+        cc->save_for_undo(2000);
+        cc->on_recovery_start(cwnd, 2000);
+        cc->on_recovery_end();
+        cc->undo(2100);
+        ASSERT_EQ(cc->window(), cwnd) << cc->name();
+        ASSERT_EQ(cc->slow_start_threshold(), ssthresh) << cc->name();
+    }
+}
+
+// Undo only takes back the reduction: a window that has grown past the
+// snapshot since is left where it is.
+TEST(CongestionControl, AnUndoNeverLowersTheWindow)
+{
+    auto cc = established_at(CongestionControlAlgorithm::RENO, 10);
+    cc->save_for_undo(0);
+    acknowledge(*cc, 10 * MSS);
+    uint32_t grown = cc->window();
+    cc->undo(0);
+    ASSERT_EQ(cc->window(), grown);
+}
+
+// CUBIC's curve is part of what is restored: W_max, K and the epoch. Two
+// identical flows, one of which has a spurious timeout and its undo 300 ms
+// later. Shifted by those 300 ms - time spent in the episode is not time the
+// curve should have grown through - the two windows grow in step.
+TEST(CongestionControl, CubicResumesItsCurveAfterAnUndo)
+{
+    auto steady = established_at(CongestionControlAlgorithm::CUBIC, BIG_WINDOW_SEGMENTS);
+    auto undone = established_at(CongestionControlAlgorithm::CUBIC, BIG_WINDOW_SEGMENTS);
+    for (CongestionControl* cc : {steady.get(), undone.get()})
+    {
+        cc->on_fast_retransmit(BIG_WINDOW_SEGMENTS * MSS, 3, 0);
+        cc->on_recovery_end();
+        for (uint32_t i = 0; i < 20; i++)
+            cc->on_ack(MSS, cc->window(), 100, 1000 + uint64_t{i} * 50);
+    }
+    ASSERT_EQ(steady->window(), undone->window());
+
+    undone->save_for_undo(2000);
+    undone->on_retransmit_timeout(undone->window(), 2000);
+    undone->undo(2300);
+    for (uint32_t i = 0; i < 40; i++)
+    {
+        steady->on_ack(MSS, steady->window(), 100, 2000 + uint64_t{i} * 50);
+        undone->on_ack(MSS, undone->window(), 100, 2300 + uint64_t{i} * 50);
+    }
+    ASSERT_EQ(undone->window(), steady->window());
 }
 
 // --- the seam, from the connection's side -----------------------------------
