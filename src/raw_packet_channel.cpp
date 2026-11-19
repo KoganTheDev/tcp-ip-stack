@@ -22,7 +22,7 @@ namespace
 #endif
 }
 
-RawPacketChannel::RawPacketChannel(const std::string& interface_name)
+RawPacketChannel::RawPacketChannel(const std::string& interface_name, int receive_buffer_bytes)
     : _fd(-1), _interface_name(interface_name), _interface_index(0), _kernel_ignores_outgoing(false), _mtu(0)
 {
     if (interface_name.empty() || interface_name.size() >= IFNAMSIZ)
@@ -49,6 +49,7 @@ RawPacketChannel::RawPacketChannel(const std::string& interface_name)
         this->_query_interface();
         this->_bind_to_interface();
         this->_configure_ignore_outgoing();
+        this->_configure_receive_buffer(receive_buffer_bytes);
     }
     catch (...)
     {
@@ -61,6 +62,40 @@ RawPacketChannel::RawPacketChannel(const std::string& interface_name)
              << this->_interface_name << " (index " << this->_interface_index << ", mac "
              << this->_interface_mac.to_string() << ", mtu " << this->_mtu
              << ", kernel drops our own frames: " << (this->_kernel_ignores_outgoing ? "yes" : "no") << ")");
+}
+
+ReceiveBufferResult request_receive_buffer(const std::function<bool()>& force, const std::function<bool()>& plain)
+{
+    if (force())
+    {
+        return ReceiveBufferResult::FORCED;
+    }
+    return plain() ? ReceiveBufferResult::CLAMPED : ReceiveBufferResult::FAILED;
+}
+
+void RawPacketChannel::_configure_receive_buffer(int bytes)
+{
+    // The kernel doubles the value for its own bookkeeping, and getsockopt
+    // reports the doubled figure; the log line shows what it reports.
+    ReceiveBufferResult result = request_receive_buffer(
+        [&]() { return setsockopt(this->_fd, SOL_SOCKET, SO_RCVBUFFORCE, &bytes, sizeof(bytes)) == 0; },
+        [&]() { return setsockopt(this->_fd, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes)) == 0; });
+    int effective = 0;
+    socklen_t length = sizeof(effective);
+    if (getsockopt(this->_fd, SOL_SOCKET, SO_RCVBUF, &effective, &length) != 0)
+    {
+        effective = -1;
+    }
+    const char* how = result == ReceiveBufferResult::FORCED    ? "forced"
+                      : result == ReceiveBufferResult::CLAMPED ? "clamped to net.core.rmem_max"
+                                                               : "request refused";
+    LOG_INFO("RawPacketChannel: receive buffer requested " << bytes << " bytes, effective " << effective << " bytes ("
+                                                           << how << ")");
+    if (result != ReceiveBufferResult::FORCED && effective >= 0 && effective < bytes)
+    {
+        LOG_WARNING("RawPacketChannel: receive buffer is smaller than requested; a burst may overrun it. "
+                    "Run with CAP_NET_ADMIN or raise net.core.rmem_max");
+    }
 }
 
 uint64_t RawPacketChannel::kernel_drops()

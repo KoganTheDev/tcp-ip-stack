@@ -70,3 +70,30 @@ TEST(NetworkStackKernelDrops, SumsOverInterfaces)
     stack->add_interface(std::make_unique<FakePacketChannel>(), config_for("aa:bb:cc:dd:ee:02", "10.0.2.2"));
     ASSERT_TRUE(stack->kernel_drops() == 7) << "the stack-wide figure is the sum of its channels'";
 }
+
+// The receive-buffer request tries SO_RCVBUFFORCE first and falls back to
+// SO_RCVBUF, which the kernel clamps; this is that selection without a socket.
+TEST(RequestReceiveBuffer, UsesTheForcedCallAndSkipsTheFallbackWhenItWorks)
+{
+    int plain_calls = 0;
+    ReceiveBufferResult result = request_receive_buffer([] { return true; },
+                                                        [&]
+                                                        {
+                                                            plain_calls++;
+                                                            return true;
+                                                        });
+    ASSERT_TRUE(result == ReceiveBufferResult::FORCED) << "the forced call succeeded";
+    ASSERT_TRUE(plain_calls == 0) << "so the plain one must not run and shrink it";
+}
+
+TEST(RequestReceiveBuffer, FallsBackToThePlainCallWithoutPrivilege)
+{
+    ReceiveBufferResult result = request_receive_buffer([] { return false; }, [] { return true; });
+    ASSERT_TRUE(result == ReceiveBufferResult::CLAMPED) << "no CAP_NET_ADMIN: the clamped request is what is left";
+}
+
+TEST(RequestReceiveBuffer, ReportsFailureWhenNeitherIsAccepted)
+{
+    ReceiveBufferResult result = request_receive_buffer([] { return false; }, [] { return false; });
+    ASSERT_TRUE(result == ReceiveBufferResult::FAILED) << "both refused";
+}

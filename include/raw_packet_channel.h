@@ -2,6 +2,7 @@
 
 #include <string>
 #include <cstdint>
+#include <functional>
 
 #include "packet_channel.h"
 #include "network_addresses.h"
@@ -19,6 +20,23 @@ public:
 private:
     uint64_t _total = 0;
 };
+
+// How a receive-buffer request was satisfied. FORCED means SO_RCVBUFFORCE took
+// it, which ignores net.core.rmem_max and needs CAP_NET_ADMIN; CLAMPED means
+// only plain SO_RCVBUF did, which the kernel caps at rmem_max (typically
+// 208 KiB), so the effective size may be far below the request; FAILED means
+// neither call was accepted.
+enum class ReceiveBufferResult
+{
+    FORCED,
+    CLAMPED,
+    FAILED,
+};
+
+// Tries `force` first, then `plain`, each a setsockopt of the same size that
+// returns whether the kernel accepted it. Factored out of the constructor so
+// the order and the fallback can be tested without a packet socket.
+ReceiveBufferResult request_receive_buffer(const std::function<bool()>& force, const std::function<bool()>& plain);
 
 // A PacketChannel over a real network interface, using an AF_PACKET socket.
 // The TAP-device counterpart is TunWrapper; NetworkStack cannot tell them apart
@@ -55,7 +73,15 @@ public:
     // Opens and binds a packet socket on interface_name (e.g. "eth0"). Throws
     // if the interface does not exist, is down, has an unexpected MTU, or if
     // the process lacks CAP_NET_RAW.
-    explicit RawPacketChannel(const std::string& interface_name);
+    //
+    // receive_buffer_bytes is the socket receive buffer to ask for. The default
+    // is generous on purpose: a burst of 200 connections arriving together
+    // overran the kernel's default (~208 KiB) buffer, 337 frames were dropped
+    // before the stack ever read them, and each loss cost the peer a 200 ms
+    // minimum RTO (the load test's round-1 p90 of 225 ms). See kernel_drops().
+    static constexpr int DEFAULT_RECEIVE_BUFFER_BYTES = 4 * 1024 * 1024;
+    explicit RawPacketChannel(const std::string& interface_name,
+                              int receive_buffer_bytes = DEFAULT_RECEIVE_BUFFER_BYTES);
     ~RawPacketChannel() override;
 
     // Owns a file descriptor, so it is neither copyable nor movable.
@@ -102,6 +128,7 @@ private:
     void _query_interface(); // index, MAC, IFF_UP and MTU checks
     void _bind_to_interface();
     void _configure_ignore_outgoing();
+    void _configure_receive_buffer(int bytes);
 
     int _fd;
     std::string _interface_name;
