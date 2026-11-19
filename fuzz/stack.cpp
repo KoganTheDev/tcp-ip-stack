@@ -137,6 +137,7 @@ namespace
         std::unique_ptr<NetworkStack> stack;
         uint64_t connection_id = 0;
         bool have_connection = false;
+        bool loopback_connected = false;
 
         World()
         {
@@ -203,8 +204,24 @@ namespace
             channel->clear_outbound();
         }
 
+        // The stack talking to itself: datagrams and one connection over
+        // 127.0.0.1 and ::1, through the loopback queue the frames above
+        // share it with. poll() between frames delivers them.
+        void loopback_traffic()
+        {
+            UdpSocket* socket = stack->bind_udp(54);
+            socket->send_to(IPv4Address("127.0.0.1"), 53, Bytes(8));
+            socket->send_to(IPv6Address("::1"), 53, Bytes(8));
+            if (!loopback_connected)
+            {
+                loopback_connected = true;
+                stack->connect(IPv4Address("127.0.0.1"), LOCAL_PORT);
+            }
+        }
+
         void application(bool closing)
         {
+            loopback_traffic();
             if (!have_connection)
                 return;
             TcpConnection* c = stack->find_connection(connection_id);

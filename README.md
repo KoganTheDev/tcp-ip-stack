@@ -453,6 +453,23 @@ segment cannot advance it and make PAWS drop the real ones. `send()` is bounded 
 accepted, and `listen()` takes a backlog so the accept queue cannot be grown without
 limit by a peer.
 
+**Loopback.** A datagram to `127.0.0.0/8`, to `::1`, or to one of the stack's own addresses never
+reaches routing, ARP or a channel. It is built as for the wire and put on a bounded queue
+(1024 datagrams; one that finds it full is dropped and counted in `loopback_drops()`, which TCP
+recovers by retransmitting). `poll()` delivers the queue - before the channels, at most half
+its frame budget per call, and only what was queued when it started, so a send never
+re-enters a receive path and a local ping-pong cannot hold `poll()` - and returns `false`
+until the queue is empty. `ms_until_next_timer()` reads 0 while it is not, because there is
+no fd to wake a driver that sleeps. There is no pseudo-interface: nothing that iterates
+interfaces sees one, and DHCP, ARP and the neighbour caches are untouched. The source of a
+local datagram is its destination (as on Linux), the loopback MTU is 65535 (the most a 16-bit
+IPv4 total length or IPv6 payload length can say, so loopback never fragments) and a local
+connection's MSS comes from it (65495 for v4, 65475 for v6). On a real interface a `127/8` or
+`::1` source or destination, or one of the stack's own addresses as a source, is dropped and
+counted in `loopback_martian_drops()` (RFC 1122 3.2.1.3; Linux's martian-source rule, which
+also stops a spoofed own-address SYN from making the stack talk to itself) - so forwarding
+can never route to or from loopback. ustack's `bind()` accepts any `127/8` address and `::1`.
+
 ## Deliberately out of scope
 
 These are documented decisions, not gaps that were missed:
