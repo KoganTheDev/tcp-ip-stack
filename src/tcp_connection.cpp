@@ -335,7 +335,7 @@ void TcpConnection::_add_options(Tcp& header, uint8_t flags, size_t payload_size
         {
             header.set_window_scale_option(WINDOW_SCALE_SHIFT);
         }
-        if (!is_syn_ack || _timestamps_negotiated)
+        if (is_syn_ack ? _timestamps_negotiated : _timestamps_enabled)
         {
             header.set_timestamp_option(_ts_clock(), _have_ts_recent ? _ts_recent : 0);
         }
@@ -474,7 +474,7 @@ void TcpConnection::_take_peer_syn_options(const Tcp& segment)
     _window_scaling_negotiated = segment.has_window_scale_option();
     _peer_window_scale = _window_scaling_negotiated ? segment.get_window_scale_option() : 0;
     _sack_permitted = segment.has_sack_permitted_option();
-    _timestamps_negotiated = segment.has_timestamp_option();
+    _timestamps_negotiated = _timestamps_enabled && segment.has_timestamp_option();
     if (_timestamps_negotiated)
     {
         _ts_recent = segment.get_timestamp_value();
@@ -492,7 +492,7 @@ bool TcpConnection::_matches_recorded_syn_options(const Tcp& segment) const
         segment.has_window_scale_option() == _window_scaling_negotiated
         && (!_window_scaling_negotiated || segment.get_window_scale_option() == _peer_window_scale);
     return mss == _peer_mss && window_scale_agrees && segment.has_sack_permitted_option() == _sack_permitted
-           && segment.has_timestamp_option() == _timestamps_negotiated;
+           && (_timestamps_enabled && segment.has_timestamp_option()) == _timestamps_negotiated;
 }
 
 void TcpConnection::_send_pure_ack()
@@ -538,8 +538,8 @@ void TcpConnection::accept_incoming_syn(uint32_t peer_isn, uint16_t peer_mss, bo
     _window_scaling_negotiated =
         peer_supports_window_scaling; // we always send our own option, so it comes down to the peer's
     _peer_window_scale = peer_window_scale;
-    _timestamps_negotiated = peer_supports_timestamps;
-    if (peer_supports_timestamps)
+    _timestamps_negotiated = _timestamps_enabled && peer_supports_timestamps;
+    if (_timestamps_negotiated)
     {
         _ts_recent = peer_timestamp;
         _have_ts_recent = true;

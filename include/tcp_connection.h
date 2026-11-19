@@ -159,6 +159,10 @@ public:
     // the clock from being shared across peers, where it would leak uptime
     // and link one host's connections together.
     void set_timestamp_offset(uint32_t offset) { _ts_offset = offset; }
+    // Whether to offer and accept timestamps (RFC 7323), like Linux's
+    // net.ipv4.tcp_timestamps. On by default. Set before the SYN is sent or
+    // answered.
+    void set_timestamps_enabled(bool enabled) { _timestamps_enabled = enabled; }
 
     // Drives every timer on the connection. The caller reports how much real
     // time has passed since it last called, in milliseconds.
@@ -1137,6 +1141,7 @@ private:
     // See set_timestamp_offset(). TSval is _ts_clock(); an echo is turned
     // back into this connection's clock by subtracting the offset.
     uint32_t _ts_offset = 0;
+    bool _timestamps_enabled = true; // see set_timestamps_enabled()
     uint32_t _ts_clock() const { return static_cast<uint32_t>(_now_ms) + _ts_offset; }
     // Last.ACK.sent (RFC 7323 4.3): the ACK field of the last segment sent.
     // TS.Recent only takes the TSval of a segment at or before it, which is

@@ -526,6 +526,7 @@ TcpConnection* NetworkStack::_open_connection(const IpAddress& remote_address, u
         this->_next_isn(this->_primary().config.ip, local_port, remote_ip, remote_port),
         this->_segment_sender(remote_ip, this->_primary().config.ip), this->_primary().config.local_mss());
     connection->set_ecn_mode(this->_tcp_ecn);
+    connection->set_timestamps_enabled(this->_tcp_timestamps);
     connection->set_local_ip(this->_primary().config.ip);
     this->_set_timestamp_clock(*connection, this->_primary().config.ip, remote_ip);
 
@@ -1841,6 +1842,7 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
         std::make_unique<TcpConnection>(key.local_port, remote_ip, key.remote_port, isn,
                                         this->_segment_sender(remote_ip, local_ip), this->_local_mss_for(remote_ip));
     connection->set_ecn_mode(this->_tcp_ecn);
+    connection->set_timestamps_enabled(this->_tcp_timestamps);
     connection->set_local_ip(destination);
     this->_set_timestamp_clock(*connection, local_ip, remote_ip);
 
