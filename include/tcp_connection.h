@@ -130,6 +130,21 @@ public:
     // Both SYNs agreed to ECN (RFC 3168 6.1.1).
     bool ecn_negotiated() const { return _ecn_negotiated; }
 
+    // Added to this connection's clock to make the TSval it sends (RFC 7323),
+    // and taken off the echoes it gets back before they are compared with
+    // that clock. Set before initiate_connect() or accept_incoming_syn().
+    //
+    // The connection's own clock starts near zero, so without an offset every
+    // new connection's first TSval is smaller than the last one its
+    // predecessor on the same four-tuple sent - and a peer holding that
+    // four-tuple in TIME_WAIT can only accept a new SYN early if its TSval is
+    // newer (RFC 6191). NetworkStack therefore sets it so that TSval is one
+    // clock per address pair: its own clock plus a keyed hash of the two
+    // addresses, which is what Linux does (secure_tcp_ts_off). The hash keeps
+    // the clock from being shared across peers, where it would leak uptime
+    // and link one host's connections together.
+    void set_timestamp_offset(uint32_t offset) { _ts_offset = offset; }
+
     // Drives every timer on the connection. The caller reports how much real
     // time has passed since it last called, in milliseconds.
     //
@@ -839,6 +854,10 @@ private:
     bool _timestamps_negotiated;
     uint32_t _ts_recent;      // newest timestamp received in sequence - echoed back
     bool _have_ts_recent;
+    // See set_timestamp_offset(). TSval is _ts_clock(); an echo is turned
+    // back into this connection's clock by subtracting the offset.
+    uint32_t _ts_offset = 0;
+    uint32_t _ts_clock() const { return static_cast<uint32_t>(_now_ms) + _ts_offset; }
     // Last.ACK.sent (RFC 7323 4.3): the ACK field of the last segment sent.
     // TS.Recent only takes the TSval of a segment at or before it, which is
     // what makes the echo the earliest unacknowledged segment's (delayed

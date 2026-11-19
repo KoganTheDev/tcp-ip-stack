@@ -283,6 +283,9 @@ public:
         uint64_t cookie_key_low;
         uint64_t cookie_key_high;
         uint64_t challenge_ack_seed;
+        // Last, so adding them did not move the keys above for a given seed.
+        uint64_t ts_key_low;
+        uint64_t ts_key_high;
         static SeededSecrets from_seed(uint64_t seed);
     };
 
@@ -914,6 +917,16 @@ private:
     // secret, which is the same as no secret at all for an attacker who only
     // needs to predict the connection in front of them.
     IsnGenerator _isn_generator;
+    // Keys the per-address-pair TSval offset (see
+    // TcpConnection::set_timestamp_offset). Its own key, as Linux keeps
+    // ts_secret apart from the ISN secret: a TSval is visible to anyone the
+    // connection talks to, and must not be a window onto the ISN hash.
+    IsnGenerator _ts_offset_generator;
+    // Sets a new connection's TSval offset: this stack's clock plus the keyed
+    // hash of the two addresses, so successive connections between the same
+    // two hosts send ever-newer timestamps. Before accept_incoming_syn() or
+    // the first SYN.
+    void _set_timestamp_clock(TcpConnection& connection, const IpAddress& local_ip, const IpAddress& remote_ip) const;
     // SYN cookies, for a listening port flooded with young half-open
     // connections (see _send_syn_cookie / _try_complete_cookie_handshake).
     SynCookies _syn_cookies;

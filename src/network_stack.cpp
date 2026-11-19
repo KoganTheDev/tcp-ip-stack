@@ -217,6 +217,8 @@ NetworkStack::SeededSecrets NetworkStack::SeededSecrets::from_seed(uint64_t seed
     secrets.cookie_key_low = next();
     secrets.cookie_key_high = next();
     secrets.challenge_ack_seed = next();
+    secrets.ts_key_low = next();
+    secrets.ts_key_high = next();
     return secrets;
 }
 
@@ -224,6 +226,7 @@ void NetworkStack::set_secret_seed(uint64_t seed)
 {
     SeededSecrets secrets = SeededSecrets::from_seed(seed);
     this->_isn_generator = IsnGenerator(secrets.isn_key_low, secrets.isn_key_high);
+    this->_ts_offset_generator = IsnGenerator(secrets.ts_key_low, secrets.ts_key_high);
     this->_syn_cookies = SynCookies(secrets.cookie_key_low, secrets.cookie_key_high);
     this->_challenge_ack_rng.seed(static_cast<std::minstd_rand::result_type>(secrets.challenge_ack_seed));
     this->_isn_on_virtual_clock = true;
@@ -237,6 +240,18 @@ uint32_t NetworkStack::_next_isn(const IpAddress& local_ip, uint16_t local_port,
         return this->_isn_generator.generate_at(local_ip, local_port, remote_ip, remote_port, this->_now_ms * 1000);
     }
     return this->_isn_generator.generate(local_ip, local_port, remote_ip, remote_port);
+}
+
+void NetworkStack::_set_timestamp_clock(TcpConnection& connection, const IpAddress& local_ip,
+                                        const IpAddress& remote_ip) const
+{
+    // The connection's clock reads now_ms() and carries on from there once it
+    // is wired to this stack's; the offset turns that into this stack's clock
+    // plus the pair's hash. Ports are left out on purpose (zero): the point is
+    // that a new connection on the same four-tuple sees a newer clock.
+    uint32_t pair_hash = this->_ts_offset_generator.offset_for(local_ip, 0, remote_ip, 0);
+    connection.set_timestamp_offset(pair_hash + static_cast<uint32_t>(this->_now_ms)
+                                    - static_cast<uint32_t>(connection.now_ms()));
 }
 
 void NetworkStack::configure_interface(const InterfaceConfig& config)
@@ -511,6 +526,7 @@ TcpConnection* NetworkStack::_open_connection(const IpAddress& remote_address, u
         this->_segment_sender(remote_ip, this->_primary().config.ip), this->_primary().config.local_mss());
     connection->set_ecn_mode(this->_tcp_ecn);
     connection->set_local_ip(this->_primary().config.ip);
+    this->_set_timestamp_clock(*connection, this->_primary().config.ip, remote_ip);
 
     TcpConnection* connection_ptr = connection.get();
     this->_register_connection(key, std::move(connection));
@@ -1739,6 +1755,7 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
                                         this->_segment_sender(remote_ip, local_ip), this->_local_mss_for(remote_ip));
     connection->set_ecn_mode(this->_tcp_ecn);
     connection->set_local_ip(destination);
+    this->_set_timestamp_clock(*connection, local_ip, remote_ip);
 
     try
     {

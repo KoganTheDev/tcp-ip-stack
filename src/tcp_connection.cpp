@@ -261,7 +261,7 @@ void TcpConnection::_add_options(Tcp& header, uint8_t flags, size_t payload_size
         }
         if (!is_syn_ack || _timestamps_negotiated)
         {
-            header.set_timestamp_option(static_cast<uint32_t>(_now_ms), _have_ts_recent ? _ts_recent : 0);
+            header.set_timestamp_option(_ts_clock(), _have_ts_recent ? _ts_recent : 0);
         }
         if (!is_syn_ack || _sack_permitted)
         {
@@ -275,7 +275,7 @@ void TcpConnection::_add_options(Tcp& header, uint8_t flags, size_t payload_size
         // RFC 7323 3.2: once negotiated, TSopt goes on every non-RST segment -
         // retransmissions and probes included - and each carries the clock
         // as it is now, not as it was when the data was first sent.
-        header.set_timestamp_option(static_cast<uint32_t>(_now_ms), _ts_recent);
+        header.set_timestamp_option(_ts_clock(), _ts_recent);
     }
 
     if (_sack_permitted)
@@ -830,7 +830,7 @@ SendScoreboard::AckContext TcpConnection::_rack_context(const Tcp& segment) cons
     rack.now_ms = _now_ms;
     rack.min_rtt_ms = _rack_min_rtt_ms;
     rack.has_echo = _timestamps_negotiated && segment.has_timestamp_option() && segment.get_timestamp_echo() != 0;
-    rack.echo = segment.get_timestamp_echo();
+    rack.echo = segment.get_timestamp_echo() - _ts_offset; // back onto this connection's clock
     return rack;
 }
 
@@ -1377,9 +1377,9 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     if (_timestamps_negotiated && segment.has_timestamp_option() && acked_anything)
     {
         uint32_t echo = segment.get_timestamp_echo();
-        if (echo != 0 && seq_at_or_before(echo, static_cast<uint32_t>(_now_ms)))
+        if (echo != 0 && seq_at_or_before(echo, _ts_clock()))
         {
-            _take_rtt_sample(static_cast<uint32_t>(_now_ms) - echo);
+            _take_rtt_sample(_ts_clock() - echo);
         }
     }
     else if (have_rtt_sample)
