@@ -455,7 +455,7 @@ public:
     // silly-window avoidance); the ceiling keeps one connection from being
     // told to pin unbounded memory.
     static constexpr size_t MIN_BUFFER_CAPACITY = 4096;
-    static constexpr size_t MAX_BUFFER_CAPACITY = 16u * 1024 * 1024; // 16 MiB
+    static constexpr size_t MAX_BUFFER_CAPACITY = size_t{16} * 1024 * 1024; // 16 MiB
 
     // The working limits (SO_RCVBUF / SO_SNDBUF). Both clamp the request to
     // [max(MIN_BUFFER_CAPACITY, 2 * MSS), MAX_BUFFER_CAPACITY].

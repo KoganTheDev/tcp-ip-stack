@@ -2322,13 +2322,13 @@ namespace
 
 void TcpConnection::set_receive_capacity(size_t bytes)
 {
-    _receive_capacity = static_cast<uint32_t>(clamp_capacity(bytes, 2u * _local_mss));
+    _receive_capacity = static_cast<uint32_t>(clamp_capacity(bytes, size_t{2} * _local_mss));
 }
 
 void TcpConnection::set_send_capacity(size_t bytes)
 {
     EntryScope scope(*this);
-    _send_capacity = clamp_capacity(bytes, 2u * _local_mss);
+    _send_capacity = clamp_capacity(bytes, size_t{2} * _local_mss);
     // A bigger limit is new room: tell a waiting writer (EPOLLOUT).
     _report_send_space();
 }
