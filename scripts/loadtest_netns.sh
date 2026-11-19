@@ -232,6 +232,29 @@ debug_rerun()
     rm -f "$LOG.kept"
 }
 
+# print_stats: asks the server for its stats line (SIGUSR1, answered on the
+# reactor thread, so it can lag by a loop pass) and prints the one that comes
+# back. The counters are cumulative over the server's life, so a phase's own
+# share is the difference from the line printed after the phase before it. Waits
+# up to 2 s for a new line, and says so if none arrives (an older server, or one
+# that has died) rather than printing a stale one.
+print_stats()
+{
+    local before line
+    before=$(grep -c 'stats: ' "$LOG" 2>/dev/null)
+    kill -USR1 "$SERVER_PID" 2>/dev/null || { echo "    (no stats: the server is not running)"; return; }
+    for _ in $(seq 1 20); do
+        [ "$(grep -c 'stats: ' "$LOG" 2>/dev/null)" -gt "$before" ] && break
+        sleep 0.1
+    done
+    if [ "$(grep -c 'stats: ' "$LOG" 2>/dev/null)" -gt "$before" ]; then
+        line=$(grep 'stats: ' "$LOG" | tail -n 1)
+        echo "    ${line#*stats: }"
+    else
+        echo "    (no stats line came back within 2 s)"
+    fi
+}
+
 # run_phase NAME LOADGEN_ARGS...: runs loadgen inside the namespace, writes the
 # JSON report, prints a summary, and counts a nonzero exit as a failure - after
 # which the capture is kept and the phase is rerun at DEBUG (see the header).
@@ -248,12 +271,14 @@ run_phase()
         # the numbers that matter, straight from the JSON
         grep -E '"(connections_per_s|throughput_mib_per_s)"|"round_trip"' "$OUT_DIR/$name.json" | sed 's/^ */    /'
         echo "    errors: $(grep '"errors"' "$OUT_DIR/$name.json" | sed 's/^ *"errors": //')"
+        print_stats
         debug_rerun "$name" "$@"
         return
     fi
     echo "  PASS  $name"
     grep -E '"(connections_per_s|throughput_mib_per_s)"|"round_trip"' "$OUT_DIR/$name.json" | sed 's/^ */    /'
     echo "    errors: $(grep '"errors"' "$OUT_DIR/$name.json" | sed 's/^ *"errors": //')"
+    print_stats
 }
 
 run_phase burst --connections "$BURST_CONNECTIONS" --concurrency "$BURST_CONNECTIONS" --size 4096 --rounds 3 \
