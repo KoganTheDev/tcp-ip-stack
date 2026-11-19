@@ -45,6 +45,10 @@ namespace
         // already received: retransmissions that were not needed.
         uint64_t spurious = 0;
         uint64_t ce_marked = 0; // client frames the link marked CE
+        // The client's congestion window (bytes) in the last tick before and in
+        // the first tick after its first RTO; 0 if it never timed out.
+        uint32_t cwnd_before_rto = 0;
+        uint32_t cwnd_after_rto = 0;
 
         std::string describe() const
         {
@@ -64,10 +68,14 @@ protected:
     // so "segment 60" means the same bytes whatever the recovery code
     // resends) and which transmission of it this is (1 for the first). True
     // loses it. Null for none (random loss comes from `wire`).
+    // ack_delay: a delay spike on the ACK path. Called with the virtual time
+    // (ms) for every frame the server sends (pure ACKs: the server only reads),
+    // returns extra delay in ms for it. Null for none.
     Result transfer(uint64_t seed, const LinkParams& wire, size_t size,
                     const std::function<bool(int index, int transmission)>& drop = nullptr,
                     CongestionControlAlgorithm algorithm = CongestionControlAlgorithm::CUBIC,
-                    TcpEcnMode client_ecn = TcpEcnMode::PASSIVE)
+                    TcpEcnMode client_ecn = TcpEcnMode::PASSIVE,
+                    const std::function<uint32_t(uint64_t now_ms)>& ack_delay = nullptr)
     {
         net = std::make_unique<SimNetwork>(seed);
         NetemChannel& link = net->add_link(wire, wire);
@@ -77,6 +85,10 @@ protected:
         client_stack.add_static_arp_entry(SERVER_IP, SERVER_MAC);
         server_stack.add_static_arp_entry(CLIENT_IP, CLIENT_MAC);
         server_stack.listen(SERVER_PORT);
+
+        if (ack_delay)
+            link.set_delay_filter(NetemChannel::B,
+                                  [this, ack_delay](const Bytes&) { return ack_delay(net->now_ms()); });
 
         int data_segments = 0;
         std::map<uint32_t, std::pair<int, int>> seen; // seq -> (index, transmissions so far)
@@ -105,6 +117,8 @@ protected:
         REQUIRE_TRUE(client != nullptr, "connect() should create a connection");
         client->set_congestion_control(algorithm);
         uint64_t client_id = client->get_id();
+        Result result;
+        uint32_t last_cwnd = 0;
         net->add_tick_hook(
             [&]()
             {
@@ -116,6 +130,15 @@ protected:
                 if (TcpConnection* s = server_id != 0 ? server_stack.find_connection(server_id) : nullptr)
                     received |= s->read();
                 TcpConnection* c = client_stack.find_connection(client_id);
+                if (c != nullptr)
+                {
+                    if (c->stats().retransmit_timeouts > 0 && result.cwnd_before_rto == 0)
+                    {
+                        result.cwnd_before_rto = last_cwnd;
+                        result.cwnd_after_rto = c->get_congestion_window();
+                    }
+                    last_cwnd = c->get_congestion_window();
+                }
                 if (c != nullptr && c->get_state() == TcpState::ESTABLISHED)
                 {
                     while (sent < payload.size())
@@ -128,7 +151,6 @@ protected:
                 }
             });
 
-        Result result;
         uint64_t start = net->now_ms();
         result.completed = net->run_until([&] { return received.size() >= payload.size(); }, MAX_VIRTUAL_MS);
         result.completion_ms = net->now_ms() - start;
@@ -297,4 +319,30 @@ TEST_F(SimRecovery, AQueueThresholdMarkerKeepsTheQueueFromOverflowing)
     ASSERT_GT(plain.stats.retransmitted_segments, 0u) << "precondition: without ECN the queue overflows";
     ASSERT_GT(ecn.ce_marked, 0u);
     ASSERT_EQ(ecn.stats.retransmitted_segments, 0u) << ecn.describe();
+}
+
+// --- Delay spikes on the ACK path ---
+
+// Baseline for D2 (sender-side D-SACK, undo, Eifel). Every ACK the receiver
+// sends between 150 ms and 600 ms gets 3 s extra delay, far past the RTO, so
+// the sender hears nothing for longer than its timer allows although nothing
+// was lost. Today it times out, cuts cwnd to the loss window and resends data
+// the receiver already holds. D2 flips this: the receiver's D-SACK (done in D1)
+// shows the retransmission was spurious, and the sender undoes the cut, so
+// the ASSERTs on the RTO, the cwnd drop and the spurious count are expected to
+// change then.
+TEST_F(SimRecovery, ADelaySpikeCausesASpuriousTimeout_Baseline)
+{
+    // 300 bytes/ms: the window, not the queue, limits what is in flight when the spike hits.
+    LinkParams slow = wire();
+    slow.bytes_per_ms = 300;
+    Result r = transfer(1, slow, 400000, nullptr, CongestionControlAlgorithm::CUBIC, TcpEcnMode::PASSIVE,
+                        [](uint64_t now_ms) { return now_ms >= 150 && now_ms < 600 ? 3000u : 0u; });
+    report("3 s ACK delay spike", r);
+    std::cout << "[ RECOVERY ]   cwnd " << r.cwnd_before_rto << " -> " << r.cwnd_after_rto
+              << " bytes at the first RTO\n";
+    ASSERT_TRUE(r.completed && r.intact) << r.describe();
+    ASSERT_GE(r.stats.retransmit_timeouts, 1u) << "today the spike costs a timeout: " << r.describe();
+    ASSERT_GT(r.cwnd_before_rto, r.cwnd_after_rto) << "and the window is cut for it";
+    ASSERT_GT(r.spurious, 0u) << "the retransmitted data had already arrived: " << r.describe();
 }
