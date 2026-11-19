@@ -508,6 +508,12 @@ TcpConnection* NetworkStack::connect(const IpAddress& remote_ip, uint16_t remote
     {
         ephemeral_port = this->_allocate_ephemeral_port();
         found_free_port = this->_connections.count(ConnectionKey{remote_ip, remote_port, ephemeral_port}) == 0;
+        // Never a port this stack listens on, as Linux's allocator. Harmless
+        // between two hosts; to a local peer it is a connection to itself,
+        // source and destination equal, which is what a listener sharing the
+        // ephemeral range (a socket layer that binds port 0) would otherwise
+        // meet on its first loopback connect.
+        found_free_port = found_free_port && this->_listening_ports.count(ephemeral_port) == 0;
     }
     if (!found_free_port)
     {

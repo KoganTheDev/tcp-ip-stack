@@ -395,3 +395,20 @@ TEST(Loopback, ASpoofedOwnSourceSynOnARealInterfaceIsDroppedAndStartsNothing)
     ASSERT_FALSE(host.stack->ms_until_next_timer().has_value()) << "no loopback traffic, no connection, no timers";
     ASSERT_EQ(host.guard->writes(), 0u);
 }
+
+TEST(Loopback, AnEphemeralPortNeverEqualsALocalListenersPort)
+{
+    // Connecting to a listener of this same stack from the very port it
+    // listens on would be a connection to itself (source == destination,
+    // equal ports): the allocator has to step over it. 49152 is the first
+    // ephemeral port the stack hands out.
+    Host host;
+    host.stack->listen(49152);
+    TcpConnection* client = host.stack->connect(LOOPBACK, 49152);
+    ASSERT_TRUE(client != nullptr);
+    ASSERT_TRUE(host.pump_until([&] { return host.stack->has_pending_accept(49152); }, 3000));
+    TcpConnection* server = host.stack->accept(49152);
+    ASSERT_TRUE(server != nullptr);
+    ASSERT_NE(client->get_local_port(), 49152);
+    ASSERT_NE(client->get_id(), server->get_id());
+}
