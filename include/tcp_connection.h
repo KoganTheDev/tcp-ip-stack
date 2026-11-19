@@ -439,13 +439,42 @@ public:
     // starts accepting less than it is offered. The application's writes are
     // bounded by this, the network's pace by the peer's window - the two are
     // deliberately separate.
+    // This is the DEFAULT; the working limit is the per-connection
+    // send_capacity() (see set_send_capacity()).
     static constexpr size_t SEND_BUFFER_CAPACITY = 131072; // 128 KiB
 
     // How much this connection will hold on the receive side before the
     // advertised window reaches zero and the peer is told to stop. Public
     // because it is the number an application needs to reason about how much
     // it can afford not to read.
+    // Likewise the DEFAULT; the working limit is receive_capacity().
     static constexpr uint32_t RECEIVE_BUFFER_CAPACITY = 131072; // 128 KiB
+
+    // Bounds for the per-connection capacities. The floor keeps a window that
+    // can still carry a couple of segments (a smaller buffer would stall on
+    // silly-window avoidance); the ceiling keeps one connection from being
+    // told to pin unbounded memory.
+    static constexpr size_t MIN_BUFFER_CAPACITY = 4096;
+    static constexpr size_t MAX_BUFFER_CAPACITY = 16u * 1024 * 1024; // 16 MiB
+
+    // The working limits (SO_RCVBUF / SO_SNDBUF). Both clamp the request to
+    // [max(MIN_BUFFER_CAPACITY, 2 * MSS), MAX_BUFFER_CAPACITY].
+    //
+    // Shrinking the receive capacity never moves the advertised right edge
+    // (RCV.NXT + RCV.WND) left: _advertised_window() keeps whatever was already
+    // offered (RFC 9293 3.8.6), so a smaller capacity only stops NEW window
+    // from being offered; the old window drains as data arrives and is read.
+    // Shrinking the send capacity below what is queued just makes
+    // send_space_available() zero until the queue drains - nothing is dropped.
+    void set_receive_capacity(size_t bytes);
+    void set_send_capacity(size_t bytes);
+    uint32_t receive_capacity() const { return _receive_capacity; }
+    size_t send_capacity() const { return _send_capacity; }
+    // True once an application chose the receive capacity explicitly. A later
+    // autotuning step must leave a locked capacity alone, as Linux does for
+    // SO_RCVBUF (SOCK_RCVBUF_LOCK).
+    void set_receive_capacity_locked(bool locked) { _receive_capacity_locked = locked; }
+    bool receive_capacity_locked() const { return _receive_capacity_locked; }
     // How many disjoint ranges the reorder buffer may hold (see
     // ReorderBuffer::MAX_RANGES).
     static constexpr uint32_t MAX_REORDER_SEGMENTS = ReorderBuffer::MAX_RANGES;
@@ -635,7 +664,7 @@ private:
 
     // Bytes occupying the receive buffer: out-of-order segments waiting for a
     // gap to fill, plus in-order data the application has not read yet. What is
-    // left of RECEIVE_BUFFER_CAPACITY after subtracting this is the window.
+    // left of _receive_capacity after subtracting this is the window.
     uint32_t _receive_buffer_occupied() const;
     // The window this side would advertise right now: the free buffer space,
     // but never less than what keeps the last offered right edge in place.
@@ -1036,6 +1065,10 @@ private:
     SendSpaceFn _on_send_space;
     // send_space_available() as of the last _report_send_space().
     size_t _reported_send_space = SEND_BUFFER_CAPACITY;
+    // Working buffer limits; see set_receive_capacity() / set_send_capacity().
+    uint32_t _receive_capacity = RECEIVE_BUFFER_CAPACITY;
+    size_t _send_capacity = SEND_BUFFER_CAPACITY;
+    bool _receive_capacity_locked = false;
 
     // --- clock and deadline bookkeeping ---
     //

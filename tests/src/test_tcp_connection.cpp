@@ -3048,3 +3048,91 @@ TEST(TcpConnection, FinIsPiggybackedOnTheLastQueuedSegment)
     ASSERT_TRUE(connection->get_state() == TcpState::FIN_WAIT_1);
     ASSERT_EQ(connection->send(Bytes(1u)), 0u) << "nothing more may be sent after close()";
 }
+
+// --- per-connection buffer capacities (SO_RCVBUF / SO_SNDBUF plumbing) ---
+
+TEST(TcpConnection, BufferCapacitiesDefaultToTheConstantsAndClamp)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    ASSERT_TRUE(connection->receive_capacity() == TcpConnection::RECEIVE_BUFFER_CAPACITY) << "default receive";
+    ASSERT_TRUE(connection->send_capacity() == TcpConnection::SEND_BUFFER_CAPACITY) << "default send";
+    ASSERT_TRUE(!connection->receive_capacity_locked()) << "not locked until an application asks";
+
+    connection->set_receive_capacity(1);
+    connection->set_send_capacity(1);
+    ASSERT_TRUE(connection->receive_capacity() == TcpConnection::MIN_BUFFER_CAPACITY) << "receive floor";
+    ASSERT_TRUE(connection->send_capacity() == TcpConnection::MIN_BUFFER_CAPACITY) << "send floor";
+
+    connection->set_receive_capacity(size_t{1} << 40);
+    connection->set_send_capacity(size_t{1} << 40);
+    ASSERT_TRUE(connection->receive_capacity() == TcpConnection::MAX_BUFFER_CAPACITY) << "receive ceiling";
+    ASSERT_TRUE(connection->send_capacity() == TcpConnection::MAX_BUFFER_CAPACITY) << "send ceiling";
+}
+
+TEST(TcpConnection, SmallReceiveCapacityAdvertisesASmallWindow)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->set_data_ready_callback([]() {});
+    connection->set_receive_capacity(8192);
+
+    // The handshake already offered a 64 KiB window, and that edge is kept
+    // (see ShrinkingReceiveCapacity...), so consume it first: only past it is
+    // the window the new capacity's.
+    uint32_t seq = 501;
+    for (int i = 0; i < 65; i += 1)
+    {
+        connection->on_segment(*make_incoming_segment(seq, 1001, FLAG_ACK, Bytes(1000)));
+        seq += 1000;
+    }
+    static_cast<void>(connection->read());
+    connection->on_segment(*make_incoming_segment(seq, 1001, FLAG_ACK, Bytes(1000)));
+    connection->on_time_passed(TEST_TICK_MS);
+
+    ASSERT_TRUE(!sent.empty()) << "the data should be acknowledged";
+    ASSERT_TRUE(sent.back().window > 0 && sent.back().window <= 8192)
+        << "an 8 KiB buffer cannot advertise more than 8 KiB, got " << sent.back().window;
+}
+
+TEST(TcpConnection, ShrinkingReceiveCapacityNeverMovesTheRightEdgeLeft)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    connection->set_data_ready_callback([]() {});
+
+    connection->on_segment(*make_incoming_segment(501, 1001, FLAG_ACK, Bytes(1000)));
+    connection->on_time_passed(TEST_TICK_MS);
+    ASSERT_TRUE(!sent.empty()) << "precondition: an ack went out";
+    // The right edge is the acked RCV.NXT plus the window just offered.
+    uint32_t edge_before = sent.back().ack + sent.back().window;
+    connection->set_receive_capacity(TcpConnection::MIN_BUFFER_CAPACITY);
+    ASSERT_TRUE(connection->receive_capacity() == TcpConnection::MIN_BUFFER_CAPACITY) << "the new limit is recorded";
+
+    connection->on_segment(*make_incoming_segment(1501, 1001, FLAG_ACK, Bytes(1000)));
+    connection->on_time_passed(TEST_TICK_MS);
+    uint32_t edge_after = sent.back().ack + sent.back().window;
+    ASSERT_TRUE(static_cast<int32_t>(edge_after - edge_before) >= 0)
+        << "the advertised right edge moved left: " << edge_before << " -> " << edge_after;
+}
+
+TEST(TcpConnection, SmallSendCapacityLimitsSpaceAndNotifiesWhenItGrows)
+{
+    std::vector<RecordedSegment> sent;
+    auto connection = make_established_connection(sent);
+    int notified = 0;
+    connection->set_send_space_callback([&notified]() { notified += 1; });
+    connection->set_send_capacity(TcpConnection::MIN_BUFFER_CAPACITY);
+
+    // a zero peer window keeps everything queued
+    connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 0));
+    ASSERT_TRUE(connection->send_space_available() == TcpConnection::MIN_BUFFER_CAPACITY) << "limited to the new cap";
+    size_t accepted = connection->send(Bytes(static_cast<unsigned int>(TcpConnection::MIN_BUFFER_CAPACITY * 2)));
+    ASSERT_TRUE(accepted == TcpConnection::MIN_BUFFER_CAPACITY) << "send() accepts only the capacity, got " << accepted;
+    ASSERT_TRUE(!connection->writable()) << "full at the small capacity";
+
+    int before = notified;
+    connection->set_send_capacity(TcpConnection::SEND_BUFFER_CAPACITY);
+    ASSERT_TRUE(connection->send_space_available() > 0) << "raising the cap makes room";
+    ASSERT_TRUE(notified > before) << "and tells a waiting writer";
+}

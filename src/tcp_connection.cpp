@@ -116,7 +116,7 @@ std::vector<Tcp::SackBlock> TcpConnection::_sack_blocks_to_report() const
 uint32_t TcpConnection::_advertised_window() const
 {
     uint32_t occupied = _receive_buffer_occupied();
-    uint32_t free_space = occupied < RECEIVE_BUFFER_CAPACITY ? RECEIVE_BUFFER_CAPACITY - occupied : 0;
+    uint32_t free_space = occupied < _receive_capacity ? _receive_capacity - occupied : 0;
     // Never shrink the window: RFC 1122 4.2.2.16 and RFC 9293 3.8.6 say a
     // receiver SHOULD NOT move the right edge (RCV.NXT + RCV.WND) left.
     // Out-of-order data lands inside the window already offered, so taking it
@@ -529,7 +529,7 @@ Bytes TcpConnection::read(size_t max_bytes)
     // RFC 1122 4.2.3.3: a window that had fallen below one segment is as
     // useless to the sender as a shut one, so reopening it past one segment
     // (min(RCV.BUFF / 2, MSS)) is announced too.
-    uint32_t useful = std::min<uint32_t>(RECEIVE_BUFFER_CAPACITY / 2, _effective_mss);
+    uint32_t useful = std::min<uint32_t>(_receive_capacity / 2, _effective_mss);
     bool reopened =
         (window_before == 0 && _advertised_window() > 0) || (window_before < useful && _advertised_window() >= useful);
     if (reopened
@@ -2308,7 +2308,29 @@ void TcpConnection::set_congestion_control(CongestionControlAlgorithm algorithm)
 
 size_t TcpConnection::send_space_available() const
 {
-    return _send_queued_bytes < SEND_BUFFER_CAPACITY ? SEND_BUFFER_CAPACITY - _send_queued_bytes : 0;
+    return _send_queued_bytes < _send_capacity ? _send_capacity - _send_queued_bytes : 0;
+}
+
+namespace
+{
+    size_t clamp_capacity(size_t bytes, size_t floor)
+    {
+        return std::clamp(bytes, std::max(TcpConnection::MIN_BUFFER_CAPACITY, floor),
+                          TcpConnection::MAX_BUFFER_CAPACITY);
+    }
+} // namespace
+
+void TcpConnection::set_receive_capacity(size_t bytes)
+{
+    _receive_capacity = static_cast<uint32_t>(clamp_capacity(bytes, 2u * _local_mss));
+}
+
+void TcpConnection::set_send_capacity(size_t bytes)
+{
+    EntryScope scope(*this);
+    _send_capacity = clamp_capacity(bytes, 2u * _local_mss);
+    // A bigger limit is new room: tell a waiting writer (EPOLLOUT).
+    _report_send_space();
 }
 
 bool TcpConnection::has_sent_unacknowledged(uint32_t seq) const
