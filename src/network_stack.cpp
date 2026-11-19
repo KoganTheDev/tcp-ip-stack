@@ -1000,7 +1000,7 @@ bool NetworkStack::_is_local_ipv4(const IPv4Address& address) const
     return false;
 }
 
-bool NetworkStack::_is_local_address(const IpAddress& address) const
+bool NetworkStack::is_local_address(const IpAddress& address) const
 {
     return address.is_v4() ? this->_is_local_ipv4(address.v4()) : this->_is_local_ipv6(address.v6());
 }
@@ -1521,8 +1521,15 @@ void NetworkStack::_handle_ip(size_t ingress, const Ip& ip, const Bytes& ip_byte
     // destination reaching the forwarding branch would be relayed. Dropping
     // here, before anything is parsed or forwarded, covers both.
     const bool from_loopback = ingress == LOOPBACK_INGRESS;
+    //
+    // The same goes for a source that is one of this host's own addresses
+    // (Linux's martian-source rule, fib_validate_source): nothing on the wire
+    // is us. Accepted, its replies would be addressed to a local address and
+    // so land in the loopback queue - a spoofed SYN with source == destination
+    // and equal ports (LAND) would make the stack talk to itself.
     if (!from_loopback
-        && (is_loopback_v4(IPv4Address(ip.get_src_address())) || is_loopback_v4(IPv4Address(ip.get_dest_address()))))
+        && (this->_is_local_ipv4(IPv4Address(ip.get_src_address()))
+            || is_loopback_v4(IPv4Address(ip.get_dest_address()))))
     {
         this->_loopback_martian_drops++;
         LOG_DEBUG("NetworkStack: dropping an IPv4 packet from "
@@ -1964,7 +1971,7 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
     // A local peer's SYN came to the address it named, which is also the one
     // this side answers from (see _open_connection).
     const IpAddress local_ip =
-        source.is_v4() && !this->_is_local_address(source) ? IpAddress(this->_primary().config.ip) : destination;
+        source.is_v4() && !this->is_local_address(source) ? IpAddress(this->_primary().config.ip) : destination;
     uint32_t isn = this->_next_isn(local_ip, key.local_port, remote_ip, key.remote_port);
     if (old_send_next)
     {
@@ -3072,7 +3079,7 @@ uint16_t NetworkStack::_local_mss_for(const IpAddress& peer) const
 {
     // A local peer is not behind any interface, so the interface MTU says
     // nothing about it: the loopback MTU does (see LOOPBACK_MTU).
-    if (this->_is_local_address(peer))
+    if (this->is_local_address(peer))
     {
         return static_cast<uint16_t>(LOOPBACK_MTU - (peer.is_v4() ? 40 : 60));
     }

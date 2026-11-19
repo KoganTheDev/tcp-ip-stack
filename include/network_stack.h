@@ -1039,7 +1039,7 @@ private:
     static constexpr size_t LOOPBACK_INGRESS = static_cast<size_t>(-1);
     // 127.0.0.0/8 or an address configured on an interface.
     bool _is_local_ipv4(const IPv4Address& address) const;
-    bool _is_local_address(const IpAddress& address) const;
+    bool is_local_address(const IpAddress& address) const;
     bool _is_local_ipv6(const IPv6Address& address) const;
     // The v6 receive path for a datagram off the loopback queue.
     void _handle_loopback_ipv6(const Bytes& packet);

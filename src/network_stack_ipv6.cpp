@@ -380,7 +380,10 @@ void NetworkStack::_handle_ipv6(size_t ingress, const Bytes& packet, const MacAd
     // spoofed ::1 source would pass every "is this local" test made above
     // the transport, exactly as 127.0.0.1 would for v4. Only the loopback
     // queue delivers it, through _handle_loopback_ipv6().
-    if (source == loopback_v6() || destination == loopback_v6())
+    // An own unicast address as the source is a martian too (see _handle_ip);
+    // the unspecified source, which DAD and router solicitation use, is not
+    // an own address and passes.
+    if (source == loopback_v6() || destination == loopback_v6() || this->_is_our_ipv6(source))
     {
         this->_loopback_martian_drops++;
         LOG_DEBUG("NetworkStack: dropping an IPv6 packet from "

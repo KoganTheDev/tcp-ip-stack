@@ -220,3 +220,18 @@ TEST(LoopbackIpv6, ASourceThatIsTheStacksOwnAddressStillCountsAsNothingSpecial)
     ASSERT_EQ(delivered, 1);
     ASSERT_EQ(host.stack->loopback_martian_drops(), 0u);
 }
+
+TEST(LoopbackIpv6, ASpoofedOwnSourceOnARealInterfaceIsDropped)
+{
+    Host host;
+    int delivered = 0;
+    host.stack->bind_udp(5000)->set_datagram_received_callback([&](const IpAddress&, uint16_t, const Bytes&)
+                                                               { delivered++; });
+    host.guard->push_inbound(udp6_frame(OWN6, OWN6, "land"));
+    host.guard->push_inbound(udp6_frame(OWN6, PEER6, "spoof"));
+    host.pump(2);
+    ASSERT_EQ(delivered, 0);
+    ASSERT_EQ(host.stack->loopback_martian_drops(), 2u);
+    ASSERT_FALSE(host.stack->ms_until_next_timer().has_value());
+    ASSERT_EQ(host.guard->writes(), 0u);
+}

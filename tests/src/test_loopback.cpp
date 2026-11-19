@@ -360,3 +360,38 @@ TEST(Loopback, ABulkTransferUsesFullSizedSegmentsAndArrivesIntact)
     ASSERT_TRUE(intact) << "the stream was corrupted";
     ASSERT_EQ(host.guard->writes(), 0u);
 }
+
+namespace
+{
+    // A TCP SYN as a peer on the wire would send it, built by hand: the
+    // checksum is valid, so only the address rules can reject it.
+    Bytes syn_frame(const IPv4Address& source, const IPv4Address& destination, uint16_t sport, uint16_t dport)
+    {
+        Tcp syn(sport, dport, 1000, 0, 5, 0x02, 65535, 0, 0);
+        syn.set_checksum(transport_checksum(source, destination, IpProtocol::TCP, syn.to_bytes()));
+        auto ip = std::make_unique<Ip>(4, 5, 0, static_cast<uint16_t>(20 + syn.to_bytes().size()), 0, 0, 0, 64,
+                                       IpProtocol::TCP, 0, source.get_address(), destination.get_address());
+        *ip /= std::make_unique<Raw>(syn.to_bytes());
+        ip->compute_checksum();
+        Ethernet frame(PEER_MAC, MAC, EtherType::IPv4);
+        frame /= std::move(ip);
+        return frame.to_bytes();
+    }
+}
+
+TEST(Loopback, ASpoofedOwnSourceSynOnARealInterfaceIsDroppedAndStartsNothing)
+{
+    // Linux's martian-source rule: nothing on the wire is us. Accepting it
+    // would send every reply into the loopback queue - and src == dst with the
+    // same port (LAND) would make the stack talk to itself.
+    Host host;
+    host.stack->listen(PORT);
+    host.guard->push_inbound(syn_frame(OWN, OWN, PORT, PORT)); // LAND
+    host.guard->push_inbound(syn_frame(OWN, OWN, 1234, PORT));
+    host.guard->push_inbound(syn_frame(OWN, IPv4Address("10.0.0.9"), 1234, PORT));
+    host.pump(5);
+    ASSERT_EQ(host.stack->loopback_martian_drops(), 3u);
+    ASSERT_FALSE(host.stack->has_pending_accept(PORT));
+    ASSERT_FALSE(host.stack->ms_until_next_timer().has_value()) << "no loopback traffic, no connection, no timers";
+    ASSERT_EQ(host.guard->writes(), 0u);
+}
