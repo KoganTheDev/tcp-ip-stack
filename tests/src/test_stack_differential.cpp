@@ -407,3 +407,16 @@ TEST(StackDifferential, BufferOptionsReadBackDoubledLikeTheKernel)
     ASSERT_TRUE(ustack.size() == 4 && ustack[2] == "SO_RCVBUF: 131072" && ustack[3] == "SO_SNDBUF: 65536")
         << "doubling is the contract being compared, not just agreement";
 }
+
+// The same scenarios with ustack talking to ITSELF over 127.0.0.1, against the
+// kernel doing the same: the loopback path must be indistinguishable to an
+// application from the kernel's.
+TEST(StackDifferential, LoopbackUserVisibleBehaviourMatchesTheKernel)
+{
+    compare_traces(run_scenario<SimLoopbackHarness>(), run_scenario<KernelHarness>());
+}
+
+TEST(StackDifferential, LoopbackReconnectIntoAServerTimeWaitMatchesTheKernel)
+{
+    compare_traces(run_reconnect_scenario<SimLoopbackHarness>(), run_reconnect_scenario<KernelHarness>());
+}

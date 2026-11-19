@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "guard_channel.h"
 #include "sim/sim_network.h"
 #include "sim/ustack_sim_driver.h"
 #include "test_support.h"
@@ -55,6 +56,29 @@ namespace
         SimNetwork _net{7};
         std::unique_ptr<ustack::Stack> _client;
         std::unique_ptr<ustack::Stack> _server;
+    };
+
+    // One ustack::Stack as both ends, over ::1 - the kernel's own view.
+    class SimLoopbackHarness6
+    {
+    public:
+        using StackT = ustack::Stack;
+        SimLoopbackHarness6()
+        {
+            NetworkStack& net_stack = _net.add_stack(std::make_unique<GuardChannel>(), MacAddress("02:00:00:00:00:01"),
+                                                     IPv4Address("10.0.0.1"));
+            net_stack.add_ipv6_address(IPv6Address("fd00::1"));
+            _stack = std::make_unique<ustack::Stack>(net_stack, std::make_unique<UstackSimDriver>(_net));
+        }
+        StackT& server_stack() { return *_stack; }
+        StackT& client_stack() { return *_stack; }
+        static const char* server_text() { return "::1"; }
+        static const char* server_mapped_text() { return "::ffff:127.0.0.1"; }
+        void settle(int ms) { _net.step(static_cast<uint64_t>(ms)); }
+
+    private:
+        SimNetwork _net{7};
+        std::unique_ptr<ustack::Stack> _stack;
     };
 
     class KernelHarness6
@@ -243,6 +267,44 @@ TEST(StackDifferentialIpv6, SocketBehaviourMatchesTheKernel)
         }
     }
     std::vector<std::string> ustack = run_scenario<SimHarness6>();
+    std::vector<std::string> kernel = run_scenario<KernelHarness6>();
+    ASSERT_EQ(ustack.size(), kernel.size()) << "the scenario took a different path";
+    std::string report;
+    for (size_t i = 0; i < ustack.size(); i++)
+    {
+        if (ustack[i] != kernel[i])
+        {
+            report += "  ustack: " + ustack[i] + "\n  kernel: " + kernel[i] + "\n\n";
+        }
+    }
+    EXPECT_TRUE(report.empty()) << "unexplained differences:\n" << report;
+    if (!report.empty())
+    {
+        for (const std::string& line : kernel)
+        {
+            std::cerr << "kernel: " << line << "\n";
+        }
+    }
+}
+
+// ustack to itself over ::1 against the kernel over ::1.
+TEST(StackDifferentialIpv6, LoopbackSocketBehaviourMatchesTheKernel)
+{
+    {
+        int probe = ::socket(AF_INET6, SOCK_STREAM, 0);
+        if (probe < 0)
+        {
+            GTEST_SKIP() << "no IPv6 in this environment";
+        }
+        sockaddr_in6 loopback = address6("::1", 0);
+        int rc = ::bind(probe, reinterpret_cast<sockaddr*>(&loopback), sizeof(loopback));
+        ::close(probe);
+        if (rc != 0)
+        {
+            GTEST_SKIP() << "::1 is not configured here";
+        }
+    }
+    std::vector<std::string> ustack = run_scenario<SimLoopbackHarness6>();
     std::vector<std::string> kernel = run_scenario<KernelHarness6>();
     ASSERT_EQ(ustack.size(), kernel.size()) << "the scenario took a different path";
     std::string report;
