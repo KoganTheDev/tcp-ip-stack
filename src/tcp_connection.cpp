@@ -1117,6 +1117,15 @@ void TcpConnection::_try_undo_dsack()
     {
         return;
     }
+    if (_now_ms > _undo_expires_ms)
+    {
+        // The D-SACKs a finished episode's copies draw come back within a
+        // round trip of its end; evidence later than an RTO after it is
+        // about a window the path has since moved on from (Linux likewise
+        // drops undo_marker once the episode is over).
+        _congestion->forget_undo();
+        return;
+    }
     uint32_t copies = _in_flight.episode_retransmissions();
     if (copies == 0 || _in_flight.episode_dsacked() < copies)
     {
@@ -1287,6 +1296,7 @@ void TcpConnection::_undo_episode()
 void TcpConnection::_end_episode()
 {
     _episode_open = false; // its ledger stays, for the D-SACKs still to come
+    _undo_expires_ms = _now_ms + static_cast<uint64_t>(_rtt.rto_ms());
     _eifel_armed = false;
     _frto = Frto::OFF;
     // RFC 8985 6.2 step 4: one recovery fewer for a widened window to last.

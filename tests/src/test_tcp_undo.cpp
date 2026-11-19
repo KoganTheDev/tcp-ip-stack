@@ -620,3 +620,17 @@ TEST(TcpSpuriousRto, FrtoIsNotFooledByAcksInsideTheRetransmission)
     s.ack(s.seg(0) + 900);
     ASSERT_EQ(s.stats().spurious_rtos_undone, 0u);
 }
+
+// D-SACK evidence that arrives after the connection went idle and restarted
+// from the initial window must not hand it the pre-idle window as a burst.
+TEST(TcpUndo, ADsackAfterAnIdleRestartRestoresNothing)
+{
+    Sender s = measured();
+    spurious_fast_recovery(s, /*report_copy=*/false);
+    s.pass(5000); // idle, longer than the RTO
+    s.send(1);    // the idle restart: cwnd back to the initial window
+    uint32_t restart_window = s.c->get_congestion_window();
+    s.ack(s.seg(10), {s.block(0)});
+    ASSERT_EQ(s.stats().spurious_recoveries_undone, 0u);
+    ASSERT_LE(s.c->get_congestion_window(), restart_window);
+}

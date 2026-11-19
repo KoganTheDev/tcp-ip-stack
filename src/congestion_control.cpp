@@ -17,6 +17,10 @@ void CongestionControl::on_idle_restart()
 {
     _cwnd = std::min(_cwnd, initial_window(_mss));
     _on_idle_restart();
+    // The window before the idle period no longer describes the path (RFC
+    // 5681 4.1), so no later evidence about an earlier episode may bring it
+    // back as a burst.
+    _undo_valid = false;
 }
 
 void CongestionControl::on_ack(uint32_t bytes_acked, uint32_t prior_in_flight, uint32_t srtt_ms, uint64_t now_ms)

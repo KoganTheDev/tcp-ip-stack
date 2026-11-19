@@ -822,6 +822,10 @@ private:
     // so an episode is undone at most once.
     // Checked after every ack; cheap unless it undoes.
     void _try_undo_dsack();
+    // A finished episode can be undone by D-SACK until this moment - one RTO
+    // after it ended - and not after an idle restart
+    // (CongestionControl::on_idle_restart() forgets the snapshot).
+    uint64_t _undo_expires_ms = 0;
     // The one undo path: the snapshot back, and the RTO back-off with it if
     // the episode had a timeout.
     void _undo_episode();
