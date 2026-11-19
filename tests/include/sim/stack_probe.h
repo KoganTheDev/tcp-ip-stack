@@ -26,8 +26,11 @@
 // instantiation lines at the bottom. Rename a member and exactly one of
 // those lines stops compiling.
 //
-// Nothing here mutates the stack. Include this from exactly one translation
-// unit: the explicit instantiations below may appear once per program.
+// Nothing here mutates the stack. Strictly, the explicit instantiations below
+// may appear once per program. Two test files include this (test_soak.cpp and
+// test_sim_load.cpp): the instantiations are identical and everything in them
+// is inline, so the linker merges them. Moving them into one .cpp would be the
+// tidy fix if a third includer appears.
 namespace stack_probe
 {
     template <class Tag, auto Member>
