@@ -1011,9 +1011,10 @@ bool NetworkStack::is_local_address(const IpAddress& address) const
     return address.is_v4() ? this->_is_local_ipv4(address.v4()) : this->_is_local_ipv6(address.v6());
 }
 
-void NetworkStack::_enqueue_loopback(bool v6, const Bytes& packet)
+void NetworkStack::_enqueue_loopback(bool v6, Bytes&& packet)
 {
-    if (this->_loopback_queue.size() >= LOOPBACK_QUEUE_LIMIT)
+    if (this->_loopback_queue.size() >= LOOPBACK_QUEUE_LIMIT
+        || this->_loopback_queued_bytes + packet.size() > LOOPBACK_QUEUE_BYTE_LIMIT)
     {
         // Loss, as on a full transmit queue: TCP retransmits, and UDP never
         // promised. Counted, since a loop that drops is otherwise invisible.
@@ -1021,7 +1022,9 @@ void NetworkStack::_enqueue_loopback(bool v6, const Bytes& packet)
         LOG_DEBUG("NetworkStack: loopback queue full - dropping a datagram");
         return;
     }
-    this->_loopback_queue.push_back({v6, packet});
+    this->_loopback_queued_bytes += packet.size();
+    // Moved all the way in: the packet is built once and never copied.
+    this->_loopback_queue.push_back({v6, std::move(packet)});
 }
 
 size_t NetworkStack::_drain_loopback(size_t limit)
@@ -1033,6 +1036,7 @@ size_t NetworkStack::_drain_loopback(size_t limit)
     {
         LoopbackDatagram datagram = std::move(this->_loopback_queue.front());
         this->_loopback_queue.pop_front();
+        this->_loopback_queued_bytes -= datagram.packet.size();
         try
         {
             if (datagram.v6)

@@ -412,3 +412,24 @@ TEST(Loopback, AnEphemeralPortNeverEqualsALocalListenersPort)
     ASSERT_NE(client->get_local_port(), 49152);
     ASSERT_NE(client->get_id(), server->get_id());
 }
+
+TEST(Loopback, TheQueueIsBoundedInBytesAsWellAsInDatagrams)
+{
+    // 1024 datagrams of 64 KiB would be 64 MiB: the count alone is no bound on
+    // memory.
+    Host host;
+    host.stack->bind_udp(5000);
+    UdpSocket* sender = host.stack->bind_udp(5001);
+    Bytes big(60000);
+    for (int i = 0; i < 100; i++)
+    {
+        sender->send_to(LOOPBACK, 5000, big);
+    }
+    ASSERT_LE(host.stack->loopback_queued_bytes(), NetworkStack::LOOPBACK_QUEUE_BYTE_LIMIT);
+    ASSERT_GT(host.stack->loopback_drops(), 0u);
+    ASSERT_GT(host.stack->loopback_queued_bytes(), NetworkStack::LOOPBACK_QUEUE_BYTE_LIMIT / 2)
+        << "it should still fill";
+    host.pump(5);
+    ASSERT_EQ(host.stack->loopback_queued_bytes(), 0u);
+    ASSERT_EQ(host.guard->writes(), 0u);
+}

@@ -835,7 +835,7 @@ void NetworkStack::_send_ipv6_packet(const IPv6Address& source, const IPv6Addres
 
     if (local)
     {
-        this->_enqueue_loopback(true, packet);
+        this->_enqueue_loopback(true, std::move(packet));
         return;
     }
 

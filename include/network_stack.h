@@ -373,8 +373,12 @@ public:
     // and the IPv6 payload length (16 bits, header excluded) can carry: a
     // loopback segment is never fragmented, and TCP's MSS on a loopback route
     // is derived from it (MTU less 40 for v4, less 60 for v6).
+    // And in bytes: 1024 datagrams of 64 KiB would otherwise be 64 MiB held
+    // for a loop that can be fed faster than it is drained. Either limit drops.
+    static constexpr size_t LOOPBACK_QUEUE_BYTE_LIMIT = 4 * 1024 * 1024;
     static constexpr uint16_t LOOPBACK_MTU = 65535;
     uint64_t loopback_drops() const { return _loopback_drops; }
+    size_t loopback_queued_bytes() const { return _loopback_queued_bytes; }
     // Packets that arrived on a real interface with a loopback source or
     // destination and were dropped (RFC 1122 3.2.1.3; RFC 4291 2.5.3).
     uint64_t loopback_martian_drops() const { return _loopback_martian_drops; }
@@ -1034,6 +1038,7 @@ private:
     };
     std::deque<LoopbackDatagram> _loopback_queue;
     uint64_t _loopback_drops = 0;
+    size_t _loopback_queued_bytes = 0;
     uint64_t _loopback_martian_drops = 0;
     // The "ingress interface" of a datagram taken off the loopback queue. Not
     // an index into _interfaces on purpose: there is no pseudo-interface (code
@@ -1051,7 +1056,7 @@ private:
     // local datagram is handled by the code that handles any other.
     void _deliver_ipv6(const Ipv6& ip, const Bytes& packet, bool link_layer_group, bool from_loopback);
     // Queues a built packet, or drops and counts it when the queue is full.
-    void _enqueue_loopback(bool v6, const Bytes& packet);
+    void _enqueue_loopback(bool v6, Bytes&& packet);
     // Delivers up to `limit` of the datagrams queued now - not those queued
     // by delivering them - and returns how many it took.
     size_t _drain_loopback(size_t limit);
