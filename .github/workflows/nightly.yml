@@ -246,9 +246,10 @@ jobs:
             || { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe sch_netem; } \
             || echo "::warning::sch_netem unavailable; the netem phase will be skipped"
 
-      - name: Build the server on our stack, and loadgen
+      - name: Build the server on our stack and on kernel sockets, and loadgen
         run: |
           make -C epoll-server -j"$(nproc)"
+          make -C epoll-server KERNEL=1 -j"$(nproc)"
           cmake --preset release
           cmake --build --preset release --target loadgen
 
