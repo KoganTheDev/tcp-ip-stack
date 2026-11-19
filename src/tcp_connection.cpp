@@ -1281,9 +1281,13 @@ void TcpConnection::_end_episode()
     _eifel_armed = false;
     _frto = Frto::OFF;
     // RFC 8985 6.2 step 4: one recovery fewer for a widened window to last.
-    if (_rack_reo_wnd_persist > 0 && --_rack_reo_wnd_persist == 0)
+    if (_rack_reo_wnd_persist > 0)
     {
-        _rack_reo_wnd_mult = 1;
+        _rack_reo_wnd_persist -= 1;
+        if (_rack_reo_wnd_persist == 0)
+        {
+            _rack_reo_wnd_mult = 1;
+        }
     }
 }
 
