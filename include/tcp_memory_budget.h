@@ -53,8 +53,9 @@ private:
 
 // One connection's draw on a budget, for one buffer. Releases what it holds
 // when told to and when destroyed, so a connection reaped in any state gives
-// its share back. Without a budget (a connection used on its own, in a test)
-// every request is granted.
+// its share back - the backstop for memory still held when it closes.
+// Without a budget (a connection used on its own, in a test) every request is
+// granted.
 class TcpMemoryCharge
 {
 public:
@@ -91,6 +92,20 @@ public:
             _budget->release(_charged);
         }
         _charged = 0;
+    }
+
+    // Gives back whatever is held beyond `keep`.
+    void release_above(size_t keep)
+    {
+        if (_charged <= keep)
+        {
+            return;
+        }
+        if (_budget)
+        {
+            _budget->release(_charged - keep);
+        }
+        _charged = keep;
     }
 
     size_t charged() const { return _charged; }

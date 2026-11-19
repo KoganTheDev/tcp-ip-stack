@@ -94,11 +94,9 @@ void TcpConnection::_transition(TcpState new_state)
     }
     if (new_state == TcpState::TIME_WAIT || new_state == TcpState::CLOSED)
     {
-        // Nothing is buffered for or from the application from here on, so
-        // the growth goes back to the stack (the capacities stay as they are:
-        // shrinking them now would gain nothing).
-        _receive_charge.release();
-        _send_charge.release();
+        // No more growth can be used from here on, so it goes back to the
+        // stack - except what bytes still sitting in the buffers occupy.
+        _trim_memory_charges();
     }
 
     // Iterate a copy: a subscriber is entitled to react by doing something that
@@ -534,6 +532,7 @@ Bytes TcpConnection::read(size_t max_bytes)
 
     _receive_queued_bytes -= taken.size();
     _bytes_read_total += taken.size();
+    _trim_memory_charges();
     uint32_t capacity_before = _receive_capacity;
     if (!taken.empty())
     {
@@ -2466,6 +2465,22 @@ namespace
                           TcpConnection::MAX_BUFFER_CAPACITY);
     }
 } // namespace
+
+void TcpConnection::_trim_memory_charges()
+{
+    if (_state != TcpState::TIME_WAIT && _state != TcpState::CLOSED)
+    {
+        return; // the capacity is still in use, whatever is buffered right now
+    }
+    // Growth is what lies above the defaults, so only bytes held beyond a
+    // default-sized buffer are growth's. Unread data can outlive the
+    // connection's state machine: an application may close() without
+    // reading, or read after the peer's FIN and TIME_WAIT.
+    size_t received = _receive_buffer_occupied();
+    _receive_charge.release_above(received > RECEIVE_BUFFER_CAPACITY ? received - RECEIVE_BUFFER_CAPACITY : 0);
+    size_t unsent = bytes_unacked();
+    _send_charge.release_above(unsent > SEND_BUFFER_CAPACITY ? unsent - SEND_BUFFER_CAPACITY : 0);
+}
 
 void TcpConnection::set_memory_budget(std::shared_ptr<TcpMemoryBudget> budget)
 {

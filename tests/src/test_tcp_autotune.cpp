@@ -347,3 +347,82 @@ TEST(TcpAutotune, AnExplicitSendBufferNeverGrows)
     ASSERT_GT(peer.connection->get_congestion_window(), TcpConnection::SEND_BUFFER_CAPACITY / 2) << "precondition";
     ASSERT_EQ(peer.connection->send_capacity(), TcpConnection::SEND_BUFFER_CAPACITY) << "SO_SNDBUF was set";
 }
+
+// --- the memory budget follows the bytes actually held ---
+
+namespace
+{
+    // Grows `peer`'s receive buffer through `budget`, then leaves `unread`
+    // bytes in it that the application never reads.
+    void grow_then_stop_reading(Peer& peer, const std::shared_ptr<TcpMemoryBudget>& budget, uint32_t unread)
+    {
+        peer.connection->set_memory_budget(budget);
+        peer.read_eagerly();
+        fast_rounds(peer, 3, 100000, TcpConnection::RCV_SPACE_FALLBACK_MS);
+        REQUIRE_TRUE(budget->in_use() > 0, "precondition: autotuning drew from the budget");
+        REQUIRE_TRUE(peer.connection->receive_capacity() >= unread, "precondition: room for the unread bytes");
+        peer.connection->set_data_ready_callback([]() {});
+        peer.burst(unread);
+        REQUIRE_TRUE(peer.connection->bytes_available() == unread, "the application has not read them");
+    }
+
+    // The peer's FIN|ACK, acknowledging our FIN, at its next sequence number.
+    void peer_fin(Peer& peer)
+    {
+        auto fin = std::make_unique<Tcp>(12345, 8080, peer.next_seq, peer.ack_number, 5, FLAG_ACK | 0x01, 65535, 0, 0);
+        if (peer.timestamps)
+        {
+            peer.peer_tsval += 1;
+            fin->set_timestamp_option(peer.peer_tsval, peer.last_tsval());
+        }
+        peer.connection->on_segment(*fin);
+    }
+}
+
+// Unread data held past the default capacity is memory autotuning's growth
+// still pins, in TIME_WAIT as in any other state: the charge stays until the
+// bytes are read (or the connection is destroyed), so other connections
+// stay blocked at the cap meanwhile.
+TEST(TcpAutotune, UnreadDataKeepsItsChargeInTimeWait)
+{
+    constexpr uint32_t UNREAD = 300000;
+    auto budget = std::make_shared<TcpMemoryBudget>();
+    Peer peer(true);
+    grow_then_stop_reading(peer, budget, UNREAD);
+    size_t above_default = UNREAD - TcpConnection::RECEIVE_BUFFER_CAPACITY;
+
+    peer.connection->close();
+    peer.ack_number += 1; // our FIN
+    peer_fin(peer);
+    ASSERT_EQ(peer.connection->get_state(), TcpState::TIME_WAIT) << "precondition";
+    ASSERT_GE(budget->in_use(), above_default) << "the unread bytes past the default are still charged";
+
+    // The cap is where it is: another connection cannot grow into memory
+    // that is still held.
+    budget->set_limit(budget->in_use());
+    Peer other(true);
+    other.connection->set_memory_budget(budget);
+    other.read_eagerly();
+    fast_rounds(other, 3, 100000, TcpConnection::RCV_SPACE_FALLBACK_MS);
+    ASSERT_EQ(other.connection->receive_capacity(), TcpConnection::RECEIVE_BUFFER_CAPACITY)
+        << "blocked at the cap while the first connection's bytes are held";
+
+    static_cast<void>(peer.connection->read());
+    ASSERT_EQ(peer.connection->memory_charged(), 0u) << "read, the bytes no longer pin anything";
+}
+
+TEST(TcpAutotune, UnreadDataKeepsItsChargeUntilAResetConnectionIsDestroyed)
+{
+    constexpr uint32_t UNREAD = 300000;
+    auto budget = std::make_shared<TcpMemoryBudget>();
+    {
+        Peer peer(true);
+        grow_then_stop_reading(peer, budget, UNREAD);
+        auto rst = std::make_unique<Tcp>(12345, 8080, peer.next_seq, 0, 5, 0x04, 0, 0, 0);
+        peer.connection->on_segment(*rst);
+        ASSERT_EQ(peer.connection->get_state(), TcpState::CLOSED) << "precondition";
+        ASSERT_GE(budget->in_use(), UNREAD - TcpConnection::RECEIVE_BUFFER_CAPACITY)
+            << "CLOSED with the bytes still queued: still charged";
+    }
+    ASSERT_EQ(budget->in_use(), 0u) << "destroyed (reaped), everything is given back";
+}
