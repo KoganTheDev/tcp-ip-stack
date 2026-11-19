@@ -13,7 +13,16 @@ CXX = g++
 # between builds and tracking them costs rebuild time for nothing. -MP emits a
 # phony target for each header, so deleting or renaming a header is a rebuild
 # rather than "No rule to make target".
-CXXFLAGS = -std=c++17 -Wall -Wextra -pthread -MMD -MP $(INCLUDES)
+#
+# Optimised by default, because this Makefile builds the binary the nightly load
+# test measures. It used to pass no -O at all, so the server ran at -O0: the
+# burst phase (200 connections at once) took 74 ms per round against 9 ms on
+# kernel sockets, and the same burst in bench/bench_burst.cpp is 23 ms per round
+# at -O0 against 4 ms at -O2, with identical frames and no drops. -O0 spent its
+# time in std::vector/unique_ptr/Bytes wrappers, not in any one algorithm. Use
+# OPT=-O0 (or -Og) for a debugging session.
+OPT ?= -O2 -g
+CXXFLAGS = -std=c++17 $(OPT) -Wall -Wextra -pthread -MMD -MP $(INCLUDES)
 
 # KERNEL=1 builds the same server logic (include/echo_server.h) against the
 # kernel's own sockets instead of this repo's stack: ustack::KernelStack, no TAP
