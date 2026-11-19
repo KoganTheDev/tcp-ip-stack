@@ -238,7 +238,7 @@ debug_rerun()
 # The JSON lines shown in a phase's console summary: rates, connect latency and
 # round-trip latency, the last also split into the first round and the rest (a
 # slow first round with fast later ones means connection setup, not the data path).
-SUMMARY_KEYS='"(connections_per_s|throughput_mib_per_s|connect|round_trip|round_trip_first|round_trip_rest)"'
+SUMMARY_KEYS='"(connections_per_s|throughput_mib_per_s|connect|round_trip|round_trip_first|round_trip_rest)":'
 
 # print_stats: asks the server for its stats line (SIGUSR1, answered on the
 # reactor thread, so it can lag by a loop pass) and prints the one that comes
