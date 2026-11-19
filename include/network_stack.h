@@ -378,6 +378,10 @@ public:
     // Packets that arrived on a real interface with a loopback source or
     // destination and were dropped (RFC 1122 3.2.1.3; RFC 4291 2.5.3).
     uint64_t loopback_martian_drops() const { return _loopback_martian_drops; }
+    // Whether a datagram to this address stays in the host: 127.0.0.0/8, ::1, or
+    // an address configured on this stack. What the socket layer asks to accept
+    // a bind() and to size a datagram by the loopback MTU.
+    bool is_local_address(const IpAddress& address) const;
     uint64_t challenge_acks_sent() const { return _challenge_acks_sent; }
     uint64_t challenge_acks_suppressed() const { return _challenge_acks_suppressed; }
     // SYNs that ended a TIME_WAIT early to open a new connection on the same
@@ -1039,7 +1043,6 @@ private:
     static constexpr size_t LOOPBACK_INGRESS = static_cast<size_t>(-1);
     // 127.0.0.0/8 or an address configured on an interface.
     bool _is_local_ipv4(const IPv4Address& address) const;
-    bool is_local_address(const IpAddress& address) const;
     bool _is_local_ipv6(const IPv6Address& address) const;
     // The v6 receive path for a datagram off the loopback queue.
     void _handle_loopback_ipv6(const Bytes& packet);

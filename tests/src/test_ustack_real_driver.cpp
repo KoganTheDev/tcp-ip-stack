@@ -2,6 +2,7 @@
 
 #include <netinet/in.h>
 #include <poll.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -225,4 +226,36 @@ TEST_F(UstackRealDriver, ExternalFdMixesWithStackSocketsAndRejectsBadRequests)
     // Closing the ustack epoll leaves no watch behind in the driver.
     ASSERT_EQ(client->close(ep), 0);
     ::close(efd);
+}
+
+// Loopback traffic has no fd, so only ms_until_next_timer() reading 0 keeps the
+// real driver from sleeping through it: a connect to 127.0.0.1 completes with
+// no timer armed and no frame on the link.
+TEST(UstackRealDriverLoopback, AConnectTo127001CompletesWithoutTheWire)
+{
+    int fds[2] = {-1, -1};
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_SEQPACKET, 0, fds), 0) << std::strerror(errno);
+    ustack::Stack stack(std::make_unique<NetworkStack>(std::make_unique<SocketPairChannel>(fds[0]),
+                                                       MacAddress("02:00:00:00:00:01"), CLIENT_IP));
+    sockaddr_in loopback = address(IPv4Address("127.0.0.1"), PORT);
+    int listener = stack.socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    ASSERT_EQ(stack.bind(listener, reinterpret_cast<sockaddr*>(&loopback), sizeof(loopback)), 0);
+    ASSERT_EQ(stack.listen(listener, 4), 0);
+    int client = stack.socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    ASSERT_EQ(stack.connect(client, reinterpret_cast<sockaddr*>(&loopback), sizeof(loopback)), -1);
+    ASSERT_EQ(errno, EINPROGRESS);
+
+    int epfd = stack.epoll_create1(0);
+    epoll_event event{};
+    event.events = EPOLLIN;
+    event.data.fd = listener;
+    ASSERT_EQ(stack.epoll_ctl(epfd, EPOLL_CTL_ADD, listener, &event), 0);
+    epoll_event out[2];
+    ASSERT_EQ(stack.epoll_wait(epfd, out, 2, 2000), 1) << "the handshake stalled";
+    ASSERT_GE(stack.accept4(listener, nullptr, nullptr, SOCK_NONBLOCK), 0);
+
+    char byte = 0;
+    ASSERT_EQ(::recv(fds[1], &byte, 1, MSG_DONTWAIT), -1) << "something reached the link";
+    ASSERT_EQ(errno, EAGAIN);
+    ::close(fds[1]);
 }
