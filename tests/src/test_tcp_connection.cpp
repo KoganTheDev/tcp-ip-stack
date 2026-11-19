@@ -2627,22 +2627,25 @@ TEST(TcpConnection, ALongerSegmentAtABufferedStartKeepsItsNewBytes)
     ASSERT_TRUE(h.delivered.to_hex() == stream(501, 540).to_hex()) << "every byte through 540 is delivered, in order";
 }
 
-// Overlapping ranges are held once: one SACK block for the union, and the
-// buffer holds the bytes actually received rather than the sum of the
-// segments that brought them.
+// Overlapping ranges are held once: one range (one SACK block) for the union,
+// and the buffer holds the bytes actually received rather than the sum of the
+// segments that brought them. Each overlap is also a duplicate, so the ack
+// that answers it leads with a D-SACK block (RFC 2883) for the overlap and
+// the union follows it as the second block.
 TEST(TcpConnection, OverlappingOutOfOrderSegmentsAreHeldOnce)
 {
     ReorderHarness h(500);
 
     h.arrive(510, 520);
     h.arrive(506, 530); // contains the first
-    ASSERT_TRUE(h.sack.size() == 1 && h.sack[0].start == 506 && h.sack[0].end == 530) << "one block for the union";
+    ASSERT_TRUE(h.sack.size() == 2 && h.sack[0].start == 510 && h.sack[0].end == 520) << "D-SACK for the overlap";
+    ASSERT_TRUE(h.sack[1].start == 506 && h.sack[1].end == 530) << "then one block for the union";
     ASSERT_TRUE(h.connection->bytes_out_of_order() == 24)
         << "24 bytes held, counted once; held " << h.connection->bytes_out_of_order();
 
     h.arrive(526, 540); // overlaps the tail
     h.arrive(502, 508); // overlaps the head, leaving 501 as the only gap
-    ASSERT_TRUE(h.sack.size() == 1 && h.sack[0].start == 502 && h.sack[0].end == 540) << "still one block";
+    ASSERT_TRUE(h.sack.size() == 2 && h.sack[1].start == 502 && h.sack[1].end == 540) << "still one range";
     ASSERT_TRUE(h.connection->bytes_out_of_order() == 38)
         << "38 bytes held; held " << h.connection->bytes_out_of_order();
 
@@ -2658,8 +2661,9 @@ TEST(TcpConnection, OverlappingSegmentsAcrossTheSequenceWrapAreMerged)
     h.arrive(0xFFFFFFF0u, 0x00000008u);
     h.arrive(0xFFFFFFF8u, 0x00000020u);
     h.arrive(0xFFFFFFE8u, 0xFFFFFFF4u);
-    ASSERT_TRUE(h.sack.size() == 1 && h.sack[0].start == 0xFFFFFFE8u && h.sack[0].end == 0x00000020u)
-        << "one block spanning the wrap";
+    ASSERT_TRUE(h.sack.size() == 2 && h.sack[0].start == 0xFFFFFFF0u && h.sack[0].end == 0xFFFFFFF4u)
+        << "D-SACK for the overlap";
+    ASSERT_TRUE(h.sack[1].start == 0xFFFFFFE8u && h.sack[1].end == 0x00000020u) << "one range spanning the wrap";
     h.arrive(0xFFFFFFE1u, 0xFFFFFFE8u);
     ASSERT_TRUE(h.delivered.to_hex() == stream(0xFFFFFFE1u, 0x00000020u).to_hex()) << "delivered whole, in order";
 }

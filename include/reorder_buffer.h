@@ -73,6 +73,14 @@ public:
     // names nothing.
     std::vector<Tcp::SackBlock> sack_blocks(size_t limit, uint64_t rcv_nxt) const;
 
+    // The part of [start, end) that is already held: the intersection with the
+    // first held range it overlaps (a segment spanning several ranges reports
+    // only the first - one D-SACK block names one range). False if none of it
+    // is held. Call before insert().
+    bool held_part(uint64_t start, uint64_t end, uint64_t& held_start, uint64_t& held_end) const;
+    // The held range that contains position `pos`, as a block; nullopt if none.
+    std::optional<Tcp::SackBlock> range_containing(uint64_t pos) const;
+
     void clear();
     bool empty() const { return _ranges.empty(); }
     // Total bytes held, kept alongside the map: summing it instead was

@@ -654,6 +654,7 @@ public:
         uint64_t loss_probes = 0;            // tail loss probes sent (RFC 8985 7.3)
         uint64_t loss_probe_repairs = 0;     // losses a probe repaired by itself (7.4.2)
         uint64_t ecn_reductions = 0;         // cwnd reductions for an ECN-Echo (RFC 3168 6.1.2)
+        uint64_t dsacks_sent = 0;            // acks that carried a D-SACK block (RFC 2883)
     };
     const Stats& stats() const { return _stats; }
     // Scoreboard entries the sender has examined, for cost tests.
@@ -684,7 +685,7 @@ private:
     void _transmit(uint8_t flags, uint32_t seq, const Bytes& payload, Ecn ecn = Ecn::NOT_ECT);
     // The options for a segment with these flags and this much payload: the
     // SYN's negotiation options, or a timestamp and whatever SACK blocks fit.
-    void _add_options(Tcp& header, uint8_t flags, size_t payload_size) const;
+    void _add_options(Tcp& header, uint8_t flags, size_t payload_size);
     // include_ack is false only for the very first segment of an active
     // open: every other segment this stack ever sends acks something.
     void _send_flags(uint8_t flags, const Bytes& payload = Bytes(), bool include_ack = true);
@@ -1012,7 +1013,22 @@ private:
     // The out-of-order ranges this side currently holds, as they would be
     // reported to the peer. One block per _reorder_buffer range, the range that
     // arrived last first.
+    // With a D-SACK pending (below) it comes first, RFC 2883 section 4.
     std::vector<Tcp::SackBlock> _sack_blocks_to_report() const;
+    // Receiver D-SACK (RFC 2883): the last duplicate range received, in
+    // unwrapped sequence space, until an ack that can carry it goes out. One
+    // slot is enough: every duplicate is acked at once, so a second one
+    // replaces a first only if that ack never left, and the first ack after
+    // a duplicate is the one the sender needs.
+    struct PendingDsack
+    {
+        uint64_t start;
+        uint64_t end;
+    };
+    std::optional<PendingDsack> _pending_dsack;
+    // Notes [start, end) (unwrapped) as a duplicate for the next ack; only
+    // when SACK was negotiated.
+    void _note_duplicate(uint64_t start, uint64_t end);
 
     // --- timestamps and PAWS (RFC 7323) ---
     //

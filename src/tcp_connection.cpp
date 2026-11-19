@@ -120,7 +120,41 @@ std::vector<Tcp::SackBlock> TcpConnection::_sack_blocks_to_report() const
     // timestamp. The ones dropped are the oldest, which the peer has most
     // likely already heard.
     size_t limit = _timestamps_negotiated ? Tcp::MAX_SACK_BLOCKS_WITH_TIMESTAMP : Tcp::MAX_SACK_BLOCKS;
-    return _reorder_buffer.sack_blocks(limit, _recv_next_unwrapped);
+    std::vector<Tcp::SackBlock> normal = _reorder_buffer.sack_blocks(limit, _recv_next_unwrapped);
+    if (!_pending_dsack)
+    {
+        return normal;
+    }
+
+    // RFC 2883 section 4: the D-SACK block first, then - when the duplicate
+    // lies inside an out-of-order range - that range, then the usual blocks.
+    std::vector<Tcp::SackBlock> blocks;
+    blocks.push_back({static_cast<uint32_t>(_pending_dsack->start), static_cast<uint32_t>(_pending_dsack->end)});
+    std::optional<Tcp::SackBlock> holder = _reorder_buffer.range_containing(_pending_dsack->start);
+    if (holder)
+    {
+        blocks.push_back(*holder);
+    }
+    for (const Tcp::SackBlock& block : normal)
+    {
+        if (blocks.size() >= limit)
+        {
+            break;
+        }
+        if (!holder || block.start != holder->start)
+        {
+            blocks.push_back(block);
+        }
+    }
+    return blocks;
+}
+
+void TcpConnection::_note_duplicate(uint64_t start, uint64_t end)
+{
+    if (_sack_permitted && end > start)
+    {
+        _pending_dsack = PendingDsack{start, end};
+    }
 }
 
 uint32_t TcpConnection::_advertised_window() const
@@ -282,7 +316,7 @@ void TcpConnection::_update_ts_recent(const Tcp& segment)
     }
 }
 
-void TcpConnection::_add_options(Tcp& header, uint8_t flags, size_t payload_size) const
+void TcpConnection::_add_options(Tcp& header, uint8_t flags, size_t payload_size)
 {
     if (flags & FLAG_SYN)
     {
@@ -333,6 +367,17 @@ void TcpConnection::_add_options(Tcp& header, uint8_t flags, size_t payload_size
         if (blocks.size() > fit)
         {
             blocks.resize(fit);
+        }
+        if (_pending_dsack)
+        {
+            // Reported once (RFC 2883): whatever ack goes out next either
+            // carries it or had no room for any block, and a late D-SACK
+            // would only mislead the sender about a newer duplicate.
+            if (fit > 0)
+            {
+                _stats.dsacks_sent++;
+            }
+            _pending_dsack.reset();
         }
         if (!blocks.empty())
         {
@@ -2037,6 +2082,16 @@ void TcpConnection::on_segment(const Tcp& segment, Ecn ecn)
             _handle_fin(segment.get_sequence_number() + payload_size); // re-ack it and restart 2*MSL
             return;
         }
+        // Data entirely below RCV.NXT is a duplicate of what was delivered:
+        // the ack that answers it carries that range as a D-SACK block (RFC
+        // 2883 section 4.1). The partly-old case is not caught here - its new
+        // tail makes it acceptable - and is noted at the data path below.
+        if (payload_size > 0 && seq_at_or_before(segment.get_sequence_number() + payload_size, _recv_next)
+            && (_state == TcpState::ESTABLISHED || _state == TcpState::FIN_WAIT_1 || _state == TcpState::FIN_WAIT_2))
+        {
+            uint32_t behind = _recv_next - segment.get_sequence_number();
+            _note_duplicate(_recv_next_unwrapped - behind, _recv_next_unwrapped - behind + payload_size);
+        }
         _send_pure_ack();
         return;
     }
@@ -2141,6 +2196,16 @@ void TcpConnection::on_segment(const Tcp& segment, Ecn ecn)
                 // sent *immediately*, never delayed
                 if (_seq_in_receive_window(seq))
                 {
+                    // Before the insert: afterwards the segment's own bytes are
+                    // held. Whole or partial, what was held already is the
+                    // duplicate (RFC 2883 section 4.1).
+                    uint64_t start = _recv_next_unwrapped + static_cast<uint32_t>(seq - _recv_next);
+                    uint64_t held_start = 0;
+                    uint64_t held_end = 0;
+                    if (_reorder_buffer.held_part(start, start + payload_size, held_start, held_end))
+                    {
+                        _note_duplicate(held_start, held_end);
+                    }
                     _buffer_out_of_order(seq, payload);
                 }
                 _send_pure_ack();
@@ -2150,6 +2215,11 @@ void TcpConnection::on_segment(const Tcp& segment, Ecn ecn)
                 // seq < _recv_next: fully or partially already seen. A
                 // partial overlap's new tail is still worth delivering
                 uint32_t already_seen = _recv_next - seq;
+                // The part below RCV.NXT is the duplicate, whole segment or
+                // just its head (RFC 2883 section 4.1); noted before the new
+                // tail is delivered moves RCV.NXT.
+                _note_duplicate(_recv_next_unwrapped - already_seen,
+                                _recv_next_unwrapped - already_seen + std::min<uint32_t>(already_seen, payload_size));
                 if (already_seen < payload.size())
                 {
                     size_t new_bytes = std::min<size_t>(payload.size() - already_seen, _advertised_window());
