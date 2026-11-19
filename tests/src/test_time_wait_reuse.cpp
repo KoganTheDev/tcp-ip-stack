@@ -361,3 +361,52 @@ TEST(TimeWaitReuse, ExpectNewIsnFailsWhenNoSynFollows)
     ASSERT_FALSE(result.passed);
     ASSERT_NE(result.message.find("never sent another SYN"), std::string::npos) << result.message;
 }
+
+// --- the client side ---
+
+namespace
+{
+    // NetworkStack's ephemeral-port counter, private: reached the way
+    // sim/stack_probe.h reaches its tables (an explicit instantiation may
+    // name a private member), so a test can make the counter come round to a
+    // port in TIME_WAIT without opening 16384 connections first.
+    struct NextEphemeralPortTag
+    {
+        static inline uint16_t NetworkStack::* member = nullptr;
+    };
+    template <class Tag, auto Member>
+    struct MemberOpener
+    {
+        static inline const bool installed = (Tag::member = Member, true);
+    };
+    template struct MemberOpener<NextEphemeralPortTag, &NetworkStack::_next_ephemeral_port>;
+}
+
+// An active close leaves this side's four-tuple in TIME_WAIT. A new connect()
+// to the same peer must not pick that port when the wrapping allocator comes
+// round to it - it would store the new connection under a live key - and a
+// caller asking for that port explicitly is refused.
+TEST(TimeWaitReuse, AnEphemeralPortInTimeWaitIsNotHandedOutAgain)
+{
+    Peer peer;
+    TcpConnection* client = peer.stack().connect(PEER_IP, PEER_PORT);
+    ASSERT_TRUE(client != nullptr);
+    tcp_frame::Segment syn = peer.take_one();
+    const uint16_t port = syn.src_port;
+    peer.inject(port, tcp_frame::SYN | tcp_frame::ACK, 0, syn.seq + 1);
+    peer.take_one(); // the handshake's ACK
+    client->close();
+    peer.take_one(); // the FIN
+    peer.inject(port, tcp_frame::FIN | tcp_frame::ACK, 1, syn.seq + 2);
+    peer.take_one(); // its ACK
+    ASSERT_EQ(client->get_state(), TcpState::TIME_WAIT);
+
+    peer.stack().*NextEphemeralPortTag::member = port;
+    TcpConnection* second = peer.stack().connect(PEER_IP, PEER_PORT);
+    ASSERT_TRUE(second != nullptr);
+    ASSERT_NE(peer.take_one().src_port, port) << "the port in TIME_WAIT was handed out again";
+    ASSERT_EQ(client->get_state(), TcpState::TIME_WAIT) << "and the old connection is untouched";
+
+    ASSERT_TRUE(peer.stack().connect(PEER_IP, PEER_PORT, port) == nullptr)
+        << "an explicit bind to the four-tuple in TIME_WAIT is refused";
+}
