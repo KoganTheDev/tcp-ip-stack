@@ -10,6 +10,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <optional>
 #include <random>
 #include <string>
@@ -76,6 +77,26 @@ public:
     static constexpr size_t DEFAULT_MAX_CONNECTIONS = 1024;
     static constexpr int ACCEPT_RETRY_MS = 1000;
 
+    // Watches one more kernel fd in the reactor's own epoll, and calls
+    // on_readable from the reactor thread when it becomes readable (level
+    // triggered, so the callback must drain it). Meant for a signalfd: the
+    // stack is only ever touched from this thread, which a signal handler
+    // could not promise. Returns false where the stack cannot watch kernel
+    // fds (the simulator); the callback then never runs. One fd, set once.
+    bool watch_kernel_fd(int fd, std::function<void()> on_readable)
+    {
+        epoll_event event{};
+        event.events = EPOLLIN;
+        event.data.u64 = EXTRA_FD_ID;
+        if (this->_stack.epoll_ctl_external(this->_epfd, EPOLL_CTL_ADD, fd, &event) != 0)
+        {
+            return false;
+        }
+        this->_extra_fd = fd;
+        this->_on_extra_fd = std::move(on_readable);
+        return true;
+    }
+
     // Makes every piece of pool work take at least this long, as real
     // per-connection processing would. Mostly for tests of the reactor's
     // sleeping.
@@ -118,6 +139,10 @@ public:
             // Before the queue's fd is closed, or the driver keeps a stale entry.
             static_cast<void>(
                 this->_stack.epoll_ctl_external(this->_epfd, EPOLL_CTL_DEL, this->_completion_queue.get_fd(), nullptr));
+        }
+        if (this->_extra_fd >= 0)
+        {
+            static_cast<void>(this->_stack.epoll_ctl_external(this->_epfd, EPOLL_CTL_DEL, this->_extra_fd, nullptr));
         }
         this->_completion_queue.drain_and_run();
         for (auto& entry : this->_conns)
@@ -322,6 +347,11 @@ private:
         if (id == COMPLETION_ID)
         {
             return; // the wake-up is all it is for; step() drains the queue
+        }
+        if (id == EXTRA_FD_ID)
+        {
+            this->_on_extra_fd();
+            return;
         }
         if (this->_listeners.count(id) > 0)
         {
@@ -663,6 +693,10 @@ private:
     // Event id of the completion queue's eventfd; connection and listener ids count up from 1.
     static constexpr uint64_t COMPLETION_ID = 0;
     bool _completion_watched = false;
+    // The fd given to watch_kernel_fd(), if any, and what to do when it is readable.
+    static constexpr uint64_t EXTRA_FD_ID = UINT64_MAX;
+    int _extra_fd = -1;
+    std::function<void()> _on_extra_fd;
     std::chrono::milliseconds _work_delay{0};
     std::chrono::microseconds _work_jitter{0};
 

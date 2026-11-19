@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include "echo_server.h"
 #include "stack_harness.h"
@@ -508,4 +510,36 @@ TEST(EchoServerWakeup, ReactorSleepsUntilPoolWorkCompletes)
     }
     EXPECT_EQ(got, "slow");
     EXPECT_LE(steps, 6) << "the reactor woke " << steps << " times while one request was in the pool";
+}
+
+// The stats line is requested through a signalfd added to the reactor's epoll
+// (watch_kernel_fd), so the callback runs on the reactor thread when the fd
+// turns readable. An eventfd stands in for the signalfd here.
+TEST(EchoServerWakeup, AWatchedKernelFdRunsItsCallbackOnTheReactorThread)
+{
+    KernelHarness harness;
+    EchoServer<ustack::KernelStack> server(harness.server_stack(), 1);
+    int event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    ASSERT_TRUE(event_fd >= 0) << "eventfd failed: " << std::strerror(errno);
+
+    std::thread::id callback_thread;
+    int calls = 0;
+    ASSERT_TRUE(server.watch_kernel_fd(event_fd,
+                                       [&]
+                                       {
+                                           uint64_t count = 0;
+                                           ASSERT_TRUE(read(event_fd, &count, sizeof(count)) == sizeof(count))
+                                               << "the callback must be able to drain the fd";
+                                           callback_thread = std::this_thread::get_id();
+                                           calls++;
+                                       }));
+
+    server.step(0);
+    ASSERT_TRUE(calls == 0) << "nothing readable yet, so no callback";
+    uint64_t one = 1;
+    ASSERT_TRUE(write(event_fd, &one, sizeof(one)) == sizeof(one)) << "eventfd write failed";
+    server.step(1000);
+    ASSERT_TRUE(calls == 1) << "the readable fd must wake the reactor and run the callback once, got " << calls;
+    ASSERT_TRUE(callback_thread == std::this_thread::get_id()) << "and on the thread that called step()";
+    close(event_fd);
 }
