@@ -530,3 +530,52 @@ TEST(TcpSpuriousRto, NoFrtoWhileALossProbeRetransmissionIsOutstanding)
         ASSERT_EQ(s.stats().spurious_rtos_undone, probe ? 0u : 1u) << (probe ? "with" : "without") << " a probe";
     }
 }
+
+// --- what a lying receiver can do with D-SACK ---
+
+// A receiver that forges D-SACKs - for ranges never resent, below
+// everything ever sent, a whole window at once, the one real
+// retransmission over and over - gets nothing for them: the episode, which
+// resent two segments, stays reduced, and the reordering window grows at
+// most the one step its single genuine report allows.
+TEST(TcpDsackForgery, ForgedDsacksUndoNothingAndWidenNothing)
+{
+    Sender s = measured();
+    s.send(10);
+    s.pass(20);
+    for (uint32_t n = 1; n <= 3; n++)
+        s.ack(s.seg(0), {{s.seg(1), s.seg(n + 1)}});
+    s.ack(s.seg(0), {{s.seg(5), s.seg(10)}, {s.seg(1), s.seg(4)}});
+    ASSERT_EQ(s.count_sent(s.seg(0)), 2u) << "precondition";
+    ASSERT_EQ(s.count_sent(s.seg(4)), 2u) << "precondition";
+    s.ack(s.seg(10));
+    uint32_t cwnd = s.c->get_congestion_window();
+
+    for (int round = 0; round < 50; round++)
+    {
+        s.ack(s.seg(10), {s.block(2)});                                // never resent
+        s.ack(s.seg(10), {{s.seg(0) - 50000, s.seg(0) - 49000}});      // below anything sent
+        s.ack(s.seg(10), {{s.seg(0), s.seg(10)}});                     // the whole flight
+        s.ack(s.seg(10), {{s.seg(0), s.seg(0) + 1}});                  // part of a resent one
+        s.ack(s.seg(10), {{s.seg(4), s.seg(0)}});                      // inverted
+        s.ack(s.seg(10), {s.block(0)});                                // the genuine one, again
+        s.ack(s.seg(10), {{s.seg(20), s.seg(21)}, {s.seg(19), s.seg(22)}}); // above anything sent
+    }
+    ASSERT_EQ(s.stats().dsacks_received, 1u) << "only the genuine report counts, once";
+    ASSERT_EQ(s.stats().spurious_recoveries_undone, 0u) << "4's copy is still unreported";
+    ASSERT_EQ(s.c->get_congestion_window(), cwnd);
+    ASSERT_LE(s.c->rack_reo_wnd_mult(), 2u);
+}
+
+// Nothing genuine at all: no count, no growth.
+TEST(TcpDsackForgery, DsacksForDataNeverResentChangeNothing)
+{
+    Sender s = measured();
+    s.send(10);
+    s.pass(20);
+    s.ack(s.seg(10));
+    for (uint32_t n = 0; n < 10; n++)
+        s.ack(s.seg(10), {s.block(n)});
+    ASSERT_EQ(s.stats().dsacks_received, 0u);
+    ASSERT_EQ(s.c->rack_reo_wnd_mult(), 1u);
+}

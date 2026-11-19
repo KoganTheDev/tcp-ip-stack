@@ -383,3 +383,67 @@ TEST_F(SimRecovery, ADelaySpikeTheRetransmissionOvertakesIsUndoneByDsack)
     ASSERT_EQ(r.stats.spurious_recoveries_undone, 1u) << r.describe();
     ASSERT_EQ(r.undo.cwnd_at_start, r.cwnd_before_rto);
 }
+
+// --- what must never be undone ---
+
+// Real losses, of every shape the tests above repair - several in one
+// flight, a lost retransmission, the tail, and a blackout of the whole
+// flight that only the RTO can repair - with and without timestamps. The
+// retransmissions they draw repair data the receiver did not have, so no
+// D-SACK can report them, Eifel sees its retransmission's TSval echoed, and
+// F-RTO a duplicate or an ack for everything: nothing is undone.
+TEST_F(SimRecovery, ARealLossIsNeverUndone)
+{
+    uint64_t timeouts = 0;
+    for (bool timestamps : {true, false})
+    {
+        // Segments carry 1448 bytes with timestamps, 1460 without.
+        const int tail = static_cast<int>((400000 + (timestamps ? 1447 : 1459)) / (timestamps ? 1448 : 1460));
+        const std::vector<std::pair<const char*, std::function<bool(int, int)>>> losses = {
+            {"3 drops in one flight", [](int index, int transmission)
+             { return transmission == 1 && (index == 60 || index == 63 || index == 66); }},
+            {"a lost retransmission", [](int index, int transmission) { return index == 60 && transmission <= 2; }},
+            {"tail loss", [tail](int index, int transmission)
+             { return transmission == 1 && (index == tail - 2 || index == tail - 1); }},
+            // Every first transmission from segment 100 on: nothing above the
+            // hole arrives to be SACKed, so only the RTO notices.
+            {"blackout", [](int index, int transmission) { return transmission == 1 && index >= 100; }},
+        };
+        for (const auto& [what, drop] : losses)
+        {
+            Result r = transfer(1, wire(), 400000, drop, CongestionControlAlgorithm::CUBIC, TcpEcnMode::PASSIVE,
+                                nullptr, timestamps);
+            report(std::string(what) + (timestamps ? ", timestamps" : ", SACK only"), r);
+            ASSERT_TRUE(r.completed && r.intact) << what << ": " << r.describe();
+            ASSERT_GT(r.stats.retransmitted_segments, 0u) << "precondition: " << what << ": " << r.describe();
+            ASSERT_EQ(r.stats.spurious_rtos_undone, 0u) << what << ": " << r.describe();
+            ASSERT_EQ(r.stats.spurious_recoveries_undone, 0u) << what << ": " << r.describe();
+            timeouts += r.stats.retransmit_timeouts;
+        }
+    }
+    ASSERT_GT(timeouts, 0u) << "precondition: the blackout costs a timeout, so the RTO detectors were tried";
+}
+
+// The delay spike that is undone above, on a path that also marks CE: the
+// ECN-Echo the sender sees during the episode is congestion, so the episode
+// is not undone, whatever Eifel, F-RTO or a D-SACK would say.
+TEST_F(SimRecovery, CeMarksDuringASpuriousTimeoutKeepItsReduction)
+{
+    LinkParams slow = wire();
+    slow.bytes_per_ms = 300;
+    slow.ecn_mark = 0.2;
+    for (bool timestamps : {true, false})
+    {
+        Result r = transfer(
+            1, slow, 400000, nullptr, CongestionControlAlgorithm::CUBIC, TcpEcnMode::ON,
+            [](uint64_t now_ms) { return now_ms >= 150 && now_ms < 700 ? 1000u : 0u; }, timestamps);
+        report(timestamps ? "1 s ACK delay spike with CE marks, timestamps"
+                          : "1 s ACK delay spike with CE marks, SACK only",
+               r);
+        ASSERT_TRUE(r.completed && r.intact) << r.describe();
+        ASSERT_GT(r.ce_marked, 0u) << "precondition: the link marked";
+        ASSERT_GE(r.stats.retransmit_timeouts, 1u) << "precondition: the spike still costs a timeout";
+        ASSERT_EQ(r.stats.spurious_rtos_undone, 0u) << r.describe();
+        ASSERT_EQ(r.stats.spurious_recoveries_undone, 0u) << r.describe();
+    }
+}

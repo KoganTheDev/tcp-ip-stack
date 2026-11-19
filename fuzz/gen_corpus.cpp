@@ -10,6 +10,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <memory>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -20,9 +22,12 @@
 #include "dhcp.h"
 #include "dns.h"
 #include "ethernet.h"
+#include "fake_packet_channel.h"
 #include "icmpv6.h"
 #include "ipv6.h"
+#include "network_stack.h"
 #include "sim/tcp_frame.h"
+#include "stack_seed.h"
 #include "utils.h"
 
 namespace
@@ -121,6 +126,34 @@ namespace
         item.push_back(control);
         item |= frame;
         return item;
+    }
+
+    // The ISN of the stack harness's connection: the same stack, seeded the
+    // same way (fuzz/stack_seed.h), answering the same SYN at the same
+    // moment, so the SYN-ACK carries the same sequence number. The setup
+    // mirrors World in fuzz/stack.cpp.
+    uint32_t stack_harness_isn(const Bytes& syn)
+    {
+        auto owned = std::make_unique<FakePacketChannel>();
+        FakePacketChannel* channel = owned.get();
+        NetworkStack stack(std::move(owned), MAC_A, IP_A);
+        stack.set_secret_seed(STACK_HARNESS_SECRET_SEED);
+        stack.add_static_arp_entry(IP_B, MAC_B);
+        stack.add_ipv6_address(IPv6Address("fd00::1"));
+        stack.enable_ipv6();
+        stack.bind_udp(53);
+        stack.listen(80);
+        channel->push_inbound(syn);
+        stack.poll();
+        for (const Bytes& frame : channel->outbound_frames())
+        {
+            tcp_frame::Segment reply;
+            std::string error;
+            if (tcp_frame::parse(frame, reply, error) && (reply.flags & tcp_frame::SYN) != 0)
+                return reply.seq;
+        }
+        (void)std::fprintf(stderr, "gen_corpus: the stack harness's SYN drew no SYN-ACK\n");
+        std::exit(1);
     }
 
     Bytes dns_response()
@@ -359,6 +392,40 @@ int main(int argc, char** argv)
         save("stack", "fragments", stack_item(frag, 0x00) | stack_item(last, 0x1f));
     }
     save("stack", "idle_then_close", stack_item(Bytes(), 0x7f) | stack_item(data, 0x7f));
+    {
+        // A lying receiver's D-SACKs (RFC 2883), against a connection with a
+        // timed-out segment: the application writes 200 bytes, 1.25 s pass
+        // (the RTO resends them), then acks carry the genuine D-SACK for the
+        // copy many times over, and forged ones - for data never resent,
+        // below the ISN, the whole window, a sliver, an inverted range, above
+        // anything sent, and the contained-in-the-second-block form. Seeds
+        // for the sender's D-SACK accounting and undo paths.
+        tcp_frame::Segment harness_syn = segment(1000, 0, tcp_frame::SYN);
+        harness_syn.options = {{tcp_frame::MSS, {1460}, {}},
+                               {tcp_frame::SACK_OK, {}, {}},
+                               {tcp_frame::TIMESTAMP, {1, 0}, {}},
+                               {tcp_frame::WSCALE, {7}, {}}};
+        const uint32_t una = stack_harness_isn(tcp_frame::build(harness_syn)) + 1;
+        uint32_t tsval = 2;
+        auto dsack_ack = [&](uint32_t ack, std::vector<uint32_t> blocks)
+        {
+            auto s = segment(1001, ack, tcp_frame::ACK);
+            s.options = {{tcp_frame::NOP, {}, {}}, {tcp_frame::NOP, {}, {}}, {tcp_frame::TIMESTAMP, {tsval++, 1}, {}},
+                         {tcp_frame::NOP, {}, {}}, {tcp_frame::NOP, {}, {}}, {tcp_frame::SACK, std::move(blocks), {}}};
+            return stack_item(tcp_frame::build(s), 0x01);
+        };
+        Bytes timed_out = stack_item(Bytes(), 0x40) | stack_item(Bytes(), 0x24);
+        Bytes genuine;
+        for (int i = 0; i < 4; i++)
+            genuine |= dsack_ack(una + 200, {una, una + 200});
+        save("stack", "dsack_genuine_repeated", timed_out | genuine);
+        save("stack", "dsack_forged",
+             timed_out | dsack_ack(una + 200, {una + 200, una + 400}) | dsack_ack(una + 200, {una - 5000, una - 4000})
+                 | dsack_ack(una + 200, {una, una + 0x40000000}) | dsack_ack(una + 200, {una, una + 1})
+                 | dsack_ack(una + 200, {una + 200, una})
+                 | dsack_ack(una, {una + 1000, una + 1200, una + 900, una + 1300})
+                 | dsack_ack(una + 200, {una, una + 200}));
+    }
     // IPv6 header and extension chain, and ICMPv6 / NDP. The shapes are the ones
     // tests/src/test_ipv6.cpp and test_icmpv6.cpp treat as interesting: a chain
     // that ends cleanly, one that never ends, a fragment header, an extension
