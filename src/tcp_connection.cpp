@@ -1145,8 +1145,14 @@ void TcpConnection::_arm_spurious_rto_detection(bool starts_episode, bool probe_
     _frto = Frto::OFF;
     if (_timestamps_negotiated)
     {
+        // RFC 3522 compares against the first retransmission, and that is
+        // the earliest still outstanding of any kind - a loss probe's
+        // included (Linux's retrans_stamp) - not necessarily the one this
+        // timeout is about to send. Against the timeout's own, the ack of a
+        // probe that repaired a real loss would echo an older TSval and
+        // look like the original's.
         _eifel_armed = true;
-        _eifel_tsval = _ts_clock(); // what the retransmission about to go out carries
+        _eifel_tsval = _retrans_stamp_valid ? _retrans_stamp : _ts_clock();
     }
     else if (_sack_permitted && !probe_outstanding)
     {
@@ -1534,6 +1540,16 @@ void TcpConnection::_retransmit(SentSegment& segment, bool rescue)
     {
         _in_flight.note_episode_retransmission(segment);
     }
+    if (!_retrans_stamp_valid)
+    {
+        _retrans_stamp = _ts_clock(); // the TSval this copy carries
+        _retrans_stamp_valid = true;
+        _retrans_stamp_end = segment.end_seq;
+    }
+    else if (seq_before(_retrans_stamp_end, segment.end_seq))
+    {
+        _retrans_stamp_end = segment.end_seq;
+    }
     _transmit(segment.flags, segment.seq, segment.payload);
     _in_flight.note_transmit(segment, _now_ms); // RFC 8985 6.1
     if (!rescue)
@@ -1920,6 +1936,10 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     if (_rto_recovery && seq_at_or_before(_recovery_point, ack))
     {
         _rto_recovery = false; // everything outstanding at the timeout is acknowledged
+    }
+    if (_retrans_stamp_valid && !_eifel_armed && seq_at_or_before(_retrans_stamp_end, ack))
+    {
+        _retrans_stamp_valid = false; // every retransmitted byte is acknowledged
     }
     if (_episode_open && _recovery_point_valid && seq_at_or_before(_recovery_point, ack))
     {

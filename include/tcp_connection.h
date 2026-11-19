@@ -841,7 +841,14 @@ private:
     // _try_undo_dsack()). Only a timeout that starts an episode is checked:
     // one inside a recovery keeps that recovery's evidence.
     bool _eifel_armed = false;
-    uint32_t _eifel_tsval = 0; // the first timeout retransmission's TSval (the per-pair clock)
+    uint32_t _eifel_tsval = 0; // the retransmission stamp when armed (the per-pair clock)
+    // Linux's retrans_stamp: the TSval of the earliest retransmission (of
+    // any kind, loss probes included) whose data is not yet all
+    // acknowledged - up to _retrans_stamp_end, the highest byte retransmitted
+    // since. What Eifel compares an echo against.
+    uint32_t _retrans_stamp = 0;
+    bool _retrans_stamp_valid = false;
+    uint32_t _retrans_stamp_end = 0;
     enum class Frto
     {
         OFF,

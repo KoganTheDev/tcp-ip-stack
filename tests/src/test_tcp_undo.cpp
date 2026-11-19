@@ -579,3 +579,31 @@ TEST(TcpDsackForgery, DsacksForDataNeverResentChangeNothing)
     ASSERT_EQ(s.stats().dsacks_received, 0u);
     ASSERT_EQ(s.c->rack_reo_wnd_mult(), 1u);
 }
+
+// --- review findings ---
+
+// A one-segment flight: the original is lost, the loss probe resends it and
+// gets through, but the probe's ack is delayed past the RTO. That ack echoes
+// the probe's TSval - older than the RTO retransmission's, yet a copy that
+// was itself a retransmission. Eifel must compare against the episode's
+// first retransmission of any kind (Linux's retrans_stamp), so this real
+// loss is not undone; the original's echo still is.
+TEST(TcpSpuriousRto, EifelComparesWithTheFirstRetransmissionTheProbeIncluded)
+{
+    for (bool original_arrived : {false, true})
+    {
+        Options options;
+        options.timestamps = true;
+        Sender s = measured(options);
+        s.send(1);
+        s.pass_to_next_timer();
+        ASSERT_EQ(s.count_sent(s.seg(0)), 2u) << "precondition: the probe resent the segment";
+        uint64_t timeouts = s.stats().retransmit_timeouts;
+        while (s.stats().retransmit_timeouts == timeouts)
+            s.pass_to_next_timer();
+        ASSERT_EQ(s.count_sent(s.seg(0)), 3u) << "precondition: the RTO resent it again";
+        s.ack(s.seg(1), {}, s.tsval_of(s.seg(0), original_arrived ? 1 : 2));
+        ASSERT_EQ(s.stats().spurious_rtos_undone, original_arrived ? 1u : 0u)
+            << (original_arrived ? "the original's echo" : "the probe's echo");
+    }
+}
