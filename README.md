@@ -53,10 +53,37 @@ simultaneous close rather than folding it into `FIN_WAIT_2`. On top of that:
   and its variation, with Karn's algorithm rejecting the ambiguous samples that come
   from retransmitted segments and exponential backoff covering the resulting blind spot
 - Out-of-order reassembly as disjoint byte ranges, so overlapping and partially
-  overlapping segments are held once and keep every new byte, bounded by a fixed
+  overlapping segments are held once and keep every new byte, bounded by the
   receive-buffer capacity that also determines the advertised window
+- **Per-connection buffers with autotuning**: send and receive capacities default to
+  128 KiB and are bounded by [max(4 KiB, 2*MSS), 16 MiB]. A fixed buffer caps a
+  connection at capacity / RTT (128 KiB over 100 ms is about 10 Mbit/s), so both grow on
+  their own, as Linux's do:
+  - the receiver keeps its **own RTT estimate** (Linux's `rcv_rtt_est`): with
+    timestamps, now minus the echoed TSval on full-sized data, smoothed; without, the
+    time RCV.NXT takes to cross RCV.NXT + RCV.WND, kept as a running minimum
+  - **receive autotuning** (dynamic right-sizing, `tcp_rcv_space_adjust`): once per
+    receiver RTT (every 200 ms until there is a sample) the bytes the application read
+    are compared with the most it ever read in one interval; if more, the buffer grows to
+    2 x that + 16 segments (plus more while the rate is still climbing). A slow reader
+    never grows its buffer, and growth never moves the advertised edge left
+  - the **send buffer** follows max(128 KiB, 2 x cwnd)
+  - `SO_RCVBUF` / `SO_SNDBUF` (or `set_*_capacity_locked()`) lock a buffer at what the
+    application chose
+  - a **stack-wide cap** like Linux's `tcp_mem`: growth above the defaults is drawn from
+    one budget per `NetworkStack` (64 MiB, `set_tcp_memory_limit()`); once it is spent
+    no connection grows further and none is shrunk. A connection keeps the share its
+    still-buffered bytes occupy until they are read or it is reaped
+
+  On a 100 Mbit/s link with 100 ms RTT one connection reaches 95% of the link with
+  autotuning and 9% with the receive buffer locked at 128 KiB (`SimThroughput.*`).
 - MSS and window scale negotiation (RFC 7323), including the rule that scaling applies
-  only if *both* SYNs carried the option
+  only if *both* SYNs carried the option. The shift offered is 9: the smallest that lets
+  the window field describe a 16 MiB buffer (Linux picks its shift from `tcp_rmem[2]` the
+  same way, which is why its default is 7 for 6 MiB). Rounding to 512-byte units never
+  promises more than the free space, and data past the window is trimmed off
+- The initial slow-start threshold is arbitrarily high (RFC 5681 3.1), so slow start runs
+  until the first loss rather than stopping at 64 KiB
 - **Timestamps and PAWS** (RFC 7323): a round-trip sample from every segment rather than
   one per window, which restores RTT measurement *during* loss recovery - exactly when
   Karn's algorithm otherwise blinds the estimator - and rejects an old duplicate whose
@@ -541,13 +568,14 @@ added to a ustack epoll and the wait sleeps in the driver's kernel epoll until i
 (level-triggered; the simulator's driver refuses with `ENOTSUP`).
 
 `SO_RCVBUF` / `SO_SNDBUF` set the per-connection receive and send capacities (clamped to
-4 KiB..16 MiB, and inherited from a listener). One difference from Linux: `getsockopt`
-returns double the value set, as Linux does for kernel bookkeeping, but the payload
-capacity used is the value the application asked for, since there is no per-skb overhead
-to pay for. Setting `SO_RCVBUF` also locks the receive capacity against future
-autotuning. A shrunk receive buffer never pulls back a window already offered. On a UDP
-socket the value is stored and read back but not applied (its queue is bounded by
-datagram count).
+4 KiB..16 MiB, and inherited from a listener) and lock them against autotuning. The
+doubling: `getsockopt` returns double the size, as Linux does to allow for kernel
+bookkeeping, but the payload capacity used is the value the application asked for, since
+there is no per-skb overhead to pay for - so set 64 KiB, read back 128 KiB, hold 64 KiB of
+data. On a connected socket `getsockopt` reports the buffer as it is now, autotuning's
+growth included (doubled likewise), as Linux reports `sk_rcvbuf`. A shrunk receive buffer
+never pulls back a window already offered. On a UDP socket the value is stored and read
+back but not applied (its queue is bounded by datagram count).
 
 [`include/ustack/kernel_stack.h`](include/ustack/kernel_stack.h) is `ustack::KernelStack`:
 the same method names and signatures, each forwarding to the real `::socket`,

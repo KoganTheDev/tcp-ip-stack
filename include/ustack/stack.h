@@ -213,9 +213,8 @@ namespace ustack
         // SO_RCVBUF locks the receive capacity against autotuning, SO_SNDBUF
         // the send capacity; unlocked, both grow, and getsockopt on a
         // connected socket reports the size as it is now (doubled), as
-        // Linux does. On a UDP
-        // socket the value is stored and read back, but not applied: the
-        // receive queue there is bounded by datagram count
+        // Linux does. On a UDP socket the value is stored and read back, but
+        // not applied: the receive queue there is bounded by datagram count
         // (UDP_RECEIVE_QUEUE_LIMIT), not bytes.
         int setsockopt(int fd, int level, int optname, const void* optval, socklen_t optlen);
         int getsockopt(int fd, int level, int optname, void* optval, socklen_t* optlen);
