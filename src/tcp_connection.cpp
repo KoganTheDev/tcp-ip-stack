@@ -88,6 +88,10 @@ void TcpConnection::_transition(TcpState new_state)
 {
     LOG_DEBUG("TcpConnection[" << _id << "] " << state_name(_state) << " -> " << state_name(new_state));
     _state = new_state;
+    if (new_state == TcpState::ESTABLISHED)
+    {
+        _rcv_space_init();
+    }
 
     // Iterate a copy: a subscriber is entitled to react by doing something that
     // registers another, and growing the vector mid-iteration would invalidate
@@ -521,6 +525,12 @@ Bytes TcpConnection::read(size_t max_bytes)
     }
 
     _receive_queued_bytes -= taken.size();
+    _bytes_read_total += taken.size();
+    uint32_t capacity_before = _receive_capacity;
+    if (!taken.empty())
+    {
+        _rcv_space_adjust();
+    }
 
     // Reading is what reopens the window, so the peer has to be told. Without
     // this it would sit blocked until its own persist probe happened to ask -
@@ -532,7 +542,14 @@ Bytes TcpConnection::read(size_t max_bytes)
     uint32_t useful = std::min<uint32_t>(_receive_capacity / 2, _effective_mss);
     bool reopened =
         (window_before == 0 && _advertised_window() > 0) || (window_before < useful && _advertised_window() >= useful);
-    if (reopened
+    // Autotuning just grew the buffer: if that at least doubles the window
+    // the peer was last offered, say so now rather than on the next ack - a
+    // sender in slow start is about to need it (Linux's tcp_cleanup_rbuf
+    // sends the same update).
+    uint64_t offered =
+        _rcv_right_edge_unwrapped > _recv_next_unwrapped ? _rcv_right_edge_unwrapped - _recv_next_unwrapped : 0;
+    bool grew = _receive_capacity > capacity_before && _advertised_window() >= 2 * offered;
+    if ((reopened || grew)
         && (_state == TcpState::ESTABLISHED || _state == TcpState::FIN_WAIT_1 || _state == TcpState::FIN_WAIT_2))
     {
         LOG_DEBUG("TcpConnection[" << _id << "] window reopened to " << _advertised_window()
@@ -541,6 +558,57 @@ Bytes TcpConnection::read(size_t max_bytes)
     }
 
     return taken;
+}
+
+void TcpConnection::_rcv_space_init()
+{
+    _rcv_space = std::min<uint64_t>(_receive_capacity, uint64_t{INITIAL_RCV_SPACE_SEGMENTS} * _effective_mss);
+    _rcv_space_read_at = _bytes_read_total;
+    _rcv_space_time_ms = _now_ms;
+}
+
+void TcpConnection::_rcv_space_adjust()
+{
+    if (_rcv_space == 0)
+    {
+        _rcv_space_init(); // read before ever being ESTABLISHED: nothing to compare with yet
+        return;
+    }
+    uint64_t interval = receiver_rtt_ms() != 0 ? receiver_rtt_ms() : RCV_SPACE_FALLBACK_MS;
+    if (_now_ms - _rcv_space_time_ms < interval)
+    {
+        return;
+    }
+    uint64_t read = _bytes_read_total - _rcv_space_read_at;
+    if (read > _rcv_space)
+    {
+        bool receiving =
+            _state == TcpState::ESTABLISHED || _state == TcpState::FIN_WAIT_1 || _state == TcpState::FIN_WAIT_2;
+        if (receiving && !_receive_capacity_locked && _window_scaling_negotiated)
+        {
+            // tcp_rcv_space_adjust(): 2 * read + 16 segments, and while the
+            // rate is still climbing, twice the relative growth on top - in
+            // slow start the next round trip carries twice this one.
+            uint64_t target = 2 * read + 16 * uint64_t{_effective_mss};
+            uint64_t growth = target * (read - _rcv_space) / _rcv_space;
+            target += 2 * growth;
+            _grow_receive_capacity(static_cast<size_t>(std::min<uint64_t>(target, MAX_BUFFER_CAPACITY)));
+        }
+        _rcv_space = read;
+    }
+    _rcv_space_read_at = _bytes_read_total;
+    _rcv_space_time_ms = _now_ms;
+}
+
+void TcpConnection::_grow_receive_capacity(size_t target)
+{
+    target = std::min(target, MAX_BUFFER_CAPACITY);
+    if (target <= _receive_capacity)
+    {
+        return;
+    }
+    LOG_DEBUG("TcpConnection[" << _id << "] receive buffer " << _receive_capacity << " -> " << target);
+    _receive_capacity = static_cast<uint32_t>(target);
 }
 
 void TcpConnection::reduce_effective_mss(uint16_t path_mss)

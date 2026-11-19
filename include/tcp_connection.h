@@ -501,6 +501,32 @@ public:
     // Milliseconds; 0 until the first sample.
     uint32_t receiver_rtt_ms() const { return _rcv_rtt_x8 >> 3; }
 
+    // --- receive buffer autotuning (Linux's tcp_rcv_space_adjust, "DRS") ---
+    //
+    // A fixed receive buffer caps a connection at capacity / RTT: 128 KiB
+    // over a 100 ms path is about 10 Mbit/s however fast the link is. Asking
+    // every application to size SO_RCVBUF for its path does not work - it
+    // does not know the path - so the receiver sizes it itself, from the one
+    // thing it can see: how fast the application actually reads.
+    //
+    // Once per receiver RTT (receiver_rtt_ms(); every RCV_SPACE_FALLBACK_MS
+    // until there is a sample), read() compares the bytes read in that
+    // interval with the largest such count so far (the space estimate). If
+    // it is larger the application is keeping up with a sender that is still
+    // speeding up, so the capacity grows to what the next round trip may
+    // need, as Linux computes it: twice what was read (the sender may double
+    // in slow start) plus 16 segments of slack, plus twice the relative
+    // growth again on top while the rate is rising quickly. Bounded by
+    // MAX_BUFFER_CAPACITY. Never when the capacity is locked (SO_RCVBUF), and
+    // never without window scaling, where the window cannot exceed 64 KiB
+    // anyway. A slow reader never grows the buffer: what it reads per round
+    // trip stays under the estimate. Growth only ever adds window, so it
+    // never moves the advertised edge left.
+    static constexpr uint64_t RCV_SPACE_FALLBACK_MS = 200;
+    // The space estimate's starting point: the initial window the sender
+    // starts slow start with (Linux's TCP_INIT_CWND segments).
+    static constexpr uint32_t INITIAL_RCV_SPACE_SEGMENTS = 10;
+
     // How many disjoint ranges the reorder buffer may hold (see
     // ReorderBuffer::MAX_RANGES).
     static constexpr uint32_t MAX_REORDER_SEGMENTS = ReorderBuffer::MAX_RANGES;
@@ -697,6 +723,19 @@ private:
     uint32_t _advertised_window() const;
     // Feeds one unambiguous round-trip measurement to _rtt, logging it.
     void _take_rtt_sample(uint32_t rtt_ms);
+
+    // --- receive autotuning (see RCV_SPACE_FALLBACK_MS) ---
+    uint64_t _bytes_read_total = 0;  // every byte read() has returned (Linux's copied_seq)
+    uint64_t _rcv_space = 0;         // largest count read in one interval so far (rcvq_space.space)
+    uint64_t _rcv_space_read_at = 0; // _bytes_read_total when the interval started
+    uint64_t _rcv_space_time_ms = 0; // when it started
+    // Starts the first interval, on entering ESTABLISHED.
+    void _rcv_space_init();
+    // Called by read(): closes an interval that has lasted a receiver RTT,
+    // growing the capacity if the application read more than ever before.
+    void _rcv_space_adjust();
+    // Raises the receive capacity towards `target` (never lowers it).
+    void _grow_receive_capacity(size_t target);
 
     // --- receiver RTT (see receiver_rtt_ms()) ---
     // The estimate in milliseconds, times 8 (Linux keeps rcv_rtt_est.rtt_us

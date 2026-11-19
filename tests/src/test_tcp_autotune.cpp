@@ -37,7 +37,7 @@ namespace
         uint32_t peer_tsval = 100;
         uint32_t next_seq = PEER_ISN + 1;
 
-        explicit Peer(bool use_timestamps) : timestamps(use_timestamps)
+        explicit Peer(bool use_timestamps, bool window_scaling = true) : timestamps(use_timestamps)
         {
             connection = std::make_unique<TcpConnection>(
                 8080, IPv4Address("10.0.0.1"), 12345, 1000,
@@ -49,7 +49,7 @@ namespace
                     sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), window,
                                     header.has_timestamp_option(), header.get_timestamp_value()});
                 });
-            connection->accept_incoming_syn(PEER_ISN, MSS, true, 7, timestamps, peer_tsval, true);
+            connection->accept_incoming_syn(PEER_ISN, MSS, window_scaling, 7, timestamps, peer_tsval, true);
             connection->on_segment(*segment(Bytes(), last_tsval()));
             REQUIRE_TRUE(connection->get_state() == TcpState::ESTABLISHED, "the handshake completes");
         }
@@ -93,7 +93,26 @@ namespace
         }
 
         void advance(uint32_t ms) { connection->on_time_passed(ms); }
+
+        // The application reads everything the moment it arrives.
+        void read_eagerly()
+        {
+            connection->set_data_ready_callback([this]() { static_cast<void>(connection->read()); });
+        }
+
+        // The window the peer was last offered, in bytes.
+        uint32_t offered_window() const { return sent.back().window; }
     };
+
+    // Rounds of `bytes` from the peer, `interval_ms` apart, each read at once.
+    void fast_rounds(Peer& peer, int rounds, uint32_t bytes, uint32_t interval_ms)
+    {
+        for (int i = 0; i < rounds; i++)
+        {
+            peer.advance(interval_ms);
+            peer.burst(bytes);
+        }
+    }
 }
 
 // --- receiver RTT ---
@@ -169,6 +188,8 @@ TEST(TcpAutotune, ReceiverRttIsIndependentOfTheTimestampOffset)
 TEST(TcpAutotune, ReceiverRttWithoutTimestampsIsOneWindowsRoundTrip)
 {
     Peer peer(false);
+    // Locked, so autotuning does not move the window this test measures by.
+    peer.connection->set_receive_capacity_locked(true);
     peer.connection->set_data_ready_callback([&peer]() { static_cast<void>(peer.connection->read()); });
     peer.data(peer.full_segment()); // starts a measurement
     ASSERT_EQ(peer.connection->receiver_rtt_ms(), 0u) << "one segment cannot complete a window's round trip";
@@ -185,4 +206,83 @@ TEST(TcpAutotune, ReceiverRttWithoutTimestampsIsOneWindowsRoundTrip)
     peer.advance(20);
     peer.burst(window + peer.full_segment());
     ASSERT_EQ(peer.connection->receiver_rtt_ms(), 20u) << "a shorter one lowers it";
+}
+
+// --- receive autotuning ---
+
+// An application that reads everything as fast as it arrives, with the
+// sender's rate climbing: the buffer grows past the default, and the bigger
+// window is offered at once.
+TEST(TcpAutotune, AFastReaderGrowsTheReceiveBuffer)
+{
+    Peer peer(true);
+    peer.read_eagerly();
+    fast_rounds(peer, 3, 100000, TcpConnection::RCV_SPACE_FALLBACK_MS);
+    ASSERT_GT(peer.connection->receive_capacity(), TcpConnection::RECEIVE_BUFFER_CAPACITY)
+        << "100 KB read per interval needs more than the default buffer";
+    ASSERT_LE(peer.connection->receive_capacity(), TcpConnection::MAX_BUFFER_CAPACITY);
+    // As much of it as the window field can carry at this stack's shift.
+    uint64_t largest =
+        std::min<uint64_t>(peer.connection->receive_capacity(), uint64_t{0xFFFF} << TcpConnection::WINDOW_SCALE_SHIFT);
+    ASSERT_GE(peer.offered_window() + (1u << TcpConnection::WINDOW_SCALE_SHIFT), largest)
+        << "and the peer is offered the bigger window, got " << peer.offered_window();
+}
+
+// The interval is the receiver RTT once there is one, not the 200 ms
+// fallback: here 40 ms, so a read 50 ms in already adjusts.
+TEST(TcpAutotune, AutotuningRunsOncePerReceiverRtt)
+{
+    Peer peer(true);
+    peer.read_eagerly();
+    uint32_t echo = peer.last_tsval();
+    peer.advance(40);
+    peer.data(peer.full_segment(), echo);
+    ASSERT_EQ(peer.connection->receiver_rtt_ms(), 40u) << "precondition: a 40 ms receiver RTT";
+    fast_rounds(peer, 2, 100000, 50);
+    ASSERT_GT(peer.connection->receive_capacity(), TcpConnection::RECEIVE_BUFFER_CAPACITY)
+        << "100 KB per 50 ms, with a 40 ms RTT, grows the buffer within 100 ms";
+
+    Peer fallback(true);
+    fallback.read_eagerly();
+    fast_rounds(fallback, 2, 100000, 50);
+    ASSERT_EQ(fallback.connection->receive_capacity(), TcpConnection::RECEIVE_BUFFER_CAPACITY)
+        << "without an RTT sample, nothing is decided before 200 ms";
+}
+
+// The data arrives as fast, but the application reads 4 KB per interval:
+// that is all it needs a buffer for, so the buffer stays as it is.
+TEST(TcpAutotune, ASlowReaderDoesNotGrowTheReceiveBuffer)
+{
+    Peer peer(true);
+    for (int i = 0; i < 20; i++)
+    {
+        peer.advance(TcpConnection::RCV_SPACE_FALLBACK_MS);
+        uint32_t room = peer.connection->receive_capacity() - static_cast<uint32_t>(peer.connection->bytes_available());
+        peer.burst(std::min<uint32_t>(room, 100000));
+        static_cast<void>(peer.connection->read(4096));
+    }
+    ASSERT_EQ(peer.connection->receive_capacity(), TcpConnection::RECEIVE_BUFFER_CAPACITY)
+        << "a reader taking 4 KB per interval never needs more than the default";
+}
+
+// SO_RCVBUF locks the capacity: the application chose it, so autotuning
+// leaves it alone however fast it reads (Linux's SOCK_RCVBUF_LOCK).
+TEST(TcpAutotune, ALockedReceiveCapacityNeverGrows)
+{
+    Peer peer(true);
+    peer.connection->set_receive_capacity(TcpConnection::RECEIVE_BUFFER_CAPACITY);
+    peer.connection->set_receive_capacity_locked(true);
+    peer.read_eagerly();
+    fast_rounds(peer, 10, 100000, TcpConnection::RCV_SPACE_FALLBACK_MS);
+    ASSERT_EQ(peer.connection->receive_capacity(), TcpConnection::RECEIVE_BUFFER_CAPACITY) << "locked";
+}
+
+// Without window scaling the window field tops out at 64 KiB, below the
+// default buffer already: growing it would only hold memory nobody can use.
+TEST(TcpAutotune, NoGrowthWithoutWindowScaling)
+{
+    Peer peer(true, false);
+    peer.read_eagerly();
+    fast_rounds(peer, 10, 60000, TcpConnection::RCV_SPACE_FALLBACK_MS);
+    ASSERT_EQ(peer.connection->receive_capacity(), TcpConnection::RECEIVE_BUFFER_CAPACITY) << "unscaled";
 }
