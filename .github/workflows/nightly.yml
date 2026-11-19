@@ -19,6 +19,12 @@ on:
         description: Seconds of fuzzing per harness
         required: false
         default: "180"
+      jobs:
+        # A manual run can pick jobs, so an investigation that only needs the
+        # load test does not also pay for 100k seeds, fuzzing and Mull.
+        description: Jobs to run, space-separated (sim soak mutation fuzz loadtest) or all
+        required: false
+        default: "all"
 
 # One nightly at a time; a manual run while the scheduled one is going waits.
 concurrency:
@@ -27,6 +33,7 @@ concurrency:
 
 jobs:
   sim:
+    if: github.event_name != 'workflow_dispatch' || inputs.jobs == 'all' || contains(format(' {0} ', inputs.jobs), ' sim ')
     name: simulator (${{ github.event.inputs.seeds || '100000' }} seeds)
     runs-on: ubuntu-latest
     # The debug build does roughly 50-100 seeds per second per core; 100000
@@ -65,6 +72,7 @@ jobs:
   # prints it, and a failure reproduces locally with
   #     SOAK_SEED=<seed> make soak
   soak:
+    if: github.event_name != 'workflow_dispatch' || inputs.jobs == 'all' || contains(format(' {0} ', inputs.jobs), ' soak ')
     name: soak (2 virtual hours)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -95,6 +103,7 @@ jobs:
   # for 24.04 and clang-19 is in its archive. If the version moves, this is the
   # job that breaks - and it is separate so that it breaks alone.
   mutation:
+    if: github.event_name != 'workflow_dispatch' || inputs.jobs == 'all' || contains(format(' {0} ', inputs.jobs), ' mutation ')
     name: mutation testing (Mull)
     runs-on: ubuntu-24.04
     timeout-minutes: 150
@@ -161,6 +170,7 @@ jobs:
   # id so every night saves a new, larger corpus; the restore key matches the
   # newest. Per-push runs restore it read-only.
   fuzz:
+    if: github.event_name != 'workflow_dispatch' || inputs.jobs == 'all' || contains(format(' {0} ', inputs.jobs), ' fuzz ')
     name: fuzz (${{ github.event.inputs.fuzz_seconds || '180' }} s per harness)
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -212,6 +222,7 @@ jobs:
   # test run); the JSON reports are uploaded whatever the outcome, and a failed
   # phase adds a packet capture and a DEBUG-level rerun of itself.
   loadtest:
+    if: github.event_name != 'workflow_dispatch' || inputs.jobs == 'all' || contains(format(' {0} ', inputs.jobs), ' loadtest ')
     name: load test (veth, real stack)
     runs-on: ubuntu-latest
     timeout-minutes: 30
