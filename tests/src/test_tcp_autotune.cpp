@@ -494,18 +494,49 @@ TEST(TcpAutotune, ScaledWindowRoundingNeverMovesTheRightEdgeLeft)
     }
 }
 
+// A zero window shuts the receive window, however the scaled field was
+// rounded before. Here a whole-unit 1024 bytes offer the edge at exactly the
+// buffer's end; 100 more leave 129948 free, which the field can only carry
+// rounded up, so the peer is told of an edge 100 bytes past the buffer. Once it has sent to the real edge the buffer is full and the window
+// is 0, and a zero-window probe (RFC 9293 3.8.6.1) is answered - window 0,
+// RCV.NXT unchanged - but its byte is not queued past the capacity.
+TEST(TcpAutotune, AZeroWindowProbeIsAckedButNotQueued)
+{
+    Peer peer(true);
+    peer.connection->set_receive_capacity_locked(true); // nothing is read; keep the capacity fixed
+    const uint32_t capacity = static_cast<uint32_t>(peer.connection->receive_capacity());
+    peer.data(1024);
+    peer.advance(TcpConnection::RCV_SPACE_FALLBACK_MS); // its ack goes out
+    peer.data(100);
+    peer.advance(TcpConnection::RCV_SPACE_FALLBACK_MS);
+    ASSERT_GT(uint64_t{peer.sent.back().ack} + peer.offered_window(), uint64_t{PEER_ISN} + 1 + capacity)
+        << "precondition: the rounded-up field offers past the buffer";
+    peer.burst(capacity - 1124);
+    peer.advance(TcpConnection::RCV_SPACE_FALLBACK_MS);
+    ASSERT_EQ(peer.connection->bytes_available(), capacity) << "precondition: the buffer is full";
+    ASSERT_EQ(peer.offered_window(), 0u) << "precondition: the window is shut";
+
+    size_t acks_before = peer.sent.size();
+    peer.data(1); // the probe
+    peer.advance(TcpConnection::RCV_SPACE_FALLBACK_MS);
+    ASSERT_GT(peer.sent.size(), acks_before) << "the probe is answered";
+    EXPECT_EQ(peer.sent.back().ack, peer.next_seq - 1) << "without acknowledging its byte";
+    EXPECT_EQ(peer.offered_window(), 0u) << "with the window still shut";
+    EXPECT_LE(peer.connection->bytes_available() + peer.connection->bytes_out_of_order(), capacity)
+        << "and the buffer holds no more than its capacity";
+}
+
 // Rounding the scaled window up keeps an edge already offered; it must never
 // become a new promise. A peer that always sends exactly to the advertised
 // edge, in sizes that are not whole scale units, to an application that
 // never reads, would otherwise walk the edge forward by up to a unit per ack
-// - past the buffer, without bound. Buffered bytes stay within the capacity
-// plus one unit of rounding.
+// - past the buffer, without bound. Nor may the rounded-up bytes be taken:
+// buffered bytes stay within the capacity.
 TEST(TcpAutotune, RoundingUpTheScaledWindowNeverGrowsTheBufferPastCapacity)
 {
     Peer peer(true);
     peer.connection->set_receive_capacity_locked(true); // nothing read anyway; keep the capacity fixed
-    const uint64_t unit = uint64_t{1} << TcpConnection::WINDOW_SCALE_SHIFT;
-    const uint64_t bound = peer.connection->receive_capacity() + unit;
+    const uint64_t bound = peer.connection->receive_capacity();
     for (int i = 0; i < 2000; i++)
     {
         uint32_t edge = peer.sent.back().ack + peer.offered_window();
@@ -525,6 +556,6 @@ TEST(TcpAutotune, RoundingUpTheScaledWindowNeverGrowsTheBufferPastCapacity)
         }
         peer.advance(TcpConnection::RCV_SPACE_FALLBACK_MS); // every ack goes out
         ASSERT_LE(peer.connection->bytes_available() + peer.connection->bytes_out_of_order(), bound)
-            << "after " << i << " rounds the buffer holds more than the capacity plus one unit";
+            << "after " << i << " rounds the buffer holds more than its capacity";
     }
 }

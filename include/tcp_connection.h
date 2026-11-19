@@ -769,6 +769,8 @@ private:
     uint32_t _receive_buffer_occupied() const;
     // The window this side would advertise right now: the free buffer space,
     // but never less than what keeps the last offered right edge in place.
+    // Also exactly what is accepted past RCV.NXT - not the scaled field's
+    // rounded-up edge (see _transmit()), so never more than the buffer holds.
     uint32_t _advertised_window() const;
     // Feeds one unambiguous round-trip measurement to _rtt, logging it.
     void _take_rtt_sample(uint32_t rtt_ms);
@@ -1081,21 +1083,11 @@ private:
     // right edge the window may never be pulled back from (RFC 1122
     // 4.2.2.16). See _advertised_window().
     uint64_t _rcv_right_edge_unwrapped = 0;
-    // The edge as the peer computes it from the field actually sent, which
-    // the scaled window's rounding up (see _transmit()) may put up to one
-    // unit beyond the promise above. Only ever used to accept data the peer
-    // was told it may send; never as the base of a new offer, so it cannot
-    // ratchet: it stays within one unit of the promised edge.
-    uint64_t _rcv_wire_edge_unwrapped = 0;
-    // What may be accepted beyond RCV.NXT: the advertised window, or up to
-    // the wire edge if that is further.
-    uint32_t _acceptance_window() const;
     void _set_recv_next(uint32_t value)
     {
         _recv_next = value;
         _recv_next_unwrapped = value;
         _rcv_right_edge_unwrapped = 0; // nothing offered yet relative to this RCV.NXT
-        _rcv_wire_edge_unwrapped = 0;
     }
     void _advance_recv_next(uint32_t count)
     {
