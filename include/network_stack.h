@@ -7,6 +7,7 @@
 #include <vector>
 #include <memory>
 #include <string>
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -238,9 +239,20 @@ public:
     // Separate from the backlog above, which counts only connections that
     // finished the handshake: how many may sit in SYN_RECEIVED on one listening
     // port at once. Without it a SYN flood (whose spoofed sources never
-    // complete) builds unbounded connections. SYNs beyond it are dropped
-    // silently, so a real client's own retransmission gets through later.
-    static constexpr size_t MAX_HALF_OPEN_PER_PORT = 64;
+    // complete) builds unbounded connections.
+    //
+    // The cap is the listener's own backlog, as in Linux (its SYN queue is full
+    // when qlen >= backlog), clamped to MAX_LISTEN_BACKLOG like somaxconn. It
+    // used to be a fixed 64, which a legitimate burst of 200 connections
+    // exceeded: the surplus was answered with SYN cookies, whose ACKs then
+    // competed for the accept queue and lost frames (see the SimLoad test).
+    // A half-open connection is small - no data buffers are allocated until
+    // bytes arrive, roughly 1 KiB of object plus a few empty deques - so a cap
+    // of 4096 bounds a flood at a few MiB per port. SYNs beyond the cap are
+    // answered with a cookie (after evicting a stale entry, below), so a real
+    // client still gets in.
+    static constexpr size_t MAX_LISTEN_BACKLOG = 4096;
+    static size_t half_open_cap(size_t backlog) { return std::clamp<size_t>(backlog, 1, MAX_LISTEN_BACKLOG); }
     // When the cap above is full, the oldest half-open connection is evicted
     // for a new SYN if it has waited at least this long - far longer than a
     // real client takes to answer a SYN-ACK, so almost certainly a flood's.

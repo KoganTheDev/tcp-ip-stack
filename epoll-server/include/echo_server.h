@@ -76,6 +76,12 @@ public:
     static constexpr int DEFAULT_SHUTDOWN_DEADLINE_MS = 5000;
     static constexpr size_t DEFAULT_MAX_CONNECTIONS = 1024;
     static constexpr int ACCEPT_RETRY_MS = 1000;
+    // Linux's usual SOMAXCONN, spelled out rather than taken from the header
+    // (older glibc says 128). On this stack the backlog also sizes the
+    // half-open (SYN_RECEIVED) table, so a burst of connections finds room
+    // instead of being pushed onto SYN cookies; the kernel clamps it to
+    // net.core.somaxconn on its own.
+    static constexpr int DEFAULT_LISTEN_BACKLOG = 4096;
 
     // Watches one more kernel fd in the reactor's own epoll, and calls
     // on_readable from the reactor thread when it becomes readable (level
@@ -163,7 +169,7 @@ public:
 
     // Starts listening on `port` (0: let the stack pick) on every address and
     // returns the port actually bound. May be called several times.
-    uint16_t listen_on(uint16_t port, int backlog = 128)
+    uint16_t listen_on(uint16_t port, int backlog = DEFAULT_LISTEN_BACKLOG)
     {
         int fd = this->_stack.socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
         if (fd < 0)

@@ -52,6 +52,10 @@ namespace
     {
         uint64_t seed = 1;
         LinkParams link;
+        // The server's listen backlog, which is also its half-open cap. The
+        // cookie-path controls below set it to 64 so a 200-connection burst
+        // still overflows it.
+        int backlog = 1024;
         size_t connections = 100; // total
         size_t concurrency = 100; // in flight at once
         uint64_t start_gap_ms = 0; // between connection starts; 0 = as fast as slots free
@@ -116,7 +120,7 @@ namespace
             _client = std::make_unique<ustack::Stack>(*_client_net, std::make_unique<UstackSimDriver>(_net));
             _server_stack = std::make_unique<ustack::Stack>(*_server_net, std::make_unique<UstackSimDriver>(_net));
             _server = std::make_unique<EchoServer<ustack::Stack>>(*_server_stack, 2);
-            _server->listen_on(ECHO_PORT, 1024);
+            _server->listen_on(ECHO_PORT, config.backlog);
             _epfd = _client->epoll_create1(0);
             REQUIRE_TRUE(_epfd >= 0, "client epoll_create1 failed");
         }
@@ -385,7 +389,7 @@ namespace
     }
 }
 
-// The burst phase: 200 at once is far past the 64 half-open cap, so most of
+// The burst phase: 200 at once is far past a 64-entry half-open cap (the backlog), so most of
 // it is answered with SYN cookies. It passed on the real run; kept as the
 // control for the netem variant below.
 TEST(EchoLoad, BurstPastTheHalfOpenCapCompletes)
@@ -393,6 +397,7 @@ TEST(EchoLoad, BurstPastTheHalfOpenCapCompletes)
     LoadConfig config;
     config.connections = 200;
     config.concurrency = 200;
+    config.backlog = 64;
     config.link.delay_ms = 1;
     EchoLoad load(config);
     LoadResult result = load.run();
@@ -430,6 +435,7 @@ TEST(EchoLoad, SustainedRateAfterABurstCompletes)
     LoadConfig burst;
     burst.connections = 200;
     burst.concurrency = 200;
+    burst.backlog = 64;
     burst.link.delay_ms = 1;
     EchoLoad load(burst);
     LoadResult first = load.run();

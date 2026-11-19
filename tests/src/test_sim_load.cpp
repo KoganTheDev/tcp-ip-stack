@@ -64,7 +64,15 @@ protected:
     // that the client stack never sent (a spoofed flood).
     PacketChannel* client_endpoint = nullptr;
 
-    void build(uint64_t seed, uint32_t delay_ms)
+    // The longest any client waited, from t=0 to its whole echo, of the last
+    // run_burst().
+    uint64_t burst_max_echo_ms = 0;
+    // 200 connections at once to a listener with this backlog, each sending
+    // 4 KiB and expecting it back; asserts that all complete intact and leaves
+    // the counters on the stacks and burst_max_echo_ms for the caller.
+    void run_burst(int backlog);
+
+    void build(uint64_t seed, uint32_t delay_ms, int backlog = SERVER_BACKLOG)
     {
         net = std::make_unique<SimNetwork>(seed);
         LinkParams params;
@@ -88,15 +96,15 @@ protected:
 
         client_stack->add_static_arp_entry(SERVER_IP, SERVER_MAC);
         server_stack->add_static_arp_entry(CLIENT_IP, CLIENT_MAC);
-        server_stack->listen(SERVER_PORT, SERVER_BACKLOG);
+        server_stack->listen(SERVER_PORT, backlog);
     }
 };
 
-TEST_F(SimLoad, BurstOf200Connections)
+void SimLoad::run_burst(int backlog)
 {
     constexpr size_t CONNECTIONS = 200;
     constexpr size_t PAYLOAD = 4096;
-    build(7, 1);
+    build(7, 1, backlog);
 
     struct ClientConn
     {
@@ -199,6 +207,7 @@ TEST_F(SimLoad, BurstOf200Connections)
               << " rto=" << client_totals.retransmit_timeouts << " retx=" << client_totals.retransmitted_segments
               << "\n";
 
+    burst_max_echo_ms = max_echo_ms;
     ASSERT_TRUE(finished) << "all " << CONNECTIONS << " echoes should complete, got " << completed;
     for (size_t i = 0; i < CONNECTIONS; i++)
     {
@@ -206,12 +215,46 @@ TEST_F(SimLoad, BurstOf200Connections)
     }
 }
 
+// With the backlog the epoll-server now asks for (4096), the half-open table
+// holds the whole burst: no SYN needs a cookie, no cookie ACK can meet a full
+// accept queue, and nothing waits for a retransmission timer.
+TEST_F(SimLoad, BurstOf200Connections)
+{
+    run_burst(4096);
+    if (HasFatalFailure())
+        return;
+    ASSERT_TRUE(server_stack->syn_cookies_sent() == 0) << "the half-open table is as large as the burst";
+    ASSERT_TRUE(server_stack->cookie_acks_dropped_queue_full() == 0) << "so no cookie ACK is at risk";
+    ASSERT_TRUE(server_stack->syns_dropped_accept_queue_full() == 0) << "and the accept queue never fills";
+    ASSERT_TRUE(client_stack->tcp_totals(false).retransmit_timeouts == 0)
+        << "so no client waited out a retransmission timer";
+    ASSERT_TRUE(burst_max_echo_ms <= 100) << "every first echo within 100 virtual ms, worst was " << burst_max_echo_ms;
+}
+
+// The same burst against the old backlog of 128. The half-open table (also
+// 128) is smaller than the burst, so 72 SYNs get cookies, and 200 completed
+// connections arrive within one tick, which exceeds an accept queue of 128: the
+// surplus ACKs are dropped, as Linux drops them when its accept queue is full,
+// and those clients recover on their retransmission timer. A full accept queue
+// has to refuse something; the fix for this size is the larger backlog above,
+// so this asserts that the drops are counted and that everything still
+// completes.
+TEST_F(SimLoad, BurstOf200ConnectionsWithBacklog128StillCompletesAndCountsItsDrops)
+{
+    run_burst(128);
+    if (HasFatalFailure())
+        return;
+    ASSERT_TRUE(server_stack->syn_cookies_sent() == 200 - 128) << "the SYNs past the half-open cap get cookies";
+    ASSERT_TRUE(server_stack->cookie_acks_dropped_queue_full() > 0)
+        << "the accept queue overflowed, and the loss is visible in the counter";
+}
+
 TEST_F(SimLoad, SynFloodKeepsTheHalfOpenTableBoundedAndARealClientStillConnects)
 {
     constexpr size_t WAVES = 20;
     constexpr size_t SYNS_PER_WAVE = 1000; // 20000 in all
     constexpr uint64_t WAVE_SPACING_MS = 500;
-    build(11, 1);
+    build(11, 1, SERVER_BACKLOG);
 
     std::mt19937_64& rng = net->engine();
     auto random_source = [&]() -> IPv4Address
@@ -309,11 +352,11 @@ TEST_F(SimLoad, SynFloodKeepsTheHalfOpenTableBoundedAndARealClientStillConnects)
     bool finished = net->run_until([&] { return received.size() >= expected.size(); }, 60000);
 
     std::cout << "[ BURST ] flood: " << waves_sent * SYNS_PER_WAVE << " spoofed SYNs, max half-open " << max_half_open
-              << " (cap " << NetworkStack::MAX_HALF_OPEN_PER_PORT << "), real client connected after " << connected_ms
-              << " ms virtual\n";
+              << " (cap " << NetworkStack::half_open_cap(SERVER_BACKLOG) << "), real client connected after "
+              << connected_ms << " ms virtual\n";
     report_server_counters("flood", *server_stack);
 
-    ASSERT_TRUE(max_half_open <= NetworkStack::MAX_HALF_OPEN_PER_PORT)
+    ASSERT_TRUE(max_half_open <= NetworkStack::half_open_cap(SERVER_BACKLOG))
         << "the half-open table must never exceed its cap, saw " << max_half_open;
     ASSERT_TRUE(waves_sent == WAVES) << "the whole flood should have been sent";
     ASSERT_TRUE(finished) << "the real client must still connect and get its echo through the flood";

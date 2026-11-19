@@ -33,6 +33,10 @@ namespace
     const IPv4Address LOCAL_IP("10.0.0.2");
     const IPv4Address PEER_IP("10.0.0.1");
 
+    // The half-open cap of a listener made with listen(port) - the default
+    // backlog, which is what the half-open cap now follows.
+    constexpr size_t HALF_OPEN_CAP = NetworkStack::DEFAULT_LISTEN_BACKLOG;
+
     constexpr uint8_t FLAG_ACK = 0x10;
     constexpr uint8_t FLAG_RST = 0x04;
     constexpr uint8_t FLAG_SYN = 0x02;
@@ -2627,7 +2631,7 @@ TEST(NetworkStack, HalfOpenConnectionsPerListeningPortAreCapped)
     stack->poll();
     channel->clear_outbound();
 
-    const int flood = static_cast<int>(NetworkStack::MAX_HALF_OPEN_PER_PORT) + 36;
+    const int flood = static_cast<int>(HALF_OPEN_CAP) + 36;
     for (int i = 0; i < flood; i++)
     {
         channel->push_inbound(syn_with_options(1000, static_cast<uint16_t>(30000 + i)));
@@ -2651,10 +2655,10 @@ TEST(NetworkStack, HalfOpenConnectionsPerListeningPortAreCapped)
             cookies++;
         }
     }
-    ASSERT_TRUE(syn_acks.size() == NetworkStack::MAX_HALF_OPEN_PER_PORT)
-        << "only MAX_HALF_OPEN_PER_PORT SYNs may get a half-open slot while none completes, got "
+    ASSERT_TRUE(syn_acks.size() == HALF_OPEN_CAP)
+        << "only a backlog's worth of SYNs may get a half-open slot while none completes, got "
                + std::to_string(syn_acks.size());
-    ASSERT_TRUE(cookies == static_cast<size_t>(flood) - NetworkStack::MAX_HALF_OPEN_PER_PORT)
+    ASSERT_TRUE(cookies == static_cast<size_t>(flood) - HALF_OPEN_CAP)
         << "and every SYN past the cap is answered with a SYN cookie instead";
 
     // The cap counts connections still half-open, not ever accepted: one
@@ -2772,7 +2776,7 @@ TEST(NetworkStack, HalfOpenConnectionsThatTimeOutFreeTheirSlots)
     channel->push_inbound(build_arp_request());
     stack->poll();
 
-    for (size_t i = 0; i < NetworkStack::MAX_HALF_OPEN_PER_PORT; i++)
+    for (size_t i = 0; i < HALF_OPEN_CAP; i++)
     {
         channel->push_inbound(syn_with_options(1000, static_cast<uint16_t>(30000 + i)));
     }
@@ -2821,7 +2825,7 @@ TEST(NetworkStack, AConnectionLeavesTheHalfOpenCountOnceNotOnEveryTransition)
     stack->poll();
     channel->clear_outbound();
 
-    for (size_t i = 0; i < NetworkStack::MAX_HALF_OPEN_PER_PORT; i++)
+    for (size_t i = 0; i < HALF_OPEN_CAP; i++)
     {
         channel->push_inbound(syn_with_options(1000, static_cast<uint16_t>(30000 + i)));
     }
@@ -3195,7 +3199,7 @@ TEST(NetworkStack, AStaleHalfOpenConnectionIsEvictedToMakeRoomForANewSyn)
     channel->push_inbound(syn_with_options(1000, 30000)); // the oldest
     stack->poll();
     stack->on_time_passed(NetworkStack::HALF_OPEN_EVICT_AGE_MS);
-    for (size_t i = 1; i < NetworkStack::MAX_HALF_OPEN_PER_PORT; i++)
+    for (size_t i = 1; i < HALF_OPEN_CAP; i++)
     {
         channel->push_inbound(syn_with_options(1000, static_cast<uint16_t>(30000 + i)));
     }
@@ -3272,7 +3276,7 @@ namespace
         stack->listen(80);
         channel->push_inbound(build_arp_request());
         stack->poll();
-        for (size_t i = 0; i < NetworkStack::MAX_HALF_OPEN_PER_PORT; i++)
+        for (size_t i = 0; i < HALF_OPEN_CAP; i++)
         {
             channel->push_inbound(
                 build_tcp_with_options(FLAG_SYN, 1000, 0, static_cast<uint16_t>(30000 + i), 80, ALL_OPTIONS));
@@ -3677,7 +3681,7 @@ TEST(NetworkStackCounters, AValidCookieAckDroppedForAFullAcceptQueueIsCounted)
     stack->listen(80, 1);
     channel->push_inbound(build_arp_request());
     stack->poll();
-    for (size_t i = 0; i < NetworkStack::MAX_HALF_OPEN_PER_PORT; i++)
+    for (size_t i = 0; i < size_t{1}; i++)
     {
         channel->push_inbound(
             build_tcp_with_options(FLAG_SYN, 1000, 0, static_cast<uint16_t>(30000 + i), 80, ALL_OPTIONS));
@@ -3709,11 +3713,14 @@ TEST(NetworkStackCounters, AHalfOpenEvictionIsCounted)
     stack->listen(80);
     channel->push_inbound(build_arp_request());
     stack->poll();
-    for (size_t i = 0; i < NetworkStack::MAX_HALF_OPEN_PER_PORT; i++)
+    for (size_t i = 0; i < HALF_OPEN_CAP; i++)
     {
         channel->push_inbound(build_tcp(FLAG_SYN, 1000, 0, static_cast<uint16_t>(30000 + i), 80));
     }
-    stack->poll();
+    for (int i = 0; i < 50; i++)
+    {
+        stack->poll();
+    }
     ASSERT_TRUE(stack->half_open_evictions() == 0) << "the cap was just reached, nothing evicted";
 
     stack->on_time_passed(NetworkStack::HALF_OPEN_EVICT_AGE_MS);
@@ -3773,4 +3780,29 @@ TEST(NetworkStackCounters, TcpTotalsSplitByOriginAndSurviveReaping)
     ASSERT_TRUE(normal_after.connections == normal_connections_before
                 && normal_after.retransmit_timeouts == normal_timeouts_before)
         << "so do a reaped normal connection's";
+}
+
+TEST(NetworkStackCounters, TheHalfOpenCapIsTheListenersBacklog)
+{
+    // Linux's SYN queue is full when qlen >= backlog; so is this one. A
+    // listener with backlog 4 gives exactly four SYNs a slot (a stateful
+    // SYN-ACK) and answers the fifth with a cookie.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    stack->listen(80, 4);
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+    channel->clear_outbound();
+    for (uint16_t i = 0; i < 4; i++)
+    {
+        channel->push_inbound(
+            build_tcp_with_options(FLAG_SYN, 1000, 0, static_cast<uint16_t>(30000 + i), 80, ALL_OPTIONS));
+        stack->poll();
+    }
+    ASSERT_TRUE(stack->syn_cookies_sent() == 0) << "the first four fit";
+    channel->push_inbound(build_tcp_with_options(FLAG_SYN, 1000, 0, 30004, 80, ALL_OPTIONS));
+    stack->poll();
+    ASSERT_TRUE(stack->syn_cookies_sent() == 1) << "the fifth is past the cap";
+    ASSERT_TRUE(NetworkStack::half_open_cap(1u << 20) == NetworkStack::MAX_LISTEN_BACKLOG) << "clamped like somaxconn";
+    ASSERT_TRUE(NetworkStack::half_open_cap(0) == 1) << "and never zero";
 }

@@ -1676,7 +1676,7 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
         //
         auto half_open_it = this->_half_open_per_port.find(key.local_port);
         size_t half_open = half_open_it == this->_half_open_per_port.end() ? 0 : half_open_it->second.size();
-        if (half_open >= MAX_HALF_OPEN_PER_PORT)
+        if (half_open >= half_open_cap(listening_it->second.backlog))
         {
             // Full. If the oldest has waited far longer than a real client
             // takes to answer, it is almost certainly a flood's: evict it and
