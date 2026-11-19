@@ -63,6 +63,13 @@
 //   close           the connection closes
 //   state NAME      the connection is in NAME (LISTEN ... CLOSED, as in
 //                   tcp_connection.h); a reaped connection counts as CLOSED
+//   expect_new_isn N
+//                   the next SYN the stack sends opens a new sequence space
+//                   (a new connection on a four-tuple it already used): its
+//                   ISN, written relative to the current one, must be at or
+//                   after N in modular order, and the stack's sequence
+//                   numbers - and injected acks - are relative to it from
+//                   then on. Fails if no SYN follows.
 //
 // Untimed directives, normally at the top:
 //

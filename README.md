@@ -60,7 +60,10 @@ simultaneous close rather than folding it into `FIN_WAIT_2`. On top of that:
 - **Timestamps and PAWS** (RFC 7323): a round-trip sample from every segment rather than
   one per window, which restores RTT measurement *during* loss recovery - exactly when
   Karn's algorithm otherwise blinds the estimator - and rejects an old duplicate whose
-  sequence number looks plausible because the space has wrapped
+  sequence number looks plausible because the space has wrapped. TSval is one clock per
+  address pair - the stack's clock plus a keyed hash of the two addresses, as Linux's
+  `secure_tcp_ts_off` - so successive connections between two hosts send ever-newer
+  timestamps without the clock giving away uptime to anyone else
 - **Selective acknowledgement** (RFC 2018), both directions. The cumulative ack can say
   "I have everything below this" and nothing else, so one lost segment hides the eight
   behind it that arrived perfectly; SACK names what did arrive, so only the holes are
@@ -124,6 +127,19 @@ simultaneous close rather than folding it into `FIN_WAIT_2`. On top of that:
 - **`TIME_WAIT` ignores RST** (RFC 1337): RFC 9293 still closes on one and names RFC
   1337 as optional; this stack takes its side, because closing early is the hazard
   `TIME_WAIT` exists to prevent
+- **A provably new SYN ends `TIME_WAIT` early**, as Linux's `tcp_timewait_state_process`
+  does, so a client reconnecting from the same port is not refused for 60 seconds. The SYN
+  must be bare (no ACK, RST or FIN) and new: TSval newer than TS.Recent if the old
+  connection used timestamps (RFC 6191), otherwise a sequence number beyond RCV.NXT (RFC
+  1122 4.2.2.13); and a listener must be there that would take it statefully - not drop
+  it for a full accept queue, nor answer with a SYN cookie. The old connection is then
+  closed and reaped exactly as when its timer runs out, and a brand-new one answers, with
+  nothing carried over and an ISN at least the old SND.NXT + 65537, so none of the old
+  connection's segments can fall in its window. Any other SYN still draws a rate-limited
+  challenge ACK. The accepted trade-off, the same Linux makes: anyone who knows the
+  four-tuple and can send a SYN with a newer TSval (or, without timestamps, a later
+  sequence number) can end that `TIME_WAIT` early - which only replaces it with a new
+  connection they must still complete, while RST, the cheaper attack, stays ignored
 - `abort()` (RFC 9293 ABORT: a RST at SND.NXT, every queue flushed) alongside `close()`,
   which is a half close - `shutdown(SHUT_WR)`, not POSIX `close()`. After a ustack `close()`
   (`abandon_receive()`), new data from the peer is answered with a RST (RFC 9293 3.10.7.4),

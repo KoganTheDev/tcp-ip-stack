@@ -1,0 +1,28 @@
+# RFC 6191's other half: in TIME_WAIT, a SYN whose TSval is not newer than
+# TS.Recent may be an old duplicate, so it is answered with a challenge ACK
+# (RFC 5961 4) and the connection stays in TIME_WAIT. With timestamps in use
+# the TSval decides - a sequence number well beyond RCV.NXT does not help.
+0      listen 8080
++0     < S 0:0(0) win 65535 <mss 1460,TS val 100 ecr 0>
++0     > S. 0:0(0) ack 1 <mss 1460,TS val * ecr 100>
++0.005 < . 1:1(0) ack 1 win 65535 <nop,nop,TS val 105 ecr 0>
++0     accept
+
++0.010 close
++0     > F. 1:1(0) ack 1 <...>
++0.005 < . 1:1(0) ack 2 win 65535 <nop,nop,TS val 120 ecr 0>
++0.005 < F. 1:1(0) ack 2 win 65535 <nop,nop,TS val 130 ecr 0>
++0     > . 2:2(0) ack 2 <...>
++0     state TIME_WAIT
+
+# Equal to TS.Recent is not newer.
++1     < S 100000:100000(0) win 65535 <mss 1460,TS val 130 ecr 0>
++0     > . 2:2(0) ack 2 <...>
++0     state TIME_WAIT
++0.010 < S 100000:100000(0) win 65535 <mss 1460,TS val 50 ecr 0>
++0     > . 2:2(0) ack 2 <...>
++0     state TIME_WAIT
+# Nor is a SYN without a TSval at all, once the old connection used them.
++0.010 < S 100000:100000(0) win 65535 <mss 1460>
++0     > . 2:2(0) ack 2 <...>
++0     state TIME_WAIT

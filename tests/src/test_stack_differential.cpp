@@ -258,30 +258,116 @@ namespace
         return trace;
     }
 
+    // The server closes first, so its end of the four-tuple is in TIME_WAIT;
+    // the client then reconnects from the same source port (bound before
+    // connect, with SO_REUSEADDR) well inside 2*MSL. Linux accepts the SYN
+    // because its TSval is newer than the TIME_WAIT socket's TS.Recent
+    // (tcp_timewait_state_process, RFC 6191), and so must ustack. Kernel
+    // timestamps on loopback use one offset per address pair, so the
+    // kernel's side of this is deterministic too.
+    template <class H>
+    std::vector<std::string> run_reconnect_scenario()
+    {
+        using S = typename H::StackT;
+        H h;
+        S& server = h.server_stack();
+        S& client = h.client_stack();
+        std::vector<std::string> trace;
+        auto note = [&](const std::string& what, const std::string& value)
+        {
+            trace.push_back(what + ": " + value);
+        };
+        int one = 1;
+
+        int listener = open_socket(server);
+        sockaddr_in any{};
+        any.sin_family = AF_INET;
+        any.sin_addr.s_addr = htonl(INADDR_ANY);
+        REQUIRE_TRUE(server.bind(listener, reinterpret_cast<sockaddr*>(&any), sizeof(any)) == 0, errno_text(errno));
+        REQUIRE_TRUE(server.listen(listener, 8) == 0, errno_text(errno));
+        socklen_t length = sizeof(any);
+        REQUIRE_TRUE(server.getsockname(listener, reinterpret_cast<sockaddr*>(&any), &length) == 0, errno_text(errno));
+        sockaddr_in target = H::server_address(ntohs(any.sin_port));
+
+        // First connection, from an ephemeral port that is then reused.
+        int cfd = open_socket(client);
+        REQUIRE_TRUE(client.setsockopt(cfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) == 0, errno_text(errno));
+        static_cast<void>(client.connect(cfd, reinterpret_cast<sockaddr*>(&target), sizeof(target)));
+        h.settle(50);
+        sockaddr_in source{};
+        length = sizeof(source);
+        REQUIRE_TRUE(client.getsockname(cfd, reinterpret_cast<sockaddr*>(&source), &length) == 0, errno_text(errno));
+        int sfd = server.accept4(listener, nullptr, nullptr, SOCK_NONBLOCK);
+        REQUIRE_TRUE(sfd >= 0, errno_text(errno));
+        note("first send", send_text(client, cfd, "one"));
+        h.settle(50);
+        note("first recv", recv_text(server, sfd));
+
+        // The server closes first; the client reads EOF and closes too.
+        REQUIRE_TRUE(server.close(sfd) == 0, errno_text(errno));
+        h.settle(50);
+        note("client recv after server close", recv_text(client, cfd));
+        REQUIRE_TRUE(client.close(cfd) == 0, errno_text(errno));
+        h.settle(50);
+
+        // Reconnect from the same source port.
+        int again = open_socket(client);
+        {
+            Probe<S> c(client, again);
+            REQUIRE_TRUE(client.setsockopt(again, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) == 0, errno_text(errno));
+            int rc = client.bind(again, reinterpret_cast<sockaddr*>(&source), sizeof(source));
+            note("bind to the same source port", rc == 0 ? "0" : errno_name(errno));
+            rc = client.connect(again, reinterpret_cast<sockaddr*>(&target), sizeof(target));
+            note("reconnect connect()", rc == 0 ? "0" : errno_name(errno));
+            h.settle(50);
+            note("client after reconnect", c.events());
+            note("client SO_ERROR", errno_name(so_error(client, again)));
+            int sfd2 = server.accept4(listener, nullptr, nullptr, SOCK_NONBLOCK);
+            note("server accept4 of the reconnect", sfd2 >= 0 ? "ok" : errno_name(errno));
+            if (sfd2 >= 0)
+            {
+                note("second send", send_text(client, again, "two"));
+                h.settle(50);
+                note("second recv", recv_text(server, sfd2));
+                REQUIRE_TRUE(server.close(sfd2) == 0, errno_text(errno));
+            }
+        }
+        REQUIRE_TRUE(client.close(again) == 0, errno_text(errno));
+        REQUIRE_TRUE(server.close(listener) == 0, errno_text(errno));
+        return trace;
+    }
+
+    // Line-by-line comparison, with the kernel's trace on failure for context.
+    void compare_traces(const std::vector<std::string>& ustack, const std::vector<std::string>& kernel)
+    {
+        ASSERT_EQ(ustack.size(), kernel.size()) << "the scenario took a different path";
+        std::string report;
+        for (size_t i = 0; i < ustack.size(); i++)
+        {
+            if (ustack[i] == kernel[i])
+            {
+                continue;
+            }
+            report += "  ustack: " + ustack[i] + "\n  kernel: " + kernel[i] + "\n\n";
+        }
+        EXPECT_TRUE(report.empty()) << "unexplained differences:\n" << report;
+        if (!report.empty())
+        {
+            for (const std::string& line : kernel)
+            {
+                std::cerr << "kernel: " << line << "\n";
+            }
+        }
+    }
+
 }
 
 TEST(StackDifferential, UserVisibleBehaviourMatchesTheKernel)
 {
-    std::vector<std::string> ustack = run_scenario<SimHarness>();
-    std::vector<std::string> kernel = run_scenario<KernelHarness>();
+    compare_traces(run_scenario<SimHarness>(), run_scenario<KernelHarness>());
+}
 
-    ASSERT_EQ(ustack.size(), kernel.size()) << "the scenario took a different path";
-    std::string report;
-    for (size_t i = 0; i < ustack.size(); i++)
-    {
-        if (ustack[i] == kernel[i])
-        {
-            continue;
-        }
-        report += "  ustack: " + ustack[i] + "\n  kernel: " + kernel[i] + "\n\n";
-    }
-    EXPECT_TRUE(report.empty()) << "unexplained differences:\n" << report;
-    // On failure, the kernel's whole trace, for context.
-    if (!report.empty())
-    {
-        for (const std::string& line : kernel)
-        {
-            std::cerr << "kernel: " << line << "\n";
-        }
-    }
+TEST(StackDifferential, ReconnectIntoAServerTimeWaitMatchesTheKernel)
+{
+    compare_traces(run_reconnect_scenario<SimHarness>(), run_reconnect_scenario<KernelHarness>());
 }

@@ -1,0 +1,24 @@
+# RFC 1122 4.2.2.13: with no timestamps on the old connection, a SYN in
+# TIME_WAIT whose sequence number is beyond RCV.NXT (2 here) is accepted as a
+# new connection, as Linux does. The new ISN is at least 65537 past the old
+# SND.NXT.
+0      listen 8080
++0     < S 0:0(0) win 65535 <mss 1460>
++0     > S. 0:0(0) ack 1 <mss 1460>
++0.005 < . 1:1(0) ack 1 win 65535
++0     accept
+
++0.010 close
++0     > F. 1:1(0) ack 1
++0.005 < . 1:1(0) ack 2 win 65535
++0.005 < F. 1:1(0) ack 2 win 65535
++0     > . 2:2(0) ack 2
++0     state TIME_WAIT
+
++1     expect_new_isn 65539
++0     < S 3:3(0) win 65535 <mss 1460>
++0     > S. 0:0(0) ack 4 <mss 1460>
++0     state CLOSED
++0.005 < . 4:4(0) ack 1 win 65535
++0     accept
++0     state ESTABLISHED

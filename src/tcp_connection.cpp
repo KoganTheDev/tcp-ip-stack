@@ -261,7 +261,7 @@ void TcpConnection::_add_options(Tcp& header, uint8_t flags, size_t payload_size
         }
         if (!is_syn_ack || _timestamps_negotiated)
         {
-            header.set_timestamp_option(static_cast<uint32_t>(_now_ms), _have_ts_recent ? _ts_recent : 0);
+            header.set_timestamp_option(_ts_clock(), _have_ts_recent ? _ts_recent : 0);
         }
         if (!is_syn_ack || _sack_permitted)
         {
@@ -275,7 +275,7 @@ void TcpConnection::_add_options(Tcp& header, uint8_t flags, size_t payload_size
         // RFC 7323 3.2: once negotiated, TSopt goes on every non-RST segment -
         // retransmissions and probes included - and each carries the clock
         // as it is now, not as it was when the data was first sent.
-        header.set_timestamp_option(static_cast<uint32_t>(_now_ms), _ts_recent);
+        header.set_timestamp_option(_ts_clock(), _ts_recent);
     }
 
     if (_sack_permitted)
@@ -830,7 +830,7 @@ SendScoreboard::AckContext TcpConnection::_rack_context(const Tcp& segment) cons
     rack.now_ms = _now_ms;
     rack.min_rtt_ms = _rack_min_rtt_ms;
     rack.has_echo = _timestamps_negotiated && segment.has_timestamp_option() && segment.get_timestamp_echo() != 0;
-    rack.echo = segment.get_timestamp_echo();
+    rack.echo = segment.get_timestamp_echo() - _ts_offset; // back onto this connection's clock
     return rack;
 }
 
@@ -1377,9 +1377,9 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     if (_timestamps_negotiated && segment.has_timestamp_option() && acked_anything)
     {
         uint32_t echo = segment.get_timestamp_echo();
-        if (echo != 0 && seq_at_or_before(echo, static_cast<uint32_t>(_now_ms)))
+        if (echo != 0 && seq_at_or_before(echo, _ts_clock()))
         {
-            _take_rtt_sample(static_cast<uint32_t>(_now_ms) - echo);
+            _take_rtt_sample(_ts_clock() - echo);
         }
     }
     else if (have_rtt_sample)
@@ -1570,6 +1570,31 @@ void TcpConnection::_handle_fin(uint32_t fin_seq)
         // moves to TIME_WAIT once our own FIN is acked
         _send_pure_ack();
         _transition(TcpState::CLOSING);
+    }
+}
+
+bool TcpConnection::accepts_reuse_syn(uint32_t seq, std::optional<uint32_t> tsval) const
+{
+    if (_state != TcpState::TIME_WAIT)
+    {
+        return false;
+    }
+    if (_timestamps_negotiated)
+    {
+        // RFC 6191 2: with timestamps the TSval decides, whatever the
+        // sequence number - it is the reliable clock, and the one PAWS would
+        // have used to drop an old duplicate of this SYN.
+        return tsval.has_value() && _have_ts_recent && seq_after(*tsval, _ts_recent);
+    }
+    return seq_after(seq, _recv_next);
+}
+
+void TcpConnection::end_time_wait()
+{
+    EntryScope scope(*this);
+    if (_state == TcpState::TIME_WAIT)
+    {
+        _transition(TcpState::CLOSED);
     }
 }
 

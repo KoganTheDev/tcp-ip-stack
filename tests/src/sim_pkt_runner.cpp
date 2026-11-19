@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -14,6 +15,7 @@
 #include "network_stack.h"
 #include "packet_channel.h"
 #include "sim/tcp_frame.h"
+#include "tcp_sequence.h"
 
 namespace
 {
@@ -277,6 +279,10 @@ namespace
                         _execute(text);
                 }
                 _expect_nothing_sent();
+                if (_new_isn_floor)
+                {
+                    throw ScriptError("expect_new_isn: the stack never sent another SYN");
+                }
                 result.passed = true;
             }
             catch (const ScriptError& e)
@@ -374,9 +380,22 @@ namespace
             // numbers are relative to from then on.
             tcp_frame::Segment s;
             std::string ignored;
-            if (direction[0] == '>' && !_have_stack_isn && tcp_frame::parse(frame, s, ignored)
+            if (direction[0] == '>' && (!_have_stack_isn || _new_isn_floor) && tcp_frame::parse(frame, s, ignored)
                 && (s.flags & tcp_frame::SYN))
             {
+                if (_new_isn_floor)
+                {
+                    // expect_new_isn: checked against the old sequence space
+                    // before switching to the new one.
+                    uint32_t relative = s.seq - _stack_isn;
+                    uint32_t floor = *_new_isn_floor;
+                    _new_isn_floor.reset();
+                    if (seq_before(relative, floor))
+                    {
+                        throw ScriptError("the new SYN's ISN is " + std::to_string(relative)
+                                          + " relative to the old one, before the floor " + std::to_string(floor));
+                    }
+                }
                 _stack_isn = s.seq;
                 _have_stack_isn = true;
             }
@@ -589,6 +608,12 @@ namespace
                     throw ScriptError("read: expected " + std::to_string(n) + " bytes, got "
                                       + std::to_string(data.size()));
             }
+            else if (command == "expect_new_isn")
+            {
+                if (!_have_stack_isn)
+                    throw ScriptError("expect_new_isn: the stack has not sent a SYN yet, so there is no old ISN");
+                _new_isn_floor = static_cast<uint32_t>(parse_number(argument, false));
+            }
             else if (command == "close")
             {
                 _connection("close")->close();
@@ -620,6 +645,7 @@ namespace
         bool _have_stack_port = false;
         uint32_t _stack_isn = 0;
         bool _have_stack_isn = false;
+        std::optional<uint32_t> _new_isn_floor; // set by expect_new_isn until the next SYN
         uint64_t _connection_id = 0;
         bool _have_connection = false;
     };

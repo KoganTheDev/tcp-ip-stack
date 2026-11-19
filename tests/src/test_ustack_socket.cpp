@@ -1,5 +1,6 @@
 #include <netinet/tcp.h>
 
+#include "test_support.h"
 #include "ustack_fixture.h"
 
 // The ustack socket calls themselves - names, errors and TCP/UDP semantics -
@@ -241,4 +242,101 @@ TEST_F(UstackSocket, SocketOptions)
     EXPECT_EQ(value, 1);
     ASSERT_EQ(server->getsockopt(accepted, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, &length), 0);
     EXPECT_EQ(value, 5000);
+}
+
+// A client that reconnects from one fixed port.
+class UstackTimeWait : public UstackFixture
+{
+protected:
+    static constexpr uint16_t CLIENT_PORT = 45000;
+
+    // A client socket bound to CLIENT_PORT (with SO_REUSEADDR, as such a
+    // client sets it) with a connect to the server in progress.
+    int connect_from_fixed_port()
+    {
+        int fd = client->socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        REQUIRE_TRUE(fd >= 0, std::strerror(errno));
+        int one = 1;
+        REQUIRE_TRUE(client->setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) == 0, std::strerror(errno));
+        sockaddr_in local = address(IPv4Address(), CLIENT_PORT);
+        REQUIRE_TRUE(client->bind(fd, as_sockaddr(local), sizeof(local)) == 0, std::strerror(errno));
+        sockaddr_in remote = address(server_ip, SERVER_PORT);
+        REQUIRE_TRUE(client->connect(fd, as_sockaddr(remote), sizeof(remote)) == -1 && errno == EINPROGRESS,
+                     std::strerror(errno));
+        return fd;
+    }
+};
+
+// The server closes first, so its end of the four-tuple sits in TIME_WAIT;
+// the client reconnects from the same port long before 2*MSL. The new SYN
+// ends TIME_WAIT (RFC 6191: the client's TSval is newer) and a new connection
+// is accepted. The old connection is reaped while its fd is closed and still
+// watched by nothing - under ASan, any callback reaching a freed socket or
+// connection shows up here.
+TEST_F(UstackTimeWait, ReconnectFromTheSamePortReusesAServerTimeWait)
+{
+    listen_fd = listen_on(SERVER_PORT);
+    int server_ep = server->epoll_create1(0);
+    int client_fd = connect_from_fixed_port();
+    int server_fd = accept_within(listen_fd);
+    ASSERT_GE(server_fd, 0);
+    ASSERT_EQ(add(*server, server_ep, server_fd, EPOLLIN | EPOLLRDHUP), 0);
+
+    ASSERT_EQ(server->close(server_fd), 0); // the server closes first
+    char byte = 0;
+    ASSERT_TRUE(net.run_until([&] { return client->recv(client_fd, &byte, 1, 0) == 0; }, 1000));
+    ASSERT_EQ(client->close(client_fd), 0);
+    net.step(100); // the client's FIN and the server's ACK: TIME_WAIT on the server
+    ASSERT_EQ(server_net->time_wait_reuses(), 0u);
+
+    int again = connect_from_fixed_port();
+    int server_again = accept_within(listen_fd, 2000);
+    ASSERT_GE(server_again, 0) << "the reconnect waited out TIME_WAIT (or never got in)";
+    EXPECT_EQ(server_net->time_wait_reuses(), 1u);
+    ASSERT_EQ(add(*server, server_ep, server_again, EPOLLIN | EPOLLRDHUP), 0);
+
+    ASSERT_EQ(send_string(*client, again, "second"), 6);
+    ASSERT_NE(events_for(wait_events(*server, server_ep, 1000), static_cast<uint64_t>(server_again)) & EPOLLIN, 0U);
+    EXPECT_EQ(recv_string(*server, server_again), "second");
+    EXPECT_EQ(client->close(again), 0);
+    EXPECT_EQ(server->close(server_again), 0);
+    net.step(61000); // the old TIME_WAIT's timer entry surfaces, stale
+    EXPECT_EQ(server->close(server_ep), 0);
+}
+
+// The same, with the server's fd still open in TIME_WAIT (shutdown, not
+// close) and in an epoll set. Ending TIME_WAIT closes that socket the way the
+// 2*MSL timer would: it is woken, reads EOF, and closes cleanly afterwards.
+TEST_F(UstackTimeWait, EndingTimeWaitForReuseWakesAnOpenFd)
+{
+    listen_fd = listen_on(SERVER_PORT);
+    int server_ep = server->epoll_create1(0);
+    int client_fd = connect_from_fixed_port();
+    int server_fd = accept_within(listen_fd);
+    ASSERT_GE(server_fd, 0);
+
+    ASSERT_EQ(server->shutdown(server_fd, SHUT_WR), 0); // FIN, fd kept
+    char byte = 0;
+    ASSERT_TRUE(net.run_until([&] { return client->recv(client_fd, &byte, 1, 0) == 0; }, 1000));
+    ASSERT_EQ(client->close(client_fd), 0);
+    ASSERT_TRUE(net.run_until([&] { return server->recv(server_fd, &byte, 1, 0) == 0; }, 1000));
+    net.step(100);
+    ASSERT_EQ(add(*server, server_ep, server_fd, EPOLLIN | EPOLLRDHUP), 0);
+    wait_events(*server, server_ep, 0); // drain what is already reported
+
+    int again = connect_from_fixed_port();
+    int server_again = accept_within(listen_fd, 2000);
+    ASSERT_GE(server_again, 0);
+    EXPECT_EQ(server_net->time_wait_reuses(), 1u);
+
+    uint32_t events = events_for(wait_events(*server, server_ep, 0), static_cast<uint64_t>(server_fd));
+    EXPECT_NE(events & EPOLLHUP, 0U) << "the old socket is closed now: " << events;
+    EXPECT_EQ(so_error(*server, server_fd), 0) << "an orderly end, as when the timer runs out";
+    EXPECT_EQ(server->recv(server_fd, &byte, 1, 0), 0);
+    EXPECT_EQ(server->close(server_fd), 0);
+
+    EXPECT_EQ(client->close(again), 0);
+    EXPECT_EQ(server->close(server_again), 0);
+    net.step(61000);
+    EXPECT_EQ(server->close(server_ep), 0);
 }

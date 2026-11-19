@@ -1,4 +1,5 @@
 #include "network_stack.h"
+#include "tcp_sequence.h"
 #include "raw.h"
 #include "exceptions.h"
 #include "utils.h"
@@ -217,6 +218,8 @@ NetworkStack::SeededSecrets NetworkStack::SeededSecrets::from_seed(uint64_t seed
     secrets.cookie_key_low = next();
     secrets.cookie_key_high = next();
     secrets.challenge_ack_seed = next();
+    secrets.ts_key_low = next();
+    secrets.ts_key_high = next();
     return secrets;
 }
 
@@ -224,6 +227,7 @@ void NetworkStack::set_secret_seed(uint64_t seed)
 {
     SeededSecrets secrets = SeededSecrets::from_seed(seed);
     this->_isn_generator = IsnGenerator(secrets.isn_key_low, secrets.isn_key_high);
+    this->_ts_offset_generator = IsnGenerator(secrets.ts_key_low, secrets.ts_key_high);
     this->_syn_cookies = SynCookies(secrets.cookie_key_low, secrets.cookie_key_high);
     this->_challenge_ack_rng.seed(static_cast<std::minstd_rand::result_type>(secrets.challenge_ack_seed));
     this->_isn_on_virtual_clock = true;
@@ -237,6 +241,18 @@ uint32_t NetworkStack::_next_isn(const IpAddress& local_ip, uint16_t local_port,
         return this->_isn_generator.generate_at(local_ip, local_port, remote_ip, remote_port, this->_now_ms * 1000);
     }
     return this->_isn_generator.generate(local_ip, local_port, remote_ip, remote_port);
+}
+
+void NetworkStack::_set_timestamp_clock(TcpConnection& connection, const IpAddress& local_ip,
+                                        const IpAddress& remote_ip) const
+{
+    // The connection's clock reads now_ms() and carries on from there once it
+    // is wired to this stack's; the offset turns that into this stack's clock
+    // plus the pair's hash. Ports are left out on purpose (zero): the point is
+    // that a new connection on the same four-tuple sees a newer clock.
+    uint32_t pair_hash = this->_ts_offset_generator.offset_for(local_ip, 0, remote_ip, 0);
+    connection.set_timestamp_offset(pair_hash + static_cast<uint32_t>(this->_now_ms)
+                                    - static_cast<uint32_t>(connection.now_ms()));
 }
 
 void NetworkStack::configure_interface(const InterfaceConfig& config)
@@ -511,6 +527,7 @@ TcpConnection* NetworkStack::_open_connection(const IpAddress& remote_address, u
         this->_segment_sender(remote_ip, this->_primary().config.ip), this->_primary().config.local_mss());
     connection->set_ecn_mode(this->_tcp_ecn);
     connection->set_local_ip(this->_primary().config.ip);
+    this->_set_timestamp_clock(*connection, this->_primary().config.ip, remote_ip);
 
     TcpConnection* connection_ptr = connection.get();
     this->_register_connection(key, std::move(connection));
@@ -1152,23 +1169,29 @@ void NetworkStack::_reap_closed_connections()
     {
         uint64_t connection_id = this->_pending_reap_ids.front();
         this->_pending_reap_ids.pop_front();
-
-        auto id_it = this->_connections_by_id.find(connection_id);
-        if (id_it == this->_connections_by_id.end())
-        {
-            continue; // already reaped - e.g. a duplicate CLOSED transition
-        }
-
-        LOG_DEBUG("NetworkStack: reaping closed connection id=" << connection_id);
-        // Its entries in the timer queue go stale with the record and are
-        // dropped as they surface.
-        TcpTotals& reaped = this->_reaped_totals[id_it->second.from_cookie ? 1 : 0];
-        reaped.connections += 1;
-        reaped.retransmit_timeouts += id_it->second.connection->stats().retransmit_timeouts;
-        reaped.retransmitted_segments += id_it->second.connection->stats().retransmitted_segments;
-        this->_connections.erase(id_it->second.key);
-        this->_connections_by_id.erase(id_it);
+        this->_reap_connection(connection_id);
     }
+}
+
+void NetworkStack::_reap_connection(uint64_t connection_id)
+{
+    auto id_it = this->_connections_by_id.find(connection_id);
+    if (id_it == this->_connections_by_id.end())
+    {
+        // already reaped - e.g. a duplicate CLOSED transition, or a TIME_WAIT
+        // ended early for reuse, whose id is still queued
+        return;
+    }
+
+    LOG_DEBUG("NetworkStack: reaping closed connection id=" << connection_id);
+    // Its entries in the timer queue go stale with the record and are
+    // dropped as they surface.
+    TcpTotals& reaped = this->_reaped_totals[id_it->second.from_cookie ? 1 : 0];
+    reaped.connections += 1;
+    reaped.retransmit_timeouts += id_it->second.connection->stats().retransmit_timeouts;
+    reaped.retransmitted_segments += id_it->second.connection->stats().retransmitted_segments;
+    this->_connections.erase(id_it->second.key);
+    this->_connections_by_id.erase(id_it);
 }
 
 NetworkStack::TcpTotals NetworkStack::tcp_totals(bool from_cookie) const
@@ -1605,11 +1628,86 @@ void NetworkStack::_dispatch_transport(const Ip& ip, const Bytes& received)
     }
 }
 
+bool NetworkStack::_reuses_time_wait(const TcpConnection& existing, const IpAddress& source,
+                                     const IpAddress& destination, const Tcp& tcp) const
+{
+    if (existing.get_state() != TcpState::TIME_WAIT || !tcp.get_syn() || tcp.get_ack() || tcp.get_rst()
+        || tcp.get_fin())
+    {
+        return false;
+    }
+    // Only a listener can take the new connection. Without one the SYN goes to
+    // the TIME_WAIT connection as before: a challenge ACK, rate limited.
+    auto listening_it = this->_listening_ports.find(tcp.get_dest_port());
+    if (listening_it == this->_listening_ports.end() || !listening_it->second.accepts(source, destination))
+    {
+        return false;
+    }
+    // And only when it would take this SYN statefully, so that the new
+    // connection exists and its ISN honours the floor. Were the SYN to be
+    // dropped (accept queue full) or answered with a SYN cookie (whose ISN is
+    // the cookie, floor or no floor), ending TIME_WAIT would give up the
+    // four-tuple's protection for nothing; the SYN goes to the TIME_WAIT
+    // connection instead. Mirrors the admission checks in _handle_tcp.
+    const Listener& listener = listening_it->second;
+    auto pending_it = this->_pending_accepts.find(tcp.get_dest_port());
+    if (pending_it != this->_pending_accepts.end() && pending_it->second.size() >= listener.backlog)
+    {
+        return false;
+    }
+    auto half_open_it = this->_half_open_per_port.find(tcp.get_dest_port());
+    if (half_open_it != this->_half_open_per_port.end()
+        && half_open_it->second.size() >= half_open_cap(listener.backlog))
+    {
+        // Full: admitted only if the oldest is stale enough to be evicted.
+        uint64_t oldest_id = half_open_it->second.begin()->first;
+        uint64_t oldest_created = half_open_it->second.begin()->second;
+        if (this->find_connection(oldest_id) == nullptr || this->_now_ms - oldest_created < HALF_OPEN_EVICT_AGE_MS)
+        {
+            return false;
+        }
+    }
+    std::optional<uint32_t> tsval;
+    if (tcp.has_timestamp_option())
+    {
+        tsval = tcp.get_timestamp_value();
+    }
+    return existing.accepts_reuse_syn(tcp.get_sequence_number(), tsval);
+}
+
 void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destination, const Tcp& tcp, Ecn ecn)
 {
     ConnectionKey key{source, tcp.get_src_port(), tcp.get_dest_port()};
 
     auto connection_it = this->_connections.find(key);
+
+    // A SYN for a four-tuple in TIME_WAIT that is provably a new connection
+    // (TcpConnection::accepts_reuse_syn - RFC 6191, RFC 1122 4.2.2.13), and
+    // that the listener would admit statefully (_reuses_time_wait), ends
+    // TIME_WAIT now instead of drawing challenge ACKs for up to 2*MSL: a
+    // client reconnecting from the same port would otherwise be stuck until
+    // then. The old connection goes through the ordinary CLOSED transition and
+    // reap, so the socket layer and the totals see an ordinary close, and the
+    // SYN then takes the listener path below like any other - a brand-new
+    // connection with nothing carried over (no TS.Recent for PAWS, no
+    // scoreboard) - except that its ISN is kept clear of the old sequence
+    // space (time_wait_reuse_isn). Every other segment, and a SYN that is not
+    // provably new, reaches the old connection exactly as before.
+    std::optional<uint32_t> old_send_next;
+    if (connection_it != this->_connections.end()
+        && this->_reuses_time_wait(*connection_it->second, source, destination, tcp))
+    {
+        TcpConnection& old = *connection_it->second;
+        LOG_DEBUG("NetworkStack: a new SYN from " << source.to_string() << ":" << key.remote_port
+                                                  << " ends TIME_WAIT on port " << key.local_port << " early");
+        old_send_next = old.get_send_next();
+        uint64_t old_id = old.get_id();
+        old.end_time_wait();
+        this->_reap_connection(old_id); // erases the key: connection_it is gone
+        this->_time_wait_reuses += 1;
+        connection_it = this->_connections.end();
+    }
+
     if (connection_it != this->_connections.end())
     {
         TcpState state_before = connection_it->second->get_state();
@@ -1733,12 +1831,17 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
     // The local address in the ISN tuple: the primary interface's for v4, as
     // it has always been, and the address the SYN was sent to for v6.
     const IpAddress local_ip = source.is_v4() ? IpAddress(this->_primary().config.ip) : destination;
+    uint32_t isn = this->_next_isn(local_ip, key.local_port, remote_ip, key.remote_port);
+    if (old_send_next)
+    {
+        isn = time_wait_reuse_isn(isn, *old_send_next);
+    }
     auto connection =
-        std::make_unique<TcpConnection>(key.local_port, remote_ip, key.remote_port,
-                                        this->_next_isn(local_ip, key.local_port, remote_ip, key.remote_port),
+        std::make_unique<TcpConnection>(key.local_port, remote_ip, key.remote_port, isn,
                                         this->_segment_sender(remote_ip, local_ip), this->_local_mss_for(remote_ip));
     connection->set_ecn_mode(this->_tcp_ecn);
     connection->set_local_ip(destination);
+    this->_set_timestamp_clock(*connection, local_ip, remote_ip);
 
     try
     {

@@ -283,6 +283,9 @@ public:
         uint64_t cookie_key_low;
         uint64_t cookie_key_high;
         uint64_t challenge_ack_seed;
+        // Last, so adding them did not move the keys above for a given seed.
+        uint64_t ts_key_low;
+        uint64_t ts_key_high;
         static SeededSecrets from_seed(uint64_t seed);
     };
 
@@ -341,6 +344,9 @@ public:
     uint64_t transmit_drops() const { return _transmit_drops; }
     uint64_t challenge_acks_sent() const { return _challenge_acks_sent; }
     uint64_t challenge_acks_suppressed() const { return _challenge_acks_suppressed; }
+    // SYNs that ended a TIME_WAIT early to open a new connection on the same
+    // four-tuple (see _handle_tcp).
+    uint64_t time_wait_reuses() const { return _time_wait_reuses; }
 
     // Pops one ESTABLISHED connection waiting on this port, or nullptr if
     // none are ready. The returned pointer is owned by NetworkStack for the
@@ -619,6 +625,15 @@ private:
     void _handle_udp(const Ip& ip, const Udp& udp, const Bytes& received);
     void _handle_icmp(const Ip& ip, const Icmp& icmp);
     void _reap_closed_connections();
+    // Takes one CLOSED connection out of the tables, folding its counters into
+    // the reaped totals. A no-op for an id already reaped.
+    void _reap_connection(uint64_t connection_id);
+    // Whether this segment, for a four-tuple held by `existing`, is a SYN that
+    // may end its TIME_WAIT and open a new connection (see _handle_tcp): a
+    // provably new bare SYN, and a listener that would take it statefully -
+    // not drop it for a full accept queue, nor answer it with a SYN cookie.
+    bool _reuses_time_wait(const TcpConnection& existing, const IpAddress& source, const IpAddress& destination,
+                           const Tcp& tcp) const;
     // Puts a connection in the tables and in the timer queue. Every
     // connection the stack creates comes through here.
     void _register_connection(const ConnectionKey& key, std::unique_ptr<TcpConnection> connection);
@@ -914,6 +929,16 @@ private:
     // secret, which is the same as no secret at all for an attacker who only
     // needs to predict the connection in front of them.
     IsnGenerator _isn_generator;
+    // Keys the per-address-pair TSval offset (see
+    // TcpConnection::set_timestamp_offset). Its own key, as Linux keeps
+    // ts_secret apart from the ISN secret: a TSval is visible to anyone the
+    // connection talks to, and must not be a window onto the ISN hash.
+    IsnGenerator _ts_offset_generator;
+    // Sets a new connection's TSval offset: this stack's clock plus the keyed
+    // hash of the two addresses, so successive connections between the same
+    // two hosts send ever-newer timestamps. Before accept_incoming_syn() or
+    // the first SYN.
+    void _set_timestamp_clock(TcpConnection& connection, const IpAddress& local_ip, const IpAddress& remote_ip) const;
     // SYN cookies, for a listening port flooded with young half-open
     // connections (see _send_syn_cookie / _try_complete_cookie_handshake).
     SynCookies _syn_cookies;
@@ -949,6 +974,7 @@ private:
     uint64_t _challenge_acks_in_window = 0;
     uint64_t _challenge_acks_sent = 0;
     uint64_t _challenge_acks_suppressed = 0;
+    uint64_t _time_wait_reuses = 0;
     uint64_t _transmit_drops = 0;
 
     // Null until start_dhcp(). Owned here rather than by the application
