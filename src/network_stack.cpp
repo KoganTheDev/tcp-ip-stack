@@ -1643,6 +1643,30 @@ bool NetworkStack::_reuses_time_wait(const TcpConnection& existing, const IpAddr
     {
         return false;
     }
+    // And only when it would take this SYN statefully, so that the new
+    // connection exists and its ISN honours the floor. Were the SYN to be
+    // dropped (accept queue full) or answered with a SYN cookie (whose ISN is
+    // the cookie, floor or no floor), ending TIME_WAIT would give up the
+    // four-tuple's protection for nothing; the SYN goes to the TIME_WAIT
+    // connection instead. Mirrors the admission checks in _handle_tcp.
+    const Listener& listener = listening_it->second;
+    auto pending_it = this->_pending_accepts.find(tcp.get_dest_port());
+    if (pending_it != this->_pending_accepts.end() && pending_it->second.size() >= listener.backlog)
+    {
+        return false;
+    }
+    auto half_open_it = this->_half_open_per_port.find(tcp.get_dest_port());
+    if (half_open_it != this->_half_open_per_port.end()
+        && half_open_it->second.size() >= half_open_cap(listener.backlog))
+    {
+        // Full: admitted only if the oldest is stale enough to be evicted.
+        uint64_t oldest_id = half_open_it->second.begin()->first;
+        uint64_t oldest_created = half_open_it->second.begin()->second;
+        if (this->find_connection(oldest_id) == nullptr || this->_now_ms - oldest_created < HALF_OPEN_EVICT_AGE_MS)
+        {
+            return false;
+        }
+    }
     std::optional<uint32_t> tsval;
     if (tcp.has_timestamp_option())
     {
@@ -1658,7 +1682,8 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
     auto connection_it = this->_connections.find(key);
 
     // A SYN for a four-tuple in TIME_WAIT that is provably a new connection
-    // (TcpConnection::accepts_reuse_syn - RFC 6191, RFC 1122 4.2.2.13) ends
+    // (TcpConnection::accepts_reuse_syn - RFC 6191, RFC 1122 4.2.2.13), and
+    // that the listener would admit statefully (_reuses_time_wait), ends
     // TIME_WAIT now instead of drawing challenge ACKs for up to 2*MSL: a
     // client reconnecting from the same port would otherwise be stuck until
     // then. The old connection goes through the ordinary CLOSED transition and

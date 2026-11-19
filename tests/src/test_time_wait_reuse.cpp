@@ -39,6 +39,8 @@ namespace
         }
 
         NetworkStack& stack() { return _stack; }
+        // The port injected segments come from (PEER_PORT unless changed).
+        uint16_t peer_port = PEER_PORT;
 
         // Sends a segment from the peer and lets the stack process it.
         void inject(uint16_t stack_port, uint8_t flags, uint32_t seq, uint32_t ack,
@@ -49,7 +51,7 @@ namespace
             s.dst_mac = STACK_MAC;
             s.src_ip = PEER_IP;
             s.dst_ip = STACK_IP;
-            s.src_port = PEER_PORT;
+            s.src_port = peer_port;
             s.dst_port = stack_port;
             s.seq = seq;
             s.ack = ack;
@@ -213,9 +215,9 @@ namespace
     // The stack listens, the peer connects (ISN 0), the stack closes first
     // and the peer's FIN puts it in TIME_WAIT. RCV.NXT is 2, TS.Recent 130
     // when `timestamps`.
-    TimeWaitSetup reach_time_wait(Peer& peer, bool timestamps)
+    TimeWaitSetup reach_time_wait(Peer& peer, bool timestamps, size_t backlog = NetworkStack::DEFAULT_LISTEN_BACKLOG)
     {
-        peer.stack().listen(LISTEN_PORT);
+        peer.stack().listen(LISTEN_PORT, backlog);
         peer.inject(LISTEN_PORT, tcp_frame::SYN, 0, 0, timestamps ? ts(100) : std::nullopt);
         tcp_frame::Segment syn_ack = peer.take_one();
         REQUIRE_TRUE(syn_ack.flags == (tcp_frame::SYN | tcp_frame::ACK), "expected a SYN-ACK");
@@ -334,6 +336,73 @@ TEST(TimeWaitReuse, RefusedSynsStayUnderTheChallengeAckRateLimit)
     ASSERT_GT(peer.stack().challenge_acks_suppressed(), 0u);
     ASSERT_EQ(peer.take_sent().size(), sent);
     ASSERT_EQ(peer.stack().find_connection(old.old_id)->get_state(), TcpState::TIME_WAIT);
+}
+
+// Reuse is decided only once the listener would take the SYN statefully.
+// With the accept queue full the listener drops the SYN; ending TIME_WAIT for
+// it would give up the four-tuple's protection for nothing, so the SYN goes
+// to the TIME_WAIT connection instead (a challenge ACK) and it survives.
+TEST(TimeWaitReuse, AFullAcceptQueueLeavesTimeWaitAlone)
+{
+    Peer peer;
+    TimeWaitSetup old = reach_time_wait(peer, true, 1);
+    // Another client completes a handshake nobody accepts: the queue is full.
+    peer.peer_port = PEER_PORT + 1;
+    peer.inject(LISTEN_PORT, tcp_frame::SYN, 0, 0, ts(200));
+    tcp_frame::Segment other = peer.take_one();
+    peer.inject(LISTEN_PORT, tcp_frame::ACK, 1, other.seq + 1, ts(201));
+    peer.peer_port = PEER_PORT;
+
+    peer.inject(LISTEN_PORT, tcp_frame::SYN, 0, 0, ts(5000));
+    tcp_frame::Segment reply = peer.take_one();
+    ASSERT_EQ(reply.flags, tcp_frame::ACK) << "a challenge ACK from the TIME_WAIT connection";
+    ASSERT_EQ(reply.seq, old.old_send_next);
+    TcpConnection* connection = peer.stack().find_connection(old.old_id);
+    ASSERT_TRUE(connection != nullptr) << "TIME_WAIT was ended for a SYN the listener then dropped";
+    ASSERT_EQ(connection->get_state(), TcpState::TIME_WAIT);
+    ASSERT_EQ(peer.stack().time_wait_reuses(), 0u);
+}
+
+// With the half-open table full of young entries the listener would answer
+// with a SYN cookie, whose ISN cannot honour the floor past the old SND.NXT.
+// So no reuse and no cookie for this four-tuple: TIME_WAIT survives.
+TEST(TimeWaitReuse, AListenerInCookieModeLeavesTimeWaitAlone)
+{
+    Peer peer;
+    TimeWaitSetup old = reach_time_wait(peer, true, 1); // half-open cap 1
+    peer.peer_port = PEER_PORT + 1;
+    peer.inject(LISTEN_PORT, tcp_frame::SYN, 0, 0, ts(200)); // half-open, young
+    peer.take_one();
+    peer.peer_port = PEER_PORT;
+
+    peer.inject(LISTEN_PORT, tcp_frame::SYN, 0, 0, ts(5000));
+    tcp_frame::Segment reply = peer.take_one();
+    ASSERT_EQ(reply.flags, tcp_frame::ACK) << "a challenge ACK, not a SYN cookie";
+    TcpConnection* connection = peer.stack().find_connection(old.old_id);
+    ASSERT_TRUE(connection != nullptr) << "TIME_WAIT was ended for a SYN answered with a cookie";
+    ASSERT_EQ(connection->get_state(), TcpState::TIME_WAIT);
+    ASSERT_EQ(peer.stack().time_wait_reuses(), 0u);
+}
+
+// A stale half-open entry is evicted to make room, as for any SYN, so that
+// listener does take the SYN statefully - and reuse goes ahead, floor and all.
+TEST(TimeWaitReuse, AStaleHalfOpenEntryDoesNotBlockReuse)
+{
+    Peer peer;
+    TimeWaitSetup old = reach_time_wait(peer, true, 1);
+    peer.peer_port = PEER_PORT + 1;
+    peer.inject(LISTEN_PORT, tcp_frame::SYN, 0, 0, ts(200));
+    peer.take_one();
+    peer.peer_port = PEER_PORT;
+    peer.advance(NetworkStack::HALF_OPEN_EVICT_AGE_MS);
+    peer.take_sent(); // the half-open connection's SYN-ACK retransmissions
+
+    peer.inject(LISTEN_PORT, tcp_frame::SYN, 0, 0, ts(50000));
+    tcp_frame::Segment syn_ack = peer.take_one();
+    ASSERT_EQ(syn_ack.flags, tcp_frame::SYN | tcp_frame::ACK);
+    ASSERT_TRUE(seq_at_or_before(old.old_send_next + 65537, syn_ack.seq)) << "the floored ISN";
+    ASSERT_TRUE(peer.stack().find_connection(old.old_id) == nullptr);
+    ASSERT_EQ(peer.stack().time_wait_reuses(), 1u);
 }
 
 // The runner's expect_new_isn must not pass vacuously: with no new SYN after

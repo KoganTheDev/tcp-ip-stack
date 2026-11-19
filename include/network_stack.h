@@ -629,7 +629,9 @@ private:
     // the reaped totals. A no-op for an id already reaped.
     void _reap_connection(uint64_t connection_id);
     // Whether this segment, for a four-tuple held by `existing`, is a SYN that
-    // may end its TIME_WAIT and open a new connection (see _handle_tcp).
+    // may end its TIME_WAIT and open a new connection (see _handle_tcp): a
+    // provably new bare SYN, and a listener that would take it statefully -
+    // not drop it for a full accept queue, nor answer it with a SYN cookie.
     bool _reuses_time_wait(const TcpConnection& existing, const IpAddress& source, const IpAddress& destination,
                            const Tcp& tcp) const;
     // Puts a connection in the tables and in the timer queue. Every
