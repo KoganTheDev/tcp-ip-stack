@@ -1029,7 +1029,7 @@ private:
     // link, so nothing in a packet depends on one.
     struct LoopbackDatagram
     {
-        bool v6;
+        bool v6 = false;
         Bytes packet;
     };
     std::deque<LoopbackDatagram> _loopback_queue;
