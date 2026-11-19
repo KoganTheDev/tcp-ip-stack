@@ -528,7 +528,7 @@ connection and waits for the peers (up to 5 s). See its own README.
 the kernel's names, signatures and constants - `socket`, `bind`, `listen`, `accept4`,
 `connect`, `send`, `recv`, `sendto`, `recvfrom`, `shutdown`, `close`, `setsockopt`
 (`TCP_NODELAY`, `SO_KEEPALIVE`, `TCP_USER_TIMEOUT`, `SO_LINGER`, `TCP_CONGESTION`,
-`SO_ERROR`), plus its own `epoll_create1`/`epoll_ctl`/`epoll_wait` - returning -1 and
+`SO_ERROR`, `SO_RCVBUF`, `SO_SNDBUF`), plus its own `epoll_create1`/`epoll_ctl`/`epoll_wait` - returning -1 and
 setting `errno` as Linux would. Its fds are indexes into its own table, not kernel fds.
 The epoll is built like the kernel's: an interest list and a ready list filled by
 callbacks from the stack, with level-triggered, `EPOLLET` and `EPOLLONESHOT` semantics.
@@ -539,6 +539,15 @@ tests. `pollable_fd()` lets it nest inside an application's own kernel epoll. Th
 direction is `epoll_ctl_external()`: a kernel fd the application owns (an eventfd, say) is
 added to a ustack epoll and the wait sleeps in the driver's kernel epoll until it is ready
 (level-triggered; the simulator's driver refuses with `ENOTSUP`).
+
+`SO_RCVBUF` / `SO_SNDBUF` set the per-connection receive and send capacities (clamped to
+4 KiB..16 MiB, and inherited from a listener). One difference from Linux: `getsockopt`
+returns double the value set, as Linux does for kernel bookkeeping, but the payload
+capacity used is the value the application asked for, since there is no per-skb overhead
+to pay for. Setting `SO_RCVBUF` also locks the receive capacity against future
+autotuning. A shrunk receive buffer never pulls back a window already offered. On a UDP
+socket the value is stored and read back but not applied (its queue is bounded by
+datagram count).
 
 [`include/ustack/kernel_stack.h`](include/ustack/kernel_stack.h) is `ustack::KernelStack`:
 the same method names and signatures, each forwarding to the real `::socket`,

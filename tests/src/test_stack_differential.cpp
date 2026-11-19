@@ -337,6 +337,34 @@ namespace
         return trace;
     }
 
+    // SO_RCVBUF / SO_SNDBUF read back what was set. Linux doubles the value
+    // for bookkeeping and ustack reports the same doubled figure (it just uses
+    // the undoubled one as the payload capacity). Values are below the default
+    // rmem_max / wmem_max (212992) so the kernel does not clamp them.
+    template <class H>
+    std::vector<std::string> run_buffer_option_scenario()
+    {
+        using S = typename H::StackT;
+        H h;
+        S& client = h.client_stack();
+        std::vector<std::string> trace;
+        int fd = open_socket(client);
+        int rcv = 65536;
+        int snd = 32768;
+        trace.push_back("set SO_RCVBUF: "
+                        + std::to_string(client.setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof(rcv))));
+        trace.push_back("set SO_SNDBUF: "
+                        + std::to_string(client.setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &snd, sizeof(snd))));
+        int value = 0;
+        socklen_t length = sizeof(value);
+        REQUIRE_TRUE(client.getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &value, &length) == 0, errno_text(errno));
+        trace.push_back("SO_RCVBUF: " + std::to_string(value));
+        length = sizeof(value);
+        REQUIRE_TRUE(client.getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &value, &length) == 0, errno_text(errno));
+        trace.push_back("SO_SNDBUF: " + std::to_string(value));
+        return trace;
+    }
+
     // Line-by-line comparison, with the kernel's trace on failure for context.
     void compare_traces(const std::vector<std::string>& ustack, const std::vector<std::string>& kernel)
     {
@@ -370,4 +398,12 @@ TEST(StackDifferential, UserVisibleBehaviourMatchesTheKernel)
 TEST(StackDifferential, ReconnectIntoAServerTimeWaitMatchesTheKernel)
 {
     compare_traces(run_reconnect_scenario<SimHarness>(), run_reconnect_scenario<KernelHarness>());
+}
+
+TEST(StackDifferential, BufferOptionsReadBackDoubledLikeTheKernel)
+{
+    std::vector<std::string> ustack = run_buffer_option_scenario<SimHarness>();
+    compare_traces(ustack, run_buffer_option_scenario<KernelHarness>());
+    ASSERT_TRUE(ustack.size() == 4 && ustack[2] == "SO_RCVBUF: 131072" && ustack[3] == "SO_SNDBUF: 65536")
+        << "doubling is the contract being compared, not just agreement";
 }

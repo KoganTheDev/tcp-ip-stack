@@ -197,11 +197,23 @@ namespace ustack
         // SOL_SOCKET: SO_KEEPALIVE, SO_LINGER (struct linger; {1, 0} means
         // abort on close, a nonzero l_linger is stored but close() never
         // waits), SO_REUSEADDR (accepted), SO_ERROR (get only, clears it),
-        // SO_TYPE (get only). IPPROTO_TCP: TCP_NODELAY, TCP_USER_TIMEOUT (ms;
+        // SO_TYPE (get only), SO_RCVBUF / SO_SNDBUF. IPPROTO_TCP: TCP_NODELAY, TCP_USER_TIMEOUT (ms;
         // 0 means the default, TcpConnection::DEFAULT_USER_TIMEOUT_MS, as 0
         // means the system default on Linux), TCP_CONGESTION
         // ("reno" or "cubic"). Options set on a listening socket are
         // inherited by the sockets accept() returns.
+        //
+        // SO_RCVBUF / SO_SNDBUF differ from Linux in one way. Linux doubles
+        // the value set to allow for kernel bookkeeping overhead, and
+        // getsockopt returns the doubled figure; this stack returns the
+        // doubled figure too (so a program that reads it back and halves it
+        // sees what it set) but uses the value the application asked for as
+        // the payload capacity, because there is no per-skb overhead to pay
+        // for. Values clamp to [4 KiB (or 2*MSS), 16 MiB]. Setting
+        // SO_RCVBUF locks the receive capacity against autotuning. On a UDP
+        // socket the value is stored and read back, but not applied: the
+        // receive queue there is bounded by datagram count
+        // (UDP_RECEIVE_QUEUE_LIMIT), not bytes.
         int setsockopt(int fd, int level, int optname, const void* optval, socklen_t optlen);
         int getsockopt(int fd, int level, int optname, void* optval, socklen_t* optlen);
         int getsockname(int fd, struct sockaddr* addr, socklen_t* addrlen);
@@ -301,6 +313,15 @@ namespace ustack
             // before a connection exists and inherited across accept().
             bool keepalive = false;
             bool nodelay = false;
+            // SO_RCVBUF / SO_SNDBUF: the payload capacity the application
+            // asked for, already clamped (what getsockopt doubles). Locked
+            // once set, so receive-buffer autotuning (when there is any) must
+            // leave it alone, as Linux does with SOCK_RCVBUF_LOCK. Only
+            // applied to a TCP connection when locked / send_capacity_set.
+            size_t receive_capacity = TcpConnection::RECEIVE_BUFFER_CAPACITY;
+            size_t send_capacity = TcpConnection::SEND_BUFFER_CAPACITY;
+            bool receive_capacity_locked = false;
+            bool send_capacity_set = false;
             bool reuseaddr = false;
             struct linger linger{};
             uint32_t user_timeout_ms = TcpConnection::DEFAULT_USER_TIMEOUT_MS;
