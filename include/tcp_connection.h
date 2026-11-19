@@ -475,6 +475,32 @@ public:
     // SO_RCVBUF (SOCK_RCVBUF_LOCK).
     void set_receive_capacity_locked(bool locked) { _receive_capacity_locked = locked; }
     bool receive_capacity_locked() const { return _receive_capacity_locked; }
+    // The window shift this stack offers in its SYN (RFC 7323). Public so
+    // tests can read a scaled window without restating it.
+    static constexpr uint8_t WINDOW_SCALE_SHIFT = 1;
+
+    // --- receiver-side RTT (Linux's rcv_rtt_est) ---
+    //
+    // get_rto_ms() is the sender's estimate, built from acks of data this side
+    // sent, so a connection that only receives has none. Receive autotuning
+    // needs one anyway: it measures how much the application read once per
+    // round trip. Measured as Linux's tcp_rcv_rtt_measure_ts() and
+    // tcp_rcv_rtt_measure() do:
+    //
+    //   - with timestamps, on a full-sized data segment that advances RCV.NXT:
+    //     now minus its TSecr, which is a TSval of ours (an ack the sender had
+    //     heard before sending this) turned back into this connection's clock.
+    //     Each echoed value is used once. Smoothed with gain 1/8.
+    //   - without, the sequence-space round trip: note RCV.NXT + RCV.WND and
+    //     the time, and the sample is how long RCV.NXT takes to reach that
+    //     point - the sender cannot send there before it has heard the ack
+    //     that offered it. A sender that is not window-limited takes longer
+    //     than one RTT, so in this mode only a smaller sample is ever taken
+    //     (a running minimum), as Linux does.
+    //
+    // Milliseconds; 0 until the first sample.
+    uint32_t receiver_rtt_ms() const { return _rcv_rtt_x8 >> 3; }
+
     // How many disjoint ranges the reorder buffer may hold (see
     // ReorderBuffer::MAX_RANGES).
     static constexpr uint32_t MAX_REORDER_SEGMENTS = ReorderBuffer::MAX_RANGES;
@@ -671,6 +697,22 @@ private:
     uint32_t _advertised_window() const;
     // Feeds one unambiguous round-trip measurement to _rtt, logging it.
     void _take_rtt_sample(uint32_t rtt_ms);
+
+    // --- receiver RTT (see receiver_rtt_ms()) ---
+    // The estimate in milliseconds, times 8 (Linux keeps rcv_rtt_est.rtt_us
+    // scaled the same way, so the 1/8 gain keeps its fraction); 0 = none.
+    uint32_t _rcv_rtt_x8 = 0;
+    // The sequence-space measurement: the unwrapped point RCV.NXT has to
+    // reach, and when it was noted (0 = none running).
+    uint64_t _rcv_rtt_seq = 0;
+    uint64_t _rcv_rtt_time_ms = 0;
+    // The last TSecr sampled, so one echo is not sampled again.
+    uint32_t _rcv_rtt_last_tsecr = 0;
+    // tcp_rcv_rtt_update(): EWMA for a timestamp sample, minimum for a
+    // window-dependent one.
+    void _rcv_rtt_update(uint32_t sample_ms, bool window_dependent);
+    // Called once a data segment has advanced RCV.NXT.
+    void _rcv_rtt_measure(const Tcp& segment, uint32_t payload_size);
 
     // --- RACK (RFC 8985 section 6), with SACK only ---
     //
@@ -1131,7 +1173,6 @@ private:
     // per-byte one; a smaller option is taken as 48.
     static constexpr uint16_t MIN_PEER_MSS = 48;
     static constexpr uint16_t DEFAULT_PEER_MSS = 536; // RFC 793's fallback when a peer's SYN carries no MSS option
-    static constexpr uint8_t WINDOW_SCALE_SHIFT = 1; // this stack's advertised shift
     // Option sizes as Tcp serializes them: timestamps are two NOPs + 10
     // bytes; SACK is two NOPs + kind + length, then 8 bytes per block.
     static constexpr size_t TIMESTAMP_OPTION_BYTES = 12;

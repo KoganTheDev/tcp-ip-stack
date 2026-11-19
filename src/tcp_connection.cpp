@@ -814,6 +814,68 @@ void TcpConnection::_take_rtt_sample(uint32_t rtt_ms)
                                << _rtt.rttvar_ms() << " rto " << _rtt.rto_ms());
 }
 
+void TcpConnection::_rcv_rtt_update(uint32_t sample_ms, bool window_dependent)
+{
+    uint32_t sample_x8 = std::max<uint32_t>(sample_ms, 1) << 3; // a 0 ms sample on a ms clock is "under 1 ms"
+    if (_rcv_rtt_x8 == 0)
+    {
+        _rcv_rtt_x8 = sample_x8;
+    }
+    else if (window_dependent)
+    {
+        _rcv_rtt_x8 = std::min(_rcv_rtt_x8, sample_x8);
+    }
+    else
+    {
+        // srtt += (sample - srtt) / 8, in the x8 domain
+        _rcv_rtt_x8 = _rcv_rtt_x8 - (_rcv_rtt_x8 >> 3) + (sample_x8 >> 3);
+    }
+}
+
+void TcpConnection::_rcv_rtt_measure(const Tcp& segment, uint32_t payload_size)
+{
+    if (_timestamps_negotiated)
+    {
+        if (!segment.has_timestamp_option())
+        {
+            return;
+        }
+        uint32_t echo = segment.get_timestamp_echo();
+        if (echo == 0 || echo == _rcv_rtt_last_tsecr)
+        {
+            return; // nothing echoed yet, or this echo was already sampled
+        }
+        _rcv_rtt_last_tsecr = echo;
+        // Only a full-sized segment: a small one may have waited for the
+        // application (or Nagle) after the echoed ack arrived, which says
+        // nothing about the path.
+        if (payload_size < _max_segment_payload())
+        {
+            return;
+        }
+        // _ts_clock() - echo is now minus the moment that TSval was sent, on
+        // this connection's clock, modulo 2^32. An echo from the future
+        // (a confused or hostile peer) would be a huge unsigned value.
+        uint32_t delta = _ts_clock() - echo;
+        if (delta < (1u << 31))
+        {
+            _rcv_rtt_update(delta, false);
+        }
+        return;
+    }
+
+    if (_rcv_rtt_time_ms != 0)
+    {
+        if (_recv_next_unwrapped < _rcv_rtt_seq)
+        {
+            return; // the noted point is not reached yet
+        }
+        _rcv_rtt_update(static_cast<uint32_t>(_now_ms - _rcv_rtt_time_ms), true);
+    }
+    _rcv_rtt_seq = _recv_next_unwrapped + _advertised_window();
+    _rcv_rtt_time_ms = _now_ms;
+}
+
 bool TcpConnection::_apply_sack_blocks(const Tcp& segment)
 {
     if (!_sack_permitted || segment.get_sack_blocks().empty())
@@ -1922,6 +1984,7 @@ void TcpConnection::on_segment(const Tcp& segment, Ecn ecn)
 
                 // drain any buffered segments the gap-filler just unblocked
                 _drain_reorder_buffer();
+                _rcv_rtt_measure(segment, payload_size);
 
                 if (fills_gap || ce_marked_data)
                 {
@@ -1960,6 +2023,7 @@ void TcpConnection::on_segment(const Tcp& segment, Ecn ecn)
                     _deliver(new_part);
 
                     _drain_reorder_buffer();
+                    _rcv_rtt_measure(segment, payload_size);
                 }
                 // a duplicate/overlap of already-seen data: ack now, don't delay
                 _send_pure_ack();
