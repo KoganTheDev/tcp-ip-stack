@@ -80,7 +80,7 @@ if(TCPIP_MULL_PLUGIN)
     endforeach()
 endif()
 
-if(TCPIP_BUILD_TESTS OR TCPIP_BUILD_APPS)
+if(TCPIP_BUILD_TESTS OR TCPIP_BUILD_APPS OR TCPIP_BUILD_BENCH)
 # --- The testable part of epoll-server --------------------------------------
 # Named explicitly rather than globbed: the rest of that program (server.cpp,
 # main.cpp, epoll_wrapper.cpp) needs a channel and an event loop, and pulling
