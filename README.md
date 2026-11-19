@@ -107,7 +107,7 @@ simultaneous close rather than folding it into `FIN_WAIT_2`. On top of that:
   cost three retransmissions and no timeout (`SimRecovery` in the test suite)
 - **RACK-TLP** (RFC 8985) alongside it when SACK is negotiated. RACK detects loss by
   *time*: once a segment sent later has been delivered and a reordering window
-  (min_RTT/4, or 0 in recovery) has passed, an earlier one is lost - a retransmission
+  (min_RTT/4, widened by D-SACKs, or 0 in recovery until reordering is seen) has passed, an earlier one is lost - a retransmission
   included, which RFC 6675's counting cannot see, so a lost retransmission no longer
   waits for the RTO. Candidates sit in a transmit-time list, so an ack costs what it
   changes rather than a walk of the flight however the peer shapes its SACK blocks, and
@@ -122,7 +122,36 @@ simultaneous close rather than folding it into `FIN_WAIT_2`. On top of that:
   as the first SACK block of the ack that answers it (just the duplicate part, if the
   segment was only partly old), followed by the range that contains it when it lies in
   out-of-order data, then the usual blocks. `TcpConnection::Stats::dsacks_sent` counts
-  them. The sender does not use them yet (below).
+  them.
+- **Sender D-SACK and undo of spurious recoveries** (RFC 2883 section 4, RFC 3708,
+  RFC 3522, RFC 4015, RFC 5682). The first SACK block is a D-SACK if it lies below the
+  cumulative ack or inside the second block; it never reaches the scoreboard as SACK.
+  Every loss episode (a fast or RTO recovery, until the ack passes its recovery point)
+  keeps a ledger of what it retransmitted - repeated copies and an outstanding loss probe
+  included - and a D-SACK counts (`dsacks_received`) only if it names exactly one or
+  more consecutive ledger ranges of the current or last episode, each with a copy not yet
+  reported. A counted D-SACK widens RACK's reordering window by a quarter min_RTT
+  (reo_wnd_mult, at most once per round trip, for 16 recoveries) and marks the path as
+  reordering, after which RACK alone - not three duplicate acks - declares losses. When
+  D-SACKs cover every copy of a finished episode, its reduction is undone
+  (`spurious_recoveries_undone`): `CongestionControl::undo()` restores cwnd, ssthresh
+  and CUBIC's curve (its epoch shifted past the episode) - never below where they are
+  now, so an undo never raises cwnd above the window the episode started with. A
+  timeout is checked sooner, in this order: with timestamps, **Eifel** (the first ack for
+  new data echoes a TSval older than the retransmission's, in the per-pair clock); with
+  SACK and no timestamps, **F-RTO** (SACK-enhanced: the first ack for part of the flight
+  sends two new segments instead of retransmissions, and a second ack for new data
+  proves the timeout spurious; a duplicate falls back to conventional recovery, an ack for
+  the whole flight stops it); otherwise D-SACK alone. Both undo through the same path,
+  which also leaves RTO recovery, takes back the loss marks and the RTO back-off
+  (`spurious_rtos_undone`). The safety rules: nothing a receiver forges counts unless it
+  names our own retransmission, once per copy; an episode that saw ECN-Echo, or a loss
+  a probe repaired after it, is never undone; an undo happens at most once per episode;
+  F-RTO is not used for a repeated timeout or while a loss probe that resent the tail is
+  outstanding. A 1 s ACK delay spike now costs one spurious retransmission and no window
+  (cwnd 46456 bytes before the RTO, 1460 after it, 46456 again on the first acks); before,
+  the window slow-started back from one segment. A repeated timeout in one episode holds
+  ssthresh (RFC 5681 3.1)
 - **ECN** (RFC 3168): negotiated on the SYNs, ECT(0) on new data only (never on SYNs,
   pure acks, retransmissions or probes), CE echoed as ECE until the sender's CWR, and
   ECE answered like a loss - the congestion-control policy's ssthresh - at most once per
@@ -428,13 +457,16 @@ limit by a peer.
 
 These are documented decisions, not gaps that were missed:
 
-- **No PRR or RACK-TLP without SACK, and no sender-side D-SACK or F-RTO.** The receiver
-  side of D-SACK is done (see the feature list); the sender ignores the blocks. Without
-  SACK, recovery is NewReno's window inflation and loss is detected by duplicate counts
-  alone; there is no SACK-less pipe estimate for PRR to work from. Without reading
-  D-SACK, RACK's reordering
-  window stays at min_RTT/4 (RFC 8985's reo_wnd_mult never grows), TLP judges a repaired
-  loss without the D-SACK case, and a spurious retransmission or timeout is not undone.
+- **No PRR or RACK-TLP without SACK.** Without SACK, recovery is NewReno's window
+  inflation and loss is detected by duplicate counts alone; there is no SACK-less pipe
+  estimate for PRR to work from, and no D-SACK, so only Eifel (with timestamps) can undo
+  a spurious timeout and nothing undoes a spurious fast retransmit.
+- **D-SACK cannot tell network duplication from a spurious retransmission.** A link that
+  duplicates the one copy of a retransmission that got through draws the same D-SACK as
+  an unneeded retransmission would, and could undo an episode that repaired a real loss
+  (RFC 3708 discusses the same limit). The undo never grants more than the window the
+  episode started with, so the cost is one reduction skipped. Linux has the same
+  exposure.
 - **ECN is RFC 3168's, not AccECN or L4S.** One reduction per marked window, no
   per-mark feedback (RFC 9768) and no DCTCP-style proportional response; a sender with a
   one-segment window does not also reset its retransmit timer on ECE (6.1.2).
@@ -766,8 +798,10 @@ almost never produce. [`fuzz/`](fuzz/) has one harness per parser (Ethernet, IPv
 with its options, UDP, ICMP, ARP, DHCP, DNS), one that feeds the IP reassembler a
 sequence of fragments, and one stateful harness that feeds frames into a whole
 `NetworkStack` with a listening port and an established connection, running `poll()` and
-the timers between frames. Each has a small committed seed corpus in `fuzz/corpus/`,
-generated from the stack's own serializers by `fuzz/gen_corpus.cpp`.
+the timers between frames. Its secrets are fixed (`fuzz/stack_seed.h`), so the
+connection's sequence numbers are the same on every run and seeds can acknowledge real
+data - the forged D-SACK seeds do. Each has a small committed seed corpus in
+`fuzz/corpus/`, generated from the stack's own serializers by `fuzz/gen_corpus.cpp`.
 
 ```sh
 make fuzz                      # every harness, 30 s each (needs clang)
