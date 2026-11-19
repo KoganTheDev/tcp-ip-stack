@@ -287,6 +287,12 @@ namespace
         std::array<uint64_t, ERR_KINDS> errors{};
         Histogram connect_us; // connect() to established
         Histogram rtt_us;     // first byte of a payload sent to last byte of its echo received
+        // The same samples split by round: the first one follows the connect
+        // and shares its queueing (a burst's accept backlog, a cookie
+        // handshake), so a slow first round with fast later ones points at
+        // connection setup rather than the data path. rtt_us stays the union.
+        Histogram rtt_first_us;
+        Histogram rtt_rest_us;
         std::vector<Failure> failures; // the first MAX_FAILURE_RECORDS of them
         uint64_t failures_not_recorded = 0;
 
@@ -326,6 +332,8 @@ namespace
             }
             connect_us.merge(other.connect_us);
             rtt_us.merge(other.rtt_us);
+            rtt_first_us.merge(other.rtt_first_us);
+            rtt_rest_us.merge(other.rtt_rest_us);
             for (const Failure& failure : other.failures)
             {
                 record_failure(failure);
@@ -731,7 +739,9 @@ namespace
                 if (conn.received == size)
                 {
                     now = now_ns();
-                    _stats.rtt_us.record((now - conn.round_started_ns) / 1000);
+                    uint64_t round_us = (now - conn.round_started_ns) / 1000;
+                    _stats.rtt_us.record(round_us);
+                    (conn.round == 0 ? _stats.rtt_first_us : _stats.rtt_rest_us).record(round_us);
                     ++_stats.round_trips;
                     if (++conn.round >= _options.rounds)
                     {
@@ -934,6 +944,8 @@ namespace
                     static_cast<unsigned long long>(stats.bytes_verified));
         print_latency_text("connect latency", stats.connect_us);
         print_latency_text("round-trip latency", stats.rtt_us);
+        print_latency_text("  round 1", stats.rtt_first_us);
+        print_latency_text("  later rounds", stats.rtt_rest_us);
         if (stats.failed() == 0)
         {
             std::printf("errors             none\n");
@@ -988,7 +1000,9 @@ namespace
         std::printf("  \"throughput_mib_per_s\": %.3f,\n", mib_per_second(stats.bytes_verified, result.elapsed_s));
         std::printf("  \"latency_us\": {\n");
         print_latency_json("connect", stats.connect_us, false);
-        print_latency_json("round_trip", stats.rtt_us, true);
+        print_latency_json("round_trip", stats.rtt_us, false);
+        print_latency_json("round_trip_first", stats.rtt_first_us, false);
+        print_latency_json("round_trip_rest", stats.rtt_rest_us, true);
         std::printf("  },\n");
         std::printf("  \"errors\": {");
         for (size_t i = 0; i < ERR_KINDS; i++)

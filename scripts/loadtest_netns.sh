@@ -232,6 +232,11 @@ debug_rerun()
     rm -f "$LOG.kept"
 }
 
+# The JSON lines shown in a phase's console summary: rates, connect latency and
+# round-trip latency, the last also split into the first round and the rest (a
+# slow first round with fast later ones means connection setup, not the data path).
+SUMMARY_KEYS='"(connections_per_s|throughput_mib_per_s|connect|round_trip|round_trip_first|round_trip_rest)"'
+
 # print_stats: asks the server for its stats line (SIGUSR1, answered on the
 # reactor thread, so it can lag by a loop pass) and prints the one that comes
 # back. The counters are cumulative over the server's life, so a phase's own
@@ -269,14 +274,14 @@ run_phase()
         sed 's/^/    /' "$OUT_DIR/$name.stderr"
         failures=$((failures + 1))
         # the numbers that matter, straight from the JSON
-        grep -E '"(connections_per_s|throughput_mib_per_s)"|"round_trip"' "$OUT_DIR/$name.json" | sed 's/^ */    /'
+        grep -E "$SUMMARY_KEYS" "$OUT_DIR/$name.json" | sed 's/^ */    /'
         echo "    errors: $(grep '"errors"' "$OUT_DIR/$name.json" | sed 's/^ *"errors": //')"
         print_stats
         debug_rerun "$name" "$@"
         return
     fi
     echo "  PASS  $name"
-    grep -E '"(connections_per_s|throughput_mib_per_s)"|"round_trip"' "$OUT_DIR/$name.json" | sed 's/^ */    /'
+    grep -E "$SUMMARY_KEYS" "$OUT_DIR/$name.json" | sed 's/^ */    /'
     echo "    errors: $(grep '"errors"' "$OUT_DIR/$name.json" | sed 's/^ *"errors": //')"
     print_stats
 }
