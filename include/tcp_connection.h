@@ -1217,8 +1217,12 @@ private:
     // held occupy beyond the defaults (see set_memory_budget()). Run on
     // entering those states and after every read().
     void _trim_memory_charges();
-    // Grows _send_capacity with cwnd (see set_send_capacity_locked()).
+    // Grows _send_capacity with cwnd (see set_send_capacity_locked()), but
+    // only after an ack that found the sender cwnd-limited.
     void _tune_send_capacity();
+    // Whether the last ack processed arrived with the sender cwnd-limited
+    // (CongestionControl::is_cwnd_limited() on the flight before it).
+    bool _cwnd_limited_at_last_ack = false;
     // Raises the send capacity towards `target` (never lowers it).
     void _grow_send_capacity(size_t target);
 

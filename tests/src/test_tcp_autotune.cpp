@@ -335,6 +335,27 @@ TEST(TcpAutotune, TheSendBufferGrowsWithTheCongestionWindow)
     ASSERT_GT(notified, 0) << "and a writer waiting on the full buffer is told about the room";
 }
 
+// A request/response connection never fills its window and never loses a
+// packet. Its cwnd and send buffer must stay where they started however many
+// round trips it runs: growing them anyway (uncapped ssthresh, 2 * cwnd of
+// send buffer) charged megabytes per idle-ish connection to the stack's
+// memory budget, starving the connections that actually move data.
+TEST(TcpAutotune, AnAppLimitedConnectionKeepsItsWindowAndSendBuffer)
+{
+    Peer peer(true);
+    uint32_t initial_cwnd = peer.connection->get_congestion_window();
+    for (int round = 0; round < 500; round++)
+    {
+        peer.data(200); // the request
+        ASSERT_EQ(peer.connection->send(Bytes(4000u)), 4000u) << "the response";
+        peer.advance(20);
+        peer.ack_all();
+    }
+    ASSERT_EQ(peer.connection->get_congestion_window(), initial_cwnd)
+        << "a 4000-byte flight never fills a " << initial_cwnd << "-byte window";
+    ASSERT_EQ(peer.connection->send_capacity(), TcpConnection::SEND_BUFFER_CAPACITY) << "nor grows the send buffer";
+}
+
 TEST(TcpAutotune, AnExplicitSendBufferNeverGrows)
 {
     Peer peer(true);

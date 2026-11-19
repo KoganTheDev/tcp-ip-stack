@@ -1421,6 +1421,11 @@ uint32_t TcpConnection::_send_by_next_seg(uint32_t pipe, uint32_t window, bool i
 
 void TcpConnection::_handle_ack(const Tcp& segment)
 {
+    // What was outstanding as this ack arrived, before it retires or SACKs
+    // anything: whether the sender was filling cwnd is a question about the
+    // flight the ack answers, not about what is left after it.
+    uint32_t prior_in_flight = _bytes_in_flight();
+    _cwnd_limited_at_last_ack = _congestion->is_cwnd_limited(prior_in_flight);
     // Apply the scoreboard before anything else looks at the window: what the
     // peer reports holding changes how much is genuinely outstanding, and
     // therefore how much may be sent.
@@ -1652,7 +1657,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
         uint32_t srtt_ms = _rtt.srtt_ms();
         if (!ecn_reduced) // RFC 3168 6.1.2: an ECE ack does not grow the window
         {
-            _congestion->on_ack(bytes_acked, _bytes_in_flight(), srtt_ms, _now_ms);
+            _congestion->on_ack(bytes_acked, prior_in_flight, srtt_ms, _now_ms);
         }
     }
 
@@ -2550,6 +2555,18 @@ void TcpConnection::set_send_capacity(size_t bytes)
 void TcpConnection::_tune_send_capacity()
 {
     if (_send_capacity_locked || (_state != TcpState::ESTABLISHED && _state != TcpState::CLOSE_WAIT))
+    {
+        return;
+    }
+    // Only a sender that was filling its window has a use for more buffer.
+    // cwnd itself no longer grows without that (CongestionControl::
+    // is_cwnd_limited()), but a window grown earlier - a bulk phase, then
+    // request/response - would still pull the buffer up to 2 * cwnd on every
+    // ack, charging the stack's budget for room nothing will fill. Linux's
+    // tcp_should_expand_sndbuf() gates on the same question from the other
+    // side: it expands when the writer ran out of buffer with cwnd not full,
+    // where here the buffer is sized ahead of cwnd and so follows it instead.
+    if (!_cwnd_limited_at_last_ack)
     {
         return;
     }

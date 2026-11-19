@@ -19,8 +19,18 @@ void CongestionControl::on_idle_restart()
     _on_idle_restart();
 }
 
-void CongestionControl::on_ack(uint32_t bytes_acked, uint32_t bytes_in_flight, uint32_t srtt_ms, uint64_t now_ms)
+void CongestionControl::on_ack(uint32_t bytes_acked, uint32_t prior_in_flight, uint32_t srtt_ms, uint64_t now_ms)
 {
+    if (!is_cwnd_limited(prior_in_flight))
+    {
+        // Application-limited: the window was not the constraint, so this
+        // ack says nothing about whether a bigger one would be safe. Both
+        // algorithms skip growth here, which is why the check sits above the
+        // split (Linux's tcp_cong_avoid hooks make the same check inside
+        // each algorithm).
+        _on_app_limited_ack(now_ms);
+        return;
+    }
     if (_cwnd < _ssthresh)
     {
         // Slow start, identical in both algorithms: one MSS of extra window per
@@ -31,7 +41,7 @@ void CongestionControl::on_ack(uint32_t bytes_acked, uint32_t bytes_in_flight, u
     }
     else
     {
-        _grow_in_congestion_avoidance(bytes_acked, bytes_in_flight, srtt_ms, now_ms);
+        _grow_in_congestion_avoidance(bytes_acked, prior_in_flight, srtt_ms, now_ms);
     }
 
     _cwnd = std::min(_cwnd, MAX_CWND);
@@ -104,6 +114,15 @@ void CubicCongestionControl::_on_reset()
     _w_est = 0.0;
     _epoch_start_ms = 0;
     _epoch_running = false;
+    _app_limited_since_ms = NOT_APP_LIMITED;
+}
+
+void CubicCongestionControl::_on_app_limited_ack(uint64_t now_ms)
+{
+    if (_epoch_running && _app_limited_since_ms == NOT_APP_LIMITED)
+    {
+        _app_limited_since_ms = now_ms;
+    }
 }
 
 void CubicCongestionControl::_on_congestion_event(uint32_t /*bytes_in_flight*/, uint64_t /*now_ms*/)
@@ -148,6 +167,18 @@ void CubicCongestionControl::_grow_in_congestion_avoidance(uint32_t bytes_acked,
                                                            uint32_t srtt_ms, uint64_t now_ms)
 {
     const double cwnd_segments = _window_in_segments();
+
+    if (_epoch_running && _app_limited_since_ms != NOT_APP_LIMITED)
+    {
+        // Resuming after an application-limited stretch: shift the epoch by
+        // its length, so the curve continues from where growth stopped
+        // instead of jumping to wherever the clock alone would put it (the
+        // gap is closed within one RTT, so a long pause would otherwise come
+        // back as a burst no ack ever justified). Linux's bictcp_cwnd_event
+        // does the same for an idle period.
+        _epoch_start_ms += now_ms - _app_limited_since_ms;
+    }
+    _app_limited_since_ms = NOT_APP_LIMITED;
 
     if (!_epoch_running)
     {
