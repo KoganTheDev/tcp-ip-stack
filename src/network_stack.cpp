@@ -1162,9 +1162,39 @@ void NetworkStack::_reap_closed_connections()
         LOG_DEBUG("NetworkStack: reaping closed connection id=" << connection_id);
         // Its entries in the timer queue go stale with the record and are
         // dropped as they surface.
+        TcpTotals& reaped = this->_reaped_totals[id_it->second.from_cookie ? 1 : 0];
+        reaped.connections += 1;
+        reaped.retransmit_timeouts += id_it->second.connection->stats().retransmit_timeouts;
+        reaped.retransmitted_segments += id_it->second.connection->stats().retransmitted_segments;
         this->_connections.erase(id_it->second.key);
         this->_connections_by_id.erase(id_it);
     }
+}
+
+NetworkStack::TcpTotals NetworkStack::tcp_totals(bool from_cookie) const
+{
+    TcpTotals totals = this->_reaped_totals[from_cookie ? 1 : 0];
+    for (const auto& entry : this->_connections_by_id)
+    {
+        if (entry.second.from_cookie != from_cookie)
+        {
+            continue;
+        }
+        totals.connections += 1;
+        totals.retransmit_timeouts += entry.second.connection->stats().retransmit_timeouts;
+        totals.retransmitted_segments += entry.second.connection->stats().retransmitted_segments;
+    }
+    return totals;
+}
+
+uint64_t NetworkStack::kernel_drops() const
+{
+    uint64_t total = 0;
+    for (const auto& interface : this->_interfaces)
+    {
+        total += interface->channel->kernel_drops();
+    }
+    return total;
 }
 
 namespace
@@ -1634,6 +1664,7 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
                         << tcp.get_dest_port() << " - the accept queue is full (" << queued << "/"
                         << listening_it->second.backlog
                         << "). The application is not accepting fast enough, or this is a SYN flood.");
+            this->_syns_dropped_accept_queue_full += 1;
             return;
         }
 
@@ -1645,7 +1676,7 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
         //
         auto half_open_it = this->_half_open_per_port.find(key.local_port);
         size_t half_open = half_open_it == this->_half_open_per_port.end() ? 0 : half_open_it->second.size();
-        if (half_open >= MAX_HALF_OPEN_PER_PORT)
+        if (half_open >= half_open_cap(listening_it->second.backlog))
         {
             // Full. If the oldest has waited far longer than a real client
             // takes to answer, it is almost certainly a flood's: evict it and
@@ -1661,6 +1692,7 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
                 LOG_WARNING("NetworkStack: port " << key.local_port << " has " << half_open
                                                   << " half-open connections - evicting the oldest, "
                                                   << (this->_now_ms - oldest_created) << " ms old");
+                this->_half_open_evictions += 1;
                 oldest->fail(TcpCloseReason::ABORTED);
             }
             else
@@ -1832,6 +1864,7 @@ NetworkStack::CookieAck NetworkStack::_try_complete_cookie_handshake(const IpAdd
     {
         LOG_WARNING("NetworkStack: a valid SYN cookie for port " << local_port
                                                                  << " arrived with the accept queue full - dropped");
+        this->_cookie_acks_dropped_queue_full += 1;
         return CookieAck::DROPPED;
     }
 
@@ -1846,6 +1879,8 @@ NetworkStack::CookieAck NetworkStack::_try_complete_cookie_handshake(const IpAdd
 
     TcpConnection* connection_ptr = connection.get();
     this->_register_connection(key, std::move(connection));
+    this->_connections_by_id.at(connection_ptr->get_id()).from_cookie = true;
+    this->_connections_from_cookie += 1;
     this->_pending_accepts[local_port].push_back(connection_ptr->get_id());
     if (this->_on_accept_ready)
     {

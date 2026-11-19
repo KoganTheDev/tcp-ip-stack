@@ -7,6 +7,7 @@
 #include <vector>
 #include <memory>
 #include <string>
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -238,9 +239,20 @@ public:
     // Separate from the backlog above, which counts only connections that
     // finished the handshake: how many may sit in SYN_RECEIVED on one listening
     // port at once. Without it a SYN flood (whose spoofed sources never
-    // complete) builds unbounded connections. SYNs beyond it are dropped
-    // silently, so a real client's own retransmission gets through later.
-    static constexpr size_t MAX_HALF_OPEN_PER_PORT = 64;
+    // complete) builds unbounded connections.
+    //
+    // The cap is the listener's own backlog, as in Linux (its SYN queue is full
+    // when qlen >= backlog), clamped to MAX_LISTEN_BACKLOG like somaxconn. It
+    // used to be a fixed 64, which a legitimate burst of 200 connections
+    // exceeded: the surplus was answered with SYN cookies, whose ACKs then
+    // competed for the accept queue and lost frames (see the SimLoad test).
+    // A half-open connection is small - no data buffers are allocated until
+    // bytes arrive, roughly 1 KiB of object plus a few empty deques - so a cap
+    // of 4096 bounds a flood at a few MiB per port. SYNs beyond the cap are
+    // answered with a cookie (after evicting a stale entry, below), so a real
+    // client still gets in.
+    static constexpr size_t MAX_LISTEN_BACKLOG = 4096;
+    static size_t half_open_cap(size_t backlog) { return std::clamp<size_t>(backlog, 1, MAX_LISTEN_BACKLOG); }
     // When the cap above is full, the oldest half-open connection is evicted
     // for a new SYN if it has waited at least this long - far longer than a
     // real client takes to answer a SYN-ACK, so almost certainly a flood's.
@@ -280,6 +292,35 @@ public:
     uint64_t syn_cookie_check_failures() const { return _syn_cookie_failures; }
     // SYN-ACKs answered with a cookie (no state kept), since the stack started.
     uint64_t syn_cookies_sent() const { return _syn_cookies_sent; }
+
+    // Burst-latency measurement. Each of these is a place a connection attempt
+    // can silently lose a round trip (the peer's SYN retransmit is 1 s), so
+    // they say which of the stack's drop paths a slow connect went through.
+    //
+    // SYNs dropped because the listening port's accept queue was full.
+    uint64_t syns_dropped_accept_queue_full() const { return _syns_dropped_accept_queue_full; }
+    // Valid cookie ACKs dropped because the accept queue was full.
+    uint64_t cookie_acks_dropped_queue_full() const { return _cookie_acks_dropped_queue_full; }
+    // Stale half-open connections evicted to make room for a new SYN.
+    uint64_t half_open_evictions() const { return _half_open_evictions; }
+    // Connections that were established by a SYN cookie rather than by state.
+    uint64_t connections_from_cookie() const { return _connections_from_cookie; }
+
+    // Loss-recovery totals over every connection of one origin (cookie or
+    // normal), including connections already reaped: a load test's
+    // connections are mostly gone by the time anyone asks.
+    struct TcpTotals
+    {
+        uint64_t connections = 0; // reaped plus live
+        uint64_t retransmit_timeouts = 0;
+        uint64_t retransmitted_segments = 0;
+    };
+    TcpTotals tcp_totals(bool from_cookie) const;
+
+    // Frames the kernel dropped before the stack read them (a full socket
+    // receive buffer), summed over the interfaces. Zero for channels that
+    // have no such notion.
+    uint64_t kernel_drops() const;
 
     // RFC 5961 challenge ACKs, across every connection. Each is a reply to a
     // segment anyone can forge (an in-window RST, a SYN on an open
@@ -883,6 +924,12 @@ private:
     std::unordered_map<uint16_t, uint64_t> _last_cookie_sent_ms;
     uint64_t _syn_cookie_failures = 0;
     uint64_t _syn_cookies_sent = 0;
+    uint64_t _syns_dropped_accept_queue_full = 0;
+    uint64_t _cookie_acks_dropped_queue_full = 0;
+    uint64_t _half_open_evictions = 0;
+    uint64_t _connections_from_cookie = 0;
+    // Stats of connections already reaped, by origin: [0] normal, [1] cookie.
+    TcpTotals _reaped_totals[2];
     // For the warning: failures counted within the current cookie slot.
     uint64_t _cookie_failure_slot = 0;
     uint64_t _cookie_failures_in_slot = 0;
@@ -1052,6 +1099,7 @@ private:
         // stale and is skipped when it surfaces. Invariant: never later than
         // the connection's real deadline - see _schedule_connection_timer().
         uint64_t queued_deadline = TcpConnection::NO_DEADLINE;
+        bool from_cookie = false; // established by a SYN cookie, for tcp_totals()
     };
     // mutable only for queued_deadline, which ms_until_next_timer() maintains.
     mutable std::unordered_map<uint64_t, ConnectionRecord> _connections_by_id;

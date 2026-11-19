@@ -32,4 +32,6 @@ add_executable(tcpip_bench ${BENCH_SOURCES}
     ${PROJECT_SOURCE_DIR}/tests/src/sim_netem_channel.cpp
     ${PROJECT_SOURCE_DIR}/tests/src/sim_tcp_frame.cpp)
 target_include_directories(tcpip_bench PRIVATE ${PROJECT_SOURCE_DIR}/tests/include)
-target_link_libraries(tcpip_bench PRIVATE tcpip benchmark::benchmark)
+# epoll_threaded carries the EchoServer headers and its thread pool, which the
+# burst benchmark runs on a real driver.
+target_link_libraries(tcpip_bench PRIVATE tcpip epoll_threaded benchmark::benchmark)

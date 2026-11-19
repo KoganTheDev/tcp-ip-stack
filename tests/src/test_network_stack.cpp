@@ -33,6 +33,10 @@ namespace
     const IPv4Address LOCAL_IP("10.0.0.2");
     const IPv4Address PEER_IP("10.0.0.1");
 
+    // The half-open cap of a listener made with listen(port) - the default
+    // backlog, which is what the half-open cap now follows.
+    constexpr size_t HALF_OPEN_CAP = NetworkStack::DEFAULT_LISTEN_BACKLOG;
+
     constexpr uint8_t FLAG_ACK = 0x10;
     constexpr uint8_t FLAG_RST = 0x04;
     constexpr uint8_t FLAG_SYN = 0x02;
@@ -2627,7 +2631,7 @@ TEST(NetworkStack, HalfOpenConnectionsPerListeningPortAreCapped)
     stack->poll();
     channel->clear_outbound();
 
-    const int flood = static_cast<int>(NetworkStack::MAX_HALF_OPEN_PER_PORT) + 36;
+    const int flood = static_cast<int>(HALF_OPEN_CAP) + 36;
     for (int i = 0; i < flood; i++)
     {
         channel->push_inbound(syn_with_options(1000, static_cast<uint16_t>(30000 + i)));
@@ -2651,10 +2655,10 @@ TEST(NetworkStack, HalfOpenConnectionsPerListeningPortAreCapped)
             cookies++;
         }
     }
-    ASSERT_TRUE(syn_acks.size() == NetworkStack::MAX_HALF_OPEN_PER_PORT)
-        << "only MAX_HALF_OPEN_PER_PORT SYNs may get a half-open slot while none completes, got "
+    ASSERT_TRUE(syn_acks.size() == HALF_OPEN_CAP)
+        << "only a backlog's worth of SYNs may get a half-open slot while none completes, got "
                + std::to_string(syn_acks.size());
-    ASSERT_TRUE(cookies == static_cast<size_t>(flood) - NetworkStack::MAX_HALF_OPEN_PER_PORT)
+    ASSERT_TRUE(cookies == static_cast<size_t>(flood) - HALF_OPEN_CAP)
         << "and every SYN past the cap is answered with a SYN cookie instead";
 
     // The cap counts connections still half-open, not ever accepted: one
@@ -2772,7 +2776,7 @@ TEST(NetworkStack, HalfOpenConnectionsThatTimeOutFreeTheirSlots)
     channel->push_inbound(build_arp_request());
     stack->poll();
 
-    for (size_t i = 0; i < NetworkStack::MAX_HALF_OPEN_PER_PORT; i++)
+    for (size_t i = 0; i < HALF_OPEN_CAP; i++)
     {
         channel->push_inbound(syn_with_options(1000, static_cast<uint16_t>(30000 + i)));
     }
@@ -2821,7 +2825,7 @@ TEST(NetworkStack, AConnectionLeavesTheHalfOpenCountOnceNotOnEveryTransition)
     stack->poll();
     channel->clear_outbound();
 
-    for (size_t i = 0; i < NetworkStack::MAX_HALF_OPEN_PER_PORT; i++)
+    for (size_t i = 0; i < HALF_OPEN_CAP; i++)
     {
         channel->push_inbound(syn_with_options(1000, static_cast<uint16_t>(30000 + i)));
     }
@@ -3195,7 +3199,7 @@ TEST(NetworkStack, AStaleHalfOpenConnectionIsEvictedToMakeRoomForANewSyn)
     channel->push_inbound(syn_with_options(1000, 30000)); // the oldest
     stack->poll();
     stack->on_time_passed(NetworkStack::HALF_OPEN_EVICT_AGE_MS);
-    for (size_t i = 1; i < NetworkStack::MAX_HALF_OPEN_PER_PORT; i++)
+    for (size_t i = 1; i < HALF_OPEN_CAP; i++)
     {
         channel->push_inbound(syn_with_options(1000, static_cast<uint16_t>(30000 + i)));
     }
@@ -3272,7 +3276,7 @@ namespace
         stack->listen(80);
         channel->push_inbound(build_arp_request());
         stack->poll();
-        for (size_t i = 0; i < NetworkStack::MAX_HALF_OPEN_PER_PORT; i++)
+        for (size_t i = 0; i < HALF_OPEN_CAP; i++)
         {
             channel->push_inbound(
                 build_tcp_with_options(FLAG_SYN, 1000, 0, static_cast<uint16_t>(30000 + i), 80, ALL_OPTIONS));
@@ -3639,4 +3643,166 @@ TEST(NetworkStack, AnUnexpectedErrorInOneConnectionDoesNotTakeDownTheOthers)
     bool b_alive = stack->find_connection(id_b) != nullptr;
     ASSERT_TRUE(a_alive != b_alive) << "exactly the connection that failed is dropped";
     ASSERT_TRUE(count_tcp_frames(channel->outbound_frames()) >= 1) << "the other one still retransmitted";
+}
+
+// --- burst-latency counters -----------------------------------------------------
+//
+// Each counts one of the places a connection attempt can silently lose a round
+// trip under a burst, so a load test can say which one it went through.
+
+TEST(NetworkStackCounters, ASynDroppedForAFullAcceptQueueIsCounted)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    stack->listen(80, 1);
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+
+    channel->clear_outbound();
+    channel->push_inbound(build_tcp(FLAG_SYN, 1000, 0, 40000, 80));
+    stack->poll();
+    uint32_t isn = find_tcp(channel->outbound_frames()).seq;
+    channel->push_inbound(build_tcp(FLAG_ACK, 1001, isn + 1, 40000, 80));
+    stack->poll();
+    ASSERT_TRUE(stack->syns_dropped_accept_queue_full() == 0) << "nothing dropped yet";
+
+    channel->push_inbound(build_tcp(FLAG_SYN, 2000, 0, 40001, 80));
+    stack->poll();
+    channel->push_inbound(build_tcp(FLAG_SYN, 3000, 0, 40002, 80));
+    stack->poll();
+    ASSERT_TRUE(stack->syns_dropped_accept_queue_full() == 2)
+        << "both SYNs hit the full queue, got " << stack->syns_dropped_accept_queue_full();
+}
+
+TEST(NetworkStackCounters, AValidCookieAckDroppedForAFullAcceptQueueIsCounted)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    stack->listen(80, 1);
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+    for (size_t i = 0; i < size_t{1}; i++)
+    {
+        channel->push_inbound(
+            build_tcp_with_options(FLAG_SYN, 1000, 0, static_cast<uint16_t>(30000 + i), 80, ALL_OPTIONS));
+    }
+    for (int i = 0; i < 50; i++)
+    {
+        stack->poll();
+    }
+    // Both cookies are minted while the queue is still empty (a SYN meeting a
+    // full queue is dropped before it can get a cookie), then both ACKs race
+    // for the one place.
+    TcpView first = syn_for_a_cookie(*stack, *channel, 20000, 5000);
+    TcpView second = syn_for_a_cookie(*stack, *channel, 20001, 6000);
+    ASSERT_TRUE(first.is_tcp && second.is_tcp) << "precondition: two cookie SYN-ACKs";
+
+    channel->push_inbound(build_tcp(FLAG_ACK, 5001, first.seq + 1, 20000, 80));
+    stack->poll();
+    ASSERT_TRUE(stack->cookie_acks_dropped_queue_full() == 0) << "the first fits";
+    channel->push_inbound(build_tcp(FLAG_ACK, 6001, second.seq + 1, 20001, 80));
+    stack->poll();
+    ASSERT_TRUE(stack->cookie_acks_dropped_queue_full() == 1) << "the second meets a full queue";
+    ASSERT_TRUE(stack->connections_from_cookie() == 1) << "and only the first became a connection";
+}
+
+TEST(NetworkStackCounters, AHalfOpenEvictionIsCounted)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    stack->listen(80);
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+    for (size_t i = 0; i < HALF_OPEN_CAP; i++)
+    {
+        channel->push_inbound(build_tcp(FLAG_SYN, 1000, 0, static_cast<uint16_t>(30000 + i), 80));
+    }
+    for (int i = 0; i < 50; i++)
+    {
+        stack->poll();
+    }
+    ASSERT_TRUE(stack->half_open_evictions() == 0) << "the cap was just reached, nothing evicted";
+
+    stack->on_time_passed(NetworkStack::HALF_OPEN_EVICT_AGE_MS);
+    channel->push_inbound(build_tcp(FLAG_SYN, 5000, 0, 20000, 80));
+    stack->poll();
+    ASSERT_TRUE(stack->half_open_evictions() == 1) << "one stale entry made room for the new SYN";
+}
+
+TEST(NetworkStackCounters, TcpTotalsSplitByOriginAndSurviveReaping)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_flooded_stack(channel);
+
+    // A cookie connection on port 80, and a normal one on port 81 (the flood
+    // filled port 80's half-open slots).
+    TcpView answer = syn_for_a_cookie(*stack, *channel, 20000, 5000);
+    channel->push_inbound(build_tcp(FLAG_ACK, 5001, answer.seq + 1, 20000, 80));
+    stack->poll();
+    TcpConnection* cookie_conn = stack->accept(80);
+    ASSERT_TRUE(cookie_conn != nullptr) << "precondition: a cookie connection";
+
+    stack->listen(81);
+    channel->clear_outbound();
+    channel->push_inbound(build_tcp(FLAG_SYN, 7000, 0, 21000, 81));
+    stack->poll();
+    uint32_t isn = find_tcp(channel->outbound_frames()).seq;
+    channel->push_inbound(build_tcp(FLAG_ACK, 7001, isn + 1, 21000, 81));
+    stack->poll();
+    TcpConnection* normal_conn = stack->accept(81);
+    ASSERT_TRUE(normal_conn != nullptr) << "precondition: a normal connection";
+
+    // Data nobody acknowledges: the RTO resends it, once per connection.
+    cookie_conn->send(Bytes::from_hex("6869"));
+    normal_conn->send(Bytes::from_hex("6869"));
+    stack->on_time_passed(1500);
+
+    NetworkStack::TcpTotals cookie = stack->tcp_totals(true);
+    NetworkStack::TcpTotals normal = stack->tcp_totals(false);
+    ASSERT_TRUE(cookie.connections == 1 && cookie.retransmit_timeouts == 1 && cookie.retransmitted_segments >= 1)
+        << "the cookie connection's RTO is counted in the cookie bucket, got " << cookie.retransmit_timeouts;
+    // The flood's half-open connections are normal ones and retransmit their
+    // SYN-ACKs too, so the normal bucket is only bounded below.
+    ASSERT_TRUE(normal.retransmit_timeouts >= 1 && normal.retransmitted_segments >= 1)
+        << "and the normal one's in the other bucket, got " << normal.retransmit_timeouts;
+    // Compare the totals across the reap.
+    uint64_t normal_connections_before = normal.connections;
+    uint64_t normal_timeouts_before = normal.retransmit_timeouts;
+
+    // Reaping removes the connections but must not take their history along.
+    cookie_conn->fail(TcpCloseReason::ABORTED);
+    normal_conn->fail(TcpCloseReason::ABORTED);
+    stack->poll();
+    NetworkStack::TcpTotals cookie_after = stack->tcp_totals(true);
+    NetworkStack::TcpTotals normal_after = stack->tcp_totals(false);
+    ASSERT_TRUE(cookie_after.connections == 1 && cookie_after.retransmit_timeouts == 1)
+        << "a reaped cookie connection's counters stay in the total";
+    ASSERT_TRUE(normal_after.connections == normal_connections_before
+                && normal_after.retransmit_timeouts == normal_timeouts_before)
+        << "so do a reaped normal connection's";
+}
+
+TEST(NetworkStackCounters, TheHalfOpenCapIsTheListenersBacklog)
+{
+    // Linux's SYN queue is full when qlen >= backlog; so is this one. A
+    // listener with backlog 4 gives exactly four SYNs a slot (a stateful
+    // SYN-ACK) and answers the fifth with a cookie.
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    stack->listen(80, 4);
+    channel->push_inbound(build_arp_request());
+    stack->poll();
+    channel->clear_outbound();
+    for (uint16_t i = 0; i < 4; i++)
+    {
+        channel->push_inbound(
+            build_tcp_with_options(FLAG_SYN, 1000, 0, static_cast<uint16_t>(30000 + i), 80, ALL_OPTIONS));
+        stack->poll();
+    }
+    ASSERT_TRUE(stack->syn_cookies_sent() == 0) << "the first four fit";
+    channel->push_inbound(build_tcp_with_options(FLAG_SYN, 1000, 0, 30004, 80, ALL_OPTIONS));
+    stack->poll();
+    ASSERT_TRUE(stack->syn_cookies_sent() == 1) << "the fifth is past the cap";
+    ASSERT_TRUE(NetworkStack::half_open_cap(1u << 20) == NetworkStack::MAX_LISTEN_BACKLOG) << "clamped like somaxconn";
+    ASSERT_TRUE(NetworkStack::half_open_cap(0) == 1) << "and never zero";
 }

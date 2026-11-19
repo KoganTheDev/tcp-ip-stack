@@ -5,6 +5,7 @@
 #include <string>
 #include <typeinfo>
 #include <vector>
+#include <sys/signalfd.h>
 #include <unistd.h>
 
 #include "channel_factory.h"
@@ -16,6 +17,7 @@
 #include "ustack/kernel_stack.h"
 #else
 #include "network_stack.h"
+#include "stack_stats.h"
 #include "ustack/stack.h"
 #endif
 
@@ -26,6 +28,36 @@ namespace
     void handle_shutdown_signal(int)
     {
         g_stop_flag = 1;
+    }
+
+    // SIGUSR1 asks for a stats line. Blocked and read through a signalfd, so
+    // it arrives as an ordinary event on the reactor thread, which is the only
+    // one allowed to look at the stack; a handler could interrupt it mid-update.
+    // Blocked here, before any thread exists, so that every thread the server
+    // starts inherits the mask and none of them takes the signal's default
+    // action (terminate). Returns -1 if the signalfd cannot be made.
+    int open_stats_signalfd()
+    {
+        sigset_t mask;
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGUSR1);
+        if (pthread_sigmask(SIG_BLOCK, &mask, nullptr) != 0)
+        {
+            return -1;
+        }
+        return signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
+    }
+
+    // Reads every pending SIGUSR1 off the signalfd; returns how many there were.
+    int drain_signalfd(int fd)
+    {
+        int count = 0;
+        signalfd_siginfo info;
+        while (read(fd, &info, sizeof(info)) == static_cast<ssize_t>(sizeof(info)))
+        {
+            count++;
+        }
+        return count;
     }
 
     struct Config
@@ -277,6 +309,11 @@ int main(int argc, char** argv)
         static_cast<void>(std::signal(SIGINT, handle_shutdown_signal));
         static_cast<void>(std::signal(SIGTERM, handle_shutdown_signal));
         static_cast<void>(std::signal(SIGPIPE, SIG_IGN)); // defensive - sends use MSG_NOSIGNAL anyway
+        int stats_fd = open_stats_signalfd();
+        if (stats_fd < 0)
+        {
+            LOG_WARNING("epoll-server: no signalfd for SIGUSR1, so no stats on request");
+        }
 
 #ifdef EPOLL_SERVER_KERNEL
         ustack::KernelStack stack;
@@ -313,6 +350,34 @@ int main(int argc, char** argv)
             port_list += (port_list.empty() ? "" : ",") + std::to_string(bound);
         }
 
+        // The stats line, on SIGUSR1 and again at exit. A load test reads it
+        // after each phase to see which of the stack's drop paths a slow
+        // connect went through. The kernel build has no such counters.
+#ifdef EPOLL_SERVER_KERNEL
+        auto log_stats = []()
+        {
+            LOG_INFO("stats: unavailable with kernel sockets");
+        };
+#else
+        NetworkStack& counters = stack.network_stack();
+        auto log_stats = [&counters]()
+        {
+            LOG_INFO(format_stack_stats(collect_stack_stats(counters)));
+        };
+#endif
+        if (stats_fd >= 0
+            && !server.watch_kernel_fd(stats_fd,
+                                       [stats_fd, &log_stats]()
+                                       {
+                                           if (drain_signalfd(stats_fd) > 0)
+                                           {
+                                               log_stats();
+                                           }
+                                       }))
+        {
+            LOG_WARNING("epoll-server: this stack cannot watch the signalfd, so no stats on request");
+        }
+
         // One line stating everything that was actually resolved. Worth its
         // weight the first time something on a real network does not behave.
 #ifdef EPOLL_SERVER_KERNEL
@@ -332,6 +397,7 @@ int main(int argc, char** argv)
         // deadline.
         server.run(g_stop_flag);
 
+        log_stats();
         LOG_INFO("Shutting down");
         return 0;
     }

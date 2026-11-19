@@ -51,6 +51,9 @@
 #   LOADTEST_PCAP_SNAPLEN       bytes captured per frame, default 128 (headers
 #                               with options; the payload is loadgen's and known)
 #
+# The kernel baseline at the end needs `make -C epoll-server KERNEL=1`; without
+# it that step is skipped with a warning.
+#
 set -uo pipefail
 
 NS=loadtest
@@ -232,6 +235,34 @@ debug_rerun()
     rm -f "$LOG.kept"
 }
 
+# The JSON lines shown in a phase's console summary: rates, connect latency and
+# round-trip latency, the last also split into the first round and the rest (a
+# slow first round with fast later ones means connection setup, not the data path).
+SUMMARY_KEYS='"(connections_per_s|throughput_mib_per_s|connect|round_trip|round_trip_first|round_trip_rest)":'
+
+# print_stats: asks the server for its stats line (SIGUSR1, answered on the
+# reactor thread, so it can lag by a loop pass) and prints the one that comes
+# back. The counters are cumulative over the server's life, so a phase's own
+# share is the difference from the line printed after the phase before it. Waits
+# up to 2 s for a new line, and says so if none arrives (an older server, or one
+# that has died) rather than printing a stale one.
+print_stats()
+{
+    local before line
+    before=$(grep -c 'stats: ' "$LOG" 2>/dev/null)
+    kill -USR1 "$SERVER_PID" 2>/dev/null || { echo "    (no stats: the server is not running)"; return; }
+    for _ in $(seq 1 20); do
+        [ "$(grep -c 'stats: ' "$LOG" 2>/dev/null)" -gt "$before" ] && break
+        sleep 0.1
+    done
+    if [ "$(grep -c 'stats: ' "$LOG" 2>/dev/null)" -gt "$before" ]; then
+        line=$(grep 'stats: ' "$LOG" | tail -n 1)
+        echo "    ${line#*stats: }"
+    else
+        echo "    (no stats line came back within 2 s)"
+    fi
+}
+
 # run_phase NAME LOADGEN_ARGS...: runs loadgen inside the namespace, writes the
 # JSON report, prints a summary, and counts a nonzero exit as a failure - after
 # which the capture is kept and the phase is rerun at DEBUG (see the header).
@@ -246,18 +277,21 @@ run_phase()
         sed 's/^/    /' "$OUT_DIR/$name.stderr"
         failures=$((failures + 1))
         # the numbers that matter, straight from the JSON
-        grep -E '"(connections_per_s|throughput_mib_per_s)"|"round_trip"' "$OUT_DIR/$name.json" | sed 's/^ */    /'
+        grep -E "$SUMMARY_KEYS" "$OUT_DIR/$name.json" | sed 's/^ */    /'
         echo "    errors: $(grep '"errors"' "$OUT_DIR/$name.json" | sed 's/^ *"errors": //')"
+        print_stats
         debug_rerun "$name" "$@"
         return
     fi
     echo "  PASS  $name"
-    grep -E '"(connections_per_s|throughput_mib_per_s)"|"round_trip"' "$OUT_DIR/$name.json" | sed 's/^ */    /'
+    grep -E "$SUMMARY_KEYS" "$OUT_DIR/$name.json" | sed 's/^ */    /'
     echo "    errors: $(grep '"errors"' "$OUT_DIR/$name.json" | sed 's/^ *"errors": //')"
+    print_stats
 }
 
-run_phase burst --connections "$BURST_CONNECTIONS" --concurrency "$BURST_CONNECTIONS" --size 4096 --rounds 3 \
-    --timeout-ms 20000
+BURST_ARGS=(--connections "$BURST_CONNECTIONS" --concurrency "$BURST_CONNECTIONS" --size 4096 --rounds 3
+    --timeout-ms 20000)
+run_phase burst "${BURST_ARGS[@]}"
 run_phase sustained --duration "$DURATION" --concurrency 50 --rate 100 --size 2048 --rounds 10 --threads 2 \
     --timeout-ms 20000
 
@@ -290,6 +324,69 @@ if grep -q "bad checksum" "$LOG"; then
     echo "FAIL  the server log reports bad checksums - is checksum offload still enabled on the veth pair?"
     failures=$((failures + 1))
 fi
+
+# json_us FILE KEY FIELD: a latency figure (microseconds) from loadgen's JSON,
+# e.g. json_us burst.json round_trip p90. Empty if it is not there.
+json_us()
+{
+    grep "\"$2\":" "$1" | sed -n "s/.*\"$3\": \([0-9]*\).*/\1/p" | head -n 1
+}
+
+# kernel_baseline: the burst again, against the same server logic on kernel
+# sockets (epoll-server built with KERNEL=1) at the same address and port, so
+# the Linux TCP stack's own numbers for this client and this veth are on the
+# page next to ours. The question it answers is whether a latency is ours or
+# the machine's. Run last, not right after the burst: the server is replaced
+# for it, and the sustained and netem phases are meant to follow the burst on
+# one server (the SYN-cookie state a burst leaves behind is part of what they
+# test). The kernel owns STACK_IP only while this runs; ours is stopped first,
+# or both would answer ARP and SYNs for it. Never fails the run: a missing
+# binary or a failed phase is a warning.
+kernel_baseline()
+{
+    local kernel_server="$REPO_ROOT/epoll-server/epoll-server-kernel"
+    if [ ! -x "$kernel_server" ]; then
+        echo "::warning::no kernel baseline - build it with: make -C epoll-server KERNEL=1"
+        return 0
+    fi
+    echo
+    echo "== burst-kernel: the same burst against epoll-server on kernel sockets"
+    stop_server
+    ip addr add "$STACK_IP/24" dev "$HOST_IF" 2>/dev/null
+    local klog="$OUT_DIR/kernel-server.log"
+    "$kernel_server" --port "$PORT" >"$klog" 2>&1 &
+    SERVER_PID=$!
+    local ready=0
+    for _ in $(seq 1 50); do
+        if grep -q "listening on TCP port" "$klog" 2>/dev/null; then
+            ready=1
+            break
+        fi
+        kill -0 "$SERVER_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if [ "$ready" = "1" ] && loadgen_once burst-kernel "${BURST_ARGS[@]}"; then
+        local u50 u90 k50 k90
+        u50=$(json_us "$OUT_DIR/burst.json" round_trip p50)
+        u90=$(json_us "$OUT_DIR/burst.json" round_trip p90)
+        k50=$(json_us "$OUT_DIR/burst-kernel.json" round_trip p50)
+        k90=$(json_us "$OUT_DIR/burst-kernel.json" round_trip p90)
+        echo "  round_trip (us)    p50        p90"
+        echo "    ustack       $(printf '%8s %10s' "${u50:-?}" "${u90:-?}")"
+        echo "    kernel       $(printf '%8s %10s' "${k50:-?}" "${k90:-?}")"
+        if [ -n "$u90" ] && [ -n "$k90" ] && [ "$k90" -gt 0 ]; then
+            awk -v u="$u90" -v k="$k90" 'BEGIN { printf "    p90 ratio ustack/kernel: %.1fx\n", u / k }'
+            if [ "$u90" -gt $((k90 * 3)) ]; then
+                echo "::warning::ustack burst round_trip p90 ($u90 us) is more than 3x the kernel's ($k90 us)"
+            fi
+        fi
+    else
+        echo "::warning::the kernel baseline did not run (server not ready, or loadgen failed); see $klog and burst-kernel.stderr"
+    fi
+    stop_server
+    ip addr del "$STACK_IP/24" dev "$HOST_IF" 2>/dev/null
+}
+kernel_baseline
 
 if [ "$failures" -ne 0 ]; then
     echo "$failures check(s) failed; reports in $OUT_DIR"
