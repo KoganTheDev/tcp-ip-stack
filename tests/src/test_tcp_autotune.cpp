@@ -238,10 +238,7 @@ TEST(TcpAutotune, AFastReaderGrowsTheReceiveBuffer)
     ASSERT_GT(peer.connection->receive_capacity(), TcpConnection::RECEIVE_BUFFER_CAPACITY)
         << "100 KB read per interval needs more than the default buffer";
     ASSERT_LE(peer.connection->receive_capacity(), TcpConnection::MAX_BUFFER_CAPACITY);
-    // As much of it as the window field can carry at this stack's shift.
-    uint64_t largest =
-        std::min<uint64_t>(peer.connection->receive_capacity(), uint64_t{0xFFFF} << TcpConnection::WINDOW_SCALE_SHIFT);
-    ASSERT_GE(peer.offered_window() + (1u << TcpConnection::WINDOW_SCALE_SHIFT), largest)
+    ASSERT_GT(peer.offered_window(), TcpConnection::RECEIVE_BUFFER_CAPACITY)
         << "and the peer is offered the bigger window, got " << peer.offered_window();
 }
 
@@ -425,4 +422,49 @@ TEST(TcpAutotune, UnreadDataKeepsItsChargeUntilAResetConnectionIsDestroyed)
             << "CLOSED with the bytes still queued: still charged";
     }
     ASSERT_EQ(budget->in_use(), 0u) << "destroyed (reaped), everything is given back";
+}
+
+// --- window scale ---
+
+// The shift covers the largest buffer autotuning can reach: a 16 MiB buffer
+// is advertised as (nearly) 16 MiB, not capped by the window field.
+TEST(TcpAutotune, TheWindowScaleCoversTheMaximumBuffer)
+{
+    ASSERT_GE(uint64_t{0xFFFF} << TcpConnection::WINDOW_SCALE_SHIFT, TcpConnection::MAX_BUFFER_CAPACITY);
+    ASSERT_LT(uint64_t{0xFFFF} << (TcpConnection::WINDOW_SCALE_SHIFT - 1), TcpConnection::MAX_BUFFER_CAPACITY)
+        << "and is the smallest that does";
+
+    Peer peer(true);
+    peer.read_eagerly();
+    uint32_t round = 100000;
+    for (int i = 0; i < 12; i++)
+    {
+        peer.advance(TcpConnection::RCV_SPACE_FALLBACK_MS);
+        peer.burst(std::min<uint32_t>(round, peer.offered_window()));
+        round *= 2;
+    }
+    ASSERT_EQ(peer.connection->receive_capacity(), TcpConnection::MAX_BUFFER_CAPACITY) << "growth stops at the maximum";
+    peer.data(peer.full_segment());
+    peer.advance(TcpConnection::RCV_SPACE_FALLBACK_MS); // its delayed ack
+    ASSERT_GE(uint64_t{peer.offered_window()} + (1u << TcpConnection::WINDOW_SCALE_SHIFT),
+              TcpConnection::MAX_BUFFER_CAPACITY - peer.full_segment())
+        << "and all of it can be offered, got " << peer.offered_window();
+}
+
+// With a shift of 9 the window moves in 512-byte units. RCV.NXT advancing by
+// something else must not pull the offered right edge back by the rounding.
+TEST(TcpAutotune, ScaledWindowRoundingNeverMovesTheRightEdgeLeft)
+{
+    Peer peer(true);
+    // Nothing is read, so every byte that arrives shrinks the free space and
+    // the offered edge is what holds the window up.
+    uint64_t edge = 0;
+    for (uint32_t size : {100u, 700u, 1u, 1000u, 333u, 1448u, 5u})
+    {
+        peer.data(size);
+        peer.advance(TcpConnection::RCV_SPACE_FALLBACK_MS); // the ack goes out
+        uint64_t now_edge = uint64_t{peer.sent.back().ack} + peer.offered_window();
+        ASSERT_GE(now_edge, edge) << "after " << size << " bytes the right edge moved left";
+        edge = now_edge;
+    }
 }

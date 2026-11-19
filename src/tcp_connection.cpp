@@ -214,7 +214,19 @@ void TcpConnection::_transmit(uint8_t flags, uint32_t seq, const Bytes& payload,
     // open _window_scaling_negotiated is already true when the SYN-ACK is
     // built, so it is not enough on its own.
     uint8_t our_shift = (_window_scaling_negotiated && !(flags & FLAG_SYN)) ? WINDOW_SCALE_SHIFT : 0;
-    uint32_t window_value = std::min<uint32_t>(available >> our_shift, 0xFFFFu);
+    uint32_t window_value = available >> our_shift;
+    // Scaling rounds down to whole units of 2^shift, which could pull the
+    // right edge back from where it was offered once RCV.NXT has moved by
+    // something other than a whole unit. Round up to keep it instead (Linux's
+    // tcp_select_window does the same): the edge was offered from free space,
+    // and the extra is less than one unit.
+    uint64_t offered =
+        _rcv_right_edge_unwrapped > _recv_next_unwrapped ? _rcv_right_edge_unwrapped - _recv_next_unwrapped : 0;
+    if ((static_cast<uint64_t>(window_value) << our_shift) < offered)
+    {
+        window_value = static_cast<uint32_t>((offered + (uint64_t{1} << our_shift) - 1) >> our_shift);
+    }
+    window_value = std::min<uint32_t>(window_value, 0xFFFFu);
 
     Tcp header(_local_port, _remote_port, seq, _recv_next, 5, flags, static_cast<uint16_t>(window_value), 0, 0);
     _add_options(header, flags, payload.size());

@@ -83,6 +83,19 @@ enum class TcpEcnMode
 //
 // Still deliberately out of scope (documented, not accidental): PRR without
 // SACK, D-SACK and F-RTO - see the README.
+// The smallest window shift with which a 16-bit window field can describe
+// `bytes` (RFC 7323 2.2), as Linux's tcp_select_initial_window() computes it.
+constexpr uint8_t tcp_window_scale_covering(size_t bytes)
+{
+    uint8_t shift = 0;
+    while (bytes > 0xFFFF && shift < 14)
+    {
+        bytes >>= 1;
+        shift++;
+    }
+    return shift;
+}
+
 class TcpConnection
 {
 public:
@@ -497,9 +510,22 @@ public:
     void set_memory_budget(std::shared_ptr<TcpMemoryBudget> budget);
     // Bytes this connection currently draws from its budget.
     size_t memory_charged() const { return _receive_charge.charged() + _send_charge.charged(); }
-    // The window shift this stack offers in its SYN (RFC 7323). Public so
-    // tests can read a scaled window without restating it.
-    static constexpr uint8_t WINDOW_SCALE_SHIFT = 1;
+    // The window shift this stack offers in its SYN (RFC 7323): the smallest
+    // that lets the 16-bit window field describe the largest receive buffer
+    // there can be, MAX_BUFFER_CAPACITY - Linux's tcp_select_initial_window()
+    // picks it the same way, from tcp_rmem[2]. For 16 MiB that is 9:
+    // 0xFFFF << 8 falls 256 bytes short. Linux's default of 7 comes from its
+    // 6 MiB tcp_rmem[2]; a shift of 7 here would cap autotuning at 8 MiB.
+    //
+    // The price of a larger shift is resolution: the window is advertised in
+    // 512-byte units, so the last few hundred bytes of free space round down
+    // to nothing - which is never more than a sliver of a 4 KiB minimum
+    // buffer - and an edge already offered is rounded up rather than pulled
+    // back (see _transmit()). The shift is fixed for the connection at the
+    // SYN, so it has to cover what the buffer may grow to later, not what it
+    // is now. Public so tests can read a scaled window without restating it.
+    static constexpr uint8_t WINDOW_SCALE_SHIFT = tcp_window_scale_covering(MAX_BUFFER_CAPACITY);
+    static_assert(WINDOW_SCALE_SHIFT <= 14, "RFC 7323 2.3: the shift is at most 14");
 
     // --- receiver-side RTT (Linux's rcv_rtt_est) ---
     //

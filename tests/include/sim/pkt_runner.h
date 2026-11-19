@@ -22,7 +22,7 @@
 // Packets. '<' is injected from the peer, '>' is expected from the stack:
 //
 //   +0     < S 0:0(0) win 65535 <mss 1460,sackOK,TS val 100 ecr 0,nop,wscale 7>
-//   +0     > S. 0:0(0) ack 1 <mss 1460,sackOK,TS val * ecr 100,wscale 1>
+//   +0     > S. 0:0(0) ack 1 <mss 1460,sackOK,TS val * ecr 100,wscale 9>
 //   +0.010 < . 1:1001(1000) ack 1 win 512
 //   +0.200 > . 1:1(0) ack 1001
 //

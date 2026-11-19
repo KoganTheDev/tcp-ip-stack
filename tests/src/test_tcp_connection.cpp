@@ -2582,8 +2582,8 @@ namespace
         return bytes;
     }
 
-    // An established connection with SACK and window scaling (shift 1, so the
-    // advertised window has 2-byte resolution) that records the last SACK
+    // An established connection with SACK and window scaling (this stack's
+    // shift, so the advertised window has 2^WINDOW_SCALE_SHIFT-byte resolution) that records the last SACK
     // report and window it sent, and collects everything it delivers.
     struct ReorderHarness
     {
@@ -2598,7 +2598,8 @@ namespace
                                                          [this](const Tcp& header, const Bytes&)
                                                          {
                                                              sack = header.get_sack_blocks();
-                                                             window = static_cast<uint32_t>(header.get_window()) << 1;
+                                                             window = static_cast<uint32_t>(header.get_window())
+                                                                      << TcpConnection::WINDOW_SCALE_SHIFT;
                                                          });
             connection->accept_incoming_syn(peer_isn, 1460, true, 0, false, 0, true);
             connection->on_segment(*make_incoming_segment(peer_isn + 1, 1001, FLAG_ACK));
@@ -2830,8 +2831,9 @@ TEST(TcpConnection, APieceJoiningHeldRangesIsAcceptedAtTheCap)
 // retransmit could ever fire.
 TEST(TcpConnection, DuplicateAcksForOutOfOrderDataCarryAnUnchangedWindow)
 {
-    // Window scaling on (shift 1), so the 128 KiB window is not capped at
-    // 65535 and a change in it shows.
+    // Window scaling on, so the 128 KiB window is not capped at 65535, and
+    // segments of several scale units each, so a window shrunk by them would
+    // show in the scaled field.
     std::vector<RecordedSegment> sent;
     auto connection = std::make_unique<TcpConnection>(
         8080, IPv4Address("10.0.0.1"), 12345, 1000,
@@ -2847,13 +2849,13 @@ TEST(TcpConnection, DuplicateAcksForOutOfOrderDataCarryAnUnchangedWindow)
     sent.clear();
 
     for (uint32_t i = 1; i <= 3; i++)
-        connection->on_segment(*make_incoming_segment(511 + 100 * i, 1001, FLAG_ACK, Bytes(100)));
+        connection->on_segment(*make_incoming_segment(511 + 2000 * i, 1001, FLAG_ACK, Bytes(1000)));
     ASSERT_TRUE(sent.size() == 3) << "each out-of-order segment draws an immediate duplicate ack";
     ASSERT_TRUE(sent[0].ack == 511 && sent[1].ack == 511 && sent[2].ack == 511) << "all acking RCV.NXT";
     ASSERT_TRUE(sent[0].window == sent[1].window && sent[1].window == sent[2].window)
         << "and all advertising the same window: " << sent[0].window << ", " << sent[1].window << ", "
         << sent[2].window;
-    ASSERT_TRUE(connection->bytes_out_of_order() == 300) << "while the 300 bytes are held";
+    ASSERT_TRUE(connection->bytes_out_of_order() == 3000) << "while the 3000 bytes are held";
 }
 
 // RFC 6675 section 2: with SACK, a duplicate acknowledgment is one whose SACK
