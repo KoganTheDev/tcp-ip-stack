@@ -8,6 +8,7 @@
 #include <cstring>
 #include <memory>
 
+#include "guard_channel.h"
 #include "sim/sim_network.h"
 #include "sim/ustack_sim_driver.h"
 #include "ustack/kernel_stack.h"
@@ -59,6 +60,40 @@ namespace stack_harness
         SimNetwork _net{42};
         std::unique_ptr<ustack::Stack> _client;
         std::unique_ptr<ustack::Stack> _server;
+    };
+
+    // Client and server are the SAME ustack::Stack, talking over 127.0.0.1 - the
+    // counterpart of KernelHarness, which is how the kernel sees the scenario.
+    // The one interface sits on a channel that fails the test on any write, so
+    // the scenario passing means it never left the host.
+    class SimLoopbackHarness
+    {
+    public:
+        using StackT = ustack::Stack;
+        static constexpr const char* NAME = "ustack over its loopback";
+
+        SimLoopbackHarness()
+        {
+            NetworkStack& net_stack = _net.add_stack(std::make_unique<GuardChannel>(), MacAddress("02:00:00:00:00:01"),
+                                                     IPv4Address("10.0.0.1"));
+            _stack = std::make_unique<ustack::Stack>(net_stack, std::make_unique<UstackSimDriver>(_net));
+        }
+
+        StackT& server_stack() { return *_stack; }
+        StackT& client_stack() { return *_stack; }
+        static sockaddr_in server_address(uint16_t port)
+        {
+            sockaddr_in in{};
+            in.sin_family = AF_INET;
+            in.sin_port = htons(port);
+            in.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            return in;
+        }
+        void settle(int ms) { _net.step(static_cast<uint64_t>(ms)); }
+
+    private:
+        SimNetwork _net{42};
+        std::unique_ptr<ustack::Stack> _stack;
     };
 
     class KernelHarness

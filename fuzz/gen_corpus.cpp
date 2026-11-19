@@ -72,7 +72,8 @@ namespace
     }
 
     // An Ethernet frame carrying `payload` as IPv4 with protocol `protocol`.
-    Bytes ip_frame(uint8_t protocol, const Bytes& payload, uint16_t flags_and_offset = 0)
+    Bytes ip_frame(uint8_t protocol, const Bytes& payload, uint16_t flags_and_offset = 0,
+                   const IPv4Address& source = IP_B, const IPv4Address& destination = IP_A)
     {
         Bytes ip;
         ip.push_back(0x45);
@@ -83,8 +84,8 @@ namespace
         ip.push_back(64);
         ip.push_back(protocol);
         ip.append_int<uint16_t>(0);
-        ip |= IP_B.get_address();
-        ip |= IP_A.get_address();
+        ip |= source.get_address();
+        ip |= destination.get_address();
         uint16_t sum = internet_checksum(ip);
         ip[10] = static_cast<byte_t>(sum >> 8);
         ip[11] = static_cast<byte_t>(sum);
@@ -392,6 +393,36 @@ int main(int argc, char** argv)
         save("stack", "fragments", stack_item(frag, 0x00) | stack_item(last, 0x1f));
     }
     save("stack", "idle_then_close", stack_item(Bytes(), 0x7f) | stack_item(data, 0x7f));
+    {
+        // Local addresses on the wire: loopback sources and destinations, and
+        // the stack's own address as a source (LAND: source == destination, equal
+        // ports). All are martians the stack must drop without a trace; the
+        // harness's own loopback sends (see World::application) share the queue.
+        const IPv4Address loopback("127.0.0.1");
+        Bytes udp_to_dns = udp_datagram(1234, 53, Bytes(16));
+        Bytes land = tcp_frame::build(
+            [&]
+            {
+                tcp_frame::Segment s = segment(1000, 0, tcp_frame::SYN);
+                s.src_ip = IP_A;
+                s.src_port = 80;
+                return s;
+            }());
+        Bytes loopback_syn = tcp_frame::build(
+            [&]
+            {
+                tcp_frame::Segment s = segment(1000, 0, tcp_frame::SYN);
+                s.dst_ip = loopback;
+                return s;
+            }());
+        save("stack", "loopback_source_udp", stack_item(ip_frame(17, udp_to_dns, 0, loopback, IP_A), 0x01));
+        save("stack", "loopback_destination_udp", stack_item(ip_frame(17, udp_to_dns, 0, IP_B, loopback), 0x01));
+        save("stack", "loopback_destination_syn", stack_item(loopback_syn, 0x01));
+        save("stack", "own_source_land_syn",
+             stack_item(land, 0x01) | stack_item(ip_frame(17, udp_to_dns, 0, IP_A, IP_A), 0x01));
+        save("stack", "own_source_ping", stack_item(ip_frame(1, icmp_echo(8, Bytes(10)), 0, IP_A, IP_A), 0x02));
+        save("stack", "loopback_app_traffic", stack_item(Bytes(), 0x41) | stack_item(Bytes(), 0x7f));
+    }
     {
         // A lying receiver's D-SACKs (RFC 2883), against a connection with a
         // timed-out segment: the application writes 200 bytes, 1.25 s pass

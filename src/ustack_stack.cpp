@@ -523,8 +523,10 @@ namespace ustack
             return fail(EINVAL); // a v4-mapped address on an IPv6-only socket
         }
         const std::vector<Ipv6ConfiguredAddress> v6_addresses = _stack.ipv6_addresses();
-        bool local = ip.is_v4() ? ip.v4() == IPv4Address() || ip.v4() == _stack.interface_config().ip
-                                : ip.v6().is_unspecified()
+        // Loopback is always this host's: any 127/8 address and ::1 (what the
+        // stack's own loopback queue serves), besides the configured ones.
+        bool local = ip.is_v4() ? ip.v4() == IPv4Address() || _stack.is_local_address(ip)
+                                : ip.v6().is_unspecified() || _stack.is_local_address(ip)
                                       || std::any_of(v6_addresses.begin(), v6_addresses.end(),
                                                      [&ip](const Ipv6ConfiguredAddress& configured)
                                                      { return configured.address == ip.v6(); });
@@ -777,7 +779,9 @@ namespace ustack
             {
                 return fail(ENETUNREACH);
             }
-            if (len + (ip.is_v4() ? IP_UDP_HEADER_BYTES : IPV6_UDP_HEADER_BYTES) > _stack.interface_config().mtu)
+            // A datagram to this host never meets the interface's MTU.
+            const size_t mtu = _stack.is_local_address(ip) ? NetworkStack::LOOPBACK_MTU : _stack.interface_config().mtu;
+            if (len + (ip.is_v4() ? IP_UDP_HEADER_BYTES : IPV6_UDP_HEADER_BYTES) > mtu)
             {
                 return fail(EMSGSIZE);
             }
