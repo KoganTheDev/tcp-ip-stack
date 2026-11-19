@@ -49,6 +49,14 @@ namespace
         return address.get_address()[0] == 127;
     }
 
+    // The same on the raw octets of a parsed header. An IPv4Address owns a
+    // heap-allocated Bytes, so building one per packet just to look at it
+    // costs an allocation each; the receive path asks on every packet.
+    bool is_loopback_v4(const Bytes& octets)
+    {
+        return octets[0] == 127;
+    }
+
     bool is_multicast(const IPv4Address& address)
     {
         return (address.get_address()[0] & 0xF0) == 0xE0;
@@ -998,13 +1006,18 @@ bool NetworkStack::poll()
 
 bool NetworkStack::_is_local_ipv4(const IPv4Address& address) const
 {
-    if (is_loopback_v4(address))
+    return this->_is_local_octets(address.get_address());
+}
+
+bool NetworkStack::_is_local_octets(const Bytes& octets) const
+{
+    if (is_loopback_v4(octets))
     {
         return true;
     }
     for (const auto& interface : this->_interfaces)
     {
-        if (interface->config.has_address() && address == interface->config.ip)
+        if (interface->config.has_address() && octets == interface->config.ip.get_address())
         {
             return true;
         }
@@ -1543,9 +1556,7 @@ void NetworkStack::_handle_ip(size_t ingress, const Ip& ip, const Bytes& ip_byte
     // is us. Accepted, its replies would be addressed to a local address and
     // so land in the loopback queue - a spoofed SYN with source == destination
     // and equal ports (LAND) would make the stack talk to itself.
-    if (!from_loopback
-        && (this->_is_local_ipv4(IPv4Address(ip.get_src_address()))
-            || is_loopback_v4(IPv4Address(ip.get_dest_address()))))
+    if (!from_loopback && (this->_is_local_octets(ip.get_src_address()) || is_loopback_v4(ip.get_dest_address())))
     {
         this->_loopback_martian_drops++;
         LOG_DEBUG("NetworkStack: dropping an IPv4 packet from "
@@ -2817,7 +2828,7 @@ bool NetworkStack::_is_broadcast_for_any_interface(const IPv4Address& ip) const
     return false;
 }
 
-IPv4Address NetworkStack::_source_address_for(const IPv4Address& dest_ip) const
+IPv4Address NetworkStack::_source_address_for(const IPv4Address& dest_ip, bool local) const
 {
     // The single answer to "what address will a packet to dest_ip carry".
     //
@@ -2832,7 +2843,7 @@ IPv4Address NetworkStack::_source_address_for(const IPv4Address& dest_ip) const
     // 127.0.0.1, an own address for that address), as on Linux: the peer that
     // answers then replies from the address it was sent to, and a reply
     // matches the connection it belongs to.
-    if (this->_is_local_ipv4(dest_ip))
+    if (local)
     {
         return dest_ip;
     }
@@ -2845,7 +2856,7 @@ IPv4Address NetworkStack::_source_address_for(const IPv4Address& dest_ip) const
     return this->_interfaces.at(egress)->config.ip;
 }
 
-void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol, const Bytes& payload,
+void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, bool local, uint8_t protocol, const Bytes& payload,
                                    bool dont_fragment, Ecn ecn)
 {
     // Local: no route, no ARP, no frame. The packet is built exactly as it
@@ -2854,7 +2865,7 @@ void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol,
     // (see _source_address_for). Never fragmented: the loopback MTU is the
     // most an IPv4 total-length field can say, so anything that fits an IP
     // packet at all fits here.
-    if (this->_is_local_ipv4(dest_ip))
+    if (local)
     {
         if (20 + payload.size() > LOOPBACK_MTU)
         {
@@ -3023,8 +3034,12 @@ void NetworkStack::_send_tcp_segment(const IpAddress& destination, const Tcp& he
     }
     const IPv4Address& dest_ip = destination.v4();
 
+    // Decided once per segment and handed down: it feeds the source address
+    // (and so the checksum), the ARP hold-back and the IP layer, and asking
+    // three times was measurable on the bulk path.
+    const bool local = this->_is_local_ipv4(dest_ip);
     uint16_t checksum =
-        transport_checksum(this->_source_address_for(dest_ip), dest_ip, IpProtocol::TCP, segment.to_bytes());
+        transport_checksum(this->_source_address_for(dest_ip, local), dest_ip, IpProtocol::TCP, segment.to_bytes());
     segment.set_checksum(checksum);
 
     // A next hop with no ARP entry - an idle peer's entry aged out mid-
@@ -3034,7 +3049,7 @@ void NetworkStack::_send_tcp_segment(const IpAddress& destination, const Tcp& he
     // queue is needed here (unlike UDP, which has no retransmission).
     IPv4Address next_hop;
     size_t egress = 0;
-    if (!this->_is_local_ipv4(dest_ip) && this->_route_for(dest_ip, next_hop, egress))
+    if (!local && this->_route_for(dest_ip, next_hop, egress))
     {
         const Interface& interface = *this->_interfaces.at(egress);
         if (!is_broadcast_address(next_hop, interface.config) && !interface.arp_table.contains(next_hop))
@@ -3046,7 +3061,7 @@ void NetworkStack::_send_tcp_segment(const IpAddress& destination, const Tcp& he
         }
     }
 
-    this->_send_ip_packet(dest_ip, IpProtocol::TCP, segment.to_bytes(), true, ecn);
+    this->_send_ip_packet(dest_ip, local, IpProtocol::TCP, segment.to_bytes(), true, ecn);
 }
 
 void NetworkStack::_send_rst(const IpAddress& source, const IpAddress& destination, const Tcp& tcp)
@@ -3210,14 +3225,15 @@ void NetworkStack::_send_udp_datagram(const IPv4Address& dest_ip, const Udp& hea
         datagram /= std::make_unique<Raw>(payload);
     }
 
+    const bool local = this->_is_local_ipv4(dest_ip);
     uint16_t checksum =
-        transport_checksum(this->_source_address_for(dest_ip), dest_ip, IpProtocol::UDP, datagram.to_bytes());
+        transport_checksum(this->_source_address_for(dest_ip, local), dest_ip, IpProtocol::UDP, datagram.to_bytes());
     // RFC 768: an all-zero result must be transmitted as all-ones instead -
     // 0 is reserved to mean "no checksum was computed", so a genuine result
     // of 0 would otherwise be indistinguishable from that
     datagram.set_checksum(checksum == 0 ? 0xFFFF : checksum);
 
-    this->_send_ip_packet(dest_ip, IpProtocol::UDP, datagram.to_bytes());
+    this->_send_ip_packet(dest_ip, local, IpProtocol::UDP, datagram.to_bytes());
 }
 
 void NetworkStack::_send_icmp_message(const IPv4Address& dest_ip, const Icmp& header, const Bytes& payload)
@@ -3250,7 +3266,8 @@ void NetworkStack::_send_icmp_message(const IPv4Address& dest_ip, const Icmp& he
     // hop, so this one check covers both the neighbour and the via-gateway case.
     //
     // A local destination has no next hop, so none of this applies to it.
-    if (!this->_is_local_ipv4(dest_ip))
+    const bool local = this->_is_local_ipv4(dest_ip);
+    if (!local)
     {
         IPv4Address next_hop;
         size_t egress = 0;
@@ -3274,7 +3291,7 @@ void NetworkStack::_send_icmp_message(const IPv4Address& dest_ip, const Icmp& he
     // a fresh one from header's fields instead
     Icmp message(header.get_type(), header.get_code(), 0, header.get_rest_of_header(), payload);
     message.compute_checksum(); // no pseudo-header, no transport_checksum() - see Icmp's own class comment
-    this->_send_ip_packet(dest_ip, IpProtocol::ICMP, message.to_bytes());
+    this->_send_ip_packet(dest_ip, local, IpProtocol::ICMP, message.to_bytes());
 }
 
 bool NetworkStack::_may_report_error_for(const IPv4Address& source, const IPv4Address& destination,

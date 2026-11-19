@@ -733,8 +733,11 @@ private:
     // not, because this stack fragments oversized datagrams itself and there is
     // no per-connection state to adjust in response.
     // `ecn` goes in the TOS octet's ECN field (RFC 3168); DSCP is 0.
-    void _send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol, const Bytes& payload, bool dont_fragment = false,
-                         Ecn ecn = Ecn::NOT_ECT);
+    // `local`: dest_ip is this host (_is_local_ipv4), decided once by the
+    // caller because the source address, the ARP hold-back and this function
+    // all need the answer.
+    void _send_ip_packet(const IPv4Address& dest_ip, bool local, uint8_t protocol, const Bytes& payload,
+                         bool dont_fragment = false, Ecn ecn = Ecn::NOT_ECT);
     // local_v6 pins the source of a v6 segment - a connection's own address;
     // without it one is chosen for the destination.
     void _send_tcp_segment(const IpAddress& destination, const Tcp& header, const Bytes& payload,
@@ -836,7 +839,7 @@ private:
     // The address a packet to this destination will carry. Used by both the IP
     // header and the transport pseudo-header checksums, so that the two cannot
     // be computed from different answers - see its definition.
-    IPv4Address _source_address_for(const IPv4Address& destination) const;
+    IPv4Address _source_address_for(const IPv4Address& destination, bool local) const;
     // True if this address is the limited broadcast, or the directed broadcast
     // of ANY of this stack's links.
     //
@@ -1048,6 +1051,9 @@ private:
     static constexpr size_t LOOPBACK_INGRESS = static_cast<size_t>(-1);
     // 127.0.0.0/8 or an address configured on an interface.
     bool _is_local_ipv4(const IPv4Address& address) const;
+    // The same test on the four raw octets, with no IPv4Address (and so no
+    // allocation) built - what the per-packet receive check uses.
+    bool _is_local_octets(const Bytes& octets) const;
     bool _is_local_ipv6(const IPv6Address& address) const;
     // The v6 receive path for a datagram off the loopback queue.
     void _handle_loopback_ipv6(const Bytes& packet);
