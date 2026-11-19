@@ -63,6 +63,17 @@ RawPacketChannel::RawPacketChannel(const std::string& interface_name)
              << ", kernel drops our own frames: " << (this->_kernel_ignores_outgoing ? "yes" : "no") << ")");
 }
 
+uint64_t RawPacketChannel::kernel_drops()
+{
+    struct tpacket_stats stats;
+    socklen_t length = sizeof(stats);
+    if (getsockopt(this->_fd, SOL_PACKET, PACKET_STATISTICS, &stats, &length) == 0)
+    {
+        this->_kernel_drops.add_reading(stats.tp_drops);
+    }
+    return this->_kernel_drops.total();
+}
+
 RawPacketChannel::~RawPacketChannel()
 {
     // Nothing to restore, because nothing machine-wide was changed - which is

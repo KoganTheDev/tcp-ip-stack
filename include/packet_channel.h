@@ -63,4 +63,8 @@ public:
     // a passing reason, FatalChannelError if the channel is unusable.
     virtual void write(const Bytes& buffer) = 0;
     virtual int get_fd() const = 0;
+    // Frames the kernel dropped on the way in because this channel's receive
+    // buffer was full, running total. Zero for a channel that has no such
+    // notion (a TAP device, a test double).
+    virtual uint64_t kernel_drops() { return 0; }
 };

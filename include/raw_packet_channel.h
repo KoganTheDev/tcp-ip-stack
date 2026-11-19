@@ -6,6 +6,20 @@
 #include "packet_channel.h"
 #include "network_addresses.h"
 
+// Running total of PACKET_STATISTICS readings. The kernel zeroes that counter
+// every time it is read, so each reading is only the drops since the previous
+// one; the total is the sum. Separate from the socket so the arithmetic can be
+// tested without CAP_NET_RAW.
+class KernelDropTotal
+{
+public:
+    void add_reading(uint32_t drops_since_last_read) { this->_total += drops_since_last_read; }
+    uint64_t total() const { return this->_total; }
+
+private:
+    uint64_t _total = 0;
+};
+
 // A PacketChannel over a real network interface, using an AF_PACKET socket.
 // The TAP-device counterpart is TunWrapper; NetworkStack cannot tell them apart
 // and needs no changes to run over either.
@@ -57,6 +71,9 @@ public:
     Bytes read(unsigned int max_length) override;
     void write(const Bytes& buffer) override;
     int get_fd() const override { return this->_fd; }
+    // Reads PACKET_STATISTICS (which resets the kernel's count) and returns the
+    // running total. A failed getsockopt leaves the total as it was.
+    uint64_t kernel_drops() override;
 
     // The interface's real hardware address, read at construction. This is
     // what the stack should use as its own MAC - see the class comment for why
@@ -95,4 +112,5 @@ private:
     // itself, using the kernel's own classification of each frame.
     bool _kernel_ignores_outgoing;
     uint16_t _mtu;
+    KernelDropTotal _kernel_drops;
 };
