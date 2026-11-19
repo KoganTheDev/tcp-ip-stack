@@ -20,6 +20,7 @@ namespace
     struct Sent
     {
         uint32_t seq;
+        uint32_t length; // payload bytes
         uint32_t ack;
         uint32_t window; // as the peer reads it: scaled by our shift once negotiated
         bool has_timestamp;
@@ -36,18 +37,20 @@ namespace
         bool timestamps;
         uint32_t peer_tsval = 100;
         uint32_t next_seq = PEER_ISN + 1;
+        uint32_t ack_number = 1001; // what the peer acknowledges of ours
 
         explicit Peer(bool use_timestamps, bool window_scaling = true) : timestamps(use_timestamps)
         {
             connection = std::make_unique<TcpConnection>(
                 8080, IPv4Address("10.0.0.1"), 12345, 1000,
-                [this](const Tcp& header, const Bytes&)
+                [this](const Tcp& header, const Bytes& payload)
                 {
                     bool scaled = !header.get_syn();
                     uint32_t window = static_cast<uint32_t>(header.get_window())
                                       << (scaled ? TcpConnection::WINDOW_SCALE_SHIFT : 0);
-                    sent.push_back({header.get_sequence_number(), header.get_acknowledgement_number(), window,
-                                    header.has_timestamp_option(), header.get_timestamp_value()});
+                    sent.push_back({header.get_sequence_number(), static_cast<uint32_t>(payload.size()),
+                                    header.get_acknowledgement_number(), window, header.has_timestamp_option(),
+                                    header.get_timestamp_value()});
                 });
             connection->accept_incoming_syn(PEER_ISN, MSS, window_scaling, 7, timestamps, peer_tsval, true);
             connection->on_segment(*segment(Bytes(), last_tsval()));
@@ -61,7 +64,7 @@ namespace
 
         std::unique_ptr<Tcp> segment(const Bytes& payload, uint32_t echo)
         {
-            auto tcp = std::make_unique<Tcp>(12345, 8080, next_seq, 1001, 5, FLAG_ACK, 65535, 0, 0);
+            auto tcp = std::make_unique<Tcp>(12345, 8080, next_seq, ack_number, 5, FLAG_ACK, 65535, 0, 0);
             if (timestamps)
             {
                 peer_tsval += 1;
@@ -98,6 +101,20 @@ namespace
         void read_eagerly()
         {
             connection->set_data_ready_callback([this]() { static_cast<void>(connection->read()); });
+        }
+
+        // The peer acknowledges everything sent so far.
+        void ack_all()
+        {
+            for (const Sent& s : sent)
+            {
+                uint32_t end = s.seq + s.length;
+                if (static_cast<int32_t>(end - ack_number) > 0)
+                {
+                    ack_number = end;
+                }
+            }
+            connection->on_segment(*segment(Bytes(), last_tsval()));
         }
 
         // The window the peer was last offered, in bytes.
@@ -285,4 +302,48 @@ TEST(TcpAutotune, NoGrowthWithoutWindowScaling)
     peer.read_eagerly();
     fast_rounds(peer, 10, 60000, TcpConnection::RCV_SPACE_FALLBACK_MS);
     ASSERT_EQ(peer.connection->receive_capacity(), TcpConnection::RECEIVE_BUFFER_CAPACITY) << "unscaled";
+}
+
+// --- send buffer growth ---
+
+namespace
+{
+    // An application that keeps the send buffer full, and a peer that acks
+    // each flight a round trip later: cwnd grows in slow start. Returns how
+    // many times the send-space callback fired.
+    int bulk_send(Peer& peer, int round_trips)
+    {
+        int notified = 0;
+        peer.connection->set_send_space_callback([&notified]() { notified += 1; });
+        for (int i = 0; i < round_trips; i++)
+        {
+            while (peer.connection->send(Bytes(65536u)) > 0)
+            {
+            }
+            peer.advance(20);
+            peer.ack_all();
+        }
+        return notified;
+    }
+}
+
+TEST(TcpAutotune, TheSendBufferGrowsWithTheCongestionWindow)
+{
+    Peer peer(true);
+    int notified = bulk_send(peer, 8);
+    uint32_t cwnd = peer.connection->get_congestion_window();
+    ASSERT_GT(cwnd, TcpConnection::SEND_BUFFER_CAPACITY / 2) << "precondition: cwnd past half the default buffer";
+    ASSERT_GE(peer.connection->send_capacity(), std::min<size_t>(size_t{2} * cwnd, TcpConnection::MAX_BUFFER_CAPACITY))
+        << "the buffer keeps up with twice cwnd";
+    ASSERT_GT(notified, 0) << "and a writer waiting on the full buffer is told about the room";
+}
+
+TEST(TcpAutotune, AnExplicitSendBufferNeverGrows)
+{
+    Peer peer(true);
+    peer.connection->set_send_capacity(TcpConnection::SEND_BUFFER_CAPACITY);
+    peer.connection->set_send_capacity_locked(true);
+    static_cast<void>(bulk_send(peer, 8));
+    ASSERT_GT(peer.connection->get_congestion_window(), TcpConnection::SEND_BUFFER_CAPACITY / 2) << "precondition";
+    ASSERT_EQ(peer.connection->send_capacity(), TcpConnection::SEND_BUFFER_CAPACITY) << "SO_SNDBUF was set";
 }

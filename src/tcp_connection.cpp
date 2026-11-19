@@ -2015,6 +2015,7 @@ void TcpConnection::on_segment(const Tcp& segment, Ecn ecn)
     }
 
     _handle_ack(segment);
+    _tune_send_capacity();
 
     // Resolved before the state check because the FIN handling at the bottom
     // needs the payload's length too: a segment carrying both data and FIN
@@ -2463,6 +2464,32 @@ void TcpConnection::set_send_capacity(size_t bytes)
     _send_capacity = clamp_capacity(bytes, size_t{2} * _local_mss);
     // A bigger limit is new room: tell a waiting writer (EPOLLOUT).
     _report_send_space();
+}
+
+void TcpConnection::_tune_send_capacity()
+{
+    if (_send_capacity_locked || (_state != TcpState::ESTABLISHED && _state != TcpState::CLOSE_WAIT))
+    {
+        return;
+    }
+    size_t target = std::max(SEND_BUFFER_CAPACITY, size_t{2} * _congestion->window());
+    if (target > _send_capacity)
+    {
+        _grow_send_capacity(target);
+    }
+}
+
+void TcpConnection::_grow_send_capacity(size_t target)
+{
+    target = std::min(target, MAX_BUFFER_CAPACITY);
+    if (target <= _send_capacity)
+    {
+        return;
+    }
+    LOG_DEBUG("TcpConnection[" << _id << "] send buffer " << _send_capacity << " -> " << target);
+    _send_capacity = target;
+    // _report_send_space() at the end of the entry point tells a waiting
+    // writer about the new room.
 }
 
 bool TcpConnection::has_sent_unacknowledged(uint32_t seq) const

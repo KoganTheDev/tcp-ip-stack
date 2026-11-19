@@ -265,6 +265,7 @@ namespace ustack
         if (socket.send_capacity_set)
         {
             connection.set_send_capacity(socket.send_capacity);
+            connection.set_send_capacity_locked(true);
         }
         connection.set_user_timeout(socket.user_timeout_ms == 0 ? TcpConnection::DEFAULT_USER_TIMEOUT_MS
                                                                 : socket.user_timeout_ms);

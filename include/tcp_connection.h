@@ -475,6 +475,16 @@ public:
     // SO_RCVBUF (SOCK_RCVBUF_LOCK).
     void set_receive_capacity_locked(bool locked) { _receive_capacity_locked = locked; }
     bool receive_capacity_locked() const { return _receive_capacity_locked; }
+    // The same for the send capacity (SO_SNDBUF, Linux's SOCK_SNDBUF_LOCK):
+    // while unlocked it grows with the congestion window, to
+    // max(SEND_BUFFER_CAPACITY, 2 * cwnd) bounded by MAX_BUFFER_CAPACITY,
+    // checked on every ack in ESTABLISHED and CLOSE_WAIT (the states that
+    // still accept send()). Twice cwnd because a full window is in flight
+    // while the next one has to be queued already, or the sender runs dry
+    // for a round trip each time the application is slow to refill it.
+    // Growth is new room, so the send-space callback (EPOLLOUT) fires.
+    void set_send_capacity_locked(bool locked) { _send_capacity_locked = locked; }
+    bool send_capacity_locked() const { return _send_capacity_locked; }
     // The window shift this stack offers in its SYN (RFC 7323). Public so
     // tests can read a scaled window without restating it.
     static constexpr uint8_t WINDOW_SCALE_SHIFT = 1;
@@ -1150,6 +1160,11 @@ private:
     uint32_t _receive_capacity = RECEIVE_BUFFER_CAPACITY;
     size_t _send_capacity = SEND_BUFFER_CAPACITY;
     bool _receive_capacity_locked = false;
+    bool _send_capacity_locked = false;
+    // Grows _send_capacity with cwnd (see set_send_capacity_locked()).
+    void _tune_send_capacity();
+    // Raises the send capacity towards `target` (never lowers it).
+    void _grow_send_capacity(size_t target);
 
     // --- clock and deadline bookkeeping ---
     //

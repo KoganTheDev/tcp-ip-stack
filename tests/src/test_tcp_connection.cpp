@@ -3123,6 +3123,7 @@ TEST(TcpConnection, SmallSendCapacityLimitsSpaceAndNotifiesWhenItGrows)
     int notified = 0;
     connection->set_send_space_callback([&notified]() { notified += 1; });
     connection->set_send_capacity(TcpConnection::MIN_BUFFER_CAPACITY);
+    connection->set_send_capacity_locked(true); // as SO_SNDBUF does: no growth with cwnd
 
     // a zero peer window keeps everything queued
     connection->on_segment(*make_incoming_segment_win(501, 1001, FLAG_ACK, 0));
