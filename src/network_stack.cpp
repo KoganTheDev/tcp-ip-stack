@@ -42,6 +42,13 @@ namespace
 
     // 224.0.0.0/4. Class E (240.0.0.0/4) is not multicast, but is no more a
     // single host's address, so callers asking "is this one host" test both.
+    // 127.0.0.0/8 (RFC 1122 3.2.1.3): the whole block is this host, not just
+    // 127.0.0.1.
+    bool is_loopback_v4(const IPv4Address& address)
+    {
+        return address.get_address()[0] == 127;
+    }
+
     bool is_multicast(const IPv4Address& address)
     {
         return (address.get_address()[0] & 0xF0) == 0xE0;
@@ -521,17 +528,30 @@ TcpConnection* NetworkStack::_open_connection(const IpAddress& remote_address, u
     const IPv4Address& remote_ip = remote_address.v4();
     ConnectionKey key{remote_ip, remote_port, local_port};
 
+    // A local peer is reached from the address it was named by (127.0.0.1 to
+    // 127.0.0.1, an own address to itself): the same rule that picks a
+    // datagram's source, so the connection's idea of its address and the one
+    // on its segments cannot disagree.
+    const bool local_peer = this->_is_local_ipv4(remote_ip);
+    const IPv4Address local_ip = local_peer ? remote_ip : this->_primary().config.ip;
     auto connection = std::make_unique<TcpConnection>(
-        local_port, remote_ip, remote_port,
-        this->_next_isn(this->_primary().config.ip, local_port, remote_ip, remote_port),
-        this->_segment_sender(remote_ip, this->_primary().config.ip), this->_primary().config.local_mss());
+        local_port, remote_ip, remote_port, this->_next_isn(local_ip, local_port, remote_ip, remote_port),
+        this->_segment_sender(remote_ip, local_ip), this->_local_mss_for(remote_ip));
     connection->set_ecn_mode(this->_tcp_ecn);
     connection->set_timestamps_enabled(this->_tcp_timestamps);
-    connection->set_local_ip(this->_primary().config.ip);
-    this->_set_timestamp_clock(*connection, this->_primary().config.ip, remote_ip);
+    connection->set_local_ip(local_ip);
+    this->_set_timestamp_clock(*connection, local_ip, remote_ip);
 
     TcpConnection* connection_ptr = connection.get();
     this->_register_connection(key, std::move(connection));
+
+    // Nothing to resolve: there is no next hop, so no ARP and no waiting. The
+    // SYN is queued for the next poll() like any loopback datagram.
+    if (local_peer)
+    {
+        connection_ptr->initiate_connect();
+        return connection_ptr;
+    }
 
     // Resolve and queue against the NEXT HOP, not the peer. For an off-link
     // peer the ARP reply that unblocks this connection comes from the gateway
@@ -902,6 +922,15 @@ bool NetworkStack::poll()
 {
     bool fully_drained = true;
 
+    // Loopback first, and capped at half the budget. First because it is work
+    // this host generated itself: a local peer's reply is waiting on nothing
+    // but this call, whereas the wire can wait one more round. Capped because a
+    // loopback conversation can feed itself without end, and the cap is what
+    // leaves the channels (and the caller's timers) their half. Only the
+    // datagrams queued at this point are taken - their replies wait for the
+    // next call - so a ping-pong cannot hold poll() here forever.
+    const int loopback_processed = static_cast<int>(this->_drain_loopback(POLL_FRAME_BUDGET / 2));
+
     // ONE budget for the whole call, spent round-robin across the interfaces.
     //
     // The budget exists to stop a fast sender starving the caller's timer work,
@@ -913,7 +942,7 @@ bool NetworkStack::poll()
     std::vector<bool> drained(this->_interfaces.size(), false);
     size_t still_draining = this->_interfaces.size();
 
-    for (int processed = 0; processed < POLL_FRAME_BUDGET && still_draining > 0;)
+    for (int processed = loopback_processed; processed < POLL_FRAME_BUDGET && still_draining > 0;)
     {
         for (size_t ingress = 0; ingress < this->_interfaces.size(); ingress++)
         {
@@ -946,10 +975,80 @@ bool NetworkStack::poll()
     // so the caller can service its timer and completion work before coming
     // back - and it must come back, since an edge-triggered fd will not notify
     // again for what is already waiting.
-    fully_drained = (still_draining == 0);
+    // Loopback datagrams left queued - over the cap, or sent by what this call
+    // just delivered - are "more to do" exactly as frames left on a channel
+    // are: the caller must come back, because nothing will wake it for them.
+    fully_drained = (still_draining == 0) && this->_loopback_queue.empty();
 
     this->_reap_closed_connections();
     return fully_drained;
+}
+
+bool NetworkStack::_is_local_ipv4(const IPv4Address& address) const
+{
+    if (is_loopback_v4(address))
+    {
+        return true;
+    }
+    for (const auto& interface : this->_interfaces)
+    {
+        if (interface->config.has_address() && address == interface->config.ip)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool NetworkStack::_is_local_address(const IpAddress& address) const
+{
+    return address.is_v4() ? this->_is_local_ipv4(address.v4()) : this->_is_local_ipv6(address.v6());
+}
+
+void NetworkStack::_enqueue_loopback(bool v6, const Bytes& packet)
+{
+    if (this->_loopback_queue.size() >= LOOPBACK_QUEUE_LIMIT)
+    {
+        // Loss, as on a full transmit queue: TCP retransmits, and UDP never
+        // promised. Counted, since a loop that drops is otherwise invisible.
+        this->_loopback_drops++;
+        LOG_DEBUG("NetworkStack: loopback queue full - dropping a datagram");
+        return;
+    }
+    this->_loopback_queue.push_back({v6, packet});
+}
+
+size_t NetworkStack::_drain_loopback(size_t limit)
+{
+    // Counted up front: what delivering one of these sends joins the queue
+    // behind them and waits for the next call.
+    const size_t take = std::min(limit, this->_loopback_queue.size());
+    for (size_t taken = 0; taken < take; taken++)
+    {
+        LoopbackDatagram datagram = std::move(this->_loopback_queue.front());
+        this->_loopback_queue.pop_front();
+        try
+        {
+            if (datagram.v6)
+            {
+                this->_handle_loopback_ipv6(datagram.packet);
+            }
+            else
+            {
+                Ip ip(datagram.packet, false);
+                this->_handle_ip(LOOPBACK_INGRESS, ip, datagram.packet, false);
+            }
+        }
+        catch (const FatalChannelError&)
+        {
+            throw;
+        }
+        catch (const BaseException& e)
+        {
+            LOG_WARNING("NetworkStack: dropped a loopback datagram while handling it: " << e.what());
+        }
+    }
+    return take;
 }
 
 void NetworkStack::on_time_passed(uint32_t elapsed_ms)
@@ -1120,6 +1219,13 @@ void NetworkStack::on_time_passed(uint32_t elapsed_ms)
 NextTimer NetworkStack::ms_until_next_timer() const
 {
     NextTimer next;
+
+    // Queued loopback traffic is due now. No driver is woken by it (there is
+    // no fd), so the only way it is not left waiting is a wait of zero.
+    if (!this->_loopback_queue.empty())
+    {
+        fold_next_timer(next, 0);
+    }
 
     this->_tidy_timer_queue();
     if (!this->_timer_queue.empty())
@@ -1407,6 +1513,24 @@ void NetworkStack::_handle_arp(size_t ingress, const Arp& arp)
 
 void NetworkStack::_handle_ip(size_t ingress, const Ip& ip, const Bytes& ip_bytes, bool link_layer_group)
 {
+    // A datagram off the loopback queue is marked by its ingress, and is the
+    // one way a 127/8 address is accepted. On a real interface it never is
+    // (RFC 1122 3.2.1.3: a host must not send 127/8 on a network, and a router
+    // must not forward it): a spoofed 127.0.0.1 source would otherwise pass
+    // every "is this local" check made further down, and a loopback
+    // destination reaching the forwarding branch would be relayed. Dropping
+    // here, before anything is parsed or forwarded, covers both.
+    const bool from_loopback = ingress == LOOPBACK_INGRESS;
+    if (!from_loopback
+        && (is_loopback_v4(IPv4Address(ip.get_src_address())) || is_loopback_v4(IPv4Address(ip.get_dest_address()))))
+    {
+        this->_loopback_martian_drops++;
+        LOG_DEBUG("NetworkStack: dropping an IPv4 packet from "
+                  << IPv4Address(ip.get_src_address()).to_string() << " to "
+                  << IPv4Address(ip.get_dest_address()).to_string() << " - a loopback address on a real interface");
+        return;
+    }
+
     // RFC 1122 3.3.6: a datagram that arrived as a link-layer broadcast or
     // multicast but names a unicast IP destination is silently discarded.
     // Answering it would draw an error from every host that heard it, and
@@ -1432,7 +1556,9 @@ void NetworkStack::_handle_ip(size_t ingress, const Ip& ip, const Bytes& ip_byte
     // which link the answer should come back on. The strong model - accept only
     // the arrival interface's own address - is more defensible on a firewall and
     // is not what this is.
-    bool addressed_to_us = false;
+    // Whatever is on the loopback queue was addressed to this host by the send
+    // path that put it there, so the interface search is skipped for it.
+    bool addressed_to_us = from_loopback;
     for (const auto& candidate : this->_interfaces)
     {
         if (candidate->config.has_address() && destination == candidate->config.ip)
@@ -1470,7 +1596,10 @@ void NetworkStack::_handle_ip(size_t ingress, const Ip& ip, const Bytes& ip_byte
     // hearing from a peer proves it's still alive at its cached MAC - keep that
     // mapping fresh so an actively-talking peer never ages out mid-conversation
     // (its data/acks arrive as IP frames, not ARP, so nothing else would)
-    this->_interfaces.at(ingress)->arp_table.refresh(IPv4Address(ip.get_src_address()));
+    if (!from_loopback)
+    {
+        this->_interfaces.at(ingress)->arp_table.refresh(IPv4Address(ip.get_src_address()));
+    }
 
     if (!ip.verify_checksum())
     {
@@ -1832,7 +1961,10 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
                                                              << " on port " << key.local_port);
     // The local address in the ISN tuple: the primary interface's for v4, as
     // it has always been, and the address the SYN was sent to for v6.
-    const IpAddress local_ip = source.is_v4() ? IpAddress(this->_primary().config.ip) : destination;
+    // A local peer's SYN came to the address it named, which is also the one
+    // this side answers from (see _open_connection).
+    const IpAddress local_ip =
+        source.is_v4() && !this->_is_local_address(source) ? IpAddress(this->_primary().config.ip) : destination;
     uint32_t isn = this->_next_isn(local_ip, key.local_port, remote_ip, key.remote_port);
     if (old_send_next)
     {
@@ -2672,6 +2804,15 @@ IPv4Address NetworkStack::_source_address_for(const IPv4Address& dest_ip) const
     // another produces a packet that is correct in a local capture and rejected
     // by every peer that verifies it - the hardest kind of bug to see, because
     // tcpdump on the sending host shows nothing wrong.
+    //
+    // For a local destination it is the destination itself (127.0.0.1 for
+    // 127.0.0.1, an own address for that address), as on Linux: the peer that
+    // answers then replies from the address it was sent to, and a reply
+    // matches the connection it belongs to.
+    if (this->_is_local_ipv4(dest_ip))
+    {
+        return dest_ip;
+    }
     IPv4Address next_hop;
     size_t egress = 0;
     if (!this->_route_for(dest_ip, next_hop, egress))
@@ -2684,6 +2825,29 @@ IPv4Address NetworkStack::_source_address_for(const IPv4Address& dest_ip) const
 void NetworkStack::_send_ip_packet(const IPv4Address& dest_ip, uint8_t protocol, const Bytes& payload,
                                    bool dont_fragment, Ecn ecn)
 {
+    // Local: no route, no ARP, no frame. The packet is built exactly as it
+    // would be for the wire - header, checksum - because the receive side
+    // treats it as any other arriving datagram; the source is the destination
+    // (see _source_address_for). Never fragmented: the loopback MTU is the
+    // most an IPv4 total-length field can say, so anything that fits an IP
+    // packet at all fits here.
+    if (this->_is_local_ipv4(dest_ip))
+    {
+        if (20 + payload.size() > LOOPBACK_MTU)
+        {
+            LOG_WARNING("NetworkStack: dropping a " << payload.size() << "-byte loopback payload - it exceeds the "
+                                                    << LOOPBACK_MTU << "-byte loopback MTU");
+            return;
+        }
+        Ip header(4, 5, static_cast<uint8_t>(ecn), static_cast<uint16_t>(20 + payload.size()), 0,
+                  dont_fragment ? IP_FLAG_DONT_FRAGMENT : 0, 0, 64, protocol, 0, dest_ip.get_address(),
+                  dest_ip.get_address());
+        header /= std::make_unique<Raw>(payload);
+        header.compute_checksum();
+        this->_enqueue_loopback(false, header.to_bytes());
+        return;
+    }
+
     // The IP header keeps naming the final destination; the frame goes to
     // whoever will carry it onward, out of the link the route names.
     IPv4Address next_hop;
@@ -2847,7 +3011,7 @@ void NetworkStack::_send_tcp_segment(const IpAddress& destination, const Tcp& he
     // queue is needed here (unlike UDP, which has no retransmission).
     IPv4Address next_hop;
     size_t egress = 0;
-    if (this->_route_for(dest_ip, next_hop, egress))
+    if (!this->_is_local_ipv4(dest_ip) && this->_route_for(dest_ip, next_hop, egress))
     {
         const Interface& interface = *this->_interfaces.at(egress);
         if (!is_broadcast_address(next_hop, interface.config) && !interface.arp_table.contains(next_hop))
@@ -2906,6 +3070,12 @@ void NetworkStack::_send_rst(const IpAddress& source, const IpAddress& destinati
 
 uint16_t NetworkStack::_local_mss_for(const IpAddress& peer) const
 {
+    // A local peer is not behind any interface, so the interface MTU says
+    // nothing about it: the loopback MTU does (see LOOPBACK_MTU).
+    if (this->_is_local_address(peer))
+    {
+        return static_cast<uint16_t>(LOOPBACK_MTU - (peer.is_v4() ? 40 : 60));
+    }
     if (peer.is_v4())
     {
         return this->_primary().config.local_mss();
@@ -2941,6 +3111,12 @@ void NetworkStack::_send_or_queue_udp(const IpAddress& destination, const Udp& h
     // address of its own talk at all, which address-configuration protocols
     // depend on.
     if (this->_is_broadcast_for_any_interface(dest_ip))
+    {
+        this->_send_udp_datagram(dest_ip, header, payload);
+        return;
+    }
+    // Local needs no resolution either: there is no neighbour to ask.
+    if (this->_is_local_ipv4(dest_ip))
     {
         this->_send_udp_datagram(dest_ip, header, payload);
         return;
@@ -3049,21 +3225,26 @@ void NetworkStack::_send_icmp_message(const IPv4Address& dest_ip, const Icmp& he
     // it with the broadcast MAC without consulting the table at all. Note
     // _next_hop_for() already reports an on-link destination as its own next
     // hop, so this one check covers both the neighbour and the via-gateway case.
-    IPv4Address next_hop;
-    size_t egress = 0;
-    if (!this->_route_for(dest_ip, next_hop, egress))
+    //
+    // A local destination has no next hop, so none of this applies to it.
+    if (!this->_is_local_ipv4(dest_ip))
     {
-        LOG_DEBUG("NetworkStack: dropping an ICMP message to " << dest_ip.to_string() << " - no route to it");
-        return;
-    }
-    Interface& egress_interface = *this->_interfaces.at(egress);
-    if (!is_broadcast_address(next_hop, egress_interface.config) && !egress_interface.arp_table.contains(next_hop))
-    {
-        LOG_DEBUG("NetworkStack: dropping an ICMP message to " << dest_ip.to_string() << " - no ARP entry for next hop "
-                                                               << next_hop.to_string()
-                                                               << "; resolving it for next time");
-        this->_ensure_arp_resolution(egress, next_hop);
-        return;
+        IPv4Address next_hop;
+        size_t egress = 0;
+        if (!this->_route_for(dest_ip, next_hop, egress))
+        {
+            LOG_DEBUG("NetworkStack: dropping an ICMP message to " << dest_ip.to_string() << " - no route to it");
+            return;
+        }
+        Interface& egress_interface = *this->_interfaces.at(egress);
+        if (!is_broadcast_address(next_hop, egress_interface.config) && !egress_interface.arp_table.contains(next_hop))
+        {
+            LOG_DEBUG("NetworkStack: dropping an ICMP message to "
+                      << dest_ip.to_string() << " - no ARP entry for next hop " << next_hop.to_string()
+                      << "; resolving it for next time");
+            this->_ensure_arp_resolution(egress, next_hop);
+            return;
+        }
     }
 
     // Icmp can't be copied (same ProtocolLayer reason as Tcp/Udp) - rebuild
@@ -3082,8 +3263,11 @@ bool NetworkStack::_may_report_error_for(const IPv4Address& source, const IPv4Ad
     // checked first so they do not spend that budget either.
 
     // Not to a single host: there is nobody, or everybody, to send it to.
-    if (source == IPv4Address("0.0.0.0") || (source.get_address()[0] == 127) || is_multicast(source)
-        || is_class_e(source) || this->_is_broadcast_for_any_interface(source))
+    // (A 127/8 source is not refused here: one can only have got this far by
+    // the loopback queue, since _handle_ip drops it from a real interface, and
+    // an error about local traffic is answered locally.)
+    if (source == IPv4Address("0.0.0.0") || is_multicast(source) || is_class_e(source)
+        || this->_is_broadcast_for_any_interface(source))
     {
         return false;
     }

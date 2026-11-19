@@ -1061,3 +1061,12 @@ void NetworkStack::_fold_ipv6_timers(NextTimer& next) const
         fold_deadline(router.expires_ms);
     }
 }
+
+// ---- loopback --------------------------------------------------------------
+
+bool NetworkStack::_is_local_ipv6(const IPv6Address&) const
+{
+    return false;
+}
+
+void NetworkStack::_handle_loopback_ipv6(const Bytes&) {}

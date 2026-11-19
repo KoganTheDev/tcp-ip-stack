@@ -355,6 +355,29 @@ public:
     // where it shows instead. Fatal channel errors are not counted here: they
     // propagate out of poll()/on_time_passed()/send().
     uint64_t transmit_drops() const { return _transmit_drops; }
+
+    // ---- Loopback ----------------------------------------------------------
+    //
+    // A datagram to 127.0.0.0/8, to ::1, or to one of this stack's own
+    // addresses is local: it never reaches routing, ARP or a channel. It is
+    // queued at the IP layer and delivered by the next poll(), so no send
+    // path ever re-enters a receive path.
+    //
+    // The queue is bounded; a datagram that finds it full is dropped and
+    // counted, which TCP treats as loss and retransmits. Delivery is deferred
+    // (never from inside send()), and ms_until_next_timer() reads 0 while
+    // anything is queued, so a driver that sleeps on it never sleeps on
+    // pending loopback traffic.
+    static constexpr size_t LOOPBACK_QUEUE_LIMIT = 1024;
+    // The largest value both IP total-length (16 bits, IPv4 header included)
+    // and the IPv6 payload length (16 bits, header excluded) can carry: a
+    // loopback segment is never fragmented, and TCP's MSS on a loopback route
+    // is derived from it (MTU less 40 for v4, less 60 for v6).
+    static constexpr uint16_t LOOPBACK_MTU = 65535;
+    uint64_t loopback_drops() const { return _loopback_drops; }
+    // Packets that arrived on a real interface with a loopback source or
+    // destination and were dropped (RFC 1122 3.2.1.3; RFC 4291 2.5.3).
+    uint64_t loopback_martian_drops() const { return _loopback_martian_drops; }
     uint64_t challenge_acks_sent() const { return _challenge_acks_sent; }
     uint64_t challenge_acks_suppressed() const { return _challenge_acks_suppressed; }
     // SYNs that ended a TIME_WAIT early to open a new connection on the same
@@ -994,6 +1017,37 @@ private:
     uint64_t _challenge_acks_suppressed = 0;
     uint64_t _time_wait_reuses = 0;
     uint64_t _transmit_drops = 0;
+
+    // ---- Loopback internals ----
+    //
+    // Whole IP packets, built and checksummed, waiting for the next poll().
+    // `v6` says which receive path takes it. No Ethernet header: there is no
+    // link, so nothing in a packet depends on one.
+    struct LoopbackDatagram
+    {
+        bool v6;
+        Bytes packet;
+    };
+    std::deque<LoopbackDatagram> _loopback_queue;
+    uint64_t _loopback_drops = 0;
+    uint64_t _loopback_martian_drops = 0;
+    // The "ingress interface" of a datagram taken off the loopback queue. Not
+    // an index into _interfaces on purpose: there is no pseudo-interface (code
+    // that iterates interfaces or assumes interface 0 must not see one), and a
+    // value that cannot be mistaken for an index makes any at() on it throw
+    // rather than quietly use the wrong link.
+    static constexpr size_t LOOPBACK_INGRESS = static_cast<size_t>(-1);
+    // 127.0.0.0/8 or an address configured on an interface.
+    bool _is_local_ipv4(const IPv4Address& address) const;
+    bool _is_local_address(const IpAddress& address) const;
+    bool _is_local_ipv6(const IPv6Address& address) const;
+    // The v6 receive path for a datagram off the loopback queue.
+    void _handle_loopback_ipv6(const Bytes& packet);
+    // Queues a built packet, or drops and counts it when the queue is full.
+    void _enqueue_loopback(bool v6, const Bytes& packet);
+    // Delivers up to `limit` of the datagrams queued now - not those queued
+    // by delivering them - and returns how many it took.
+    size_t _drain_loopback(size_t limit);
 
     // Null until start_dhcp(). Owned here rather than by the application
     // because it reconfigures the interface, which is this class's state.
