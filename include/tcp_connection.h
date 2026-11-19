@@ -858,6 +858,7 @@ private:
     };
     Frto _frto = Frto::OFF;
     uint32_t _frto_recover = 0; // SND.NXT at the timeout (RFC 5682 "recover")
+    uint32_t _frto_rxt_end = 0; // end of the segment the timeout resent
     // At a timeout: Eifel with timestamps, else F-RTO with SACK unless a
     // loss probe retransmission is outstanding.
     void _arm_spurious_rto_detection(bool starts_episode, bool probe_outstanding);

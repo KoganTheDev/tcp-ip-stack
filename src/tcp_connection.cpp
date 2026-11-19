@@ -1185,10 +1185,12 @@ void TcpConnection::_detect_spurious_rto(const Tcp& segment, uint32_t ack, uint3
     {
     case Frto::AWAIT_FIRST_ACK:
         // RFC 5682 3.1 step 2. An ack that covers everything outstanding at
-        // the timeout cannot tell the copies apart (2a), and a duplicate
-        // says a hole is still there: conventional recovery. One for part
-        // of the flight sends new data instead (2b).
-        if (duplicate || (advances && seq_at_or_before(_frto_recover, ack)))
+        // the timeout cannot tell the copies apart, one that stops inside the
+        // retransmitted segment has not acknowledged all of it, and a
+        // duplicate says a hole is still there (2a): conventional recovery.
+        // One that covers the retransmission and part of the rest of the
+        // flight sends new data instead (2b).
+        if (duplicate || (advances && (seq_at_or_before(_frto_recover, ack) || seq_before(ack, _frto_rxt_end))))
         {
             _frto = Frto::OFF;
         }
@@ -1201,13 +1203,14 @@ void TcpConnection::_detect_spurious_rto(const Tcp& segment, uint32_t ack, uint3
         _frto = Frto::OFF; // the new data never went out
         break;
     case Frto::AWAIT_SECOND_ACK:
-        // Step 3: data that was never retransmitted is acknowledged again,
-        // so the flight was not lost (3b); a duplicate means it was (3a).
-        if (advances)
+        // Step 3: data that was never retransmitted - above the timeout's
+        // retransmission - is acknowledged again, so the flight was not lost
+        // (3b); anything else, a duplicate included, means it was (3a).
+        if (advances && seq_before(_frto_rxt_end, ack))
         {
             _undo_spurious_rto("F-RTO");
         }
-        else if (duplicate)
+        else if (duplicate || advances)
         {
             _frto = Frto::OFF;
         }
@@ -2832,6 +2835,7 @@ void TcpConnection::_run_timers()
     }
     _episode_had_rto = true;
     _arm_spurious_rto_detection(starts_episode, probe_outstanding);
+    _frto_rxt_end = oldest.end_seq;
     if (repeated)
     {
         _congestion->on_repeated_retransmit_timeout();

@@ -607,3 +607,16 @@ TEST(TcpSpuriousRto, EifelComparesWithTheFirstRetransmissionTheProbeIncluded)
             << (original_arrived ? "the original's echo" : "the probe's echo");
     }
 }
+
+// F-RTO's first ack must acknowledge all of the retransmitted segment (RFC
+// 5682 step 2a); a peer acking a few bytes of it at a time proves nothing
+// about data that was never retransmitted.
+TEST(TcpSpuriousRto, FrtoIsNotFooledByAcksInsideTheRetransmission)
+{
+    Sender s;
+    time_out(s, 20);
+    s.ack(s.seg(0) + 300);
+    s.ack(s.seg(0) + 600);
+    s.ack(s.seg(0) + 900);
+    ASSERT_EQ(s.stats().spurious_rtos_undone, 0u);
+}
