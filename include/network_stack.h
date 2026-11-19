@@ -1043,6 +1043,10 @@ private:
     bool _is_local_ipv6(const IPv6Address& address) const;
     // The v6 receive path for a datagram off the loopback queue.
     void _handle_loopback_ipv6(const Bytes& packet);
+    // Everything _handle_ipv6 does once the link layer is out of the picture:
+    // address checks and transport demux. Shared with the loopback path so a
+    // local datagram is handled by the code that handles any other.
+    void _deliver_ipv6(const Ipv6& ip, const Bytes& packet, bool link_layer_group, bool from_loopback);
     // Queues a built packet, or drops and counts it when the queue is full.
     void _enqueue_loopback(bool v6, const Bytes& packet);
     // Delivers up to `limit` of the datagrams queued now - not those queued

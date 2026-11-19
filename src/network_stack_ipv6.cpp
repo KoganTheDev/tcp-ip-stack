@@ -14,6 +14,13 @@
 
 namespace
 {
+    // ::1 (RFC 4291 2.5.3), the one v6 loopback address.
+    const IPv6Address& loopback_v6()
+    {
+        static const IPv6Address loopback("::1");
+        return loopback;
+    }
+
     constexpr uint8_t DEFAULT_HOP_LIMIT = 64;
     constexpr size_t UDP_HEADER_SIZE = 8;
     constexpr size_t TCP_MIN_HEADER_SIZE = 20;
@@ -237,6 +244,13 @@ bool NetworkStack::_ipv6_group_joined(const IPv6Address& group) const
 
 std::optional<IPv6Address> NetworkStack::_ipv6_source_for(const IPv6Address& destination) const
 {
+    // A local destination is its own source: ::1 from ::1, an own address from
+    // itself (as for v4 - see _source_address_for). Needs no configured
+    // address, which is what lets ::1 work on a stack that has none usable.
+    if (this->_is_local_ipv6(destination))
+    {
+        return destination;
+    }
     const bool link_scope = destination.is_link_local() || is_link_scope_multicast(destination);
     std::optional<IPv6Address> link_local;
     std::optional<IPv6Address> global;
@@ -325,7 +339,7 @@ TcpConnection* NetworkStack::_open_ipv6_connection(const IPv6Address& remote_ip,
     this->_register_connection(key, std::move(connection));
 
     IPv6Address next_hop;
-    if (!local || !this->_ipv6_route_for(remote_ip, next_hop))
+    if (!local || (!this->_is_local_ipv6(remote_ip) && !this->_ipv6_route_for(remote_ip, next_hop)))
     {
         LOG_WARNING("NetworkStack: no IPv6 " << (local ? "route" : "source address") << " for " << remote_ip.to_string()
                                              << " - failing the connection");
@@ -361,7 +375,36 @@ void NetworkStack::_handle_ipv6(size_t ingress, const Bytes& packet, const MacAd
         return;
     }
 
-    if (destination.is_multicast() ? !this->_ipv6_group_joined(destination) : !this->_is_our_ipv6(destination))
+    // ::1 on a real interface, as source or destination, is a martian (RFC
+    // 4291 2.5.3: it must never leave the host). Both ends are refused: a
+    // spoofed ::1 source would pass every "is this local" test made above
+    // the transport, exactly as 127.0.0.1 would for v4. Only the loopback
+    // queue delivers it, through _handle_loopback_ipv6().
+    if (source == loopback_v6() || destination == loopback_v6())
+    {
+        this->_loopback_martian_drops++;
+        LOG_DEBUG("NetworkStack: dropping an IPv6 packet from "
+                  << source.to_string() << " to " << destination.to_string() << " - ::1 on a real interface");
+        return;
+    }
+
+    this->_deliver_ipv6(ip, packet, link_layer_group, false);
+}
+
+void NetworkStack::_handle_loopback_ipv6(const Bytes& packet)
+{
+    Ipv6 ip(packet);
+    this->_deliver_ipv6(ip, packet, false, true);
+}
+
+void NetworkStack::_deliver_ipv6(const Ipv6& ip, const Bytes& packet, bool link_layer_group, bool from_loopback)
+{
+    const IPv6Address& source = ip.get_source();
+    const IPv6Address& destination = ip.get_destination();
+    // What the loopback queue holds was addressed to this host by the send
+    // path that queued it, and ::1 is in no address list.
+    if (!from_loopback
+        && (destination.is_multicast() ? !this->_ipv6_group_joined(destination) : !this->_is_our_ipv6(destination)))
     {
         // Not for us; there is no v6 forwarding.
         return;
@@ -767,7 +810,11 @@ void NetworkStack::_send_ipv6_packet(const IPv6Address& source, const IPv6Addres
     {
         return;
     }
-    const size_t mtu = this->_primary().config.mtu;
+    // Local: no route, no neighbour, no frame. Built whole, as for the wire,
+    // and queued for the next poll(). The MTU is the loopback one, which is
+    // the largest the 16-bit payload length can describe.
+    const bool local = this->_is_local_ipv6(destination);
+    const size_t mtu = local ? LOOPBACK_MTU : this->_primary().config.mtu;
     if (Ipv6::HEADER_SIZE + payload.size() > mtu)
     {
         // RFC 8200 5: a source may fragment, but this one does not - TCP sizes
@@ -782,6 +829,12 @@ void NetworkStack::_send_ipv6_packet(const IPv6Address& source, const IPv6Addres
     Ipv6 header(traffic_class, 0, static_cast<uint16_t>(payload.size()), next_header, hop_limit, source, destination,
                 payload);
     Bytes packet = header.to_bytes();
+
+    if (local)
+    {
+        this->_enqueue_loopback(true, packet);
+        return;
+    }
 
     if (destination.is_multicast())
     {
@@ -1064,9 +1117,9 @@ void NetworkStack::_fold_ipv6_timers(NextTimer& next) const
 
 // ---- loopback --------------------------------------------------------------
 
-bool NetworkStack::_is_local_ipv6(const IPv6Address&) const
+bool NetworkStack::_is_local_ipv6(const IPv6Address& address) const
 {
-    return false;
+    // Only once v6 is on: before that the stack has no v6 identity at all, and
+    // a datagram to ::1 is as undeliverable as any other v6 send.
+    return this->_v6.enabled && (address == loopback_v6() || this->_is_our_ipv6(address));
 }
-
-void NetworkStack::_handle_loopback_ipv6(const Bytes&) {}
