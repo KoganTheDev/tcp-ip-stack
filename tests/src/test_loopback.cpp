@@ -433,3 +433,14 @@ TEST(Loopback, TheQueueIsBoundedInBytesAsWellAsInDatagrams)
     ASSERT_EQ(host.stack->loopback_queued_bytes(), 0u);
     ASSERT_EQ(host.guard->writes(), 0u);
 }
+
+TEST(Loopback, ADestinationPortIsNeverTheSourcePortOfALocalConnect)
+{
+    // No listener, so only the destination port can collide: connecting to
+    // 49152 (the next ephemeral port) must not come from 49152, which would
+    // be a connection to itself.
+    Host host;
+    TcpConnection* client = host.stack->connect(LOOPBACK, 49152);
+    ASSERT_TRUE(client != nullptr);
+    ASSERT_NE(client->get_local_port(), 49152);
+}

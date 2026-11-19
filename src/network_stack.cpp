@@ -502,6 +502,7 @@ TcpConnection* NetworkStack::connect(const IpAddress& remote_ip, uint16_t remote
     // under a live key would destroy that connection in place, leaving the
     // application's pointer to it dangling and its id finding this one.
     constexpr size_t EPHEMERAL_PORT_COUNT = 65536 - FIRST_EPHEMERAL_PORT;
+    const bool local_destination = this->is_local_address(remote_ip);
     uint16_t ephemeral_port = 0;
     bool found_free_port = false;
     for (size_t attempt = 0; attempt < EPHEMERAL_PORT_COUNT && !found_free_port; attempt++)
@@ -514,6 +515,11 @@ TcpConnection* NetworkStack::connect(const IpAddress& remote_ip, uint16_t remote
         // ephemeral range (a socket layer that binds port 0) would otherwise
         // meet on its first loopback connect.
         found_free_port = found_free_port && this->_listening_ports.count(ephemeral_port) == 0;
+        // Nor, to a local peer, its own destination port: with no listener
+        // there the same collision arises (source == destination, equal
+        // ports). Linux would allow that simultaneous self-connect; this stack
+        // only wants not to fall into one by accident.
+        found_free_port = found_free_port && !(local_destination && ephemeral_port == remote_port);
     }
     if (!found_free_port)
     {
