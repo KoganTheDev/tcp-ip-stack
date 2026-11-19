@@ -2801,13 +2801,21 @@ void TcpConnection::_run_timers()
     uint32_t cwnd_before = _congestion->window();
     bool starts_episode = (oldest.flags & FLAG_SYN) == 0 && !_episode_open;
     bool probe_outstanding = _tlp_outstanding && _tlp_is_retrans;
+    bool repeated = _episode_open && _episode_had_rto;
     if ((oldest.flags & FLAG_SYN) == 0)
     {
         _begin_episode();
     }
     _episode_had_rto = true;
     _arm_spurious_rto_detection(starts_episode, probe_outstanding);
-    _congestion->on_retransmit_timeout(_bytes_in_flight(), _now_ms);
+    if (repeated)
+    {
+        _congestion->on_repeated_retransmit_timeout();
+    }
+    else
+    {
+        _congestion->on_retransmit_timeout(_bytes_in_flight(), _now_ms);
+    }
     // RFC 6675 5.1 (and RFC 6582's "recover"): a timeout ends any recovery,
     // and no new one starts until everything sent so far is acknowledged.
     _in_recovery = false;

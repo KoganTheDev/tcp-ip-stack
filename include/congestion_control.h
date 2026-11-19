@@ -159,6 +159,13 @@ public:
     // statement than "one segment went missing". Collapse to one segment and
     // slow-start back up.
     void on_retransmit_timeout(uint32_t bytes_in_flight, uint64_t now_ms);
+    // Another timeout before the last one's recovery is over: one segment
+    // again, but ssthresh (and CUBIC's curve) held - RFC 5681 3.1, for a
+    // segment the timer already resent, as Linux's tcp_enter_loss() keeps
+    // its threshold in the Loss state. The window that timed out is the
+    // slow start after the first timeout, which says nothing about the
+    // path; the first timeout's reduction stands.
+    void on_repeated_retransmit_timeout() { _cwnd = _mss; }
 
     // --- undo (RFC 3708 for a D-SACK, RFC 4015 for a spurious timeout) ---
     //

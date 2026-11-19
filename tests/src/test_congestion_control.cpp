@@ -226,6 +226,25 @@ TEST(CongestionControl, RetransmitTimeoutCollapsesBothAlgorithmsToOneSegment)
     }
 }
 
+// RFC 5681 3.1: a timeout while the last one's recovery is still under way
+// holds ssthresh. The window at the second timeout is the slow start that
+// followed the first - nothing to do with the path's capacity - and halving
+// it again would leave ssthresh at two segments, so the repair would crawl
+// in congestion avoidance from there.
+TEST(CongestionControl, ARepeatedTimeoutHoldsTheThreshold)
+{
+    for (auto algorithm : {CongestionControlAlgorithm::RENO, CongestionControlAlgorithm::CUBIC})
+    {
+        auto cc = established_at(algorithm, BIG_WINDOW_SEGMENTS);
+        cc->on_retransmit_timeout(BIG_WINDOW_SEGMENTS * MSS, 5000);
+        uint32_t ssthresh = cc->slow_start_threshold();
+        acknowledge(*cc, MSS);
+        cc->on_repeated_retransmit_timeout();
+        ASSERT_EQ(cc->window(), MSS) << cc->name();
+        ASSERT_EQ(cc->slow_start_threshold(), ssthresh) << cc->name();
+    }
+}
+
 TEST(CongestionControl, FastRecoveryInflatesPerDuplicateAckAndDeflatesOnExit)
 {
     for (auto algorithm : {CongestionControlAlgorithm::RENO, CongestionControlAlgorithm::CUBIC})
