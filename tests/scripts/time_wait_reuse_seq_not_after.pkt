@@ -1,0 +1,22 @@
+# With no timestamps, a SYN in TIME_WAIT at or before RCV.NXT (2 here) may be
+# an old duplicate: a challenge ACK (RFC 5961 4), and still TIME_WAIT. The
+# comparison is modular, so 4294967000 is before 2, not after it.
+0      listen 8080
++0     < S 0:0(0) win 65535 <mss 1460>
++0     > S. 0:0(0) ack 1 <mss 1460>
++0.005 < . 1:1(0) ack 1 win 65535
++0     accept
+
++0.010 close
++0     > F. 1:1(0) ack 1
++0.005 < . 1:1(0) ack 2 win 65535
++0.005 < F. 1:1(0) ack 2 win 65535
++0     > . 2:2(0) ack 2
++0     state TIME_WAIT
+
++1     < S 2:2(0) win 65535 <mss 1460>
++0     > . 2:2(0) ack 2
++0     state TIME_WAIT
++0.010 < S 4294967000:4294967000(0) win 65535 <mss 1460>
++0     > . 2:2(0) ack 2
++0     state TIME_WAIT

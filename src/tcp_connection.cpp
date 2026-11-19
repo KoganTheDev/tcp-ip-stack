@@ -1573,6 +1573,31 @@ void TcpConnection::_handle_fin(uint32_t fin_seq)
     }
 }
 
+bool TcpConnection::accepts_reuse_syn(uint32_t seq, std::optional<uint32_t> tsval) const
+{
+    if (_state != TcpState::TIME_WAIT)
+    {
+        return false;
+    }
+    if (_timestamps_negotiated)
+    {
+        // RFC 6191 2: with timestamps the TSval decides, whatever the
+        // sequence number - it is the reliable clock, and the one PAWS would
+        // have used to drop an old duplicate of this SYN.
+        return tsval.has_value() && _have_ts_recent && seq_after(*tsval, _ts_recent);
+    }
+    return seq_after(seq, _recv_next);
+}
+
+void TcpConnection::end_time_wait()
+{
+    EntryScope scope(*this);
+    if (_state == TcpState::TIME_WAIT)
+    {
+        _transition(TcpState::CLOSED);
+    }
+}
+
 void TcpConnection::on_segment(const Tcp& segment, Ecn ecn)
 {
     EntryScope scope(*this);

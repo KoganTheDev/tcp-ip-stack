@@ -344,6 +344,9 @@ public:
     uint64_t transmit_drops() const { return _transmit_drops; }
     uint64_t challenge_acks_sent() const { return _challenge_acks_sent; }
     uint64_t challenge_acks_suppressed() const { return _challenge_acks_suppressed; }
+    // SYNs that ended a TIME_WAIT early to open a new connection on the same
+    // four-tuple (see _handle_tcp).
+    uint64_t time_wait_reuses() const { return _time_wait_reuses; }
 
     // Pops one ESTABLISHED connection waiting on this port, or nullptr if
     // none are ready. The returned pointer is owned by NetworkStack for the
@@ -622,6 +625,13 @@ private:
     void _handle_udp(const Ip& ip, const Udp& udp, const Bytes& received);
     void _handle_icmp(const Ip& ip, const Icmp& icmp);
     void _reap_closed_connections();
+    // Takes one CLOSED connection out of the tables, folding its counters into
+    // the reaped totals. A no-op for an id already reaped.
+    void _reap_connection(uint64_t connection_id);
+    // Whether this segment, for a four-tuple held by `existing`, is a SYN that
+    // may end its TIME_WAIT and open a new connection (see _handle_tcp).
+    bool _reuses_time_wait(const TcpConnection& existing, const IpAddress& source, const IpAddress& destination,
+                           const Tcp& tcp) const;
     // Puts a connection in the tables and in the timer queue. Every
     // connection the stack creates comes through here.
     void _register_connection(const ConnectionKey& key, std::unique_ptr<TcpConnection> connection);
@@ -962,6 +972,7 @@ private:
     uint64_t _challenge_acks_in_window = 0;
     uint64_t _challenge_acks_sent = 0;
     uint64_t _challenge_acks_suppressed = 0;
+    uint64_t _time_wait_reuses = 0;
     uint64_t _transmit_drops = 0;
 
     // Null until start_dhcp(). Owned here rather than by the application

@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <cstdio>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -7,6 +9,7 @@
 
 #include "fake_packet_channel.h"
 #include "network_stack.h"
+#include "sim/pkt_runner.h"
 #include "sim/tcp_frame.h"
 #include "tcp_sequence.h"
 #include "test_support.h"
@@ -157,4 +160,204 @@ TEST(TimestampClock, TheOffsetIsKeyed)
     ASSERT_TRUE(a.stack().connect(PEER_IP, PEER_PORT) != nullptr);
     ASSERT_TRUE(b.stack().connect(PEER_IP, PEER_PORT) != nullptr);
     ASSERT_NE(timestamp(a.take_one()), timestamp(b.take_one()));
+}
+
+// --- the ISN floor ---
+
+TEST(TimeWaitReuseIsn, AGeneratedIsnPastTheFloorIsKept)
+{
+    ASSERT_EQ(time_wait_reuse_isn(1000000, 1000), 1000000u);
+}
+
+TEST(TimeWaitReuseIsn, AGeneratedIsnShortOfTheFloorIsRaisedToIt)
+{
+    // Linux's tw_snd_nxt + 65535 + 2.
+    ASSERT_EQ(time_wait_reuse_isn(1000, 1000), 1000u + 65537u);
+    ASSERT_EQ(time_wait_reuse_isn(1000 + 65537, 1000), 1000u + 65537u) << "the floor itself is not past it";
+    ASSERT_EQ(time_wait_reuse_isn(500, 1000), 1000u + 65537u) << "behind the old SND.NXT";
+}
+
+TEST(TimeWaitReuseIsn, TheComparisonIsModularAcrossTheWrap)
+{
+    // The floor wraps past zero: 0xFFFFFFF0 + 65537 = 0x0000FFF1.
+    const uint32_t old_snd_nxt = 0xFFFFFFF0u;
+    const uint32_t floor = 0x0000FFF1u;
+    ASSERT_EQ(time_wait_reuse_isn(5, old_snd_nxt), floor) << "numerically small, but before the floor";
+    ASSERT_EQ(time_wait_reuse_isn(0xFFFFFFF8u, old_snd_nxt), floor)
+        << "numerically huge, but just past the old SND.NXT and so before the floor";
+    ASSERT_EQ(time_wait_reuse_isn(0x00010000u, old_snd_nxt), 0x00010000u) << "past the wrapped floor";
+    // And the other way round: an old SND.NXT just below the wrap with a
+    // floor that has not wrapped yet, against a generated ISN that has.
+    ASSERT_EQ(time_wait_reuse_isn(0x00000010u, 0xFFFEFFF0u), 0x00000010u);
+}
+
+// --- reuse on the stack ---
+
+namespace
+{
+    constexpr uint16_t LISTEN_PORT = 8080;
+    using Timestamps = std::optional<std::pair<uint32_t, uint32_t>>;
+
+    Timestamps ts(uint32_t value)
+    {
+        return std::make_pair(value, 0u);
+    }
+
+    struct TimeWaitSetup
+    {
+        uint64_t old_id = 0;
+        uint32_t old_isn = 0;
+        uint32_t old_send_next = 0;
+    };
+
+    // The stack listens, the peer connects (ISN 0), the stack closes first
+    // and the peer's FIN puts it in TIME_WAIT. RCV.NXT is 2, TS.Recent 130
+    // when `timestamps`.
+    TimeWaitSetup reach_time_wait(Peer& peer, bool timestamps)
+    {
+        peer.stack().listen(LISTEN_PORT);
+        peer.inject(LISTEN_PORT, tcp_frame::SYN, 0, 0, timestamps ? ts(100) : std::nullopt);
+        tcp_frame::Segment syn_ack = peer.take_one();
+        REQUIRE_TRUE(syn_ack.flags == (tcp_frame::SYN | tcp_frame::ACK), "expected a SYN-ACK");
+        const uint32_t isn = syn_ack.seq;
+        peer.inject(LISTEN_PORT, tcp_frame::ACK, 1, isn + 1, timestamps ? ts(105) : std::nullopt);
+        TcpConnection* connection = peer.stack().accept(LISTEN_PORT);
+        REQUIRE_TRUE(connection != nullptr, "the handshake completes");
+        connection->close();
+        tcp_frame::Segment fin = peer.take_one();
+        REQUIRE_TRUE((fin.flags & tcp_frame::FIN) != 0, "the stack closes first");
+        peer.inject(LISTEN_PORT, tcp_frame::ACK, 1, isn + 2, timestamps ? ts(120) : std::nullopt);
+        peer.inject(LISTEN_PORT, tcp_frame::FIN | tcp_frame::ACK, 1, isn + 2, timestamps ? ts(130) : std::nullopt);
+        peer.take_one(); // the ACK of the peer's FIN
+        REQUIRE_TRUE(connection->get_state() == TcpState::TIME_WAIT, "the stack is in TIME_WAIT");
+        return TimeWaitSetup{connection->get_id(), isn, connection->get_send_next()};
+    }
+}
+
+// The old connection goes once through the ordinary close and reap, the
+// four-tuple belongs to a brand-new connection, and the totals count each of
+// them once - also after the old one's TIME_WAIT would have run out, when its
+// stale reap and timer entries surface.
+TEST(TimeWaitReuse, ANewerSynReplacesTheConnectionAndIsCountedOnce)
+{
+    Peer peer;
+    TimeWaitSetup old = reach_time_wait(peer, true);
+    ASSERT_EQ(peer.stack().tcp_totals(false).connections, 1u);
+
+    peer.advance(1000);
+    peer.inject(LISTEN_PORT, tcp_frame::SYN, 0, 0, ts(1130));
+    tcp_frame::Segment syn_ack = peer.take_one();
+    ASSERT_EQ(syn_ack.flags, tcp_frame::SYN | tcp_frame::ACK) << "a SYN-ACK, not a challenge ACK";
+    ASSERT_EQ(syn_ack.ack, 1u);
+    ASSERT_TRUE(seq_at_or_before(old.old_send_next + 65537, syn_ack.seq))
+        << "the new ISN " << syn_ack.seq << " must be past the old SND.NXT " << old.old_send_next << " + 65537";
+    ASSERT_EQ(timestamp(syn_ack, 1), 1130u) << "the new connection echoes the new SYN's TSval";
+
+    ASSERT_TRUE(peer.stack().find_connection(old.old_id) == nullptr) << "the old connection is reaped at once";
+    ASSERT_EQ(peer.stack().time_wait_reuses(), 1u);
+    ASSERT_EQ(peer.stack().tcp_totals(false).connections, 2u) << "one reaped, one live";
+
+    // The first ACK of the new connection carries a TSval below nothing the
+    // new connection has seen; it completes the handshake, and data on it is
+    // delivered - no PAWS against the old connection's TS.Recent.
+    peer.inject(LISTEN_PORT, tcp_frame::ACK, 1, syn_ack.seq + 1, ts(1130));
+    TcpConnection* fresh = peer.stack().accept(LISTEN_PORT);
+    ASSERT_TRUE(fresh != nullptr);
+    ASSERT_NE(fresh->get_id(), old.old_id);
+    ASSERT_EQ(fresh->get_state(), TcpState::ESTABLISHED);
+
+    // Past the moment the old TIME_WAIT would have ended: nothing is reaped
+    // or counted twice, and the new connection is untouched.
+    peer.advance(61000);
+    ASSERT_EQ(fresh->get_state(), TcpState::ESTABLISHED);
+    ASSERT_TRUE(peer.stack().find_connection(fresh->get_id()) == fresh);
+    ASSERT_EQ(peer.stack().tcp_totals(false).connections, 2u);
+}
+
+TEST(TimeWaitReuse, TheFirstSegmentsOfTheNewConnectionAreNotCheckedAgainstTheOldTsRecent)
+{
+    // The new SYN's TSval is only just past the old TS.Recent (130). The new
+    // connection's PAWS starts from that SYN, so its first ACK, carrying the
+    // same TSval, completes the handshake silently - no PAWS reject, no ACK.
+    Peer peer;
+    reach_time_wait(peer, true);
+    peer.inject(LISTEN_PORT, tcp_frame::SYN, 0, 0, ts(131));
+    tcp_frame::Segment syn_ack = peer.take_one();
+    ASSERT_EQ(syn_ack.flags, tcp_frame::SYN | tcp_frame::ACK);
+    peer.inject(LISTEN_PORT, tcp_frame::ACK, 1, syn_ack.seq + 1, ts(131));
+    TcpConnection* fresh = peer.stack().accept(LISTEN_PORT);
+    ASSERT_TRUE(fresh != nullptr);
+    ASSERT_EQ(fresh->get_state(), TcpState::ESTABLISHED);
+    ASSERT_TRUE(peer.take_sent().empty()) << "the ACK was accepted, not answered as a PAWS reject";
+}
+
+TEST(TimeWaitReuse, WithoutAListenerTheSynGetsAChallengeAck)
+{
+    Peer peer;
+    TimeWaitSetup old = reach_time_wait(peer, true);
+    peer.stack().unlisten(LISTEN_PORT);
+    peer.inject(LISTEN_PORT, tcp_frame::SYN, 0, 0, ts(5000));
+    tcp_frame::Segment reply = peer.take_one();
+    ASSERT_EQ(reply.flags, tcp_frame::ACK) << "a challenge ACK";
+    ASSERT_EQ(reply.seq, old.old_send_next);
+    ASSERT_EQ(reply.ack, 2u);
+    TcpConnection* connection = peer.stack().find_connection(old.old_id);
+    ASSERT_TRUE(connection != nullptr);
+    ASSERT_EQ(connection->get_state(), TcpState::TIME_WAIT);
+    ASSERT_EQ(peer.stack().time_wait_reuses(), 0u);
+}
+
+TEST(TimeWaitReuse, AnAckingSynIsNotAReuse)
+{
+    Peer peer;
+    TimeWaitSetup old = reach_time_wait(peer, true);
+    peer.inject(LISTEN_PORT, tcp_frame::SYN | tcp_frame::ACK, 0, old.old_send_next, ts(5000));
+    tcp_frame::Segment reply = peer.take_one();
+    ASSERT_EQ(reply.flags, tcp_frame::ACK) << "a challenge ACK";
+    ASSERT_EQ(peer.stack().find_connection(old.old_id)->get_state(), TcpState::TIME_WAIT);
+}
+
+// The reuse check comes before the old connection sees the SYN, but a SYN it
+// refuses still reaches the old connection - and so the RFC 5961 rate limit.
+TEST(TimeWaitReuse, RefusedSynsStayUnderTheChallengeAckRateLimit)
+{
+    Peer peer;
+    TimeWaitSetup old = reach_time_wait(peer, true);
+    const uint64_t sent_before = peer.stack().challenge_acks_sent();
+    const int SYNS = 2000; // more than the largest per-second limit (1500)
+    for (int i = 0; i < SYNS; i++)
+    {
+        peer.inject(LISTEN_PORT, tcp_frame::SYN, 0, 0, ts(50));
+    }
+    const uint64_t sent = peer.stack().challenge_acks_sent() - sent_before;
+    ASSERT_LT(sent, static_cast<uint64_t>(SYNS));
+    ASSERT_GT(peer.stack().challenge_acks_suppressed(), 0u);
+    ASSERT_EQ(peer.take_sent().size(), sent);
+    ASSERT_EQ(peer.stack().find_connection(old.old_id)->get_state(), TcpState::TIME_WAIT);
+}
+
+// The runner's expect_new_isn must not pass vacuously: with no new SYN after
+// it (here the SYN is refused), the script fails.
+TEST(TimeWaitReuse, ExpectNewIsnFailsWhenNoSynFollows)
+{
+    const std::string path = ::testing::TempDir() + "expect_new_isn_without_syn.pkt";
+    {
+        std::ofstream script(path);
+        script << "0      listen 8080\n"
+                  "+0     < S 0:0(0) win 65535 <mss 1460>\n"
+                  "+0     > S. 0:0(0) ack 1 <mss 1460>\n"
+                  "+0.005 < . 1:1(0) ack 1 win 65535\n"
+                  "+0     accept\n"
+                  "+0.010 close\n"
+                  "+0     > F. 1:1(0) ack 1\n"
+                  "+0.005 < F. 1:1(0) ack 2 win 65535\n"
+                  "+0     > . 2:2(0) ack 2\n"
+                  "+0     expect_new_isn 65539\n"
+                  "+1     < S 2:2(0) win 65535 <mss 1460>\n"
+                  "+0     > . 2:2(0) ack 2\n";
+    }
+    PktResult result = run_pkt_script(path);
+    std::remove(path.c_str());
+    ASSERT_FALSE(result.passed);
+    ASSERT_NE(result.message.find("never sent another SYN"), std::string::npos) << result.message;
 }

@@ -20,3 +20,22 @@ inline bool seq_before(uint32_t a, uint32_t b)
 {
     return static_cast<int32_t>(a - b) < 0;
 }
+
+inline bool seq_after(uint32_t a, uint32_t b)
+{
+    return seq_before(b, a);
+}
+
+// The ISN for a connection that replaces one in TIME_WAIT on the same
+// four-tuple (see NetworkStack::_handle_tcp): the generated one if it is
+// already past the old connection's SND.NXT by more than a maximum unscaled
+// window, otherwise exactly that far past it - Linux's tw_snd_nxt + 65535 + 2.
+// A segment of the old connection still in the network then lies more than a
+// whole window behind the new connection's first sequence number, where the
+// peer cannot take it for new data. Modular, like everything here: an
+// old_snd_nxt near 2^32 wraps.
+inline uint32_t time_wait_reuse_isn(uint32_t generated, uint32_t old_snd_nxt)
+{
+    const uint32_t floor = old_snd_nxt + 65535 + 2;
+    return seq_after(generated, floor) ? generated : floor;
+}

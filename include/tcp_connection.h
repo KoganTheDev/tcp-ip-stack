@@ -4,6 +4,7 @@
 #include <functional>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "bytes.h"
@@ -237,6 +238,28 @@ public:
     // a segment; an off-path forgery has to guess one. Always false with
     // nothing in flight, since then no error can be about anything.
     bool has_sent_unacknowledged(uint32_t seq) const;
+
+    // Whether a bare SYN (no ACK, RST or FIN - the caller checks the flags)
+    // with this sequence number and TSval, if it carried one, is provably a
+    // new connection rather than a straggler from this one, so that the
+    // four-tuple may be reused before TIME_WAIT runs out. Only ever true in
+    // TIME_WAIT. Linux's tcp_timewait_state_process asks the same question:
+    //
+    //   - this connection used timestamps: the SYN's TSval must be newer than
+    //     TS.Recent (RFC 6191). A SYN without one is not accepted.
+    //   - it did not: the SYN's sequence number must be beyond RCV.NXT
+    //     (RFC 1122 4.2.2.13).
+    //
+    // Both comparisons are modular. Anything this refuses goes to
+    // on_segment() as before, which answers a SYN with a challenge ACK.
+    bool accepts_reuse_syn(uint32_t seq, std::optional<uint32_t> tsval) const;
+    // Ends TIME_WAIT now: CLOSED, exactly as when the 2*MSL timer runs out,
+    // so everything watching for CLOSED runs as it would then. Nothing in
+    // any other state.
+    void end_time_wait();
+    // SND.NXT. A connection replacing this one in TIME_WAIT starts its
+    // sequence space beyond it (time_wait_reuse_isn in tcp_sequence.h).
+    uint32_t get_send_next() const { return _send_next; }
     // Half-closes our side: a FIN goes out once everything already queued has
     // been sent, and from then on send() accepts nothing. Receiving is not
     // affected - read() keeps working, and data the peer sends in FIN_WAIT_1/2

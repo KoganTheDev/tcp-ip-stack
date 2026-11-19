@@ -1,0 +1,32 @@
+# RFC 6191: the stack closed first and holds the four-tuple in TIME_WAIT. A
+# new SYN on it whose TSval is newer than TS.Recent is provably not an old
+# duplicate, so it is accepted at once (as Linux does) instead of drawing
+# challenge ACKs until 2*MSL runs out. The old connection is closed and
+# reaped; a brand-new one answers, its ISN at least 65537 past the old
+# SND.NXT (2 here: SYN and FIN) so nothing of the old one can land in its
+# window. The new connection carries nothing over: its first ACK and data
+# are checked against its own TS.Recent, not the old one.
+0      listen 8080
++0     < S 0:0(0) win 65535 <mss 1460,TS val 100 ecr 0>
++0     > S. 0:0(0) ack 1 <mss 1460,TS val * ecr 100>
++0.005 < . 1:1(0) ack 1 win 65535 <nop,nop,TS val 105 ecr 0>
++0     accept
+
++0.010 close
++0     > F. 1:1(0) ack 1 <...>
++0.005 < . 1:1(0) ack 2 win 65535 <nop,nop,TS val 120 ecr 0>
++0     state FIN_WAIT_2
++0.005 < F. 1:1(0) ack 2 win 65535 <nop,nop,TS val 130 ecr 0>
++0     > . 2:2(0) ack 2 <...>
++0     state TIME_WAIT
+
++1     expect_new_isn 65539
++0     < S 0:0(0) win 65535 <mss 1460,TS val 1130 ecr 0>
++0     > S. 0:0(0) ack 1 <mss 1460,TS val * ecr 1130>
++0     state CLOSED
++0.005 < . 1:1(0) ack 1 win 65535 <nop,nop,TS val 1135 ecr 0>
++0     accept
++0     state ESTABLISHED
++0.005 < P. 1:11(10) ack 1 win 65535 <nop,nop,TS val 1140 ecr 0>
++0.200 > . 1:1(0) ack 11 <...>
++0     read 10
