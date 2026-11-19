@@ -1805,10 +1805,11 @@ TEST(TcpConnection, ACoalescedRetransmissionDrainsTheOutOfOrderSegmentsItCovers)
     size_t delivered = 0;
     connection->set_data_ready_callback([&delivered, &connection]() { delivered += connection->read().size(); });
 
-    // 70 KB arrives out of order, one 1000-byte segment at a time, leaving the
-    // first 1000 bytes missing.
+    // 60 KB arrives out of order, one 1000-byte segment at a time, leaving the
+    // first 1000 bytes missing - all of it inside the 64 KiB unscaled window,
+    // since anything past the window's edge is trimmed off.
     const uint32_t chunk = 1000;
-    const uint32_t chunks = 70;
+    const uint32_t chunks = 60;
     for (uint32_t i = 1; i <= chunks; i++)
     {
         connection->on_segment(*make_incoming_segment(501 + i * chunk, 1001, FLAG_ACK, Bytes(chunk)));

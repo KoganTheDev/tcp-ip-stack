@@ -520,8 +520,9 @@ public:
     // The price of a larger shift is resolution: the window is advertised in
     // 512-byte units, so the last few hundred bytes of free space round down
     // to nothing - which is never more than a sliver of a 4 KiB minimum
-    // buffer - and an edge already offered is rounded up rather than pulled
-    // back (see _transmit()). The shift is fixed for the connection at the
+    // buffer - and an edge already promised is rounded up to rather than
+    // pulled back, while the rounding itself is never promised (see
+    // _transmit()). The shift is fixed for the connection at the
     // SYN, so it has to cover what the buffer may grow to later, not what it
     // is now. Public so tests can read a scaled window without restating it.
     static constexpr uint8_t WINDOW_SCALE_SHIFT = tcp_window_scale_covering(MAX_BUFFER_CAPACITY);
@@ -1080,11 +1081,21 @@ private:
     // right edge the window may never be pulled back from (RFC 1122
     // 4.2.2.16). See _advertised_window().
     uint64_t _rcv_right_edge_unwrapped = 0;
+    // The edge as the peer computes it from the field actually sent, which
+    // the scaled window's rounding up (see _transmit()) may put up to one
+    // unit beyond the promise above. Only ever used to accept data the peer
+    // was told it may send; never as the base of a new offer, so it cannot
+    // ratchet: it stays within one unit of the promised edge.
+    uint64_t _rcv_wire_edge_unwrapped = 0;
+    // What may be accepted beyond RCV.NXT: the advertised window, or up to
+    // the wire edge if that is further.
+    uint32_t _acceptance_window() const;
     void _set_recv_next(uint32_t value)
     {
         _recv_next = value;
         _recv_next_unwrapped = value;
         _rcv_right_edge_unwrapped = 0; // nothing offered yet relative to this RCV.NXT
+        _rcv_wire_edge_unwrapped = 0;
     }
     void _advance_recv_next(uint32_t count)
     {

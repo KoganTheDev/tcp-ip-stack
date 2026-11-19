@@ -141,13 +141,20 @@ uint32_t TcpConnection::_advertised_window() const
     return std::max<uint32_t>(free_space, static_cast<uint32_t>(promised));
 }
 
+uint32_t TcpConnection::_acceptance_window() const
+{
+    uint64_t wire =
+        _rcv_wire_edge_unwrapped > _recv_next_unwrapped ? _rcv_wire_edge_unwrapped - _recv_next_unwrapped : 0;
+    return std::max<uint32_t>(_advertised_window(), static_cast<uint32_t>(wire));
+}
+
 bool TcpConnection::_segment_acceptable(uint32_t seq, uint32_t length) const
 {
     // RFC 9293 3.10.7.4's table, in modular arithmetic: a segment is
     // acceptable if its first or its last sequence number falls in
     // [RCV.NXT, RCV.NXT + RCV.WND). With the window shut only RCV.NXT
     // itself is, which keeps a zero-window probe answerable.
-    uint32_t window = _advertised_window();
+    uint32_t window = _acceptance_window();
     auto in_window = [this, window](uint32_t s)
     {
         return (s - _recv_next) < window;
@@ -172,7 +179,7 @@ bool TcpConnection::_ack_acceptable_in_syn_sent(uint32_t ack) const
 
 bool TcpConnection::_seq_in_receive_window(uint32_t seq) const
 {
-    uint32_t window = _advertised_window();
+    uint32_t window = _acceptance_window();
     if (window == 0)
     {
         return seq == _recv_next;
@@ -214,19 +221,26 @@ void TcpConnection::_transmit(uint8_t flags, uint32_t seq, const Bytes& payload,
     // open _window_scaling_negotiated is already true when the SYN-ACK is
     // built, so it is not enough on its own.
     uint8_t our_shift = (_window_scaling_negotiated && !(flags & FLAG_SYN)) ? WINDOW_SCALE_SHIFT : 0;
-    uint32_t window_value = available >> our_shift;
-    // Scaling rounds down to whole units of 2^shift, which could pull the
-    // right edge back from where it was offered once RCV.NXT has moved by
-    // something other than a whole unit. Round up to keep it instead (Linux's
-    // tcp_select_window does the same): the edge was offered from free space,
-    // and the extra is less than one unit.
+    // What may be promised: the window rounded down to whole units of
+    // 2^shift, so never more than the free space (or the edge already
+    // promised) covers.
+    uint32_t promise_value = std::min<uint32_t>(available >> our_shift, 0xFFFFu);
+    uint32_t window_value = promise_value;
+    // Rounding down could pull the right edge back from where it was offered
+    // once RCV.NXT has moved by something other than a whole unit. The field
+    // is rounded up to keep it instead (Linux's tcp_select_window does the
+    // same) - but only on the wire: the rounded-up edge is NOT recorded as a
+    // new promise. Recording it would let the next ack round up from there,
+    // and a peer sending exactly to each advertised edge would walk it
+    // forward by up to a unit per ack, past the buffer without bound. The
+    // slack it is allowed is tracked apart, in _rcv_wire_edge_unwrapped.
     uint64_t offered =
         _rcv_right_edge_unwrapped > _recv_next_unwrapped ? _rcv_right_edge_unwrapped - _recv_next_unwrapped : 0;
     if ((static_cast<uint64_t>(window_value) << our_shift) < offered)
     {
-        window_value = static_cast<uint32_t>((offered + (uint64_t{1} << our_shift) - 1) >> our_shift);
+        window_value =
+            static_cast<uint32_t>(std::min<uint64_t>((offered + (uint64_t{1} << our_shift) - 1) >> our_shift, 0xFFFFu));
     }
-    window_value = std::min<uint32_t>(window_value, 0xFFFFu);
 
     Tcp header(_local_port, _remote_port, seq, _recv_next, 5, flags, static_cast<uint16_t>(window_value), 0, 0);
     _add_options(header, flags, payload.size());
@@ -234,10 +248,13 @@ void TcpConnection::_transmit(uint8_t flags, uint32_t seq, const Bytes& payload,
     if (flags & FLAG_ACK)
     {
         _last_ack_sent = _recv_next;
-        // The right edge just offered, as the peer will compute it - from the
-        // scaled-down value actually sent.
-        uint64_t edge = _recv_next_unwrapped + (static_cast<uint64_t>(window_value) << our_shift);
+        // The promise is the rounded-down edge (see above); the edge the
+        // peer actually computes, which may be up to a unit beyond it, only
+        // widens what is accepted, never what is offered next.
+        uint64_t edge = _recv_next_unwrapped + (static_cast<uint64_t>(promise_value) << our_shift);
         _rcv_right_edge_unwrapped = std::max(_rcv_right_edge_unwrapped, edge);
+        uint64_t wire_edge = _recv_next_unwrapped + (static_cast<uint64_t>(window_value) << our_shift);
+        _rcv_wire_edge_unwrapped = std::max(_rcv_wire_edge_unwrapped, wire_edge);
     }
 }
 
@@ -671,7 +688,7 @@ void TcpConnection::_buffer_out_of_order(uint32_t seq, const Bytes& payload)
     // 3.10.7.4 trims a segment to the window): that is what bounds the
     // buffer by the window offered.
     uint64_t start = _recv_next_unwrapped + static_cast<uint32_t>(seq - _recv_next);
-    _reorder_buffer.insert(start, payload, _recv_next_unwrapped + _advertised_window());
+    _reorder_buffer.insert(start, payload, _recv_next_unwrapped + _acceptance_window());
 }
 
 void TcpConnection::_drain_reorder_buffer()
@@ -2074,6 +2091,20 @@ void TcpConnection::on_segment(const Tcp& segment, Ecn ecn)
                 // of) a gap - RFC 5681 4.2 wants that acked at once, since a
                 // sender in recovery is waiting on exactly this ack.
                 bool fills_gap = !_reorder_buffer.empty();
+                uint32_t room = _acceptance_window();
+                if (payload.size() > room)
+                {
+                    // RFC 9293 3.10.7.4: a segment is trimmed to the window.
+                    // Taken whole, a peer ignoring the window (or a zero-
+                    // window probe) would grow the queue past the buffer.
+                    if (room > 0)
+                    {
+                        _deliver(payload.slice(0, room));
+                        _drain_reorder_buffer();
+                    }
+                    _send_pure_ack();
+                    return; // a FIN on it lies beyond the window too
+                }
                 _deliver(payload);
 
                 // drain any buffered segments the gap-filler just unblocked
@@ -2113,7 +2144,8 @@ void TcpConnection::on_segment(const Tcp& segment, Ecn ecn)
                 uint32_t already_seen = _recv_next - seq;
                 if (already_seen < payload.size())
                 {
-                    Bytes new_part = payload.slice(static_cast<size_t>(already_seen));
+                    size_t new_bytes = std::min<size_t>(payload.size() - already_seen, _acceptance_window());
+                    Bytes new_part = payload.slice(static_cast<size_t>(already_seen), new_bytes);
                     _deliver(new_part);
 
                     _drain_reorder_buffer();

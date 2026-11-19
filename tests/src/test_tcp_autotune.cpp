@@ -452,7 +452,10 @@ TEST(TcpAutotune, TheWindowScaleCoversTheMaximumBuffer)
 }
 
 // With a shift of 9 the window moves in 512-byte units. RCV.NXT advancing by
-// something else must not pull the offered right edge back by the rounding.
+// something else must not pull the offered right edge back by more than the
+// rounding: less than one unit, which RFC 7323 2.4 says a sender must accept
+// with a scaled window. (The edge promised from free space - which the
+// rounding never extends - does not move back at all.)
 TEST(TcpAutotune, ScaledWindowRoundingNeverMovesTheRightEdgeLeft)
 {
     Peer peer(true);
@@ -464,7 +467,43 @@ TEST(TcpAutotune, ScaledWindowRoundingNeverMovesTheRightEdgeLeft)
         peer.data(size);
         peer.advance(TcpConnection::RCV_SPACE_FALLBACK_MS); // the ack goes out
         uint64_t now_edge = uint64_t{peer.sent.back().ack} + peer.offered_window();
-        ASSERT_GE(now_edge, edge) << "after " << size << " bytes the right edge moved left";
+        ASSERT_GT(now_edge + (uint64_t{1} << TcpConnection::WINDOW_SCALE_SHIFT), edge)
+            << "after " << size << " bytes the right edge moved left by a whole unit or more";
         edge = now_edge;
+    }
+}
+
+// Rounding the scaled window up keeps an edge already offered; it must never
+// become a new promise. A peer that always sends exactly to the advertised
+// edge, in sizes that are not whole scale units, to an application that
+// never reads, would otherwise walk the edge forward by up to a unit per ack
+// - past the buffer, without bound. Buffered bytes stay within the capacity
+// plus one unit of rounding.
+TEST(TcpAutotune, RoundingUpTheScaledWindowNeverGrowsTheBufferPastCapacity)
+{
+    Peer peer(true);
+    peer.connection->set_receive_capacity_locked(true); // nothing read anyway; keep the capacity fixed
+    const uint64_t unit = uint64_t{1} << TcpConnection::WINDOW_SCALE_SHIFT;
+    const uint64_t bound = peer.connection->receive_capacity() + unit;
+    for (int i = 0; i < 2000; i++)
+    {
+        uint32_t edge = peer.sent.back().ack + peer.offered_window();
+        uint32_t room = edge - peer.next_seq;
+        if (static_cast<int32_t>(room) <= 0)
+        {
+            peer.data(1); // a probe past the edge, which must not be taken
+        }
+        else
+        {
+            // Not a whole unit: the first byte alone, then the rest.
+            peer.data(1);
+            if (room > 1)
+            {
+                peer.data(std::min<uint32_t>(room - 1, peer.full_segment()));
+            }
+        }
+        peer.advance(TcpConnection::RCV_SPACE_FALLBACK_MS); // every ack goes out
+        ASSERT_LE(peer.connection->bytes_available() + peer.connection->bytes_out_of_order(), bound)
+            << "after " << i << " rounds the buffer holds more than the capacity plus one unit";
     }
 }
