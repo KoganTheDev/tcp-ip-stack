@@ -661,6 +661,7 @@ public:
         uint64_t dsacks_sent = 0;            // acks that carried a D-SACK block (RFC 2883)
         uint64_t dsacks_received = 0;        // D-SACKs naming a retransmission of ours (RFC 2883 4)
         uint64_t spurious_recoveries_undone = 0; // episodes undone: D-SACKs covered every copy (RFC 3708)
+        uint64_t spurious_rtos_undone = 0;       // timeouts undone by Eifel (RFC 3522) or F-RTO (RFC 5682)
     };
     const Stats& stats() const { return _stats; }
     // Scoreboard entries the sender has examined, for cost tests.
@@ -824,6 +825,41 @@ private:
     // The one undo path: the snapshot back, and the RTO back-off with it if
     // the episode had a timeout.
     void _undo_episode();
+
+    // --- spurious timeouts (RFC 3522 Eifel, RFC 5682 F-RTO) ---
+    //
+    // A timeout whose flight had in fact arrived - the acks were delayed,
+    // not the data lost - is detected on the acks right after it, and
+    // undone through _undo_episode(); it also leaves RTO recovery, so the
+    // rest of the flight is not resent. With timestamps, Eifel: the first
+    // ack for new data echoes a TSval older than the retransmission's, so
+    // the original is what arrived (Linux's tcp_packet_delayed()). Without
+    // timestamps but with SACK, F-RTO (SACK-enhanced, RFC 5682 3.1; Linux's
+    // tcp_frto = 2): after a first ack for part of the flight, two new
+    // segments go out instead of retransmissions, and a second ack for new
+    // data shows the flight was not lost. Without either, D-SACK alone (see
+    // _try_undo_dsack()). Only a timeout that starts an episode is checked:
+    // one inside a recovery keeps that recovery's evidence.
+    bool _eifel_armed = false;
+    uint32_t _eifel_tsval = 0; // the first timeout retransmission's TSval (the per-pair clock)
+    enum class Frto
+    {
+        OFF,
+        AWAIT_FIRST_ACK,  // step 2: the first ack after the timeout
+        SEND_NEW,         // step 2b decided; the new data goes out on this ack
+        AWAIT_SECOND_ACK, // step 3
+    };
+    Frto _frto = Frto::OFF;
+    uint32_t _frto_recover = 0; // SND.NXT at the timeout (RFC 5682 "recover")
+    // At a timeout: Eifel with timestamps, else F-RTO with SACK unless a
+    // loss probe retransmission is outstanding.
+    void _arm_spurious_rto_detection(bool starts_episode, bool probe_outstanding);
+    // Runs on each ack, before it retires anything; `duplicate` is RFC 5681's
+    // (or RFC 6675's) duplicate ack - a window update is neither.
+    void _detect_spurious_rto(const Tcp& segment, uint32_t ack, uint32_t snd_una, bool duplicate);
+    // Up to two new segments, past cwnd (RFC 5682 step 2b). False if none.
+    bool _frto_send_new_data();
+    void _undo_spurious_rto(const char* detector);
     // What RACK needs from this ack (see SendScoreboard::AckContext).
     SendScoreboard::AckContext _rack_context(const Tcp& segment) const;
 

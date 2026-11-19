@@ -38,7 +38,8 @@ namespace
         CongestionControlAlgorithm algorithm = CongestionControlAlgorithm::RENO;
     };
 
-    // An established connection with a 1000-byte MSS and a large peer window.
+    // An established connection with 1000 bytes of data per segment and a
+    // large peer window.
     struct Sender
     {
         explicit Sender(Options options = {}) : options(options)
@@ -52,8 +53,11 @@ namespace
                                     header.has_timestamp_option() ? header.get_timestamp_value() : 0});
                 },
                 1460, options.algorithm);
-            c->accept_incoming_syn(PEER_ISN, static_cast<uint16_t>(MSS), false, 0, options.timestamps, peer_tsval,
-                                   options.sack, options.ecn);
+            // With timestamps the MSS leaves room for their 12 bytes, so a
+            // segment still carries MSS bytes of data.
+            uint16_t peer_mss = static_cast<uint16_t>(MSS + (options.timestamps ? 12 : 0));
+            c->accept_incoming_syn(PEER_ISN, peer_mss, false, 0, options.timestamps, peer_tsval, options.sack,
+                                   options.ecn);
             ack(1001);
             sent.clear();
         }
@@ -389,4 +393,140 @@ TEST(TcpUndo, AnEpisodeThatSawEceIsNeverUndone)
     spurious_fast_recovery(s, /*report_copy=*/true, /*ece=*/true);
     ASSERT_EQ(s.stats().dsacks_received, 1u);
     ASSERT_EQ(s.stats().spurious_recoveries_undone, 0u);
+}
+
+// --- spurious timeouts: Eifel (RFC 3522) and F-RTO (RFC 5682) ---
+
+// The sender here has no RTT sample yet, so no loss probe goes out before the
+// timeout (RFC 8985 7.3 needs one) - except where a test wants one.
+namespace
+{
+    // Sends `segments` (more than the window takes, so some stay queued),
+    // lets the RTO fire, and returns the window just before it.
+    uint32_t time_out(Sender& s, uint32_t segments)
+    {
+        s.send(segments);
+        uint32_t cwnd = s.c->get_congestion_window();
+        uint64_t timeouts = s.stats().retransmit_timeouts;
+        while (s.stats().retransmit_timeouts == timeouts)
+            s.pass_to_next_timer();
+        REQUIRE_TRUE(s.count_sent(s.seg(0)) >= 2, "precondition: the timeout resent segment 0");
+        return cwnd;
+    }
+
+    Options with_timestamps()
+    {
+        Options options;
+        options.timestamps = true;
+        return options;
+    }
+}
+
+// Eifel: the first ack after the timeout's retransmission echoes the TSval
+// of the original transmission, so it was the original that arrived - the
+// timeout was spurious. The window is given back, and the rest of the
+// flight is not resent.
+TEST(TcpSpuriousRto, EifelUndoesATimeoutWhoseOriginalArrived)
+{
+    Sender s(with_timestamps());
+    uint32_t cwnd = time_out(s, 5);
+    ASSERT_LT(s.c->get_congestion_window(), 2 * MSS) << "precondition: the timeout cut the window";
+    s.ack(s.seg(2), {}, s.tsval_of(s.seg(0), 1));
+    ASSERT_EQ(s.stats().spurious_rtos_undone, 1u);
+    ASSERT_GE(s.c->get_congestion_window(), cwnd);
+    s.ack(s.seg(5), {}, s.tsval_of(s.seg(2), 1));
+    ASSERT_EQ(s.count_sent(s.seg(2)), 1u) << "nothing else was resent";
+    ASSERT_EQ(s.stats().retransmitted_segments, 1u);
+}
+
+// The retransmission is what arrived (its TSval is echoed): a real loss.
+TEST(TcpSpuriousRto, EifelLeavesARealLossAlone)
+{
+    Sender s(with_timestamps());
+    time_out(s, 5);
+    s.ack(s.seg(1), {}, s.tsval_of(s.seg(0), 2));
+    ASSERT_EQ(s.stats().spurious_rtos_undone, 0u);
+    ASSERT_LT(s.c->get_congestion_window(), 4 * MSS);
+}
+
+// Only an ack that acknowledges the retransmitted data decides: a stale
+// duplicate ack echoing an old TSval says nothing about it.
+TEST(TcpSpuriousRto, EifelIgnoresADuplicateAckWithAnOldEcho)
+{
+    Sender s(with_timestamps());
+    time_out(s, 5);
+    s.ack(s.seg(0), {}, s.tsval_of(s.seg(0), 1));
+    s.ack(s.seg(1), {}, s.tsval_of(s.seg(0), 2));
+    ASSERT_EQ(s.stats().spurious_rtos_undone, 0u);
+}
+
+// F-RTO, without timestamps: the first ack after the timeout acknowledges
+// new data, so instead of resending the rest of the flight two new segments
+// go out. The next ack acknowledges more data that was never resent: the
+// flight was not lost, the timeout was spurious.
+TEST(TcpSpuriousRto, FrtoUndoesATimeoutWhenTheFlightKeepsBeingAcked)
+{
+    Sender s;
+    uint32_t cwnd = time_out(s, 20); // ten in flight, the rest queued
+    uint32_t first_unsent = s.seg(cwnd / MSS);
+    size_t sent_before = s.sent.size();
+    s.ack(s.seg(2));
+    ASSERT_EQ(s.sent.size(), sent_before + 2) << "two segments go out";
+    ASSERT_EQ(s.sent[sent_before].seq, first_unsent) << "both new";
+    ASSERT_EQ(s.count_sent(s.seg(2)), 1u) << "and nothing is resent";
+    s.ack(s.seg(4));
+    ASSERT_EQ(s.stats().spurious_rtos_undone, 1u);
+    ASSERT_GE(s.c->get_congestion_window(), cwnd);
+    ASSERT_EQ(s.stats().retransmitted_segments, 1u);
+}
+
+// The ack after the two new segments is a duplicate (they arrived, but a
+// hole below them did not fill): the loss was real, and recovery carries on
+// as after any timeout, resending the hole.
+TEST(TcpSpuriousRto, FrtoFallsBackWhenTheSecondAckIsADuplicate)
+{
+    Sender s;
+    uint32_t cwnd = time_out(s, 20);
+    uint32_t first_unsent_index = cwnd / MSS;
+    s.ack(s.seg(2));
+    s.ack(s.seg(2), {{s.seg(first_unsent_index), s.seg(first_unsent_index + 1)}});
+    ASSERT_EQ(s.stats().spurious_rtos_undone, 0u);
+    ASSERT_EQ(s.count_sent(s.seg(2)), 2u) << "conventional recovery resends the hole";
+}
+
+// The first ack covers everything outstanding at the timeout: it cannot
+// tell which copy arrived, so F-RTO stops and nothing is undone.
+TEST(TcpSpuriousRto, FrtoStopsWhenTheFirstAckCoversTheWholeFlight)
+{
+    Sender s;
+    uint32_t cwnd = time_out(s, 20);
+    s.ack(s.seg(cwnd / MSS));
+    s.ack(s.seg(cwnd / MSS + 1));
+    ASSERT_EQ(s.stats().spurious_rtos_undone, 0u);
+}
+
+// A loss probe that resent the tail was outstanding when the timer fired:
+// F-RTO is not used (the probe has made the tail's acks ambiguous), and acks
+// that would otherwise prove the timeout spurious undo nothing. A probe of
+// new data does not stop it - see the delay-spike test in SimRecovery.
+TEST(TcpSpuriousRto, NoFrtoWhileALossProbeRetransmissionIsOutstanding)
+{
+    for (bool probe : {false, true})
+    {
+        Sender s = measured();
+        uint32_t window = s.c->get_congestion_window() / MSS;
+        s.send(window); // fills cwnd, nothing queued
+        if (probe)
+        {
+            s.pass_to_next_timer();
+            ASSERT_EQ(s.count_sent(s.seg(window - 1)), 2u) << "precondition: the probe resent the last segment";
+        }
+        s.send(10); // queued behind the full window
+        uint64_t timeouts = s.stats().retransmit_timeouts;
+        while (s.stats().retransmit_timeouts == timeouts)
+            s.pass_to_next_timer();
+        s.ack(s.seg(2));
+        s.ack(s.seg(4));
+        ASSERT_EQ(s.stats().spurious_rtos_undone, probe ? 0u : 1u) << (probe ? "with" : "without") << " a probe";
+    }
 }

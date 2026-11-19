@@ -512,6 +512,35 @@ void SendScoreboard::mark_all_lost()
     _reset_high_rxt();
 }
 
+void SendScoreboard::undo_loss_marks()
+{
+    std::vector<SentSegment*> candidates;
+    for (SentSegment& entry : _segments)
+    {
+        _visits++;
+        _rack_unlink(entry);
+        if (!entry.sacked)
+        {
+            entry.lost = false;
+            entry.rexmit_in_recovery = false;
+            candidates.push_back(&entry);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const SentSegment* a, const SentSegment* b) { return a->xmit_order < b->xmit_order; });
+    for (SentSegment* entry : candidates)
+    {
+        _rack_link(*entry);
+    }
+    _lost_cursor_valid = false;
+    // RACK.segment is most likely the timeout's retransmission, its delivery
+    // inferred from an ack that was in fact for the original - the very
+    // ambiguity the undo has just resolved. Kept, it would make every
+    // segment sent before the retransmission look overdue. The next
+    // delivery sets it afresh.
+    _rack_valid = false;
+}
+
 void SendScoreboard::start_recovery()
 {
     for (SentSegment& entry : _segments)

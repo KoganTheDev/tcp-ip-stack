@@ -179,6 +179,11 @@ public:
     // presumed lost and none counts as retransmitted, so the holes are
     // refilled in order as the window allows (SACKed segments are skipped).
     void mark_all_lost();
+    // Takes back mark_all_lost() for a timeout found to be spurious: no
+    // unSACKed segment is lost or counted as retransmitted in recovery, and
+    // all of them are RACK candidates again, in transmission order, with
+    // RACK.segment forgotten.
+    void undo_loss_marks();
     // A new recovery episode: HighRxt goes back to HighACK, so nothing counts
     // as retransmitted in it yet.
     void start_recovery();

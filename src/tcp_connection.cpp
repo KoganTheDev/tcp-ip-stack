@@ -794,6 +794,18 @@ void TcpConnection::_restart_after_idle()
 void TcpConnection::_send_queued_while_window_allows()
 {
     _restart_after_idle();
+    if (_frto == Frto::SEND_NEW)
+    {
+        // RFC 5682 3.1 step 2b: up to two new segments instead of the
+        // retransmissions the timeout queued up - unless there are none to
+        // send, in which case conventional recovery it is.
+        _frto = _frto_send_new_data() ? Frto::AWAIT_SECOND_ACK : Frto::OFF;
+    }
+    if (_frto != Frto::OFF)
+    {
+        _arm_or_disarm_persist(); // nothing goes until F-RTO has decided
+        return;
+    }
     if (_in_recovery && _sack_permitted)
     {
         // During SACK recovery only the ack clock sends (RFC 6675 step C).
@@ -1118,6 +1130,136 @@ void TcpConnection::_try_undo_dsack()
     }
 }
 
+void TcpConnection::_arm_spurious_rto_detection(bool starts_episode, bool probe_outstanding)
+{
+    if (!starts_episode)
+    {
+        // A timeout inside an episode (a repeated one, or one during fast
+        // recovery): F-RTO stops (RFC 5682 3.1 step 1, "already in RTO
+        // recovery"); Eifel keeps the TSval of the episode's first timeout
+        // retransmission, as Linux keeps retrans_stamp.
+        _frto = Frto::OFF;
+        return;
+    }
+    _eifel_armed = false;
+    _frto = Frto::OFF;
+    if (_timestamps_negotiated)
+    {
+        _eifel_armed = true;
+        _eifel_tsval = _ts_clock(); // what the retransmission about to go out carries
+    }
+    else if (_sack_permitted && !probe_outstanding)
+    {
+        // Not while a loss probe that resent the tail is outstanding: an
+        // ack covering the tail could then be for either copy, and F-RTO's
+        // evidence is data acknowledged that was sent only once. (A probe
+        // of new data is just more of that data.)
+        _frto = Frto::AWAIT_FIRST_ACK;
+        _frto_recover = _send_next;
+    }
+}
+
+void TcpConnection::_detect_spurious_rto(const Tcp& segment, uint32_t ack, uint32_t snd_una, bool duplicate)
+{
+    bool advances = seq_before(snd_una, ack) && seq_at_or_before(ack, _send_next);
+    if (_eifel_armed && advances)
+    {
+        // RFC 3522: the first ack for new data after the retransmission. An
+        // echo older than the retransmission's TSval was the original's,
+        // so the original arrived and the timeout was spurious.
+        _eifel_armed = false;
+        uint32_t echo = segment.get_timestamp_echo();
+        if (segment.has_timestamp_option() && echo != 0 && seq_before(echo, _eifel_tsval))
+        {
+            _undo_spurious_rto("Eifel");
+        }
+        return;
+    }
+    switch (_frto)
+    {
+    case Frto::AWAIT_FIRST_ACK:
+        // RFC 5682 3.1 step 2. An ack that covers everything outstanding at
+        // the timeout cannot tell the copies apart (2a), and a duplicate
+        // says a hole is still there: conventional recovery. One for part
+        // of the flight sends new data instead (2b).
+        if (duplicate || (advances && seq_at_or_before(_frto_recover, ack)))
+        {
+            _frto = Frto::OFF;
+        }
+        else if (advances)
+        {
+            _frto = Frto::SEND_NEW;
+        }
+        break;
+    case Frto::SEND_NEW:
+        _frto = Frto::OFF; // the new data never went out
+        break;
+    case Frto::AWAIT_SECOND_ACK:
+        // Step 3: data that was never retransmitted is acknowledged again,
+        // so the flight was not lost (3b); a duplicate means it was (3a).
+        if (advances)
+        {
+            _undo_spurious_rto("F-RTO");
+        }
+        else if (duplicate)
+        {
+            _frto = Frto::OFF;
+        }
+        break;
+    case Frto::OFF:
+        break;
+    }
+}
+
+bool TcpConnection::_frto_send_new_data()
+{
+    // Whatever cwnd says (it is one segment after the timeout), as the RFC
+    // has it; the peer's window still bounds it.
+    int sent = 0;
+    while (sent < 2 && !_send_queue.empty())
+    {
+        uint32_t snd_una = _in_flight.snd_una_or(_send_next);
+        if ((_send_next - snd_una) + _send_queue.front().size() > _peer_window)
+        {
+            break;
+        }
+        Bytes chunk = std::move(_send_queue.front());
+        _send_queue.pop_front();
+        _send_queued_bytes -= chunk.size();
+        _send_chunk(chunk);
+        sent++;
+    }
+    return sent > 0;
+}
+
+void TcpConnection::_undo_spurious_rto(const char* detector)
+{
+    if (!_congestion->has_undo())
+    {
+        // ECN-Echo (or a probe-repaired loss) since the episode began: real
+        // congestion, so the timeout's reduction and recovery stand.
+        _eifel_armed = false;
+        _frto = Frto::OFF;
+        return;
+    }
+    _undo_episode();
+    // Leave RTO recovery: the flight it presumed lost was not, so nothing
+    // more is resent, and a new loss may start a recovery of its own.
+    _rto_recovery = false;
+    _in_recovery = false;
+    _recovery_point_valid = false;
+    _in_flight.undo_loss_marks();
+    _end_episode();
+    _stats.spurious_rtos_undone += 1;
+    // The timer for what is now oldest restarts from the un-backed-off RTO.
+    if (SentSegment* oldest = _in_flight.oldest_unsacked())
+    {
+        oldest->retransmit_ms_remaining = _rtt.rto_ms();
+        oldest->retransmit_deadline_ms = _now_ms + static_cast<uint64_t>(_rtt.rto_ms());
+    }
+    LOG_DEBUG("TcpConnection[" << _id << "] " << detector << ": the timeout was spurious");
+}
+
 void TcpConnection::_undo_episode()
 {
     uint32_t before = _congestion->window();
@@ -1136,6 +1278,8 @@ void TcpConnection::_undo_episode()
 void TcpConnection::_end_episode()
 {
     _episode_open = false; // its ledger stays, for the D-SACKs still to come
+    _eifel_armed = false;
+    _frto = Frto::OFF;
     // RFC 8985 6.2 step 4: one recovery fewer for a widened window to last.
     if (_rack_reo_wnd_persist > 0 && --_rack_reo_wnd_persist == 0)
     {
@@ -1648,6 +1792,7 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     // signal itself. Counted too, so a peer that shrinks its window as it
     // buffers out-of-order data cannot keep fast retransmit from firing.
     is_duplicate_ack = is_duplicate_ack || (!_in_flight.empty() && ack == snd_una && sack_advanced);
+    _detect_spurious_rto(segment, ack, snd_una, is_duplicate_ack);
     // TLP's "DupAck without any SACK option" (RFC 8985 7.4.2): the copy that
     // arrived second drew it, possibly with nothing left outstanding, which
     // RFC 5681's definition above would not count.
@@ -2654,11 +2799,14 @@ void TcpConnection::_run_timers()
     // algorithms treat that as the harsher signal; how much harsher is theirs
     // to decide.
     uint32_t cwnd_before = _congestion->window();
+    bool starts_episode = (oldest.flags & FLAG_SYN) == 0 && !_episode_open;
+    bool probe_outstanding = _tlp_outstanding && _tlp_is_retrans;
     if ((oldest.flags & FLAG_SYN) == 0)
     {
         _begin_episode();
     }
     _episode_had_rto = true;
+    _arm_spurious_rto_detection(starts_episode, probe_outstanding);
     _congestion->on_retransmit_timeout(_bytes_in_flight(), _now_ms);
     // RFC 6675 5.1 (and RFC 6582's "recover"): a timeout ends any recovery,
     // and no new one starts until everything sent so far is acknowledged.
