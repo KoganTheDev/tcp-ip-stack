@@ -247,3 +247,16 @@ TEST(SendScoreboard, HighSackIsForgottenOnceTheAckPassesIt)
     board.push(segment(later + MSS, MSS));
     ASSERT_EQ(board.next_speculative(), nullptr) << "no SACKed data in flight, so no hole lies below a SACK";
 }
+
+// Loss marking needs SACKed segments above a hole; with none there is
+// nothing to find. It used to walk the whole scoreboard anyway, on every
+// ack - O(flight) per ack on a lossless path, which at the window a long
+// fat link needs (thousands of segments) was most of the sender's work.
+TEST(SendScoreboard, LossMarkingWithNothingSackedVisitsNothing)
+{
+    SendScoreboard board = board_of(5000);
+    uint64_t before = board.visits();
+    board.mark_losses(3, MSS);
+    ASSERT_EQ(board.visits(), before) << "no segment is examined";
+    ASSERT_EQ(board.next_lost(), nullptr) << "and nothing is marked";
+}

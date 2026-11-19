@@ -424,6 +424,13 @@ const SentSegment* SendScoreboard::oldest_unsacked() const
 
 void SendScoreboard::mark_losses(uint32_t dup_thresh, uint32_t smss)
 {
+    if (_sacked_bytes == 0)
+    {
+        // Both rules need SACKed data above a segment, so with none there is
+        // nothing to mark - and this runs on every ack, so the walk would be
+        // O(flight) per ack on a lossless path.
+        return;
+    }
     uint32_t sacked_segments_above = 0;
     uint32_t sacked_bytes_above = 0;
     for (auto it = _segments.rbegin(); it != _segments.rend(); ++it)
