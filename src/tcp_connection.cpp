@@ -1036,12 +1036,63 @@ void TcpConnection::_rcv_rtt_measure(const Tcp& segment, uint32_t payload_size)
 
 bool TcpConnection::_apply_sack_blocks(const Tcp& segment)
 {
-    if (!_sack_permitted || segment.get_sack_blocks().empty())
+    const std::vector<Tcp::SackBlock>& blocks = segment.get_sack_blocks();
+    if (!_sack_permitted || blocks.empty())
     {
         return false;
     }
     SendScoreboard::AckContext rack = _rack_context(segment);
-    return _in_flight.apply_sack(segment.get_sack_blocks(), &rack);
+    if (!_is_dsack(blocks, segment.get_acknowledgement_number()))
+    {
+        return _in_flight.apply_sack(blocks, &rack);
+    }
+    _on_dsack(blocks.front());
+    std::vector<Tcp::SackBlock> rest(blocks.begin() + 1, blocks.end());
+    return !rest.empty() && _in_flight.apply_sack(rest, &rack);
+}
+
+bool TcpConnection::_is_dsack(const std::vector<Tcp::SackBlock>& blocks, uint32_t ack)
+{
+    // Linux's tcp_check_dsack() makes the same two tests.
+    const Tcp::SackBlock& first = blocks.front();
+    if (seq_before(first.start, ack))
+    {
+        return true;
+    }
+    return blocks.size() > 1 && seq_at_or_before(blocks[1].start, first.start)
+           && seq_at_or_before(first.end, blocks[1].end);
+}
+
+void TcpConnection::_on_dsack(const Tcp::SackBlock& block)
+{
+    if (!seq_before(block.start, block.end))
+    {
+        return;
+    }
+    bool counted = _in_flight.match_dsack(block) != SendScoreboard::DsackMatch::NONE;
+    if (!counted && _tlp_outstanding && _tlp_is_retrans && !_tlp_dsacked && block.start == _tlp_probe_seq
+        && block.end == _tlp_probe_end)
+    {
+        _tlp_dsacked = true;
+        counted = true;
+    }
+    if (!counted)
+    {
+        return;
+    }
+    _stats.dsacks_received += 1;
+    LOG_DEBUG("TcpConnection[" << _id << "] D-SACK " << block.start << ":" << block.end
+                               << " reports a spurious retransmission");
+}
+
+void TcpConnection::_begin_episode()
+{
+    if (_episode_open)
+    {
+        return;
+    }
+    _episode_open = true;
+    _in_flight.begin_episode();
 }
 
 SendScoreboard::AckContext TcpConnection::_rack_context(const Tcp& segment) const
@@ -1179,6 +1230,9 @@ void TcpConnection::_send_loss_probe()
         }
         _retransmit(*last, /*rescue=*/true); // not a NextSeg() retransmission: HighRxt stays
         _tlp_is_retrans = true;
+        _tlp_probe_seq = last->seq;
+        _tlp_probe_end = last->end_seq;
+        _tlp_dsacked = false;
     }
     LOG_DEBUG("TcpConnection[" << _id << "] tail loss probe (" << (sent_new ? "new data" : "retransmission")
                                << "), end_seq " << _send_next);
@@ -1195,14 +1249,15 @@ void TcpConnection::_send_loss_probe()
 
 void TcpConnection::_tlp_process_ack(uint32_t ack, bool pure_dup_ack)
 {
-    // RFC 8985 7.4.2, without D-SACK (which this stack does not parse).
+    // RFC 8985 7.4.2.
     if (!_tlp_outstanding || !seq_at_or_before(_tlp_end_seq, ack))
     {
         return;
     }
-    // A probe of new data was delivered, or (a duplicate ack without SACK)
-    // both copies of a retransmitted one arrived: either way, no loss.
-    if (!_tlp_is_retrans || pure_dup_ack)
+    // A probe of new data was delivered, or (a duplicate ack without SACK,
+    // or a D-SACK for the probe) both copies of a retransmitted one
+    // arrived: either way, no loss.
+    if (!_tlp_is_retrans || pure_dup_ack || _tlp_dsacked)
     {
         _tlp_outstanding = false;
     }
@@ -1261,6 +1316,10 @@ bool TcpConnection::_on_ecn_echo(const Tcp& segment, uint32_t ack)
 
 void TcpConnection::_retransmit(SentSegment& segment, bool rescue)
 {
+    if (_episode_open)
+    {
+        _in_flight.note_episode_retransmission(segment);
+    }
     _transmit(segment.flags, segment.seq, segment.payload);
     _in_flight.note_transmit(segment, _now_ms); // RFC 8985 6.1
     if (!rescue)
@@ -1291,6 +1350,7 @@ void TcpConnection::_enter_recovery(uint32_t delivered)
         return; // everything outstanding is already held by the peer
     }
     uint32_t cwnd_before = _congestion->window();
+    _begin_episode();
     _in_recovery = true;
     _tlp_reset();
     _note_window_reduced();
@@ -1634,6 +1694,10 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     if (_rto_recovery && seq_at_or_before(_recovery_point, ack))
     {
         _rto_recovery = false; // everything outstanding at the timeout is acknowledged
+    }
+    if (_episode_open && _recovery_point_valid && seq_at_or_before(_recovery_point, ack))
+    {
+        _episode_open = false; // its ledger stays, for the D-SACKs still to come
     }
     _schedule_loss_probe(); // RFC 8985 7.2: on an ack that acknowledges new data
 
@@ -2508,6 +2572,10 @@ void TcpConnection::_run_timers()
     // algorithms treat that as the harsher signal; how much harsher is theirs
     // to decide.
     uint32_t cwnd_before = _congestion->window();
+    if ((oldest.flags & FLAG_SYN) == 0)
+    {
+        _begin_episode();
+    }
     _congestion->on_retransmit_timeout(_bytes_in_flight(), _now_ms);
     // RFC 6675 5.1 (and RFC 6582's "recover"): a timeout ends any recovery,
     // and no new one starts until everything sent so far is acknowledged.

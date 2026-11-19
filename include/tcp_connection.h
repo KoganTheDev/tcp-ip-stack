@@ -655,6 +655,7 @@ public:
         uint64_t loss_probe_repairs = 0;     // losses a probe repaired by itself (7.4.2)
         uint64_t ecn_reductions = 0;         // cwnd reductions for an ECN-Echo (RFC 3168 6.1.2)
         uint64_t dsacks_sent = 0;            // acks that carried a D-SACK block (RFC 2883)
+        uint64_t dsacks_received = 0;        // D-SACKs naming a retransmission of ours (RFC 2883 4)
     };
     const Stats& stats() const { return _stats; }
     // Scoreboard entries the sender has examined, for cost tests.
@@ -759,8 +760,28 @@ private:
 
     // Applies the peer's SACK blocks (if SACK is in use) to the scoreboard. Returns true if
     // anything was newly marked, which is what makes a duplicate ack
-    // informative rather than merely repeated.
+    // informative rather than merely repeated. A D-SACK block is taken out
+    // first and handed to _on_dsack(), never to the scoreboard: it reports a
+    // duplicate, not data held above a hole.
     bool _apply_sack_blocks(const Tcp& segment);
+    // RFC 2883 section 4: the first block is a D-SACK if it lies below the
+    // cumulative ack, or inside the second block.
+    static bool _is_dsack(const std::vector<Tcp::SackBlock>& blocks, uint32_t ack);
+    // A D-SACK block: counted (Stats::dsacks_received) only if it names
+    // exactly what this side retransmitted - in the current or last loss
+    // episode (see SendScoreboard::match_dsack()), or the loss probe - with a
+    // copy not yet reported. Anything else is ignored.
+    void _on_dsack(const Tcp::SackBlock& block);
+
+    // --- loss episodes (for D-SACK accounting) ---
+    //
+    // An episode is a fast recovery or an RTO recovery, from its start until
+    // the cumulative ack reaches the recovery point. A timeout inside a
+    // recovery joins that episode rather than starting another, as Linux
+    // keeps its undo state across tcp_enter_loss() from Recovery. Every
+    // retransmission while one is open goes on its ledger.
+    bool _episode_open = false;
+    void _begin_episode();
     // What RACK needs from this ack (see SendScoreboard::AckContext).
     SendScoreboard::AckContext _rack_context(const Tcp& segment) const;
 
@@ -848,6 +869,11 @@ private:
     bool _tlp_outstanding = false;
     uint32_t _tlp_end_seq = 0;
     bool _tlp_is_retrans = false;
+    // The range a retransmitted probe resent, and whether a D-SACK has
+    // reported it: both copies arrived, so there was no loss (7.4.2).
+    uint32_t _tlp_probe_seq = 0;
+    uint32_t _tlp_probe_end = 0;
+    bool _tlp_dsacked = false;
     // RFC 8985 7.3 condition 2: a fresh RTT sample since the last probe (or
     // the start of the connection) - without one there is no SRTT to time a
     // probe by, and probes must not keep the estimator from adapting.
@@ -863,7 +889,8 @@ private:
     // TLP_send_probe() (7.3).
     void _send_loss_probe();
     // TLP_process_ack() (7.4.2); `pure_dup_ack` is a duplicate ack without
-    // SACK blocks - the sign, without D-SACK, that both copies arrived.
+    // SACK blocks - the sign, besides a D-SACK for the probe, that both
+    // copies arrived.
     void _tlp_process_ack(uint32_t ack, bool pure_dup_ack);
     // TLP_init() (7.1): on entering fast or RTO recovery.
     void _tlp_reset()

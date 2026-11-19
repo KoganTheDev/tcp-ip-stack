@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <vector>
 
 #include "bytes.h"
@@ -240,6 +241,43 @@ public:
     // latest: the timer re-runs this, which then finds the rest.
     uint32_t rack_detect_loss(uint64_t now_ms, uint64_t reo_wnd_ms, uint64_t& wait_ms);
 
+    // --- D-SACK accounting (RFC 2883 section 4; RFC 3708) ---
+    //
+    // A D-SACK names data the receiver got twice. That is evidence of a
+    // spurious retransmission only if this side did retransmit exactly that
+    // data, and only once per copy it sent - a receiver can name any range,
+    // and one that could make a D-SACK count for something it never resent
+    // (or count one copy many times) could switch off the congestion
+    // response at will. So each loss episode keeps a ledger of what it
+    // retransmitted, and a D-SACK block counts only if it is exactly one or
+    // more consecutive ledger entries that still have an unreported copy.
+    //
+    // Two ledgers: the current (or most recent) episode's and the one before
+    // it, since the duplicate a retransmission causes is reported a round
+    // trip later, after recovery may have ended or a new one begun.
+
+    // Starts a new episode's ledger; the current one becomes the last.
+    // Segments still outstanding that were retransmitted before it (a loss
+    // probe, a previous episode's copies) are carried in with one copy each:
+    // their duplicates would be reported in this episode too (Linux starts
+    // undo_retrans from retrans_out for the same reason).
+    void begin_episode();
+    // Records one retransmission of `segment` in the current episode.
+    void note_episode_retransmission(const SentSegment& segment);
+    // Which ledger a D-SACK block was counted against.
+    enum class DsackMatch
+    {
+        NONE,
+        CURRENT,
+        LAST,
+    };
+    DsackMatch match_dsack(const Tcp::SackBlock& block);
+    // Copies retransmitted in the current episode, and how many of them a
+    // D-SACK has reported as duplicates (Linux's undo_retrans is the
+    // difference).
+    uint32_t episode_retransmissions() const { return _ledgers[0].copies; }
+    uint32_t episode_dsacked() const { return _ledgers[0].dsacked; }
+
     // Scoreboard entries examined so far, by every query - a cost meter for
     // tests: one ack must cost a bounded number of passes, whatever the
     // peer's SACK pattern.
@@ -301,4 +339,26 @@ private:
     void _reset_high_rxt();
     uint32_t _unsacked_bytes = 0;
     uint32_t _sacked_bytes = 0;
+
+    // One episode's retransmissions, keyed by offset from `base` (SND.UNA
+    // when it began): every range in it is at or above that, and offsets
+    // order correctly across the 2^32 wrap where raw sequence numbers would
+    // not.
+    struct LedgerEntry
+    {
+        uint32_t length = 0;
+        uint32_t copies = 0;  // times this exact range was resent
+        uint32_t dsacked = 0; // of those, reported duplicate; never above copies
+    };
+    struct Ledger
+    {
+        uint32_t base = 0;
+        bool valid = false;
+        std::map<uint32_t, LedgerEntry> entries;
+        uint32_t copies = 0;
+        uint32_t dsacked = 0;
+    };
+    // [0] the current episode, [1] the one before it.
+    Ledger _ledgers[2];
+    static bool _match_in(Ledger& ledger, const Tcp::SackBlock& block);
 };
