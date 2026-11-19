@@ -40,23 +40,17 @@ namespace
     constexpr uint8_t FLAG_SYN = 0x02;
     constexpr uint8_t FLAG_FIN = 0x01;
 
-    // 224.0.0.0/4. Class E (240.0.0.0/4) is not multicast, but is no more a
-    // single host's address, so callers asking "is this one host" test both.
     // 127.0.0.0/8 (RFC 1122 3.2.1.3): the whole block is this host, not just
-    // 127.0.0.1.
-    bool is_loopback_v4(const IPv4Address& address)
-    {
-        return address.get_address()[0] == 127;
-    }
-
-    // The same on the raw octets of a parsed header. An IPv4Address owns a
-    // heap-allocated Bytes, so building one per packet just to look at it
-    // costs an allocation each; the receive path asks on every packet.
+    // 127.0.0.1. Takes the raw octets of a parsed header: an IPv4Address owns a
+    // heap-allocated Bytes, so building one per packet just to look at it costs
+    // an allocation each, and the receive path asks on every packet.
     bool is_loopback_v4(const Bytes& octets)
     {
         return octets[0] == 127;
     }
 
+    // 224.0.0.0/4. Class E (240.0.0.0/4) is not multicast, but is no more a
+    // single host's address, so callers asking "is this one host" test both.
     bool is_multicast(const IPv4Address& address)
     {
         return (address.get_address()[0] & 0xF0) == 0xE0;

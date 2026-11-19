@@ -375,7 +375,7 @@ public:
     // is derived from it (MTU less 40 for v4, less 60 for v6).
     // And in bytes: 1024 datagrams of 64 KiB would otherwise be 64 MiB held
     // for a loop that can be fed faster than it is drained. Either limit drops.
-    static constexpr size_t LOOPBACK_QUEUE_BYTE_LIMIT = 4 * 1024 * 1024;
+    static constexpr size_t LOOPBACK_QUEUE_BYTE_LIMIT = size_t{4} * 1024 * 1024;
     static constexpr uint16_t LOOPBACK_MTU = 65535;
     uint64_t loopback_drops() const { return _loopback_drops; }
     size_t loopback_queued_bytes() const { return _loopback_queued_bytes; }
