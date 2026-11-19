@@ -210,7 +210,10 @@ namespace ustack
         // sees what it set) but uses the value the application asked for as
         // the payload capacity, because there is no per-skb overhead to pay
         // for. Values clamp to [4 KiB (or 2*MSS), 16 MiB]. Setting
-        // SO_RCVBUF locks the receive capacity against autotuning. On a UDP
+        // SO_RCVBUF locks the receive capacity against autotuning, SO_SNDBUF
+        // the send capacity; unlocked, both grow, and getsockopt on a
+        // connected socket reports the size as it is now (doubled), as
+        // Linux does. On a UDP
         // socket the value is stored and read back, but not applied: the
         // receive queue there is bounded by datagram count
         // (UDP_RECEIVE_QUEUE_LIMIT), not bytes.

@@ -1243,7 +1243,14 @@ namespace ustack
             case SO_SNDBUF:
             {
                 // Doubled as Linux does; see the comment on setsockopt in stack.h.
+                // A connected TCP socket reports its connection's capacity as
+                // it is now, autotuning's growth included, as Linux reports
+                // sk_rcvbuf / sk_sndbuf.
                 size_t capacity = optname == SO_RCVBUF ? socket->receive_capacity : socket->send_capacity;
+                if (const TcpConnection* connection = _connection(*socket))
+                {
+                    capacity = optname == SO_RCVBUF ? connection->receive_capacity() : connection->send_capacity();
+                }
                 error = write_int_option(optval, optlen, static_cast<int>(capacity * 2));
                 break;
             }

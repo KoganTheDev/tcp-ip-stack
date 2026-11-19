@@ -281,6 +281,37 @@ TEST_F(UstackSocket, BufferOptionsRoundTripDoubledAndClamp)
     EXPECT_EQ(buffer_option(*client, fd, SO_SNDBUF), 2 * static_cast<int>(TcpConnection::MAX_BUFFER_CAPACITY));
 }
 
+// Linux's getsockopt reports the buffer as it is now, autotuning included
+// (sk_rcvbuf / sk_sndbuf grow), doubled like everything else it reports.
+TEST_F(UstackSocket, BufferOptionsReportTheAutotunedSize)
+{
+    auto [client_fd, server_fd] = connected_pair();
+    std::string chunk(65536, 'x');
+    size_t sent = 0;
+    size_t received = 0;
+    constexpr size_t TOTAL = size_t{4} * 1024 * 1024;
+    ASSERT_TRUE(net.run_until(
+        [&]
+        {
+            while (sent < TOTAL)
+            {
+                ssize_t n = client->send(client_fd, chunk.data(), chunk.size(), MSG_NOSIGNAL);
+                if (n <= 0)
+                    break;
+                sent += static_cast<size_t>(n);
+            }
+            received += recv_string(*server, server_fd, 1 << 20).size();
+            return received >= TOTAL;
+        },
+        60000))
+        << "the transfer completes; received " << received;
+    EXPECT_GT(buffer_option(*server, server_fd, SO_RCVBUF),
+              2 * static_cast<int>(TcpConnection::RECEIVE_BUFFER_CAPACITY))
+        << "the receive buffer grew, and getsockopt says so";
+    EXPECT_GT(buffer_option(*client, client_fd, SO_SNDBUF), 2 * static_cast<int>(TcpConnection::SEND_BUFFER_CAPACITY))
+        << "so did the send buffer";
+}
+
 TEST_F(UstackSocket, BufferOptionsOnAUdpSocketAreStoredNotApplied)
 {
     int fd = client->socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
