@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795126681167,
+  "lastUpdate": 1795127067492,
   "repoUrl": "https://github.com/KoganTheDev/tcp-ip-stack",
   "entries": {
     "tcp-ip-stack microbenchmarks": [
@@ -1056,6 +1056,221 @@ window.BENCHMARK_DATA = {
             "value": 17.422446200000508,
             "unit": "ms/iter",
             "extra": "iterations: 40\ncpu: 17.420640100000018 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "109174220+KoganTheDev@users.noreply.github.com",
+            "name": "Yuval Kogan",
+            "username": "KoganTheDev"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ee7e938d7cc15db99e3f2ecebad10c18b7fc9e5c",
+          "message": "Merge pull request #22 from KoganTheDev/feat/loopback\n\nLoopback: 127/8, ::1 and own addresses stay inside the stack",
+          "timestamp": "2026-11-20T00:23:10+02:00",
+          "tree_id": "0e605ce0d29bfde7a4877387833ed93a00f3df61",
+          "url": "https://github.com/KoganTheDev/tcp-ip-stack/commit/ee7e938d7cc15db99e3f2ecebad10c18b7fc9e5c"
+        },
+        "date": 1795127067134,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_EchoBurst/200/iterations:3/manual_time",
+            "value": 38.77819866666667,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 39.66649133333333 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_InternetChecksum/64",
+            "value": 7.6009868332729,
+            "unit": "ns/iter",
+            "extra": "iterations: 91773152\ncpu: 7.59913875465452 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_InternetChecksum/576",
+            "value": 52.121052468932184,
+            "unit": "ns/iter",
+            "extra": "iterations: 13461642\ncpu: 52.111620632906444 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_InternetChecksum/1500",
+            "value": 133.93288708589418,
+            "unit": "ns/iter",
+            "extra": "iterations: 5233270\ncpu: 133.89823781306904 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_InternetChecksum/9000",
+            "value": 801.7047612400577,
+            "unit": "ns/iter",
+            "extra": "iterations: 873974\ncpu: 801.6912505406343 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ParseEthernetIpTcp",
+            "value": 713.1963810936475,
+            "unit": "ns/iter",
+            "extra": "iterations: 986928\ncpu: 713.0071383120145 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SerializeEthernetIpTcp",
+            "value": 1783.030042338337,
+            "unit": "ns/iter",
+            "extra": "iterations: 392080\ncpu: 1782.6301418077956 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_DnsParseResponse/1",
+            "value": 373.4455048226095,
+            "unit": "ns/iter",
+            "extra": "iterations: 1924785\ncpu: 373.37137706289275 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_DnsParseResponse/8",
+            "value": 1292.3942315494626,
+            "unit": "ns/iter",
+            "extra": "iterations: 542260\ncpu: 1292.1281488584807 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_DnsParseResponse/32",
+            "value": 4798.003134796016,
+            "unit": "ns/iter",
+            "extra": "iterations: 144826\ncpu: 4797.807175507154 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ReorderBuffer/0/16",
+            "value": 6987.498869026835,
+            "unit": "ns/iter",
+            "extra": "iterations: 101239\ncpu: 6994.345696816414 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ReorderBuffer/0/256",
+            "value": 136274.49640582193,
+            "unit": "ns/iter",
+            "extra": "iterations: 5147\ncpu: 136284.4861084157 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ReorderBuffer/0/1000",
+            "value": 588538.8301265354,
+            "unit": "ns/iter",
+            "extra": "iterations: 1195\ncpu: 588588.3029289012 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ReorderBuffer/0/4096",
+            "value": 2308974.138612025,
+            "unit": "ns/iter",
+            "extra": "iterations: 303\ncpu: 2307782.0891088755 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ReorderBuffer/1/16",
+            "value": 11803.712336504157,
+            "unit": "ns/iter",
+            "extra": "iterations: 60390\ncpu: 11818.28362311738 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ReorderBuffer/1/256",
+            "value": 214185.4291275799,
+            "unit": "ns/iter",
+            "extra": "iterations: 3337\ncpu: 214200.2256518002 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ReorderBuffer/1/1000",
+            "value": 989487.5969098585,
+            "unit": "ns/iter",
+            "extra": "iterations: 712\ncpu: 989482.2766854028 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ReorderBuffer/1/4096",
+            "value": 2279655.0977191087,
+            "unit": "ns/iter",
+            "extra": "iterations: 307\ncpu: 2279590.3843648387 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SackScoreboardWalk/16",
+            "value": 238.4151062799974,
+            "unit": "ns/iter",
+            "extra": "iterations: 2935971\ncpu: 238.34909506939903 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SackScoreboardWalk/64",
+            "value": 374.1954596159898,
+            "unit": "ns/iter",
+            "extra": "iterations: 1879841\ncpu: 374.15463541863494 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SackScoreboardWalk/256",
+            "value": 861.5184248275414,
+            "unit": "ns/iter",
+            "extra": "iterations: 801690\ncpu: 861.4329603712157 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SackScoreboardWalk/512",
+            "value": 1641.1324129634017,
+            "unit": "ns/iter",
+            "extra": "iterations: 410632\ncpu: 1641.1223674725827 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_OnTimePassedIdleConnections/1",
+            "value": 16.510820658202647,
+            "unit": "ns/iter",
+            "extra": "iterations: 42439008\ncpu: 16.509908596355526 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_OnTimePassedIdleConnections/10",
+            "value": 16.471526506461988,
+            "unit": "ns/iter",
+            "extra": "iterations: 42336375\ncpu: 16.470693156889272 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_OnTimePassedIdleConnections/100",
+            "value": 16.47808281661043,
+            "unit": "ns/iter",
+            "extra": "iterations: 42266859\ncpu: 16.477031449154993 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_OnTimePassedIdleConnections/1000",
+            "value": 16.517270095204662,
+            "unit": "ns/iter",
+            "extra": "iterations: 42187376\ncpu: 16.516025860437477 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_OnTimePassedIdleConnections/10000",
+            "value": 16.496350363421417,
+            "unit": "ns/iter",
+            "extra": "iterations: 42596844\ncpu: 16.495372004555072 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_OnTimePassedIdleConnections_BigO",
+            "value": null,
+            "unit": "ns/iter",
+            "extra": "iterations: undefined\ncpu: undefined ns\nthreads: 1"
+          },
+          {
+            "name": "BM_OnTimePassedIdleConnections_RMS",
+            "unit": "undefined/iter",
+            "extra": "iterations: undefined\ncpu: undefined undefined\nthreads: 1"
+          },
+          {
+            "name": "BM_SimulatedBulkTransfer/0/real_time",
+            "value": 12.683873309091807,
+            "unit": "ms/iter",
+            "extra": "iterations: 55\ncpu: 12.682424381818176 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SimulatedBulkTransfer/10/real_time",
+            "value": 14.174423320000642,
+            "unit": "ms/iter",
+            "extra": "iterations: 50\ncpu: 14.174467839999991 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SimulatedBulkTransfer/50/real_time",
+            "value": 18.020407102564825,
+            "unit": "ms/iter",
+            "extra": "iterations: 39\ncpu: 18.01887312820519 ms\nthreads: 1"
           }
         ]
       }
