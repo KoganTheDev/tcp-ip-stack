@@ -38,12 +38,27 @@ namespace
 {
     using namespace stack_harness;
 
-    constexpr uint16_t PORT_A = 7401;
-    constexpr uint16_t PORT_B = 7402;
-    constexpr uint16_t PORT_BOUND = 7403;
-    constexpr uint16_t PORT_DEAD = 7404; // never bound
-    constexpr uint16_t PORT_C = 7405;
-    constexpr uint16_t PORT_MAPPED = 7406;
+    // The kernel side binds these on the host's loopback, so a fixed number
+    // collides with another test process running at the same time (and with
+    // whatever else listens there). The block of six is chosen per process from
+    // its pid, below the ephemeral range (32768+) like the TIME_WAIT reconnect
+    // test in test_stack_differential.cpp; the traces never print a port number,
+    // so they stay comparable. Consecutive pids, which is what parallel
+    // launches get, land in different blocks.
+    constexpr uint16_t PORT_BLOCK = 6;
+    constexpr uint16_t PORT_BLOCKS = 1600; // 20000 .. 29599
+    inline uint16_t port_slot(uint16_t slot)
+    {
+        static const uint16_t base =
+            static_cast<uint16_t>(20000 + (static_cast<unsigned>(getpid()) % PORT_BLOCKS) * PORT_BLOCK);
+        return static_cast<uint16_t>(base + slot);
+    }
+    const uint16_t PORT_A = port_slot(0);
+    const uint16_t PORT_B = port_slot(1);
+    const uint16_t PORT_BOUND = port_slot(2);
+    const uint16_t PORT_DEAD = port_slot(3); // never bound
+    const uint16_t PORT_C = port_slot(4);
+    const uint16_t PORT_MAPPED = port_slot(5);
 
     // ---- IPv6 harnesses, as in test_stack_differential_ipv6.cpp --------------
 
@@ -109,7 +124,7 @@ namespace
     class KernelHarness6
     {
     public:
-        using StackT = ustack::KernelStack;
+        using StackT = stack_harness::OwnedKernelStack;
         StackT& server_stack() { return _stack; }
         StackT& client_stack() { return _stack; }
         static const char* server_text() { return "::1"; }
@@ -366,6 +381,21 @@ namespace
             _open.emplace_back(&s, fd);
             return fd;
         }
+        // Closes one socket now and forgets it, so the destructor does not close
+        // the same number again: on the kernel the number may by then belong to
+        // a socket opened afterwards, which the second close would kill.
+        void close(S& s, int fd)
+        {
+            s.close(fd);
+            for (auto it = _open.begin(); it != _open.end(); ++it)
+            {
+                if (it->first == &s && it->second == fd)
+                {
+                    _open.erase(it);
+                    return;
+                }
+            }
+        }
         int bound(S& s, int family, const Endpoint& to)
         {
             int fd = open(s, family);
@@ -516,7 +546,7 @@ namespace
         const Endpoint q_name = sockname(client, q);
         note("peer sends", sendto_text(server, queued_peer, "data", q_name));
         settle();
-        server.close(queued_peer);
+        sockets.close(server, queued_peer);
         note("send to the closed port", send_text(client, q, "x"));
         settle();
         note("poll: data and error", poll_one(client, q));
