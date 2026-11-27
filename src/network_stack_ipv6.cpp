@@ -136,7 +136,7 @@ std::unordered_set<IPv6Address> NetworkStack::_ipv6_neighbours_in_use() const
     }
     for (const auto& entry : this->_connections_by_id)
     {
-        const IpAddress& peer = entry.second.key.remote_ip;
+        const IpAddress& peer = entry.second.connection->get_remote_ip();
         TcpState state = entry.second.connection->get_state();
         if (!peer.is_v6() || state == TcpState::SYN_RECEIVED || state == TcpState::CLOSED)
         {

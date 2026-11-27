@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -700,12 +701,29 @@ private:
     // from one peer ip:port to one local port, but to two of this host's
     // addresses, are two connections (the peer keys them by its remote
     // address), as Linux's established hash keys them.
+    //
+    // The addresses are held inline rather than as IpAddress, whose IPv4 form
+    // keeps its four bytes on the heap: every segment builds a key to look
+    // its connection up, and with two addresses in it that was two
+    // allocations per packet on the receive path.
+    struct PackedAddress
+    {
+        std::array<uint8_t, 16> bytes{};
+        bool v6 = false;
+        PackedAddress() = default;
+        // Implicit, so a key is written {peer, port, port, local} from any address type.
+        PackedAddress(const IpAddress& address);   // NOLINT(google-explicit-constructor)
+        PackedAddress(const IPv4Address& address); // NOLINT(google-explicit-constructor)
+        PackedAddress(const IPv6Address& address); // NOLINT(google-explicit-constructor)
+        IpAddress unpack() const;
+        bool operator==(const PackedAddress& other) const { return v6 == other.v6 && bytes == other.bytes; }
+    };
     struct ConnectionKey
     {
-        IpAddress remote_ip;
+        PackedAddress remote_ip;
         uint16_t remote_port{};
         uint16_t local_port{};
-        IpAddress local_ip;
+        PackedAddress local_ip;
         bool operator==(const ConnectionKey& other) const;
     };
     struct ConnectionKeyHash
@@ -1081,8 +1099,12 @@ private:
     IsnGenerator _ts_offset_generator;
     // SO_REUSEPORT's selection hash (reuseport_hash()): the same keyed
     // four-tuple hash as the two above, under its own key, so knowing one
-    // reveals nothing about the others.
-    IsnGenerator _reuseport_hasher;
+    // reveals nothing about the others. Keyed on first use (from
+    // std::random_device, by IsnGenerator's default constructor) or by
+    // set_secret_seed(): drawing it in the constructor cost every stack a
+    // second entropy read and mt19937_64 seeding - 1% of a benchmark that
+    // builds stacks - for a key most stacks never use.
+    mutable std::optional<IsnGenerator> _reuseport_hasher;
     // Sets a new connection's TSval offset: this stack's clock plus the keyed
     // hash of the two addresses, so successive connections between the same
     // two hosts send ever-newer timestamps. Before accept_incoming_syn() or

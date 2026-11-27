@@ -186,13 +186,63 @@ bool NetworkStack::ConnectionKey::operator==(const ConnectionKey& other) const
            && this->remote_ip == other.remote_ip && this->local_ip == other.local_ip;
 }
 
+namespace
+{
+    void pack_into(std::array<uint8_t, 16>& out, const Bytes& raw)
+    {
+        std::copy(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(std::min(raw.size(), out.size())),
+                  out.begin());
+    }
+}
+
+NetworkStack::PackedAddress::PackedAddress(const IpAddress& address) : v6(address.is_v6())
+{
+    pack_into(bytes, address.bytes());
+}
+
+NetworkStack::PackedAddress::PackedAddress(const IPv4Address& address)
+{
+    pack_into(bytes, address.get_address());
+}
+
+NetworkStack::PackedAddress::PackedAddress(const IPv6Address& address) : v6(true)
+{
+    pack_into(bytes, address.get_address());
+}
+
+IpAddress NetworkStack::PackedAddress::unpack() const
+{
+    if (v6)
+    {
+        return IpAddress(IPv6Address(Bytes(std::vector<byte_t>(bytes.begin(), bytes.end()))));
+    }
+    return IpAddress(IPv4Address(Bytes(std::vector<byte_t>(bytes.begin(), bytes.begin() + 4))));
+}
+
 size_t NetworkStack::ConnectionKeyHash::operator()(const ConnectionKey& key) const
 {
-    size_t h1 = std::hash<IpAddress>{}(key.remote_ip);
-    size_t h2 = std::hash<uint16_t>{}(key.remote_port);
-    size_t h3 = std::hash<uint16_t>{}(key.local_port);
-    size_t h4 = std::hash<IpAddress>{}(key.local_ip);
-    return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3);
+    // Not keyed: the table's own spread, not a defence (the remote end picks
+    // its port, but std::unordered_map degrades only to a longer chain).
+    // FNV-1a over both addresses and ports.
+    uint64_t h = 1469598103934665603ULL;
+    auto mix = [&h](uint8_t b)
+    {
+        h ^= b;
+        h *= 1099511628211ULL;
+    };
+    for (const PackedAddress* address : {&key.remote_ip, &key.local_ip})
+    {
+        size_t length = address->v6 ? 16 : 4;
+        for (size_t i = 0; i < length; i++)
+        {
+            mix(address->bytes[i]);
+        }
+    }
+    mix(static_cast<uint8_t>(key.remote_port >> 8));
+    mix(static_cast<uint8_t>(key.remote_port));
+    mix(static_cast<uint8_t>(key.local_port >> 8));
+    mix(static_cast<uint8_t>(key.local_port));
+    return static_cast<size_t>(h);
 }
 
 namespace
@@ -291,7 +341,7 @@ void NetworkStack::set_secret_seed(uint64_t seed)
     SeededSecrets secrets = SeededSecrets::from_seed(seed);
     this->_isn_generator = IsnGenerator(secrets.isn_key_low, secrets.isn_key_high);
     this->_ts_offset_generator = IsnGenerator(secrets.ts_key_low, secrets.ts_key_high);
-    this->_reuseport_hasher = IsnGenerator(secrets.reuseport_key_low, secrets.reuseport_key_high);
+    this->_reuseport_hasher.emplace(secrets.reuseport_key_low, secrets.reuseport_key_high);
     this->_syn_cookies = SynCookies(secrets.cookie_key_low, secrets.cookie_key_high);
     this->_challenge_ack_rng.seed(static_cast<std::minstd_rand::result_type>(secrets.challenge_ack_seed));
     this->_isn_on_virtual_clock = true;
@@ -689,7 +739,11 @@ void NetworkStack::_queue_for_accept(Listener& listener, uint64_t connection_id)
 uint32_t NetworkStack::reuseport_hash(const IpAddress& local_ip, uint16_t local_port, const IpAddress& remote_ip,
                                       uint16_t remote_port) const
 {
-    return this->_reuseport_hasher.offset_for(local_ip, local_port, remote_ip, remote_port);
+    if (!this->_reuseport_hasher)
+    {
+        this->_reuseport_hasher.emplace();
+    }
+    return this->_reuseport_hasher->offset_for(local_ip, local_port, remote_ip, remote_port);
 }
 
 void NetworkStack::set_connection_reuse(uint64_t connection_id, bool reuseaddr, bool reuseport)
@@ -715,7 +769,7 @@ void NetworkStack::for_each_connection_on_port(
         const ConnectionRecord& record = this->_connections_by_id.at(connection_id);
         if (record.connection->get_state() != TcpState::CLOSED)
         {
-            visit(record.key.local_ip, record.reuseaddr, record.reuseport);
+            visit(record.key.local_ip.unpack(), record.reuseaddr, record.reuseport);
         }
     }
 }
@@ -2284,7 +2338,7 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
             // listening port either - RFC 793 SS3.4's reset-generation rule
             // for exactly this case. Never RST in response to an RST itself
             // (that's how two stacks could RST each other forever).
-            LOG_DEBUG("NetworkStack: sending RST to " << key.remote_ip.to_string() << ":" << key.remote_port
+            LOG_DEBUG("NetworkStack: sending RST to " << source.to_string() << ":" << key.remote_port
                                                       << " (no matching connection, not a SYN to a listening port)");
             this->_send_rst(source, destination, tcp);
         }
