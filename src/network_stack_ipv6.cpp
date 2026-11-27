@@ -821,6 +821,7 @@ void NetworkStack::_handle_icmpv6_error(const Icmpv6& message)
         return; // too short to name a connection, or not about TCP
     }
     const size_t transport = QUOTE + Ipv6::HEADER_SIZE;
+    IPv6Address original_source(body.slice(QUOTE + 8, IPv6Address::SIZE));
     IPv6Address original_destination(body.slice(QUOTE + 24, IPv6Address::SIZE));
     uint16_t local_port = body.slice_int<uint16_t>(transport);
     uint16_t remote_port = body.slice_int<uint16_t>(transport + 2);
@@ -832,6 +833,12 @@ void NetworkStack::_handle_icmpv6_error(const Icmpv6& message)
         return;
     }
     TcpConnection& connection = *it->second;
+    // tcp_v6_err looks the socket up by the full four-tuple; the table here is
+    // keyed without the local address, so compare the quoted source.
+    if (connection.get_local_ip() != IpAddress(original_source))
+    {
+        return;
+    }
     // RFC 5927 5.1: only an error quoting a sequence number this connection
     // has in flight is believed - anything else is a blind attacker guessing.
     if (!connection.has_sent_unacknowledged(quoted_seq))
