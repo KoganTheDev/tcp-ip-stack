@@ -465,7 +465,44 @@ public:
     Bytes peek(size_t max_bytes = static_cast<size_t>(-1)) const;
 
     // Bytes waiting to be read. The application's share of the receive buffer.
+    // An urgent byte held out of band is in this count until it is passed,
+    // as Linux's is (poll says readable for a lone one).
     size_t bytes_available() const { return _receive_queued_bytes; }
+
+    // --- Urgent data (MSG_OOB), with Linux's semantics ---
+    //
+    // Off by default: URG is then ignored and "urgent" bytes are plain stream
+    // data (RFC 6093, what every other user of this class gets). A socket
+    // layer that offers MSG_OOB turns it on. Then, as in tcp_check_urg() /
+    // tcp_urg(), one out-of-band byte is tracked per connection: the byte at
+    // the urgent pointer minus one (Linux reads the pointer as one past it).
+    // It stays in the receive queue, in sequence order, and is copied aside
+    // when its segment arrives. A later pointer replaces it; the old byte is
+    // dropped if it was at the head of the queue and is ordinary data if not.
+    //
+    // read() and peek() stop at the mark - with the byte inline or not - and
+    // when they start at it, skip it unless it is inline.
+    void set_urgent_tracking(bool on) { _urgent_tracking = on; }
+    // SO_OOBINLINE: the byte is read in the stream, and read_urgent() has
+    // nothing to give.
+    void set_oob_inline(bool on) { _oob_inline = on; }
+    // POLLPRI: an urgent byte has arrived and has not been read out of band.
+    bool urgent_pending() const { return _urgent_tracking && _urg_state == UrgState::VALID; }
+    // SIOCATMARK: the next byte to read is where the urgent pointer is.
+    bool at_urgent_mark() const;
+    // FIONREAD: with an urgent byte held out of band, what lies before it;
+    // otherwise everything queued.
+    size_t bytes_before_urgent_mark() const;
+    // recv(MSG_OOB). BYTE: *byte is the urgent byte (and, unless `peek`, it
+    // is now read - once only). NONE: none, already read, or inline (EINVAL).
+    // NOT_YET: the pointer has arrived and the byte has not (EAGAIN).
+    enum class UrgentRead
+    {
+        BYTE,
+        NONE,
+        NOT_YET
+    };
+    UrgentRead read_urgent(uint8_t& byte, bool peek);
     // Bytes held out of order, waiting for a gap before them to fill. They
     // occupy the receive buffer but no longer shrink the advertised window
     // (see _advertised_window()), so this is the way to see them.
@@ -1328,6 +1365,32 @@ private:
         _recv_next += count;
         _recv_next_unwrapped += count;
     }
+    // Urgent data, receive side (see set_urgent_tracking()). The state is
+    // Linux's urg_data: NONE, NOT_YET (pointer seen, its byte not), VALID
+    // (byte saved, unread), READ (taken by read_urgent()). _urg_seq is the
+    // unwrapped position of the urgent byte.
+    enum class UrgState
+    {
+        NONE,
+        NOT_YET,
+        VALID,
+        READ
+    };
+    bool _urgent_tracking = false;
+    bool _oob_inline = false;
+    UrgState _urg_state = UrgState::NONE;
+    uint64_t _urg_seq = 0;
+    uint8_t _urg_byte = 0;
+    // The unwrapped position of the next byte the application reads
+    // (Linux's copied_seq).
+    uint64_t _copied_unwrapped() const { return _recv_next_unwrapped - _receive_queued_bytes; }
+    // What a read of up to `max` bytes does about the urgent byte: skip it
+    // first (it is at the head, out of band), and take at most `limit`.
+    void _urgent_plan(size_t max, size_t& skip, size_t& limit) const;
+    void _discard_front(size_t count);
+    void _track_urgent(const Tcp& segment, const Bytes* payload);
+    // Linux clears urg_data once the reader is past the byte.
+    void _urgent_after_read();
     // Stores whatever part of an out-of-order segment is not already held.
     void _buffer_out_of_order(uint32_t seq, const Bytes& payload);
     uint32_t _user_timeout_ms = DEFAULT_USER_TIMEOUT_MS;

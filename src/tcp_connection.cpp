@@ -615,17 +615,170 @@ void TcpConnection::set_data_ready_callback(DataReadyFn callback)
 
 Bytes TcpConnection::peek(size_t max_bytes) const
 {
+    size_t skip = 0;
+    size_t limit = max_bytes;
+    _urgent_plan(max_bytes, skip, limit);
     Bytes seen;
     for (const Bytes& chunk : _receive_queue)
     {
-        if (seen.size() >= max_bytes)
+        if (seen.size() >= limit)
         {
             break;
         }
-        const size_t room = max_bytes - seen.size();
-        seen |= chunk.size() <= room ? chunk : chunk.slice(0, room);
+        if (skip >= chunk.size())
+        {
+            skip -= chunk.size();
+            continue;
+        }
+        const size_t from = skip;
+        skip = 0;
+        const size_t room = limit - seen.size();
+        const size_t available = chunk.size() - from;
+        seen |= (from == 0 && available <= room) ? chunk : chunk.slice(from, std::min(room, available));
     }
     return seen;
+}
+
+void TcpConnection::_urgent_plan(size_t max, size_t& skip, size_t& limit) const
+{
+    skip = 0;
+    limit = max;
+    if (!_urgent_tracking || _urg_state == UrgState::NONE || max == 0)
+    {
+        return;
+    }
+    // The urgent byte is in the queue when it lies before RCV.NXT (it cannot
+    // lie before the reader: passing it clears the state).
+    const uint64_t offset = _urg_seq - _copied_unwrapped();
+    if (offset >= _receive_queued_bytes)
+    {
+        return;
+    }
+    if (offset > 0)
+    {
+        limit = std::min<size_t>(max, static_cast<size_t>(offset)); // stop at the mark
+    }
+    else if (!_oob_inline)
+    {
+        skip = 1; // the byte is out of band: the read steps over it
+    }
+}
+
+void TcpConnection::_discard_front(size_t count)
+{
+    // Takes `count` bytes off the front of the queue unread: no counter, no
+    // autotuning, only the queue and what is charged for it.
+    size_t left = count;
+    while (left > 0 && !_receive_queue.empty())
+    {
+        Bytes& front = _receive_queue.front();
+        if (front.size() <= left)
+        {
+            left -= front.size();
+            _receive_queue.pop_front();
+        }
+        else
+        {
+            front = front.slice(left);
+            left = 0;
+        }
+    }
+    if (count > left)
+    {
+        _receive_queued_bytes -= count - left;
+        _trim_memory_charges();
+    }
+}
+
+void TcpConnection::_urgent_after_read()
+{
+    if (_urg_state != UrgState::NONE && _copied_unwrapped() > _urg_seq)
+    {
+        _urg_state = UrgState::NONE;
+    }
+}
+
+bool TcpConnection::at_urgent_mark() const
+{
+    return _urgent_tracking && _urg_state != UrgState::NONE && _urg_seq == _copied_unwrapped();
+}
+
+size_t TcpConnection::bytes_before_urgent_mark() const
+{
+    // tcp_ioctl(SIOCINQ): only a byte held out of band, and still ahead of
+    // RCV.NXT, shortens the answer.
+    if (!_urgent_tracking || _oob_inline || _urg_state == UrgState::NONE || _urg_seq < _copied_unwrapped()
+        || _urg_seq >= _recv_next_unwrapped)
+    {
+        return _receive_queued_bytes;
+    }
+    return static_cast<size_t>(_urg_seq - _copied_unwrapped());
+}
+
+TcpConnection::UrgentRead TcpConnection::read_urgent(uint8_t& byte, bool peek)
+{
+    EntryScope scope(*this);
+    if (!_urgent_tracking || _oob_inline || _urg_state == UrgState::NONE || _urg_state == UrgState::READ)
+    {
+        return UrgentRead::NONE;
+    }
+    if (_urg_state == UrgState::NOT_YET)
+    {
+        return UrgentRead::NOT_YET;
+    }
+    byte = _urg_byte;
+    if (!peek)
+    {
+        _urg_state = UrgState::READ;
+    }
+    return UrgentRead::BYTE;
+}
+
+void TcpConnection::_track_urgent(const Tcp& segment, const Bytes* payload)
+{
+    // Where this segment's first byte sits, unwrapped. Acceptable segments are
+    // within a window of RCV.NXT either side, so the signed distance is exact.
+    const int64_t position =
+        static_cast<int64_t>(_recv_next_unwrapped) + static_cast<int32_t>(segment.get_sequence_number() - _recv_next);
+    const int64_t copied = static_cast<int64_t>(_copied_unwrapped());
+    if (segment.get_urg())
+    {
+        // tcp_check_urg: the pointer is one past the urgent byte (tcp_stdurg
+        // off), so the byte is at pointer - 1 - when there is a pointer.
+        uint32_t pointer = segment.get_urgent_ptr();
+        if (pointer != 0)
+        {
+            pointer--;
+        }
+        const int64_t target = position + pointer;
+        const bool stale = target < copied; // behind the reader
+        const bool not_newer = _urg_state != UrgState::NONE && static_cast<uint64_t>(target) <= _urg_seq;
+        if (!stale && !not_newer)
+        {
+            if (_urg_state != UrgState::NONE && _urg_seq == _copied_unwrapped() && !_oob_inline
+                && _receive_queued_bytes > 0)
+            {
+                _discard_front(1); // the old byte, at the head, goes
+            }
+            _urg_state = UrgState::NOT_YET;
+            _urg_seq = static_cast<uint64_t>(target);
+        }
+    }
+    // tcp_urg: a byte waiting for its segment is taken from the one that has
+    // it, whichever segment that is.
+    if (_urg_state == UrgState::NOT_YET && payload != nullptr)
+    {
+        const int64_t offset = static_cast<int64_t>(_urg_seq) - position;
+        if (offset >= 0 && offset < static_cast<int64_t>(payload->size()))
+        {
+            _urg_byte = (*payload)[static_cast<size_t>(offset)];
+            _urg_state = UrgState::VALID;
+            if (_on_data_ready)
+            {
+                _on_data_ready(); // POLLPRI
+            }
+        }
+    }
 }
 
 Bytes TcpConnection::read(size_t max_bytes)
@@ -633,11 +786,16 @@ Bytes TcpConnection::read(size_t max_bytes)
     EntryScope scope(*this);
     uint32_t window_before = _advertised_window();
 
+    size_t skip = 0;
+    size_t limit = max_bytes;
+    _urgent_plan(max_bytes, skip, limit);
+    _discard_front(skip);
+
     Bytes taken;
-    while (!_receive_queue.empty() && taken.size() < max_bytes)
+    while (!_receive_queue.empty() && taken.size() < limit)
     {
         Bytes& front = _receive_queue.front();
-        size_t room = max_bytes - taken.size();
+        size_t room = limit - taken.size();
 
         if (front.size() <= room)
         {
@@ -655,6 +813,7 @@ Bytes TcpConnection::read(size_t max_bytes)
     _receive_queued_bytes -= taken.size();
     _bytes_read_total += taken.size();
     _trim_memory_charges();
+    _urgent_after_read();
     uint32_t capacity_before = _receive_capacity;
     if (!taken.empty())
     {
@@ -2507,12 +2666,17 @@ void TcpConnection::on_segment(const Tcp& segment, Ecn ecn)
     // _handle_fin() has to know where the FIN actually sits. Held as a pointer
     // rather than a copied Bytes so states that ignore data pay nothing.
     //
-    // URG and the urgent pointer are deliberately never looked at (RFC 6093):
-    // implementations disagree on what the pointer points to and middleboxes
-    // clear it, so "urgent" bytes are delivered inline, in sequence order,
-    // like any others. Nothing this stack sends ever sets URG.
+    // URG and the urgent pointer are, unless set_urgent_tracking() asked for
+    // them, deliberately never looked at (RFC 6093): implementations disagree
+    // on what the pointer points to and middleboxes clear it, so "urgent"
+    // bytes are delivered inline, in sequence order, like any others. Only
+    // send(..., urgent) ever sets URG on what this stack sends.
     if (_state == TcpState::ESTABLISHED || _state == TcpState::FIN_WAIT_1 || _state == TcpState::FIN_WAIT_2)
     {
+        if (_urgent_tracking)
+        {
+            _track_urgent(segment, payload_layer != nullptr ? &payload_layer->get_data() : nullptr);
+        }
         if (payload_size > 0)
         {
             const Bytes& payload = payload_layer->get_data();
@@ -3298,6 +3462,7 @@ void TcpConnection::abort()
     _fin_requested = false;
     _receive_queue.clear();
     _receive_queued_bytes = 0;
+    _urg_state = UrgState::NONE;
     _reorder_buffer.clear();
     _ack_pending = false;
     _persist_deadline_ms = 0;
