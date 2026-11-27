@@ -1110,7 +1110,9 @@ namespace ustack
     {
         // MSG_WAITALL is a TCP idea; on UDP Linux ignores it, and so does this.
         const Socket* first = _get(fd);
-        if (first != nullptr && first->kind == Kind::TCP && !first->listening && (flags & MSG_WAITALL) != 0)
+        // With len 0 WAITALL changes nothing (its target is raised to 1), so
+        // the plain path answers.
+        if (first != nullptr && first->kind == Kind::TCP && !first->listening && (flags & MSG_WAITALL) != 0 && len > 0)
         {
             return _recv_waitall(fd, buf, len, flags, src_addr, addrlen);
         }
@@ -1123,11 +1125,18 @@ namespace ustack
         // Linux: recv waits for at most SO_RCVTIMEO (sock_rcvtimeo()).
         std::optional<uint64_t> deadline = _deadline(socket->rcvtimeo_us);
         bool ready_again = false;
+        const bool tcp_zero_length = len == 0 && socket->kind == Kind::TCP; // socket may be gone after a wait
         for (;;)
         {
             if (int error = _block_until(fd, READABLE | EPOLLRDHUP | EPOLLERR | EPOLLHUP, deadline, ready_again);
                 error != 0)
             {
+                // tcp_recvmsg waits once for len == 0 and its "len > 0" loop
+                // condition then ends the call: a timeout is 0, not EAGAIN.
+                if (error == EAGAIN && tcp_zero_length)
+                {
+                    return 0;
+                }
                 return fail(error);
             }
             result = _recvfrom_once(fd, buf, len, flags, src_addr, addrlen);
@@ -1322,10 +1331,9 @@ namespace ustack
         {
             return 0; // closed: end of stream
         }
-        if (len == 0)
-        {
-            return 0;
-        }
+        // len == 0 is not special: Linux's tcp_recvmsg runs its loop once, so
+        // data queued gives 0 (nothing consumed) and an empty socket gives
+        // EAGAIN - an application reads a bare 0 as EOF.
         if (connection->bytes_available() > 0)
         {
             // MSG_TRUNC on TCP: the bytes are counted (and, unless peeking,

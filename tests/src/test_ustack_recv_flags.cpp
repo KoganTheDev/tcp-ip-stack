@@ -483,8 +483,8 @@ TEST_F(UstackRecvFlags, TcpTruncAllowsANullBufferAndOtherwiseItIsEfault)
     EXPECT_EQ(client->recv(c, nullptr, 20, MSG_TRUNC | MSG_WAITALL), 7) << "non-blocking: what is there";
     EXPECT_EQ(client->recv(c, nullptr, 4, MSG_TRUNC), -1);
     EXPECT_EQ(errno, EAGAIN);
-    EXPECT_EQ(client->recv(c, nullptr, 0, MSG_DONTWAIT), 0)
-        << "len 0 with nothing queued differs from Linux (EAGAIN): not compared";
+    EXPECT_EQ(client->recv(c, nullptr, 0, MSG_DONTWAIT), -1) << "len 0 runs the normal path, as Linux does";
+    EXPECT_EQ(errno, EAGAIN);
 }
 
 TEST_F(UstackRecvFlags, BlockingWaitallTruncDiscardsIntoANullBuffer)
