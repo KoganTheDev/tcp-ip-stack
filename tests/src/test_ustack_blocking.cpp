@@ -310,7 +310,10 @@ TEST_F(UstackBlocking, PeerResetDuringBlockedRecvIsEconnreset)
 
 TEST_F(UstackBlocking, BlockingSendQueuesEveryByteWhileThePeerDrains)
 {
-    auto [c, s] = blocking_pair();
+    const std::pair<int, int> fds =
+        blocking_pair(); // named, not a structured binding: C++17 lambdas cannot capture those
+    const int c = fds.first;
+    const int s = fds.second;
     set_timeout(*client, c, SO_SNDTIMEO, 60000);
     const size_t total = 2 * 1024 * 1024; // far above the send buffer
     std::string data(total, 'x');
@@ -373,7 +376,10 @@ TEST_F(UstackBlocking, UdpSendtoNeverBlocksAndRecvfromWaits)
 
 TEST_F(UstackBlocking, ClosingTheFdFromInsideThePumpIsEbadfNotAUseAfterFree)
 {
-    auto [c, s] = blocking_pair();
+    const std::pair<int, int> fds =
+        blocking_pair(); // named, not a structured binding: C++17 lambdas cannot capture those
+    const int c = fds.first;
+    const int s = fds.second;
     static_cast<void>(s);
     set_timeout(*client, c, SO_RCVTIMEO, 5000);
     on_tick(1, [&] { client->close(c); });
@@ -386,7 +392,10 @@ TEST_F(UstackBlocking, AFdReusedDuringThePumpIsStillEbadf)
 {
     // The hook closes the fd and opens a new socket, which takes the same
     // number. The blocked call must not wake on, or touch, the new one.
-    auto [c, s] = blocking_pair();
+    const std::pair<int, int> fds =
+        blocking_pair(); // named, not a structured binding: C++17 lambdas cannot capture those
+    const int c = fds.first;
+    const int s = fds.second;
     static_cast<void>(s);
     int reused = -1;
     on_tick(1,
