@@ -1,13 +1,16 @@
 #pragma once
 
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/epoll.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 
 #include <cerrno>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <list>
 #include <map>
 #include <memory>
@@ -78,9 +81,11 @@
 // so a V6ONLY listener and an AF_INET listener cannot share a port - a
 // dual-stack socket is the way to serve both.
 //
-// What is not here: MSG_PEEK and every other flag but MSG_DONTWAIT/MSG_NOSIGNAL
-// (MSG_NOSIGNAL accepted, and meaningless here), connect() on a UDP socket,
-// nesting one ustack epoll inside another, poll()/select(), and every fcntl()
+// What is not here: every send/recv flag but MSG_DONTWAIT/MSG_NOSIGNAL/
+// MSG_PEEK/MSG_WAITALL/MSG_TRUNC (MSG_NOSIGNAL accepted, and meaningless
+// here; see recvfrom()), urgent data (MSG_OOB, so select()'s exceptional set
+// is always empty), connect() on a UDP socket,
+// nesting one ustack epoll inside another, and every fcntl()
 // command but F_GETFL/F_SETFL (O_NONBLOCK only) and F_GETFD/F_SETFD.
 //
 // Not thread-safe: one thread owns a Stack and everything it drives.
@@ -219,6 +224,22 @@ namespace ustack
         // error is returned by this call instead of through SO_ERROR.
         int connect(int fd, const struct sockaddr* addr, socklen_t addrlen);
         ssize_t send(int fd, const void* buf, size_t len, int flags);
+        // recv() flags, with Linux's semantics: MSG_DONTWAIT (one call
+        // non-blocking), MSG_PEEK (TCP: copy without consuming, so repeated
+        // peeks see the same bytes and a peek is not a new edge for EPOLLET;
+        // UDP: the datagram stays queued), MSG_WAITALL (TCP: wait for len
+        // bytes, but return the partial count at EOF, on an error or when
+        // SO_RCVTIMEO expires, and on a non-blocking socket or with
+        // MSG_DONTWAIT take only what is there; UDP ignores it), MSG_TRUNC
+        // (UDP: return the datagram's real length even if it was cut short;
+        // TCP: consume - or with MSG_PEEK just count - bytes without copying
+        // them), MSG_NOSIGNAL (accepted, meaningless). Like Linux, any other
+        // flag is ignored, except that MSG_OOB on TCP is EINVAL: there is no
+        // urgent data. (send() is stricter: its flags other than MSG_DONTWAIT
+        // and MSG_NOSIGNAL are EOPNOTSUPP.) A deviation: after a partial
+        // MSG_WAITALL read cut short by an error, the error is kept for the
+        // next call, as Linux does, but the readiness bits (EPOLLERR) are not
+        // re-announced to an edge-triggered epoll.
         ssize_t recv(int fd, void* buf, size_t len, int flags);
         // UDP: one datagram each. A datagram larger than the interface MTU
         // allows fails with EMSGSIZE (no IP fragmentation on send); recvfrom()
@@ -268,6 +289,35 @@ namespace ustack
         // third argument is an int, not a variadic, so ustack::KernelStack
         // forwards it with no va_list handling.
         int fcntl(int fd, int cmd, int arg = 0);
+
+        // --- poll and select ---
+        // Readiness is _poll(fd), the same function epoll_wait() asks, so the
+        // three calls cannot disagree. Both block as the F1 calls do: they
+        // pump the stack with the remaining time (the driver's clock, so a
+        // timeout is virtual time in the simulator, a real sleep on the
+        // RealDriver) and fail with EDEADLK if there is no timeout and nothing
+        // could ever happen.
+        //
+        // poll(): revents is what is ready among `events` plus POLLERR and
+        // POLLHUP, which are always reported (POLLIN, POLLOUT, POLLRDHUP,
+        // POLLERR, POLLHUP as epoll reports them). An fd that is not an open
+        // fd of this Stack gets POLLNVAL in revents (not an error) and counts
+        // as ready; so does one closed - or closed and reused - while the call
+        // waits. A negative fd is ignored (revents 0). timeout_ms -1 waits
+        // forever, 0 only looks. POLLPRI is accepted and never reported.
+        int poll(struct pollfd* fds, nfds_t nfds, int timeout_ms);
+        // select(): EBADF for a set bit that is not an open fd (also if it is
+        // closed during the wait), EINVAL for nfds outside [0, FD_SETSIZE] or
+        // a bad timeval (Linux clamps nfds to its fd table instead of failing,
+        // so it silently ignores a bit for an fd number past the table's end
+        // where this reports EBADF).
+        // Readable is POLLIN|POLLHUP|POLLERR and writable POLLOUT|POLLERR, as
+        // in Linux. The exceptional set is Linux's too, EPOLLPRI alone, so it
+        // is always empty: there is no urgent data (MSG_OOB) here. On return
+        // the sets hold only the ready fds (all cleared on timeout), the
+        // result is the number of bits set, and `timeout` is updated with the
+        // time not slept, as Linux does.
+        int select(int nfds, fd_set* readfds, fd_set* writefds, fd_set* exceptfds, struct timeval* timeout);
 
         // --- epoll ---
         // flags: 0 or EPOLL_CLOEXEC (a no-op).
@@ -424,6 +474,10 @@ namespace ustack
         ssize_t _sendto_once(int fd, const void* buf, size_t len, int flags, const struct sockaddr* dest_addr,
                              socklen_t addrlen);
         ssize_t _recvfrom_once(int fd, void* buf, size_t len, int flags, struct sockaddr* src_addr, socklen_t* addrlen);
+        // recv() with MSG_WAITALL on a TCP socket: keeps taking what is there
+        // until len bytes, EOF, an error, SO_RCVTIMEO or (if it may not wait)
+        // nothing more, as tcp_recvmsg does. Returns what recv() would.
+        ssize_t _recv_waitall(int fd, void* buf, size_t len, int flags, struct sockaddr* src_addr, socklen_t* addrlen);
         // Pumps the stack until _poll(fd) has one of `events`, deadline (the
         // driver's now_ms()) passes, or something goes wrong. Returns 0 when
         // ready, EAGAIN on timeout, EBADF if the fd was closed (or reused) while
@@ -432,6 +486,13 @@ namespace ustack
         // ready and its attempt still would block, so look again only after
         // the stack has moved (never a busy loop).
         int _block_until(int fd, uint32_t events, std::optional<uint64_t> deadline, bool must_wait = false);
+        // The pump loop under _block_until() and poll()/select(): runs the
+        // stack until done() is true (checked first, unless must_wait, and
+        // after every pump), the deadline passes (EAGAIN) or the driver can
+        // never make progress (EDEADLK). Returns 0 when done() was true.
+        // done() runs after application callbacks may have closed fds, so it
+        // must look everything up afresh.
+        int _pump_until(const std::function<bool()>& done, std::optional<uint64_t> deadline, bool must_wait = false);
         // now + timeout_us on the driver's clock, or nullopt for "forever".
         std::optional<uint64_t> _deadline(int64_t timeout_us);
         int _new_fd(std::unique_ptr<Socket> socket);

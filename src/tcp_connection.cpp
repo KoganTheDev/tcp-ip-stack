@@ -583,6 +583,21 @@ void TcpConnection::set_data_ready_callback(DataReadyFn callback)
     }
 }
 
+Bytes TcpConnection::peek(size_t max_bytes) const
+{
+    Bytes seen;
+    for (const Bytes& chunk : _receive_queue)
+    {
+        if (seen.size() >= max_bytes)
+        {
+            break;
+        }
+        const size_t room = max_bytes - seen.size();
+        seen |= chunk.size() <= room ? chunk : chunk.slice(0, room);
+    }
+    return seen;
+}
+
 Bytes TcpConnection::read(size_t max_bytes)
 {
     EntryScope scope(*this);
