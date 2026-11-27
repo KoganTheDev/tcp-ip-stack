@@ -452,6 +452,12 @@ namespace ustack
             // UDP
             UdpSocket* udp = nullptr;
             std::deque<Datagram> received;
+            // connect() fixed a default peer (peer_ip/peer_port); local_ip is
+            // then the address datagrams leave from.
+            bool udp_connected = false;
+            // The port came from bind() naming one, so disconnecting keeps it;
+            // an automatic one (bind to 0, or an implicit bind) is given back.
+            bool port_from_bind = false;
 
             // EPOLL
             std::unique_ptr<EpollInstance> epoll;
@@ -529,6 +535,8 @@ namespace ustack
         int _bind_port(int fd, Socket& socket, uint16_t port);
         void _on_connection_state(uint64_t connection_id, TcpState state);
         int _take_error(Socket& socket);
+        // connect() on a datagram socket, AF_UNSPEC included.
+        int _connect_udp(int fd, Socket& socket, const struct sockaddr* addr, socklen_t addrlen);
         // As the socket's family: a v4 address on an AF_INET6 socket is given
         // in its v4-mapped form.
         static int _fill_address(int family, const IpAddress& ip, uint16_t port, struct sockaddr* addr,
