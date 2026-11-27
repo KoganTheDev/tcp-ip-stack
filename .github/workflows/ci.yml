@@ -57,7 +57,7 @@ jobs:
 
       - name: Upload test results
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: test-results-debug-${{ matrix.cxx }}
           path: build/debug/test-results/
@@ -83,7 +83,7 @@ jobs:
 
       - name: Upload captures and logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: sim-pcaps
           path: |
@@ -122,7 +122,7 @@ jobs:
 
       - name: Upload test results
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: test-results-strict
           path: build/strict/test-results/
@@ -237,7 +237,7 @@ jobs:
 
       - name: Upload test results
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: test-results-${{ matrix.sanitizer }}
           path: test-results/
@@ -279,14 +279,14 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the HTML report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: coverage-html
           path: build/coverage/html/
 
       - name: Upload test results
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: test-results-coverage
           path: test-results/
@@ -323,7 +323,7 @@ jobs:
       - uses: ./.github/actions/install-libfuzzer
 
       - name: Restore the grown corpus
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: build/fuzz/corpus
           key: fuzz-corpus-restore-only
@@ -334,7 +334,7 @@ jobs:
 
       - name: Upload reproducers and logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: fuzz-crashes
           path: |
