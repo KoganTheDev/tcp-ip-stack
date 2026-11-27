@@ -7,6 +7,11 @@ UdpSocket::UdpSocket(uint16_t local_port, SendDatagramFn send_datagram)
 
 void UdpSocket::on_datagram(const IpAddress& src_ip, const Udp& segment)
 {
+    if (_peer && (_peer->ip != src_ip || _peer->port != segment.get_src_port()))
+    {
+        _datagrams_filtered++;
+        return;
+    }
     if (!_on_datagram_received)
     {
         return; // nobody's listening on this socket yet - drop, like a kernel socket with no recvfrom() call pending
@@ -30,6 +35,15 @@ bool UdpSocket::on_datagram(const IpAddress& src_ip, const IpAddress& dest_ip, c
     {
         return false;
     }
+    // Checked here as well as in the two-argument form, because only this one
+    // can say "refused": a connected socket does not match a datagram from
+    // anyone else, so with no other socket on the port Linux answers it with
+    // Port Unreachable - and the peer's own connected socket then sees that.
+    if (_peer && (_peer->ip != src_ip || _peer->port != segment.get_src_port()))
+    {
+        _datagrams_filtered++;
+        return false;
+    }
     on_datagram(src_ip, segment);
     return true;
 }
@@ -47,4 +61,23 @@ void UdpSocket::send_to(const IpAddress& dest_ip, uint16_t dest_port, const Byte
 void UdpSocket::set_datagram_received_callback(DatagramReceivedFn callback)
 {
     _on_datagram_received = std::move(callback);
+}
+
+void UdpSocket::set_error_callback(ErrorFn callback)
+{
+    _on_error = std::move(callback);
+}
+
+void UdpSocket::connect_peer(const IpAddress& peer_ip, uint16_t peer_port)
+{
+    _peer = Peer{peer_ip, peer_port};
+}
+
+void UdpSocket::on_icmp_error(const IpAddress& dest_ip, uint16_t dest_port, int error)
+{
+    if (!_peer || _peer->ip != dest_ip || _peer->port != dest_port || !_on_error)
+    {
+        return;
+    }
+    _on_error(error);
 }

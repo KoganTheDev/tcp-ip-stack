@@ -1,3 +1,4 @@
+#include <cerrno>
 #include "network_stack.h"
 #include "tcp_sequence.h"
 #include "raw.h"
@@ -66,6 +67,41 @@ namespace
     bool is_icmp_error_type(uint8_t type)
     {
         return type == 3 || type == 4 || type == 5 || type == 11 || type == 12;
+    }
+
+    // What Linux makes of an ICMP Destination Unreachable code for a UDP
+    // socket (icmp_err_convert): the errno, and whether the error is hard.
+    // With IP_RECVERR off only hard errors reach a connected socket - net and
+    // host unreachable are routinely transient, so a datagram socket hears
+    // nothing of them. Verified against a 7.x kernel by injecting each code.
+    struct UdpIcmpError
+    {
+        int error;
+        bool hard;
+    };
+
+    UdpIcmpError udp_error_for_icmp_code(uint8_t code)
+    {
+        switch (code)
+        {
+        case 0: return {ENETUNREACH, false};   // net unreachable
+        case 1: return {EHOSTUNREACH, false};  // host unreachable
+        case 2: return {ENOPROTOOPT, true};    // protocol unreachable
+        case 3: return {ECONNREFUSED, true};   // port unreachable
+        case 4: return {EMSGSIZE, true};       // fragmentation needed (default PMTU discovery)
+        case 5: return {EOPNOTSUPP, false};    // source route failed
+        case 6: return {ENETUNREACH, true};    // destination network unknown
+        case 7: return {EHOSTDOWN, true};      // destination host unknown
+        case 8: return {ENONET, true};         // source host isolated
+        case 9: return {ENETUNREACH, true};    // network administratively prohibited
+        case 10: return {EHOSTUNREACH, true};  // host administratively prohibited
+        case 11: return {ENETUNREACH, false};  // network unreachable for TOS
+        case 12: return {EHOSTUNREACH, false}; // host unreachable for TOS
+        case 13: return {EHOSTUNREACH, true};  // communication administratively prohibited
+        case 14: return {EHOSTUNREACH, true};  // host precedence violation
+        case 15: return {EHOSTUNREACH, true};  // precedence cutoff
+        default: return {0, false};
+        }
     }
 
     // RFC 792: an error quotes the offending packet's IP header - all of it,
@@ -2392,8 +2428,8 @@ TcpConnection* NetworkStack::_connection_from_icmp_quote(const Icmp& icmp, uint3
     uint8_t protocol = embedded[9];
     if (protocol != IpProtocol::TCP)
     {
-        // UDP is connectionless - there's no per-connection state to act on,
-        // and a lost datagram is already UDP's contract. Only TCP benefits.
+        // UDP errors take their own path (_handle_icmp_udp_error): only a
+        // connected socket has a peer for one to be about.
         return nullptr;
     }
 
@@ -2456,8 +2492,43 @@ void NetworkStack::_handle_icmp_fragmentation_needed(const Icmp& icmp)
     connection->reduce_effective_mss(path_mss);
 }
 
+void NetworkStack::_handle_icmp_udp_error(const Icmp& icmp, const Bytes& quoted)
+{
+    const UdpIcmpError mapped = udp_error_for_icmp_code(icmp.get_code());
+    if (!mapped.hard)
+    {
+        LOG_DEBUG("NetworkStack: ignoring an ICMP Destination Unreachable code "
+                  << static_cast<int>(icmp.get_code()) << " for a UDP datagram - not a hard error");
+        return;
+    }
+    const size_t ihl = static_cast<size_t>(quoted[0] & 0x0f) * 4;
+    IPv4Address original_dest(quoted.slice(16, 4));
+    uint16_t local_port = quoted.slice_int<uint16_t>(ihl);
+    uint16_t remote_port = quoted.slice_int<uint16_t>(ihl + 2);
+    auto it = this->_udp_sockets.find(local_port);
+    if (it == this->_udp_sockets.end())
+    {
+        return;
+    }
+    it->second->on_icmp_error(original_dest, remote_port, mapped.error);
+}
+
 void NetworkStack::_handle_icmp_error(const Icmp& icmp)
 {
+    if (const Raw* raw = icmp.has_next_layer() ? dynamic_cast<const Raw*>(&icmp.get_next_layer()) : nullptr)
+    {
+        const Bytes& quoted = raw->get_data();
+        if (quoted.size() >= 28 && quoted[9] == IpProtocol::UDP && (quoted[0] >> 4) == 4)
+        {
+            const size_t ihl = static_cast<size_t>(quoted[0] & 0x0f) * 4;
+            if (ihl >= 20 && quoted.size() >= ihl + 4)
+            {
+                this->_handle_icmp_udp_error(icmp, quoted);
+            }
+            return;
+        }
+    }
+
     // Fragmentation Needed is not a failure. It says the destination is fine
     // and the packet was simply too big for a link on the way - the answer is
     // to send smaller ones, not to give up. Failing the connection on it, as
@@ -2820,6 +2891,32 @@ bool NetworkStack::_is_broadcast_for_any_interface(const IPv4Address& ip) const
         }
     }
     return false;
+}
+
+std::optional<IpAddress> NetworkStack::source_address_for(const IpAddress& destination) const
+{
+    if (destination.is_v6())
+    {
+        IPv6Address next_hop;
+        if (!this->_is_local_ipv6(destination.v6()) && !this->_ipv6_route_for(destination.v6(), next_hop))
+        {
+            return std::nullopt;
+        }
+        std::optional<IPv6Address> source = this->_ipv6_source_for(destination.v6());
+        if (!source)
+        {
+            return std::nullopt;
+        }
+        return IpAddress(*source);
+    }
+    const bool local = this->is_local_address(destination);
+    IPv4Address next_hop;
+    size_t egress = 0;
+    if (!local && !this->_route_for(destination.v4(), next_hop, egress))
+    {
+        return std::nullopt;
+    }
+    return IpAddress(this->_source_address_for(destination.v4(), local));
 }
 
 IPv4Address NetworkStack::_source_address_for(const IPv4Address& dest_ip, bool local) const
