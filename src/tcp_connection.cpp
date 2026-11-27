@@ -506,13 +506,24 @@ void TcpConnection::_send_pure_ack()
     _ack_deadline_ms = 0;
 }
 
+void TcpConnection::set_quickack(bool on)
+{
+    _pingpong = !on;
+    _quick_acks = on ? QUICKACK_SEGMENTS : 0;
+}
+
 void TcpConnection::_schedule_or_send_ack()
 {
     // RFC 1122 4.2.3.2: an in-order segment needn't be acked at once - hold the
     // ack briefly to coalesce it with the next segment or piggyback it on
     // outgoing data. But ack at least every *second* full-sized segment, so a
     // second segment arriving with one already pending forces the ack out now.
-    if (_ack_pending)
+    if (_quick_acks > 0)
+    {
+        _quick_acks--;
+        _send_pure_ack();
+    }
+    else if (_ack_pending)
     {
         _send_pure_ack(); // clears the pending state
     }
@@ -2757,6 +2768,7 @@ void TcpConnection::_run_timers()
     if (_ack_pending && _now_ms >= _ack_deadline_ms)
     {
         _send_pure_ack();
+        _pingpong = false; // Linux leaves ping-pong mode when the delayed ack fires
     }
 
     // The user timeout (see set_user_timeout): counts only while there is

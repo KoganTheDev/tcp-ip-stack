@@ -250,6 +250,19 @@ public:
     // here or in flight. The answer to "has my data actually gone", which
     // nothing could previously ask.
     size_t bytes_unacked() const;
+    // Of those, the bytes still waiting for window room: not yet put on the
+    // wire at all (SIOCOUTQNSD).
+    size_t bytes_unsent() const { return _send_queued_bytes; }
+
+    // TCP_QUICKACK. true: ack the next QUICKACK_SEGMENTS in-order segments at
+    // once instead of holding each for the delayed-ACK timer (a pending ack
+    // is left to its timer, as Linux leaves it). false: back to delayed acks
+    // (Linux's "ping-pong" mode), and quickack() reads false - until a delayed
+    // ack fires, which puts Linux, and this, back to true. Not permanent, as
+    // the man page says: the protocol re-enters and leaves the mode itself.
+    void set_quickack(bool on);
+    bool quickack() const { return !_pingpong; }
+    static constexpr uint32_t QUICKACK_SEGMENTS = 16; // Linux's TCP_MAX_QUICKACKS
     // Whether seq lies in [SND.UNA, SND.NXT) - i.e. names a segment this side
     // sent and the peer has not yet acknowledged. RFC 5927's test for an ICMP
     // error that claims to be about this connection: a genuine one quotes such
@@ -1144,6 +1157,8 @@ private:
 
     // --- delayed ACK ---
     bool _ack_pending;              // an in-order segment is awaiting a coalesced ack
+    bool _pingpong = false;         // TCP_QUICKACK cleared: see set_quickack()
+    uint32_t _quick_acks = 0;       // segments still to be acked at once
     uint64_t _ack_deadline_ms;      // when a pending ack is forced out
 
     // --- keepalive (RFC 1122 4.2.3.6) ---

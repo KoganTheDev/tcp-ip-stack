@@ -254,6 +254,7 @@ namespace
     TEST_F(UstackIoctlLowat, PollSelectAndEpollWaitForTheMark)
     {
         auto [c, s] = connected_pair();
+        ASSERT_EQ(set_int(*client, c, IPPROTO_TCP, TCP_NODELAY, 1), 0) << "small writes must not wait behind Nagle";
         ASSERT_EQ(set_int(*server, s, SOL_SOCKET, SO_RCVLOWAT, 5), 0);
         int epfd = server->epoll_create1(0);
         ASSERT_EQ(add(*server, epfd, s, EPOLLIN), 0);
@@ -327,6 +328,7 @@ namespace
         timeval timeout{0, 300000};
         ASSERT_EQ(client->setsockopt(bc, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), 0);
         ASSERT_EQ(set_int(*client, bc, SOL_SOCKET, SO_RCVLOWAT, 10), 0);
+        ASSERT_EQ(set_int(*server, bs, IPPROTO_TCP, TCP_NODELAY, 1), 0);
         ASSERT_EQ(server->send(bs, "abc", 3, MSG_NOSIGNAL), 3);
         net.step(100);
 

@@ -166,7 +166,7 @@ namespace
         note("SIOCOUTQ no connection", ioctl_text(client, fresh, SIOCOUTQ));
         note("FIONREAD empty", ioctl_text(server, s, FIONREAD));
         REQUIRE_TRUE(client.send(c, "hello", 5, MSG_NOSIGNAL) == 5, failure());
-        h.settle(100);
+        h.settle(400); // past ustack's delayed-ACK timer: Linux acks the first segments at once
         note("FIONREAD 5 queued", ioctl_text(server, s, FIONREAD));
         note("SIOCINQ 5 queued", ioctl_text(server, s, SIOCINQ));
         note("SIOCOUTQ sender, acked", ioctl_text(client, c, SIOCOUTQ));
@@ -288,6 +288,9 @@ namespace
         int c = pair.client;
         int s = pair.server;
         int udp = client.socket(AF_INET, SOCK_DGRAM, 0);
+        // Small writes must not wait behind Nagle for a delayed ACK (ustack's
+        // first ACK is delayed, Linux's is not): the mark is what is tested.
+        REQUIRE_TRUE(set_option(client, c, IPPROTO_TCP, TCP_NODELAY, 1) == "ok", failure());
 
         note("get RCVLOWAT default", int_option(server, s, SOL_SOCKET, SO_RCVLOWAT));
         note("set 0", set_option(server, s, SOL_SOCKET, SO_RCVLOWAT, 0));

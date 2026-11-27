@@ -464,6 +464,8 @@ namespace ustack
             // before a connection exists and inherited across accept().
             bool keepalive = false;
             bool nodelay = false;
+            bool quickack = true;  // TCP_QUICKACK as set; a live connection answers for itself
+            int rcvlowat = 1;      // SO_RCVLOWAT, already clamped (TCP only acts on it)
             // SO_RCVBUF / SO_SNDBUF: the payload capacity the application
             // asked for, already clamped (what getsockopt doubles). Locked
             // once set, so receive-buffer autotuning (when there is any) must
@@ -524,7 +526,12 @@ namespace ustack
         // recv() with MSG_WAITALL on a TCP socket: keeps taking what is there
         // until len bytes, EOF, an error, SO_RCVTIMEO or (if it may not wait)
         // nothing more, as tcp_recvmsg does. Returns what recv() would.
-        ssize_t _recv_waitall(int fd, void* buf, size_t len, int flags, struct sockaddr* src_addr, socklen_t* addrlen);
+        ssize_t _recv_waitall(int fd, void* buf, size_t len, size_t target, int flags, struct sockaddr* src_addr,
+                              socklen_t* addrlen);
+        // SO_RCVLOWAT as it acts on a TCP socket: at least 1, and never more
+        // than the connection can ever queue (Linux grows the buffer for a
+        // big mark; here a mark above the capacity would never be reached).
+        size_t _rcvlowat(const Socket& socket) const;
         // Pumps the stack until _poll(fd) has one of `events`, deadline (the
         // driver's now_ms()) passes, or something goes wrong. Returns 0 when
         // ready, EAGAIN on timeout, EBADF if the fd was closed (or reused) while
