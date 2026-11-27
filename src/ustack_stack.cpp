@@ -2169,6 +2169,16 @@ namespace ustack
         }
     }
 
+    int Stack::poll(struct pollfd*, nfds_t, int)
+    {
+        return fail(ENOSYS);
+    }
+
+    int Stack::select(int, fd_set*, fd_set*, fd_set*, struct timeval*)
+    {
+        return fail(ENOSYS);
+    }
+
     int Stack::run_once(int timeout_ms)
     {
         CallScope scope(*this);

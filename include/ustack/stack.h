@@ -1,7 +1,9 @@
 #pragma once
 
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/epoll.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 
@@ -268,6 +270,11 @@ namespace ustack
         // third argument is an int, not a variadic, so ustack::KernelStack
         // forwards it with no va_list handling.
         int fcntl(int fd, int cmd, int arg = 0);
+
+        // --- poll and select ---
+        // Placeholder: see the commit that implements them.
+        int poll(struct pollfd* fds, nfds_t nfds, int timeout_ms);
+        int select(int nfds, fd_set* readfds, fd_set* writefds, fd_set* exceptfds, struct timeval* timeout);
 
         // --- epoll ---
         // flags: 0 or EPOLL_CLOEXEC (a no-op).

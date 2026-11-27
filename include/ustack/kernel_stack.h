@@ -1,6 +1,8 @@
 #pragma once
 
 #include <fcntl.h>
+#include <poll.h>
+#include <sys/select.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -70,6 +72,13 @@ namespace ustack
         // An int third argument, like ustack::Stack's, so this is a plain
         // forward; ::fcntl itself is variadic.
         int fcntl(int fd, int cmd, int arg = 0) { return ::fcntl(fd, cmd, arg); }
+
+        // --- poll and select ---
+        int poll(struct pollfd* fds, nfds_t nfds, int timeout_ms) { return ::poll(fds, nfds, timeout_ms); }
+        int select(int nfds, fd_set* readfds, fd_set* writefds, fd_set* exceptfds, struct timeval* timeout)
+        {
+            return ::select(nfds, readfds, writefds, exceptfds, timeout);
+        }
 
         // --- epoll ---
         int epoll_create1(int flags) { return ::epoll_create1(flags); }
