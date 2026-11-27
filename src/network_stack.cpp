@@ -705,16 +705,15 @@ void NetworkStack::set_connection_reuse(uint64_t connection_id, bool reuseaddr, 
 void NetworkStack::for_each_connection_on_port(
     uint16_t port, const std::function<void(const IpAddress& local, bool reuseaddr, bool reuseport)>& visit) const
 {
-    // A walk of every connection, but only for a port some connection uses:
-    // bind() is rare and this is never on the packet path.
-    if (this->_connections_per_port.count(port) == 0)
+    auto port_it = this->_connections_by_port.find(port);
+    if (port_it == this->_connections_by_port.end())
     {
         return;
     }
-    for (const auto& entry : this->_connections_by_id)
+    for (uint64_t connection_id : port_it->second)
     {
-        const ConnectionRecord& record = entry.second;
-        if (record.key.local_port == port && record.connection->get_state() != TcpState::CLOSED)
+        const ConnectionRecord& record = this->_connections_by_id.at(connection_id);
+        if (record.connection->get_state() != TcpState::CLOSED)
         {
             visit(record.key.local_ip, record.reuseaddr, record.reuseport);
         }
@@ -1081,7 +1080,7 @@ void NetworkStack::_register_connection(const ConnectionKey& key, std::unique_pt
     this->_wire_connection(*connection_ptr);
     this->_connections_by_id[connection_id] = ConnectionRecord{key, connection_ptr, TcpConnection::NO_DEADLINE};
     this->_connections[key] = std::move(connection);
-    this->_connections_per_port[key.local_port] += 1;
+    this->_connections_by_port[key.local_port].push_back(connection_id);
     // It may have armed a timer before it was wired (the SYN-ACK
     // accept_incoming_syn() sent), when there was nobody to tell.
     this->_schedule_connection_timer(connection_id);
@@ -1605,10 +1604,20 @@ void NetworkStack::_reap_connection(uint64_t connection_id)
     reaped.connections += 1;
     reaped.retransmit_timeouts += id_it->second.connection->stats().retransmit_timeouts;
     reaped.retransmitted_segments += id_it->second.connection->stats().retransmitted_segments;
-    auto port_it = this->_connections_per_port.find(id_it->second.key.local_port);
-    if (port_it != this->_connections_per_port.end() && --port_it->second == 0)
+    auto port_it = this->_connections_by_port.find(id_it->second.key.local_port);
+    if (port_it != this->_connections_by_port.end())
     {
-        this->_connections_per_port.erase(port_it);
+        std::vector<uint64_t>& ids = port_it->second;
+        auto found = std::find(ids.begin(), ids.end(), connection_id);
+        if (found != ids.end())
+        {
+            *found = ids.back();
+            ids.pop_back();
+        }
+        if (ids.empty())
+        {
+            this->_connections_by_port.erase(port_it);
+        }
     }
     this->_connections.erase(id_it->second.key);
     this->_connections_by_id.erase(id_it);

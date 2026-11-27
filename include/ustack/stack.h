@@ -531,6 +531,7 @@ namespace ustack
             bool receive_capacity_locked = false;
             bool send_capacity_set = false;
             bool reuseaddr = false;
+            bool reuseport = false; // SO_REUSEPORT
             struct linger linger{};
             uint32_t user_timeout_ms = TcpConnection::DEFAULT_USER_TIMEOUT_MS;
             bool user_timeout_set = false;
@@ -538,6 +539,7 @@ namespace ustack
 
             // TCP
             bool listening = false;
+            NetworkStack::ListenerId listener_id = 0; // while listening
             uint64_t connection_id = 0; // 0: no connection (yet)
             // The connection reached CLOSED; it may already be reaped, so it
             // is not looked up again.
@@ -633,9 +635,43 @@ namespace ustack
         // the pollable fd's signal.
         void _after_call();
         void _update_signal();
-        uint16_t _ephemeral_port(Kind kind);
+        // A free port for bind(0), listen()'s or sendto()'s automatic bind:
+        // one nothing of this Stack is bound to and, as Linux's
+        // inet_csk_find_open_port, that no connection holds in a way
+        // _bind_conflict() objects to. (connect() takes its port from
+        // NetworkStack, which needs only a unique four-tuple.)
+        uint16_t _ephemeral_port(int fd, const Socket& socket, const IpAddress& ip);
         bool _port_taken(Kind kind, uint16_t port) const;
-        int _bind_port(int fd, Socket& socket, uint16_t port);
+        // Binds `socket` to port (0: an ephemeral one) at `ip`, or returns
+        // EADDRINUSE when _bind_conflict() says another socket or connection
+        // holds it.
+        int _bind_port(int fd, Socket& socket, uint16_t port, const IpAddress& ip);
+        // Linux's inet_csk_bind_conflict / udp_lib_lport_inuse, for `socket`
+        // at ip:port (listening: as it would be once listening). Two bindings
+        // conflict when their addresses overlap (_overlaps) unless both set
+        // SO_REUSEADDR and the one already there is not listening, or both set
+        // SO_REUSEPORT (one owner here, so Linux's same-uid test always
+        // holds). For TCP every live connection on the port counts as well -
+        // accepted, connecting, or left in TIME_WAIT by a closed socket - with
+        // the flags its socket had.
+        bool _bind_conflict(int fd, const Socket& socket, const IpAddress& ip, uint16_t port, bool listening) const;
+        // Which local addresses a binding covers, per family: none, every one
+        // (a wildcard), or one. A dual-stack :: covers both families'
+        // wildcards; a v4-mapped bind is an IPv4 one.
+        struct Coverage
+        {
+            enum class Part
+            {
+                NONE,
+                ANY,
+                ONE,
+            };
+            Part v4 = Part::NONE;
+            Part v6 = Part::NONE;
+            IpAddress address; // for ONE
+        };
+        static Coverage _coverage(int family, bool v6only, const IpAddress& ip);
+        static bool _overlaps(const Coverage& a, const Coverage& b);
         void _on_connection_state(uint64_t connection_id, TcpState state);
         int _take_error(Socket& socket);
         // connect() on a datagram socket, AF_UNSPEC included.
@@ -662,9 +698,13 @@ namespace ustack
 
         std::vector<std::unique_ptr<Socket>> _sockets; // indexed by fd; nullptr = free
         std::unordered_map<uint64_t, int> _fd_by_connection;
-        std::unordered_map<uint16_t, int> _listener_by_port;
-        std::unordered_set<uint16_t> _tcp_ports; // bound by a socket of this Stack
-        std::unordered_set<uint16_t> _udp_ports;
+        std::unordered_map<NetworkStack::ListenerId, int> _fd_by_listener;
+        // Per port, the sockets of this Stack bound there (bind() or an
+        // automatic bind), in bind order. Accepted sockets are not here:
+        // their connections are, through NetworkStack.
+        std::unordered_map<uint16_t, std::vector<int>> _tcp_binds;
+        std::unordered_map<uint16_t, std::vector<int>> _udp_binds;
+        void _unbind(Kind kind, uint16_t port, int fd);
         std::unordered_set<int> _epoll_fds;
         uint16_t _next_ephemeral = FIRST_EPHEMERAL_PORT;
         uint64_t _next_serial = 1;

@@ -1357,9 +1357,9 @@ private:
         bool reuseaddr = false; // see set_connection_reuse()
         bool reuseport = false;
     };
-    // Live connections per local port, so for_each_connection_on_port() is
-    // free for a port none uses.
-    std::unordered_map<uint16_t, size_t> _connections_per_port;
+    // The connections on each local port, by id, so for_each_connection_on_port()
+    // visits only those - free for a port none uses.
+    std::unordered_map<uint16_t, std::vector<uint64_t>> _connections_by_port;
     // mutable only for queued_deadline, which ms_until_next_timer() maintains.
     mutable std::unordered_map<uint64_t, ConnectionRecord> _connections_by_id;
 
