@@ -669,6 +669,43 @@ public:
         uint64_t spurious_rtos_undone = 0;       // timeouts undone by Eifel (RFC 3522) or F-RTO (RFC 5682)
     };
     const Stats& stats() const { return _stats; }
+
+    // What getsockopt(TCP_INFO) is built from, in the connection's own units
+    // (milliseconds, bytes); the socket layer converts to Linux's (microseconds,
+    // segments). A snapshot: nothing in it changes afterwards.
+    struct Info
+    {
+        TcpState state = TcpState::CLOSED;
+        bool has_rtt_sample = false;
+        uint32_t srtt_ms = 0;
+        uint32_t rttvar_ms = 0;
+        uint32_t rto_ms = 0;
+        uint32_t cwnd_bytes = 0;
+        uint32_t ssthresh_bytes = 0; // UINT32_MAX while uncapped (no loss yet)
+        uint32_t cwnd_unit_bytes = 0; // the MSS cwnd is counted in
+        uint32_t send_mss = 0;       // payload per segment, options excluded
+        bool timestamps = false;
+        bool sack = false;
+        bool window_scaling = false;
+        bool ecn = false;
+        uint8_t snd_wscale = 0; // the peer's shift, applied to windows it sends
+        uint8_t rcv_wscale = 0; // ours, applied to the windows we send
+        uint32_t consecutive_timeouts = 0; // RTO retransmissions of the oldest segment
+        uint64_t total_retransmissions = 0;
+        uint32_t unacked_segments = 0;
+        uint32_t sacked_segments = 0;
+        uint32_t lost_segments = 0;
+        uint32_t retransmitted_segments = 0; // retransmitted and still outstanding
+        uint64_t bytes_acked = 0;            // SND.UNA - ISS: counts the SYN, and the FIN once acked
+        uint64_t bytes_received = 0;         // RCV.NXT - IRS - 1: counts the FIN
+        uint32_t notsent_bytes = 0;
+        uint32_t peer_window = 0;
+        uint32_t receive_window = 0;
+        uint32_t receive_space = 0;
+        bool in_recovery = false;
+        bool in_rto_recovery = false;
+    };
+    Info info() const;
     // Scoreboard entries the sender has examined, for cost tests.
     uint64_t scoreboard_visits() const { return _in_flight.visits(); }
     // The part of it spent by RACK.
@@ -1233,6 +1270,9 @@ private:
     // equal modulo 2^32. Every buffered range lies after it and within the
     // window, so (seq - RCV.NXT) + this is a range's unwrapped position.
     uint64_t _recv_next_unwrapped = 0;
+    // RCV.NXT, unwrapped, as it was when the peer's SYN was taken in: what
+    // bytes received are counted from (TCP_INFO's tcpi_bytes_received).
+    uint64_t _recv_start_unwrapped = 0;
     // RCV.NXT + RCV.WND as last advertised, unwrapped like the above: the
     // right edge the window may never be pulled back from (RFC 1122
     // 4.2.2.16). See _advertised_window().
@@ -1241,6 +1281,7 @@ private:
     {
         _recv_next = value;
         _recv_next_unwrapped = value;
+        _recv_start_unwrapped = value;
         _rcv_right_edge_unwrapped = 0; // nothing offered yet relative to this RCV.NXT
     }
     void _advance_recv_next(uint32_t count)

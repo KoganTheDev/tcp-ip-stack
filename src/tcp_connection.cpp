@@ -3040,6 +3040,62 @@ size_t TcpConnection::bytes_unacked() const
     return _send_queued_bytes + _bytes_in_flight();
 }
 
+TcpConnection::Info TcpConnection::info() const
+{
+    Info out;
+    out.state = _state;
+    out.has_rtt_sample = _rtt.has_sample();
+    out.srtt_ms = _rtt.srtt_ms();
+    out.rttvar_ms = _rtt.rttvar_ms();
+    out.rto_ms = static_cast<uint32_t>(_rtt.rto_ms());
+    out.cwnd_bytes = _congestion->window();
+    out.ssthresh_bytes =
+        _congestion->slow_start_threshold_uncapped() ? UINT32_MAX : _congestion->slow_start_threshold();
+    out.cwnd_unit_bytes = _effective_mss;
+    out.send_mss = static_cast<uint32_t>(_max_segment_payload());
+    out.timestamps = _timestamps_negotiated;
+    out.sack = _sack_permitted;
+    out.window_scaling = _window_scaling_negotiated;
+    out.ecn = _ecn_negotiated;
+    out.snd_wscale = _window_scaling_negotiated ? _peer_window_scale : 0;
+    out.rcv_wscale = _window_scaling_negotiated ? WINDOW_SCALE_SHIFT : 0;
+    out.total_retransmissions = _stats.retransmitted_segments;
+    uint32_t una = _send_next;
+    if (!_in_flight.empty())
+    {
+        una = _in_flight.front().seq;
+        out.consecutive_timeouts = static_cast<uint32_t>(std::max(_in_flight.front().retransmit_attempts, 0));
+    }
+    out.unacked_segments = static_cast<uint32_t>(_in_flight.size());
+    out.sacked_segments = _in_flight.sacked_segments();
+    for (const SentSegment& segment : _in_flight)
+    {
+        if (segment.lost && !segment.sacked)
+        {
+            out.lost_segments++;
+        }
+        if (segment.retransmitted)
+        {
+            out.retransmitted_segments++;
+        }
+    }
+    // Linux counts the SYN acked by an active opener, not the SYN-ACK acked by
+    // a passive one (its child socket starts counting after the handshake).
+    out.bytes_acked = static_cast<uint32_t>(una - _iss);
+    if (!_active_open && out.bytes_acked > 0)
+    {
+        out.bytes_acked--;
+    }
+    out.bytes_received = _recv_next_unwrapped - _recv_start_unwrapped;
+    out.notsent_bytes = static_cast<uint32_t>(_send_queued_bytes);
+    out.peer_window = _peer_window;
+    out.receive_window = _advertised_window();
+    out.receive_space = _receive_capacity;
+    out.in_recovery = _in_recovery;
+    out.in_rto_recovery = _rto_recovery;
+    return out;
+}
+
 size_t TcpConnection::send(const Bytes& data)
 {
     EntryScope scope(*this);

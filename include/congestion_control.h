@@ -47,6 +47,10 @@ public:
     // The congestion window in bytes. The sender takes min(this, peer window).
     uint32_t window() const { return _cwnd; }
     uint32_t slow_start_threshold() const { return _ssthresh; }
+    // True until a loss or congestion signal first lowers ssthresh: it still
+    // holds the "no limit" starting value (TCP_INFO shows that as Linux's
+    // TCP_INFINITE_SSTHRESH).
+    bool slow_start_threshold_uncapped() const { return _ssthresh >= INITIAL_SSTHRESH; }
 
     // The handshake finished and settled the effective MSS, which every
     // quantity in here is denominated in. Also the reset point: a window

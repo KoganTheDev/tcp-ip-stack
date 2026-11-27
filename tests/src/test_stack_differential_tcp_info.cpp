@@ -23,6 +23,11 @@
 // SYN, bytes_received does not), and the optlen rules. Compared line by line,
 // as in test_stack_differential.cpp.
 //
+// Explained and tolerated: rtt is compared only for an end that sent data.
+// ustack takes round-trip samples from acked data only (Karn), so right after
+// the handshake, and on a receiver, it has none; Linux also samples the
+// handshake and every timestamp echo.
+//
 // Found by probing: on Linux a socket in TIME_WAIT reads TCP_CLOSE (the
 // timewait sock has taken over), and an unconnected socket reads TCP_CLOSE with
 // rto 1 s, cwnd 10, ssthresh 0x7fffffff and snd_mss 536.
@@ -41,7 +46,7 @@ namespace
     }
 
     template <class S>
-    std::string info_shape(S& s, int fd)
+    std::string info_shape(S& s, int fd, bool sent_data = false)
     {
         tcp_info info;
         std::memset(&info, 0, sizeof(info));
@@ -52,8 +57,8 @@ namespace
         }
         return "len=" + std::to_string(length) + " state=" + std::to_string(info.tcpi_state)
                + " opts=" + std::to_string(info.tcpi_options) + " wscale=" + flag(info.tcpi_snd_wscale != 0) + "/"
-               + flag(info.tcpi_rcv_wscale != 0) + " rto>=200ms=" + flag(info.tcpi_rto >= 200000)
-               + " rto<=60s=" + flag(info.tcpi_rto <= 60000000) + " rtt>0=" + flag(info.tcpi_rtt > 0)
+               + flag(info.tcpi_rcv_wscale != 0) + " rto>=200ms=" + flag(info.tcpi_rto >= 200000) + " rto<=60s="
+               + flag(info.tcpi_rto <= 60000000) + (sent_data ? " rtt>0=" + flag(info.tcpi_rtt > 0) : std::string())
                + " rtt<10s=" + flag(info.tcpi_rtt < 10000000) + " mss>0=" + flag(info.tcpi_snd_mss > 0)
                + " cwnd=" + std::to_string(info.tcpi_snd_cwnd >= 1 && info.tcpi_snd_cwnd <= 100 ? 1 : 0)
                + " ssthresh_inf=" + flag(info.tcpi_snd_ssthresh == 0x7fffffff)
@@ -153,7 +158,7 @@ namespace
         }
         h.settle(500);
         note("bytes sent", std::to_string(sent) + " of " + std::to_string(data.size()));
-        note("client, after 20000 bytes", info_shape(client, pair.client));
+        note("client, after 20000 bytes", info_shape(client, pair.client, true));
         note("server, after 20000 bytes", info_shape(server, pair.server));
 
         note("optlen 0", optlen_case(client, pair.client, 0));

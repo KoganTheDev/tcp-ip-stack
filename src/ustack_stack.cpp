@@ -146,6 +146,103 @@ namespace ustack
             return 0;
         }
 
+        // TCP_INFO state numbers (the kernel's TCP_* values).
+        uint8_t linux_state(TcpState state)
+        {
+            switch (state)
+            {
+            case TcpState::ESTABLISHED:
+                return 1;
+            case TcpState::SYN_SENT:
+                return 2;
+            case TcpState::SYN_RECEIVED:
+                return 3;
+            case TcpState::FIN_WAIT_1:
+                return 4;
+            case TcpState::FIN_WAIT_2:
+                return 5;
+            case TcpState::CLOSE_WAIT:
+                return 8;
+            case TcpState::LAST_ACK:
+                return 9;
+            case TcpState::LISTEN:
+                return 10;
+            case TcpState::CLOSING:
+                return 11;
+            case TcpState::TIME_WAIT: // Linux moves the connection to a timewait sock; the socket reads CLOSE
+            case TcpState::CLOSED:
+                return 7;
+            }
+            return 7;
+        }
+
+        // What Linux reports for a socket with no connection: TCP_CLOSE, the
+        // initial RTO and window, no samples. (A listener differs a little:
+        // see fill_listener_info.)
+        tcp_info fresh_tcp_info()
+        {
+            tcp_info info;
+            std::memset(&info, 0, sizeof(info));
+            info.tcpi_state = 7;
+            info.tcpi_rto = static_cast<uint32_t>(RttEstimator::INITIAL_RTO_MS) * 1000;
+            info.tcpi_rttvar = info.tcpi_rto / 4;
+            info.tcpi_snd_ssthresh = 0x7fffffff; // TCP_INFINITE_SSTHRESH
+            info.tcpi_snd_cwnd = 10;
+            info.tcpi_snd_mss = 536; // TCP_MSS_DEFAULT
+            return info;
+        }
+
+        // Linux: a listener reads TCP_LISTEN with a cwnd of 10 and the rest zero.
+        tcp_info listener_tcp_info()
+        {
+            tcp_info info;
+            std::memset(&info, 0, sizeof(info));
+            info.tcpi_state = 10;
+            info.tcpi_snd_cwnd = 10;
+            return info;
+        }
+
+        // The connection's numbers in Linux's units: microseconds for the
+        // times, segments for cwnd and ssthresh (the stack keeps milliseconds
+        // and bytes), sequence-space byte counts as the kernel counts them.
+        // Fields the stack has no counterpart for stay zero.
+        tcp_info connection_tcp_info(const TcpConnection::Info& in)
+        {
+            tcp_info info;
+            std::memset(&info, 0, sizeof(info));
+            info.tcpi_state = linux_state(in.state);
+            info.tcpi_options =
+                static_cast<uint8_t>((in.timestamps ? TCPI_OPT_TIMESTAMPS : 0) | (in.sack ? TCPI_OPT_SACK : 0)
+                                     | (in.window_scaling ? TCPI_OPT_WSCALE : 0) | (in.ecn ? TCPI_OPT_ECN : 0));
+            info.tcpi_snd_wscale = in.snd_wscale & 0xF;
+            info.tcpi_rcv_wscale = in.rcv_wscale & 0xF;
+            info.tcpi_rto = in.rto_ms * 1000;
+            info.tcpi_rtt = in.has_rtt_sample ? std::max<uint32_t>(in.srtt_ms * 1000, 1) : 0;
+            info.tcpi_rttvar = in.has_rtt_sample ? in.rttvar_ms * 1000 : in.rto_ms * 250;
+            const uint32_t unit = std::max<uint32_t>(in.cwnd_unit_bytes, 1);
+            info.tcpi_snd_cwnd = std::max<uint32_t>(in.cwnd_bytes / unit, 1);
+            info.tcpi_snd_ssthresh =
+                in.ssthresh_bytes == UINT32_MAX ? 0x7fffffff : std::max<uint32_t>(in.ssthresh_bytes / unit, 2);
+            info.tcpi_snd_mss = in.send_mss;
+            info.tcpi_rcv_mss = in.send_mss; // no estimate of the peer's segment size: ours is the best guess
+            info.tcpi_advmss = in.cwnd_unit_bytes;
+            info.tcpi_retransmits = static_cast<uint8_t>(std::min<uint32_t>(in.consecutive_timeouts, 255));
+            info.tcpi_backoff = info.tcpi_retransmits;
+            info.tcpi_ca_state = in.in_rto_recovery ? 4 : in.in_recovery ? 3 : 0; // Loss, Recovery, Open
+            info.tcpi_unacked = in.unacked_segments;
+            info.tcpi_sacked = in.sacked_segments;
+            info.tcpi_lost = in.lost_segments;
+            info.tcpi_retrans = in.retransmitted_segments;
+            info.tcpi_total_retrans = static_cast<uint32_t>(in.total_retransmissions);
+            info.tcpi_rcv_space = in.receive_space;
+            info.tcpi_bytes_acked = in.bytes_acked;
+            info.tcpi_bytes_received = in.bytes_received;
+            info.tcpi_notsent_bytes = in.notsent_bytes;
+            info.tcpi_snd_wnd = in.peer_window;
+            info.tcpi_rcv_wnd = in.receive_window;
+            return info;
+        }
+
         const char* congestion_name(CongestionControlAlgorithm algorithm)
         {
             return algorithm == CongestionControlAlgorithm::RENO ? "reno" : "cubic";
@@ -1752,12 +1849,42 @@ namespace ustack
             error = write_int_option(optval, optlen, socket->v6only ? 1 : 0);
             return error != 0 ? fail(error) : 0;
         }
-        if (level != IPPROTO_TCP || socket->kind != Kind::TCP)
+        if (level == IPPROTO_TCP && socket->kind != Kind::TCP)
+        {
+            return fail(EOPNOTSUPP); // udp_lib_getsockopt hands anything but SOL_UDP to ip_getsockopt
+        }
+        if (level != IPPROTO_TCP)
         {
             return fail(ENOPROTOOPT);
         }
         switch (optname)
         {
+        case TCP_INFO:
+        {
+            // Linux: a negative length is EINVAL; otherwise min(len, sizeof)
+            // bytes are copied and that count written back.
+            if (static_cast<int>(*optlen) < 0)
+            {
+                return fail(EINVAL);
+            }
+            tcp_info info;
+            if (socket->listening)
+            {
+                info = listener_tcp_info();
+            }
+            else if (const TcpConnection* connection = _connection(*socket); connection != nullptr)
+            {
+                info = connection_tcp_info(connection->info());
+            }
+            else
+            {
+                info = fresh_tcp_info();
+            }
+            const socklen_t length = std::min<socklen_t>(*optlen, sizeof(info));
+            std::memcpy(optval, &info, length);
+            *optlen = length;
+            break;
+        }
         case TCP_NODELAY:
             error = write_int_option(optval, optlen, socket->nodelay ? 1 : 0);
             break;

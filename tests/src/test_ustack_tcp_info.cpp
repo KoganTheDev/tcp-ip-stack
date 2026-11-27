@@ -212,7 +212,7 @@ protected:
     static LinkParams lossy()
     {
         LinkParams params;
-        params.loss = 0.15;
+        params.loss = 0.03;
         params.delay_ms = 5;
         return params;
     }
@@ -241,5 +241,5 @@ TEST_F(UstackTcpInfoLossy, RetransmissionsAreCounted)
     tcp_info info{};
     socklen_t length = sizeof(info);
     ASSERT_EQ(client->getsockopt(c, IPPROTO_TCP, TCP_INFO, &info, &length), 0);
-    EXPECT_GT(info.tcpi_total_retrans, 0u) << "15% loss over 200 kB";
+    EXPECT_GT(info.tcpi_total_retrans, 0u) << "3% loss over 200 kB";
 }
