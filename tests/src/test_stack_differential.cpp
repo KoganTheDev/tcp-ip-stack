@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 
 #include <cerrno>
 #include <iostream>
@@ -258,6 +260,126 @@ namespace
         return trace;
     }
 
+    // A BLOCKING client against a non-blocking server. On the kernel the calls
+    // really block; on ustack they pump the stack inside the call. Every
+    // blocking call has a timeout (SO_RCVTIMEO/SO_SNDTIMEO), so a wrong
+    // answer shows up as a differing line, not a hung test.
+    template <class S>
+    void set_timeout_ms(S& s, int fd, int option, long ms)
+    {
+        timeval tv{};
+        tv.tv_sec = ms / 1000;
+        tv.tv_usec = (ms % 1000) * 1000;
+        REQUIRE_TRUE(s.setsockopt(fd, SOL_SOCKET, option, &tv, sizeof(tv)) == 0, errno_text(errno));
+    }
+
+    template <class S>
+    std::string blocking_flag(S& s, int fd)
+    {
+        int flags = s.fcntl(fd, F_GETFL);
+        return flags < 0 ? errno_name(errno) : ((flags & O_NONBLOCK) != 0 ? "nonblocking" : "blocking");
+    }
+
+    template <class H>
+    std::vector<std::string> run_blocking_scenario()
+    {
+        using S = typename H::StackT;
+        H h;
+        S& server = h.server_stack();
+        S& client = h.client_stack();
+        std::vector<std::string> trace;
+        auto note = [&](const std::string& what, const std::string& value)
+        {
+            trace.push_back(what + ": " + value);
+        };
+
+        int listener = open_socket(server);
+        sockaddr_in any{};
+        any.sin_family = AF_INET;
+        any.sin_addr.s_addr = htonl(INADDR_ANY);
+        REQUIRE_TRUE(server.bind(listener, reinterpret_cast<sockaddr*>(&any), sizeof(any)) == 0, errno_text(errno));
+        REQUIRE_TRUE(server.listen(listener, 8) == 0, errno_text(errno));
+        socklen_t length = sizeof(any);
+        REQUIRE_TRUE(server.getsockname(listener, reinterpret_cast<sockaddr*>(&any), &length) == 0, errno_text(errno));
+        sockaddr_in target = H::server_address(ntohs(any.sin_port));
+
+        // --- connect, accept, flags ---
+        int cfd = client.socket(AF_INET, SOCK_STREAM, 0);
+        REQUIRE_TRUE(cfd >= 0, errno_text(errno));
+        note("new socket", blocking_flag(client, cfd));
+        set_timeout_ms(client, cfd, SO_RCVTIMEO, 2000);
+        set_timeout_ms(client, cfd, SO_SNDTIMEO, 2000);
+        int rc = client.connect(cfd, reinterpret_cast<sockaddr*>(&target), sizeof(target));
+        note("blocking connect()", rc == 0 ? "0" : errno_name(errno));
+        int sfd = server.accept4(listener, nullptr, nullptr, SOCK_NONBLOCK);
+        REQUIRE_TRUE(sfd >= 0, errno_text(errno));
+        note("accept4(SOCK_NONBLOCK)", blocking_flag(server, sfd));
+
+        // --- data, blocking send and recv ---
+        note("blocking send", send_text(client, cfd, "ping"));
+        h.settle(50);
+        note("server recv", recv_text(server, sfd));
+        note("server send", send_text(server, sfd, "pong"));
+        note("blocking recv", recv_text(client, cfd));
+
+        // --- timeouts and MSG_DONTWAIT ---
+        set_timeout_ms(client, cfd, SO_RCVTIMEO, 100);
+        note("blocking recv, SO_RCVTIMEO 100 ms, nothing sent", recv_text(client, cfd));
+        char byte = 0;
+        ssize_t n = client.recv(cfd, &byte, 1, MSG_DONTWAIT);
+        note("recv(MSG_DONTWAIT) on a blocking socket", n < 0 ? errno_name(errno) : "returned");
+
+        // --- fcntl toggling ---
+        REQUIRE_TRUE(client.fcntl(cfd, F_SETFL, O_NONBLOCK) == 0, errno_text(errno));
+        note("after F_SETFL O_NONBLOCK", blocking_flag(client, cfd));
+        note("nonblocking recv", recv_text(client, cfd));
+        REQUIRE_TRUE(client.fcntl(cfd, F_SETFL, 0) == 0, errno_text(errno));
+        note("after F_SETFL 0", blocking_flag(client, cfd));
+        note("F_SETFD FD_CLOEXEC", std::to_string(client.fcntl(cfd, F_SETFD, FD_CLOEXEC)));
+        note("F_GETFD", std::to_string(client.fcntl(cfd, F_GETFD) & FD_CLOEXEC));
+
+        // --- EOF ---
+        REQUIRE_TRUE(server.shutdown(sfd, SHUT_WR) == 0, errno_text(errno));
+        set_timeout_ms(client, cfd, SO_RCVTIMEO, 2000);
+        note("blocking recv at EOF", recv_text(client, cfd));
+        REQUIRE_TRUE(client.close(cfd) == 0, errno_text(errno));
+        REQUIRE_TRUE(server.close(sfd) == 0, errno_text(errno));
+
+        // --- blocking accept: flags inherited, timeout honoured ---
+        int blocking_listener = server.socket(AF_INET, SOCK_STREAM, 0);
+        any.sin_port = 0;
+        REQUIRE_TRUE(server.bind(blocking_listener, reinterpret_cast<sockaddr*>(&any), sizeof(any)) == 0,
+                     errno_text(errno));
+        REQUIRE_TRUE(server.listen(blocking_listener, 8) == 0, errno_text(errno));
+        length = sizeof(any);
+        REQUIRE_TRUE(server.getsockname(blocking_listener, reinterpret_cast<sockaddr*>(&any), &length) == 0,
+                     errno_text(errno));
+        sockaddr_in target2 = H::server_address(ntohs(any.sin_port));
+        set_timeout_ms(server, blocking_listener, SO_RCVTIMEO, 100);
+        int none = server.accept(blocking_listener, nullptr, nullptr);
+        note("blocking accept, SO_RCVTIMEO 100 ms, nobody connecting", none >= 0 ? "accepted" : errno_name(errno));
+        int c2 = client.socket(AF_INET, SOCK_STREAM, 0);
+        set_timeout_ms(client, c2, SO_SNDTIMEO, 2000);
+        REQUIRE_TRUE(client.connect(c2, reinterpret_cast<sockaddr*>(&target2), sizeof(target2)) == 0,
+                     errno_text(errno));
+        int plain = server.accept(blocking_listener, nullptr, nullptr);
+        REQUIRE_TRUE(plain >= 0, errno_text(errno));
+        note("accept() of a blocking listener", blocking_flag(server, plain));
+        REQUIRE_TRUE(server.close(plain) == 0, errno_text(errno));
+        REQUIRE_TRUE(client.close(c2) == 0, errno_text(errno));
+
+        // --- blocking connect to a closed port ---
+        REQUIRE_TRUE(server.close(blocking_listener) == 0, errno_text(errno));
+        REQUIRE_TRUE(server.close(listener) == 0, errno_text(errno));
+        int refused = client.socket(AF_INET, SOCK_STREAM, 0);
+        set_timeout_ms(client, refused, SO_SNDTIMEO, 2000);
+        rc = client.connect(refused, reinterpret_cast<sockaddr*>(&target), sizeof(target));
+        note("blocking connect() to a closed port", rc == 0 ? "0" : errno_name(errno));
+        note("SO_ERROR afterwards", errno_name(so_error(client, refused)));
+        REQUIRE_TRUE(client.close(refused) == 0, errno_text(errno));
+        return trace;
+    }
+
     // The server closes first, so its end of the four-tuple is in TIME_WAIT;
     // the client then reconnects from the same source port (bound before
     // connect, with SO_REUSEADDR) well inside 2*MSL. Linux accepts the SYN
@@ -419,4 +541,9 @@ TEST(StackDifferential, LoopbackUserVisibleBehaviourMatchesTheKernel)
 TEST(StackDifferential, LoopbackReconnectIntoAServerTimeWaitMatchesTheKernel)
 {
     compare_traces(run_reconnect_scenario<SimLoopbackHarness>(), run_reconnect_scenario<KernelHarness>());
+}
+
+TEST(StackDifferential, BlockingClientMatchesTheKernel)
+{
+    compare_traces(run_blocking_scenario<SimHarness>(), run_blocking_scenario<KernelHarness>());
 }
