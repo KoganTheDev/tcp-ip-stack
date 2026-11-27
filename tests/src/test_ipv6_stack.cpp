@@ -617,13 +617,15 @@ TEST(Ipv6Stack, AnIcmpv6ErrorQuotingAnotherLocalAddressIsIgnored)
     unreachable.append_int<uint32_t>(0);
     unreachable |= quote_of_syn(isn, other);
     host.deliver(icmpv6_packet(PEER, LOCAL, ICMPV6_DESTINATION_UNREACHABLE, unreachable, 64, 4));
-    EXPECT_EQ(connection->get_state(), TcpState::SYN_SENT) << "a foreign-source quote must not refuse the handshake";
+    uint64_t id = connection->get_id();
+    ASSERT_NE(host.stack->find_connection(id), nullptr) << "a foreign-source quote must not refuse the handshake";
+    ASSERT_EQ(connection->get_state(), TcpState::SYN_SENT);
 
     unreachable = Bytes();
     unreachable.append_int<uint32_t>(0);
     unreachable |= quote_of_syn(isn);
     host.deliver(icmpv6_packet(PEER, LOCAL, ICMPV6_DESTINATION_UNREACHABLE, unreachable, 64, 4));
-    EXPECT_NE(connection->get_state(), TcpState::SYN_SENT) << "the genuine quote still refuses it";
+    EXPECT_EQ(host.stack->find_connection(id), nullptr) << "the genuine quote still refuses it (and the connection is reaped)";
 }
 
 TEST(Ipv6Stack, PortUnreachableDuringTheHandshakeRefusesTheConnection)
