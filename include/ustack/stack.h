@@ -81,7 +81,11 @@
 // so a V6ONLY listener and an AF_INET listener cannot share a port - a
 // dual-stack socket is the way to serve both.
 //
-// What is not here: every send/recv flag but MSG_DONTWAIT/MSG_NOSIGNAL/
+// What is not here: ioctl() requests other than FIONREAD / SIOCINQ,
+// SIOCOUTQ and SIOCOUTQNSD (ENOTTY; SIOCOUTQ does not count an unacked FIN),
+// the rest of struct tcp_info (see TCP_INFO below), a tcpi_rcv_mss that
+// tracks the peer's segment sizes, quick-ack mode at the start of a
+// connection, every send/recv flag but MSG_DONTWAIT/MSG_NOSIGNAL/
 // MSG_PEEK/MSG_WAITALL/MSG_TRUNC (MSG_NOSIGNAL accepted, and meaningless
 // here; see recvfrom()), urgent data (MSG_OOB, so select()'s exceptional set
 // is always empty), IP_RECVERR (so a connected UDP socket hears only the hard
@@ -272,6 +276,12 @@ namespace ustack
         // MSG_WAITALL read cut short by an error, the error is kept for the
         // next call, as Linux does, but the readiness bits (EPOLLERR) are not
         // re-announced to an edge-triggered epoll.
+        // len 0 is not special: Linux runs the receive loop once, so queued
+        // data gives 0 with nothing consumed, an empty socket that may not
+        // wait gives EAGAIN (not 0, which would read as EOF), a blocking one
+        // waits once and then gives 0 (woken or timed out), end of stream 0,
+        // a reset the error, no connection ENOTCONN; on UDP the datagram is
+        // consumed and 0 returned (MSG_TRUNC: its real length).
         ssize_t recv(int fd, void* buf, size_t len, int flags);
         // UDP: one datagram each. A datagram larger than the interface MTU
         // allows fails with EMSGSIZE (no IP fragmentation on send); recvfrom()
@@ -292,11 +302,56 @@ namespace ustack
         // abort on close, a nonzero l_linger is stored but close() never
         // waits), SO_REUSEADDR (accepted), SO_ERROR (get only, clears it),
         // SO_TYPE (get only), SO_RCVTIMEO / SO_SNDTIMEO (struct timeval, 0 =
-        // forever; tv_usec outside [0, 1e6) is EDOM, as Linux), SO_RCVBUF / SO_SNDBUF. IPPROTO_TCP: TCP_NODELAY, TCP_USER_TIMEOUT (ms;
+        // forever; tv_usec outside [0, 1e6) is EDOM, as Linux), SO_RCVBUF / SO_SNDBUF, SO_RCVLOWAT (below), SO_SNDLOWAT (get only, always 1;
+        // setting it is ENOPROTOOPT, as on Linux). IPPROTO_TCP: TCP_NODELAY, TCP_QUICKACK, TCP_INFO
+        // (get only, below), TCP_USER_TIMEOUT (ms;
         // 0 means the default, TcpConnection::DEFAULT_USER_TIMEOUT_MS, as 0
         // means the system default on Linux), TCP_CONGESTION
         // ("reno" or "cubic"). Options set on a listening socket are
         // inherited by the sockets accept() returns.
+        //
+        // TCP_INFO fills the system's struct tcp_info (<netinet/tcp.h>) as
+        // Linux does: min(optlen, sizeof) bytes are copied and that length
+        // written back; a negative length is EINVAL; on a UDP socket the get is
+        // EOPNOTSUPP, as for every IPPROTO_TCP option there. Units are Linux's,
+        // not the stack's: tcpi_rtt / rttvar / rto in microseconds (whole
+        // milliseconds here), tcpi_snd_cwnd and tcpi_snd_ssthresh in segments
+        // (0x7fffffff while ssthresh is uncapped), tcpi_snd_mss the payload
+        // per segment, the state in the TCP_* numbering. A socket in TIME_WAIT
+        // and one with no connection both read TCP_CLOSE, which is what Linux
+        // shows; a listener reads TCP_LISTEN with only cwnd 10 set. Filled:
+        // state, ca_state (Open / Recovery / Loss), options (TIMESTAMPS, SACK,
+        // WSCALE, ECN), snd/rcv_wscale, rto, rtt, rttvar, snd_mss, rcv_mss
+        // (= snd_mss: no estimate of the peer's), advmss, retransmits and
+        // backoff (RTO retransmissions of the oldest segment), unacked,
+        // sacked, lost, retrans, total_retrans, rcv_space (the receive
+        // capacity), bytes_acked (counts the SYN for an active opener and the
+        // FIN once acked, not a passive opener's SYN-ACK), bytes_received
+        // (counts the FIN), notsent_bytes, snd_wnd, rcv_wnd. Zero: the
+        // timestamps, pacing and delivery-rate fields, segs_in/out,
+        // delivered, bytes_sent/retrans, dsack_dups, reord_seen, min_rtt. rtt
+        // is 0 until an acked data segment gives a sample (unlike Linux, which
+        // also samples the handshake and every timestamp echo).
+        //
+        // TCP_QUICKACK reads 1 unless cleared, takes any nonzero value as
+        // set, and goes back to 1 once a delayed ACK fires, as on Linux.
+        // Setting it makes the next 16 in-order segments ACKed at once; a
+        // pending delayed ACK is left to its timer (Linux does the same).
+        // Clearing it changes nothing about the ACKs, which are delayed
+        // anyway. Linux also starts every connection in quick-ack mode; ustack
+        // does not, so the first segments' ACKs are delayed (up to 200 ms).
+        //
+        // SO_RCVLOWAT: 0 reads back 1, a negative value or one above 16 MiB
+        // 16777216 (Linux: half of tcp_rmem's maximum, so another sysctl moves
+        // it). On TCP, poll/select/epoll report readable only with that many
+        // bytes queued - or the end of the stream, an error or a shutdown - and
+        // a read that may not wait still takes whatever is there. A blocking
+        // read keeps waiting, SO_RCVTIMEO allowing, for min(mark, len) bytes,
+        // then returns what it has; like Linux's it looks at the queue once
+        // more at the deadline, since data below the mark does not wake it. A
+        // mark above the receive capacity counts as the capacity (Linux
+        // grows the buffer; there is nothing to grow here). UDP stores the
+        // value and ignores it. Inherited by accepted sockets.
         //
         // SO_RCVBUF / SO_SNDBUF differ from Linux in one way. Linux doubles
         // the value set to allow for kernel bookkeeping overhead, and
