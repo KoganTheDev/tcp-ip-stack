@@ -1,5 +1,6 @@
 #pragma once
 
+#include <fcntl.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -21,7 +22,8 @@
 // Differences an application can see, all because the kernel is the kernel:
 //  - The fds are kernel fds, so ::read(), ::close() and friends work on them
 //    too; a ustack::Stack's do not.
-//  - socket() does not insist on SOCK_NONBLOCK. Portable code passes it anyway.
+//  - Blocking sockets block the calling thread in the kernel; ustack::Stack's
+//    pump the stack inside the call instead. Same results, different mechanism.
 //  - There is no driver and no virtual time: epoll_wait() really sleeps.
 //  - A closed fd number is reused by the kernel at once.
 //
@@ -65,6 +67,9 @@ namespace ustack
         }
         int getsockname(int fd, struct sockaddr* addr, socklen_t* addrlen) { return ::getsockname(fd, addr, addrlen); }
         int getpeername(int fd, struct sockaddr* addr, socklen_t* addrlen) { return ::getpeername(fd, addr, addrlen); }
+        // An int third argument, like ustack::Stack's, so this is a plain
+        // forward; ::fcntl itself is variadic.
+        int fcntl(int fd, int cmd, int arg = 0) { return ::fcntl(fd, cmd, arg); }
 
         // --- epoll ---
         int epoll_create1(int flags) { return ::epoll_create1(flags); }

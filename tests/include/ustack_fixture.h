@@ -26,9 +26,10 @@ class UstackFixture : public ::testing::Test
 protected:
     static constexpr uint16_t SERVER_PORT = 7000;
 
-    UstackFixture()
+    // `params` shape both directions of the link; the default is an ideal one.
+    explicit UstackFixture(const LinkParams& params = LinkParams{})
     {
-        NetemChannel& link = net.add_link(LinkParams{}, LinkParams{});
+        NetemChannel& link = net.add_link(params, params);
         client_net = &net.add_stack(link.take_endpoint(NetemChannel::A), MacAddress("02:00:00:00:00:01"), client_ip);
         server_net = &net.add_stack(link.take_endpoint(NetemChannel::B), MacAddress("02:00:00:00:00:02"), server_ip);
         client = std::make_unique<ustack::Stack>(*client_net, std::make_unique<UstackSimDriver>(net));

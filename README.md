@@ -612,14 +612,26 @@ connection and waits for the peers (up to 5 s). See its own README.
 the kernel's names, signatures and constants - `socket`, `bind`, `listen`, `accept4`,
 `connect`, `send`, `recv`, `sendto`, `recvfrom`, `shutdown`, `close`, `setsockopt`
 (`TCP_NODELAY`, `SO_KEEPALIVE`, `TCP_USER_TIMEOUT`, `SO_LINGER`, `TCP_CONGESTION`,
-`SO_ERROR`, `SO_RCVBUF`, `SO_SNDBUF`), plus its own `epoll_create1`/`epoll_ctl`/`epoll_wait` - returning -1 and
+`SO_ERROR`, `SO_RCVBUF`, `SO_SNDBUF`, `SO_RCVTIMEO`, `SO_SNDTIMEO`), `fcntl`, plus its own `epoll_create1`/`epoll_ctl`/`epoll_wait` - returning -1 and
 setting `errno` as Linux would. Its fds are indexes into its own table, not kernel fds.
 The epoll is built like the kernel's: an interest list and a ready list filled by
 callbacks from the stack, with level-triggered, `EPOLLET` and `EPOLLONESHOT` semantics.
-It is non-blocking only (`socket()` requires `SOCK_NONBLOCK`), because the thread that
-would block is the one that drives the stack; `epoll_wait()` is what runs it, through a
-driver that waits on the channel fds and a timerfd, or on the simulator's virtual time in
-tests. `pollable_fd()` lets it nest inside an application's own kernel epoll. The other
+Sockets block or not as on Linux: `socket()` without `SOCK_NONBLOCK` is blocking,
+`fcntl(fd, F_SETFL, O_NONBLOCK)` toggles it, `accept()` returns a blocking socket and
+`accept4()` takes `SOCK_NONBLOCK`, `MSG_DONTWAIT` makes one call non-blocking, and
+`SO_RCVTIMEO` / `SO_SNDTIMEO` bound the wait (`accept`/`recv` and `connect`/`send`
+respectively, as on Linux; expiry is `EAGAIN`, the partial count for `send`, or
+`EINPROGRESS` for `connect`). The model is "pump inside the call": the stack has no
+thread of its own and nothing else reads the frames a blocked caller waits for, so a
+blocking call runs the stack's own event loop - the same driver `epoll_wait()` uses -
+until the socket is ready, the timeout passes or an error arrives. It sleeps in the
+driver (a kernel epoll and a timerfd, no spinning), time is the driver's clock (virtual
+in the simulator, so a 30 s timeout costs nothing), and it re-looks the socket up after
+every pump, failing with `EBADF` if something closed the fd meanwhile. A call that can
+never complete - the simulator with nothing pending and no timeout - fails with
+`EDEADLK` instead of hanging. The one-thread rule is unchanged: one thread owns a
+`Stack`, and it is the thread inside the blocking call; nothing else may call into that
+`Stack` meanwhile. `pollable_fd()` lets it nest inside an application's own kernel epoll. The other
 direction is `epoll_ctl_external()`: a kernel fd the application owns (an eventfd, say) is
 added to a ustack epoll and the wait sleeps in the driver's kernel epoll until it is ready
 (level-triggered; the simulator's driver refuses with `ENOTSUP`).

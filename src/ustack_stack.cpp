@@ -1,14 +1,19 @@
+#include <fcntl.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/eventfd.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <climits>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -90,6 +95,40 @@ namespace ustack
                 return EINVAL;
             }
             std::memcpy(&value, optval, sizeof(int));
+            return 0;
+        }
+
+        // A struct timeval option, as sock_set_timeout() reads it: tv_usec out
+        // of range is EDOM; a negative tv_sec means "no timeout".
+        int read_timeout_option(const void* optval, socklen_t optlen, int64_t& microseconds)
+        {
+            if (optlen < static_cast<socklen_t>(sizeof(struct timeval)))
+            {
+                return EINVAL;
+            }
+            struct timeval tv{};
+            std::memcpy(&tv, optval, sizeof(tv));
+            if (tv.tv_usec < 0 || tv.tv_usec >= 1000000)
+            {
+                return EDOM;
+            }
+            // Clamped before multiplying: tv_sec * 1000000 overflows (signed,
+            // so undefined) for a large tv_sec, and wrapping could turn
+            // "forever" into an instant timeout. Linux likewise turns a value
+            // too big for a jiffy count into MAX_SCHEDULE_TIMEOUT.
+            constexpr int64_t MAX_SECONDS = std::numeric_limits<int64_t>::max() / 1000000 - 1;
+            if (tv.tv_sec < 0)
+            {
+                microseconds = 0;
+            }
+            else if (static_cast<int64_t>(tv.tv_sec) > MAX_SECONDS)
+            {
+                microseconds = MAX_SECONDS * 1000000;
+            }
+            else
+            {
+                microseconds = static_cast<int64_t>(tv.tv_sec) * 1000000 + tv.tv_usec;
+            }
             return 0;
         }
 
@@ -220,6 +259,7 @@ namespace ustack
 
     int Stack::_new_fd(std::unique_ptr<Socket> socket)
     {
+        socket->serial = _next_serial++;
         // The lowest free number, as POSIX requires of every call that makes
         // an fd.
         for (size_t fd = 0; fd < _sockets.size(); fd++)
@@ -469,13 +509,11 @@ namespace ustack
         {
             return fail(EAFNOSUPPORT);
         }
-        if ((type & SOCK_NONBLOCK) == 0)
-        {
-            return fail(EINVAL); // blocking sockets are not supported - see stack.h
-        }
         int base_type = type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
         auto socket = std::make_unique<Socket>();
         socket->family = domain;
+        socket->nonblock = (type & SOCK_NONBLOCK) != 0;
+        socket->cloexec = (type & SOCK_CLOEXEC) != 0;
         socket->bound_ip = domain == AF_INET6 ? IpAddress(IPv6Address()) : IpAddress(IPv4Address());
         if (base_type == SOCK_STREAM)
         {
@@ -603,6 +641,33 @@ namespace ustack
 
     int Stack::accept4(int fd, struct sockaddr* addr, socklen_t* addrlen, int flags)
     {
+        int result = _accept4_once(fd, addr, addrlen, flags);
+        Socket* listener = result < 0 && errno == EAGAIN ? _get(fd) : nullptr;
+        if (listener == nullptr || listener->nonblock || listener->kind != Kind::TCP)
+        {
+            return result;
+        }
+        // Linux: accept() waits for at most SO_RCVTIMEO (inet_csk_accept
+        // takes sock_rcvtimeo()).
+        std::optional<uint64_t> deadline = _deadline(listener->rcvtimeo_us);
+        bool ready_again = false;
+        for (;;)
+        {
+            if (int error = _block_until(fd, READABLE, deadline, ready_again); error != 0)
+            {
+                return fail(error);
+            }
+            result = _accept4_once(fd, addr, addrlen, flags);
+            if (result >= 0 || errno != EAGAIN)
+            {
+                return result;
+            }
+            ready_again = true; // ready, yet nothing to take
+        }
+    }
+
+    int Stack::_accept4_once(int fd, struct sockaddr* addr, socklen_t* addrlen, int flags)
+    {
         CallScope scope(*this);
         Socket* listener = _get(fd);
         if (listener == nullptr)
@@ -634,6 +699,10 @@ namespace ustack
         auto socket = std::make_unique<Socket>();
         socket->kind = Kind::TCP;
         socket->family = listener->family;
+        socket->nonblock = (flags & SOCK_NONBLOCK) != 0; // not inherited, as on Linux
+        socket->cloexec = (flags & SOCK_CLOEXEC) != 0;
+        socket->rcvtimeo_us = listener->rcvtimeo_us; // timeouts are, as on Linux
+        socket->sndtimeo_us = listener->sndtimeo_us;
         socket->v6only = listener->v6only;
         socket->keepalive = listener->keepalive;
         socket->nodelay = listener->nodelay;
@@ -658,6 +727,43 @@ namespace ustack
     }
 
     int Stack::connect(int fd, const struct sockaddr* addr, socklen_t addrlen)
+    {
+        int result = _connect_once(fd, addr, addrlen);
+        Socket* socket = result < 0 && (errno == EINPROGRESS || errno == EALREADY) ? _get(fd) : nullptr;
+        if (socket == nullptr || socket->nonblock)
+        {
+            return result;
+        }
+        // Linux: connect() waits for at most SO_SNDTIMEO (inet_stream_connect
+        // uses sock_sndtimeo) and, when that expires, still says EINPROGRESS:
+        // the handshake goes on in the background.
+        int attempt_errno = errno;
+        std::optional<uint64_t> deadline = _deadline(socket->sndtimeo_us);
+        if (int error = _block_until(fd, WRITABLE | EPOLLERR | EPOLLHUP, deadline); error != 0)
+        {
+            return fail(error == EAGAIN ? attempt_errno : error);
+        }
+        socket = _get(fd); // _block_until checked it is still the same socket
+        if (socket->so_error == 0)
+        {
+            return 0;
+        }
+        int error = _take_error(*socket);
+        if (socket->dead)
+        {
+            // A failed attempt leaves the socket unconnected, free to try
+            // again; connect() reported the error, so SO_ERROR stays clear.
+            socket->connection_id = 0;
+            socket->dead = false;
+            if (!socket->port_reserved)
+            {
+                socket->local_port = 0;
+            }
+        }
+        return fail(error);
+    }
+
+    int Stack::_connect_once(int fd, const struct sockaddr* addr, socklen_t addrlen)
     {
         CallScope scope(*this);
         Socket* socket = _get(fd);
@@ -742,6 +848,50 @@ namespace ustack
 
     ssize_t Stack::sendto(int fd, const void* buf, size_t len, int flags, const struct sockaddr* dest_addr,
                           socklen_t addrlen)
+    {
+        ssize_t sent = _sendto_once(fd, buf, len, flags, dest_addr, addrlen);
+        int sent_errno = errno;
+        Socket* socket = _get(fd);
+        if (socket == nullptr || socket->kind != Kind::TCP || socket->nonblock || (flags & MSG_DONTWAIT) != 0
+            || (sent < 0 && sent_errno != EAGAIN) || (sent >= 0 && static_cast<size_t>(sent) == len))
+        {
+            return sent;
+        }
+        // Blocking TCP send: keep going until every byte is queued, as Linux's
+        // does (tcp_sendmsg waits for send-buffer space up to SO_SNDTIMEO). A
+        // short count is returned only when the timeout or an error comes after
+        // some bytes went in; with none queued it is -1 and the error.
+        std::optional<uint64_t> deadline = _deadline(socket->sndtimeo_us);
+        size_t total = sent > 0 ? static_cast<size_t>(sent) : 0;
+        const auto* bytes = static_cast<const byte_t*>(buf);
+        bool ready_again = false;
+        while (total < len)
+        {
+            if (int error = _block_until(fd, WRITABLE | EPOLLERR | EPOLLHUP, deadline, ready_again); error != 0)
+            {
+                return total > 0 && error == EAGAIN ? static_cast<ssize_t>(total) : fail(error);
+            }
+            ssize_t n = _sendto_once(fd, bytes + total, len - total, flags, dest_addr, addrlen);
+            if (n > 0)
+            {
+                total += static_cast<size_t>(n);
+                ready_again = false;
+            }
+            else if (n < 0 && errno == EAGAIN)
+            {
+                ready_again = true;
+            }
+            else
+            {
+                int error = n < 0 ? errno : 0;
+                return total > 0 || error == 0 ? static_cast<ssize_t>(total) : fail(error);
+            }
+        }
+        return static_cast<ssize_t>(total);
+    }
+
+    ssize_t Stack::_sendto_once(int fd, const void* buf, size_t len, int flags, const struct sockaddr* dest_addr,
+                                socklen_t addrlen)
     {
         CallScope scope(*this);
         Socket* socket = _get(fd);
@@ -842,6 +992,34 @@ namespace ustack
     }
 
     ssize_t Stack::recvfrom(int fd, void* buf, size_t len, int flags, struct sockaddr* src_addr, socklen_t* addrlen)
+    {
+        ssize_t result = _recvfrom_once(fd, buf, len, flags, src_addr, addrlen);
+        Socket* socket = result < 0 && errno == EAGAIN ? _get(fd) : nullptr;
+        if (socket == nullptr || socket->nonblock || (flags & MSG_DONTWAIT) != 0)
+        {
+            return result;
+        }
+        // Linux: recv waits for at most SO_RCVTIMEO (sock_rcvtimeo()).
+        std::optional<uint64_t> deadline = _deadline(socket->rcvtimeo_us);
+        bool ready_again = false;
+        for (;;)
+        {
+            if (int error = _block_until(fd, READABLE | EPOLLRDHUP | EPOLLERR | EPOLLHUP, deadline, ready_again);
+                error != 0)
+            {
+                return fail(error);
+            }
+            result = _recvfrom_once(fd, buf, len, flags, src_addr, addrlen);
+            if (result >= 0 || errno != EAGAIN)
+            {
+                return result;
+            }
+            ready_again = true;
+        }
+    }
+
+    ssize_t Stack::_recvfrom_once(int fd, void* buf, size_t len, int flags, struct sockaddr* src_addr,
+                                  socklen_t* addrlen)
     {
         CallScope scope(*this);
         Socket* socket = _get(fd);
@@ -1070,6 +1248,17 @@ namespace ustack
         {
             switch (optname)
             {
+            case SO_RCVTIMEO:
+            case SO_SNDTIMEO:
+            {
+                int64_t microseconds = 0;
+                if (int error = read_timeout_option(optval, optlen, microseconds); error != 0)
+                {
+                    return fail(error);
+                }
+                (optname == SO_RCVTIMEO ? socket->rcvtimeo_us : socket->sndtimeo_us) = microseconds;
+                return 0;
+            }
             case SO_KEEPALIVE:
                 if (int error = read_int_option(optval, optlen, value); error != 0)
                 {
@@ -1240,6 +1429,21 @@ namespace ustack
             case SO_TYPE:
                 error = write_int_option(optval, optlen, socket->kind == Kind::TCP ? SOCK_STREAM : SOCK_DGRAM);
                 break;
+            case SO_RCVTIMEO:
+            case SO_SNDTIMEO:
+            {
+                if (*optlen < static_cast<socklen_t>(sizeof(struct timeval)))
+                {
+                    return fail(EINVAL);
+                }
+                int64_t microseconds = optname == SO_RCVTIMEO ? socket->rcvtimeo_us : socket->sndtimeo_us;
+                struct timeval tv{};
+                tv.tv_sec = static_cast<time_t>(microseconds / 1000000);
+                tv.tv_usec = static_cast<suseconds_t>(microseconds % 1000000);
+                std::memcpy(optval, &tv, sizeof(tv));
+                *optlen = sizeof(tv);
+                break;
+            }
             case SO_KEEPALIVE:
                 error = write_int_option(optval, optlen, socket->keepalive ? 1 : 0);
                 break;
@@ -1428,6 +1632,98 @@ namespace ustack
             return fail(error);
         }
         return 0;
+    }
+
+    int Stack::fcntl(int fd, int cmd, int arg)
+    {
+        CallScope scope(*this);
+        Socket* socket = _get(fd);
+        if (socket == nullptr)
+        {
+            return fail(EBADF);
+        }
+        switch (cmd)
+        {
+        case F_GETFL:
+            return O_RDWR | (socket->nonblock ? O_NONBLOCK : 0);
+        case F_SETFL:
+            // Only O_NONBLOCK can change on a socket here; the rest (O_APPEND,
+            // O_ASYNC ...) mean nothing to it and are ignored.
+            socket->nonblock = (arg & O_NONBLOCK) != 0;
+            return 0;
+        case F_GETFD:
+            return socket->cloexec ? FD_CLOEXEC : 0;
+        case F_SETFD:
+            socket->cloexec = (arg & FD_CLOEXEC) != 0;
+            return 0;
+        default:
+            return fail(EINVAL);
+        }
+    }
+
+    // --- blocking ---
+
+    std::optional<uint64_t> Stack::_deadline(int64_t timeout_us)
+    {
+        // Over a year is "forever": it keeps the deadline arithmetic far from
+        // overflow, and no caller can tell the difference.
+        constexpr int64_t FOREVER_US = 366LL * 24 * 3600 * 1000000;
+        if (timeout_us <= 0 || timeout_us >= FOREVER_US)
+        {
+            return std::nullopt;
+        }
+        // Rounded up: a timeout of 1 us still waits a tick of the ms clock.
+        return _driver->now_ms() + static_cast<uint64_t>((timeout_us + 999) / 1000);
+    }
+
+    int Stack::_block_until(int fd, uint32_t events, std::optional<uint64_t> deadline, bool must_wait)
+    {
+        Socket* socket = _get(fd);
+        if (socket == nullptr)
+        {
+            return EBADF;
+        }
+        const uint64_t serial = socket->serial;
+        _driver->run_pending(_stack);
+        for (;;)
+        {
+            // Everything below may run application callbacks (the pump), which
+            // may close this fd and even give its number to a new socket: look
+            // it up afresh and compare the serial, never hold the pointer.
+            socket = _get(fd);
+            if (socket == nullptr || socket->serial != serial)
+            {
+                return EBADF;
+            }
+            if (!must_wait && (_poll(fd) & events) != 0)
+            {
+                return 0;
+            }
+            must_wait = false;
+            int remaining = -1;
+            if (deadline.has_value())
+            {
+                uint64_t now = _driver->now_ms();
+                if (now >= *deadline)
+                {
+                    return EAGAIN;
+                }
+                remaining = static_cast<int>(std::min<uint64_t>(*deadline - now, INT_MAX));
+            }
+            else if (!_driver->can_progress(_stack))
+            {
+                static_cast<void>(
+                    std::fprintf(stderr,
+                                 "ustack: blocking call on fd %d can never complete: no timeout, and the driver has no "
+                                 "frame or timer pending (returning EDEADLK)\n",
+                                 fd));
+                return EDEADLK;
+            }
+            // The call so far may have armed an earlier timer than the one the
+            // driver is set to wake for (a SYN's retransmission, say).
+            _driver->stack_changed(_stack);
+            _driver->wait_stack_only(_stack, remaining);
+        }
     }
 
     // --- readiness ---
