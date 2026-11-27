@@ -4,6 +4,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <cerrno>
 #include <iostream>
@@ -414,6 +415,23 @@ namespace
         // First connection, from an ephemeral port that is then reused.
         int cfd = open_socket(client);
         REQUIRE_TRUE(client.setsockopt(cfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) == 0, errno_text(errno));
+        // The source port is chosen here, outside the kernel's ephemeral range
+        // (ip_local_port_range, 32768-60999 by default), instead of letting
+        // connect() pick one. The scenario rebinds that exact port after the
+        // first socket is gone, and a port from the shared ephemeral pool can
+        // be taken in that gap by ANY other process's connect() on the
+        // machine (an autobound socket has no SO_REUSEADDR, so our rebind then
+        // fails with EADDRINUSE: the "bind to the same source port" line
+        // differed from ustack's, about once in a few hundred sanitizer runs).
+        // Nothing autobinds below the range. The counter walks a window of
+        // ports so back-to-back runs and parallel processes (seeded by pid)
+        // do not meet each other's leftovers either.
+        static unsigned next_source_offset = static_cast<unsigned>(getpid());
+        sockaddr_in chosen{};
+        chosen.sin_family = AF_INET;
+        chosen.sin_addr.s_addr = htonl(INADDR_ANY);
+        chosen.sin_port = htons(static_cast<uint16_t>(20000 + (next_source_offset++ % 10000)));
+        REQUIRE_TRUE(client.bind(cfd, reinterpret_cast<sockaddr*>(&chosen), sizeof(chosen)) == 0, errno_text(errno));
         static_cast<void>(client.connect(cfd, reinterpret_cast<sockaddr*>(&target), sizeof(target)));
         h.settle(50);
         sockaddr_in source{};
