@@ -84,9 +84,39 @@
 // What is not here: every send/recv flag but MSG_DONTWAIT/MSG_NOSIGNAL/
 // MSG_PEEK/MSG_WAITALL/MSG_TRUNC (MSG_NOSIGNAL accepted, and meaningless
 // here; see recvfrom()), urgent data (MSG_OOB, so select()'s exceptional set
-// is always empty), connect() on a UDP socket,
-// nesting one ustack epoll inside another, and every fcntl()
+// is always empty), IP_RECVERR (so a connected UDP socket hears only the hard
+// ICMP errors, as Linux does by default), nesting one ustack epoll inside another, and every fcntl()
 // command but F_GETFL/F_SETFL (O_NONBLOCK only) and F_GETFD/F_SETFD.
+//
+// connect() on a UDP socket (SOCK_DGRAM, either family) fixes a default peer;
+// nothing is sent. It binds an ephemeral port if there is none and sets the
+// socket's own address from the route (getsockname() then shows it, unless
+// bind() named one); 0.0.0.0 and :: mean this host. send()/write() without an
+// address go to the peer, and a sendto() with an address still goes where it
+// says, for that datagram only - both as on Linux. Only the peer's datagrams
+// are delivered: those from anyone else are dropped and counted
+// (UdpSocket::datagrams_filtered()) and, because a connected socket does not
+// match them, answered with ICMP Port Unreachable, which a stranger that is
+// itself connected to us then sees. getpeername() gives the peer, or ENOTCONN.
+// connect() with AF_UNSPEC (only sa_family need be there; addrlen < 2 is
+// EINVAL) dissolves the association, and, as udp_disconnect does, gives back
+// a port that was chosen automatically (an implicit bind, or bind() to port
+// 0) while keeping one that bind() named, and returns the address to the
+// wildcard unless bind() named it; a pending error is not cleared.
+// An ICMP error about the peer is the socket's pending error: the next
+// send() fails with it (sending nothing) or recv() does (before any queued
+// datagram, MSG_PEEK included), once; SO_ERROR returns and clears it; poll and
+// epoll show EPOLLERR meanwhile. Only HARD errors count, with Linux's errno:
+// port unreachable ECONNREFUSED, fragmentation needed / Packet Too Big
+// EMSGSIZE, protocol unreachable ENOPROTOOPT, administratively prohibited
+// EHOSTUNREACH (EACCES for ICMPv6). Net and host unreachable (and ICMPv6 no
+// route, beyond scope, address unreachable) are NOT reported - they are
+// soft errors Linux hears only with IP_RECVERR, which was checked by
+// injecting each code in a private network namespace. An unconnected socket
+// hears none of it, and neither does one for a sendto() to an address other
+// than the peer. An error is matched to the peer as it is at the moment it
+// arrives, so one about an earlier peer that arrives after a reconnect is
+// dropped.
 //
 // Not thread-safe: one thread owns a Stack and everything it drives.
 namespace ustack
@@ -216,12 +246,14 @@ namespace ustack
         // blocks, as accept()'s does); SOCK_CLOEXEC is stored only. Blocks, if
         // the listener does, until a connection is waiting (SO_RCVTIMEO).
         int accept4(int fd, struct sockaddr* addr, socklen_t* addrlen, int flags);
-        // TCP only. Non-blocking: starts the handshake and fails with
+        // TCP: non-blocking: starts the handshake and fails with
         // EINPROGRESS; the socket becomes writable (EPOLLOUT) when it
         // completes, or reports EPOLLERR|EPOLLHUP with SO_ERROR set when it
         // does not. Blocking: waits for the handshake and returns 0 or the
         // error (ECONNREFUSED, ETIMEDOUT ...; EINTR never happens here), the
         // error is returned by this call instead of through SO_ERROR.
+        // UDP: sets the default peer at once and returns 0 (see the notes
+        // above the class); AF_UNSPEC undoes it.
         int connect(int fd, const struct sockaddr* addr, socklen_t addrlen);
         ssize_t send(int fd, const void* buf, size_t len, int flags);
         // recv() flags, with Linux's semantics: MSG_DONTWAIT (one call
