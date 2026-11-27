@@ -1849,6 +1849,10 @@ namespace ustack
                 {
                     socket->udp->set_reuseport(socket->reuseport);
                 }
+                if (socket->listening)
+                {
+                    _stack.set_listener_reuseport(socket->listener_id, socket->reuseport);
+                }
                 if (connection != nullptr)
                 {
                     _stack.set_connection_reuse(connection->get_id(), socket->reuseaddr, socket->reuseport);

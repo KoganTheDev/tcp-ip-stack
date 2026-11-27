@@ -505,9 +505,42 @@ NetworkStack::ListenerId NetworkStack::open_listener(uint16_t port, const Listen
     listener.local = options.local;
     listener.reuseport = options.reuseport;
     listener.reuseaddr = options.reuseaddr;
+    std::vector<ListenerId>& on_port = this->_listeners_by_port[port];
+    if (listener.reuseport)
+    {
+        // inet_reuseport_add_sock: join the group of a listener on the same
+        // binding that has the option set now - creating that group if it
+        // set the option only after it opened.
+        for (auto it = on_port.rbegin(); it != on_port.rend(); ++it)
+        {
+            Listener& other = this->_listeners.at(*it);
+            if (other.reuseport && other.same_binding(listener))
+            {
+                if (other.group == 0)
+                {
+                    other.group = this->_next_group_id++;
+                }
+                listener.group = other.group;
+                break;
+            }
+        }
+        if (listener.group == 0)
+        {
+            listener.group = this->_next_group_id++;
+        }
+    }
     this->_listeners.emplace(id, std::move(listener));
-    this->_listeners_by_port[port].push_back(id);
+    on_port.push_back(id);
     return id;
+}
+
+void NetworkStack::set_listener_reuseport(ListenerId id, bool reuseport)
+{
+    auto it = this->_listeners.find(id);
+    if (it != this->_listeners.end())
+    {
+        it->second.reuseport = reuseport;
+    }
 }
 
 void NetworkStack::set_listener_backlog(ListenerId id, size_t backlog)
@@ -690,7 +723,8 @@ const NetworkStack::Listener* NetworkStack::_select_listener(const IpAddress& so
             best_score = score;
         }
     }
-    if (best == nullptr || !best->reuseport)
+    // The flag of the listener landed on, read now; the group, as joined.
+    if (best == nullptr || !best->reuseport || best->group == 0)
     {
         return best;
     }
@@ -703,7 +737,7 @@ const NetworkStack::Listener* NetworkStack::_select_listener(const IpAddress& so
     for (ListenerId id : ids)
     {
         const Listener& member = this->_listeners.at(id);
-        if (member.same_group(*best))
+        if (member.group == best->group)
         {
             group.push_back(&member);
         }

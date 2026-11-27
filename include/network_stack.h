@@ -264,6 +264,13 @@ public:
     ListenerId open_listener(uint16_t port, const ListenOptions& options);
     // listen() again on a listening socket: a new backlog, nothing else.
     void set_listener_backlog(ListenerId id, size_t backlog);
+    // SO_REUSEPORT set or cleared on a listening socket. Linux reads the flag
+    // live but fixes group membership when a listener opens (probed): set
+    // after listen(), it lets the next listener to open on the same binding
+    // join this one's group - the two then share by hash; cleared, the
+    // listener stays a member, and a SYN that lands on it (the latest opened
+    // among equals) is no longer spread.
+    void set_listener_reuseport(ListenerId id, bool reuseport);
     // As unlisten(), for one listener: its queued connections are reset and
     // its half-open ones dropped - also when it leaves a reuseport group, as
     // Linux does with net.ipv4.tcp_migrate_req at its default of 0. The other
@@ -1321,12 +1328,14 @@ private:
         {
             return (local ? 4 : 0) + (peer.is_v4() && family == ListenFamily::IPV4_ONLY ? 1 : 0);
         }
-        // Members of one SO_REUSEPORT group: same family rule, same address.
-        bool same_group(const Listener& other) const
-        {
-            return reuseport && other.reuseport && family == other.family && local == other.local;
-        }
+        // The SO_REUSEPORT group it joined when it opened, 0 for none. Fixed
+        // then, as Linux fixes membership when a socket is hashed: the
+        // option set or cleared later changes `reuseport` (read live, on the
+        // listener a SYN lands on) but not who is in the group.
+        uint64_t group = 0;
+        bool same_binding(const Listener& other) const { return family == other.family && local == other.local; }
     };
+    uint64_t _next_group_id = 1;
     std::unordered_map<ListenerId, Listener> _listeners;
     // Per port, its listeners in the order they were opened - which is also
     // the order of a reuseport group's members for the hash.
