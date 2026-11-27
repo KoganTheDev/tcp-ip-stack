@@ -68,14 +68,14 @@ void UdpSocket::set_error_callback(ErrorFn callback)
     _on_error = std::move(callback);
 }
 
-void UdpSocket::connect_peer(const IpAddress& peer_ip, uint16_t peer_port)
+void UdpSocket::connect_peer(const IpAddress& peer_ip, uint16_t peer_port, const IpAddress& local_ip)
 {
-    _peer = Peer{peer_ip, peer_port};
+    _peer = Peer{peer_ip, peer_port, local_ip};
 }
 
-void UdpSocket::on_icmp_error(const IpAddress& dest_ip, uint16_t dest_port, int error)
+void UdpSocket::on_icmp_error(const IpAddress& source_ip, const IpAddress& dest_ip, uint16_t dest_port, int error)
 {
-    if (!_peer || _peer->ip != dest_ip || _peer->port != dest_port || !_on_error)
+    if (!_peer || _peer->ip != dest_ip || _peer->port != dest_port || _peer->local_ip != source_ip || !_on_error)
     {
         return;
     }

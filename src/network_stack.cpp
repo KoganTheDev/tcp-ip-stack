@@ -2525,7 +2525,7 @@ void NetworkStack::_handle_icmp_udp_error(const Icmp& icmp, const Bytes& quoted)
     {
         return;
     }
-    it->second->on_icmp_error(original_dest, remote_port, mapped.error);
+    it->second->on_icmp_error(IPv4Address(quoted.slice(12, 4)), original_dest, remote_port, mapped.error);
 }
 
 void NetworkStack::_handle_icmp_error(const Icmp& icmp)

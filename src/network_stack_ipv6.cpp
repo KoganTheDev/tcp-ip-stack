@@ -794,13 +794,14 @@ void NetworkStack::_handle_icmpv6_udp_error(const Icmpv6& message, const Bytes& 
     }
     constexpr size_t QUOTE = 4;
     const size_t transport = QUOTE + Ipv6::HEADER_SIZE;
+    IPv6Address original_source(body.slice(QUOTE + 8, IPv6Address::SIZE));
     IPv6Address original_destination(body.slice(QUOTE + 24, IPv6Address::SIZE));
     uint16_t local_port = body.slice_int<uint16_t>(transport);
     uint16_t remote_port = body.slice_int<uint16_t>(transport + 2);
     auto it = this->_udp_sockets.find(local_port);
     if (it != this->_udp_sockets.end())
     {
-        it->second->on_icmp_error(IpAddress(original_destination), remote_port, error);
+        it->second->on_icmp_error(IpAddress(original_source), IpAddress(original_destination), remote_port, error);
     }
 }
 

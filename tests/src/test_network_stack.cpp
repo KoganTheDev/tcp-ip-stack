@@ -3815,11 +3815,12 @@ namespace
     // An ICMP Destination Unreachable as the peer's stack would send it for a
     // datagram we sent from local_port to PEER_IP:remote_port: the IP header
     // plus the first 8 bytes of the UDP header, quoted back (RFC 792).
-    Bytes build_icmp_unreachable_for_our_udp(uint16_t local_port, uint16_t remote_port, uint8_t code)
+    Bytes build_icmp_unreachable_for_our_udp(uint16_t local_port, uint16_t remote_port, uint8_t code,
+                                             const IPv4Address& quoted_source = LOCAL_IP)
     {
         Udp ours(local_port, remote_port, 9, 0, Bytes());
-        auto embedded_ip = std::make_unique<Ip>(4, 5, 0, 29, 0, 0, 0, 64, IpProtocol::UDP, 0, LOCAL_IP.get_address(),
-                                                PEER_IP.get_address());
+        auto embedded_ip = std::make_unique<Ip>(4, 5, 0, 29, 0, 0, 0, 64, IpProtocol::UDP, 0,
+                                                quoted_source.get_address(), PEER_IP.get_address());
         *embedded_ip /= std::make_unique<Raw>(ours.to_bytes());
         embedded_ip->compute_checksum();
         Bytes embedded = embedded_ip->to_bytes().slice(0, 28);
@@ -3830,7 +3831,8 @@ namespace
     }
 
     // What a UDP socket is told when `code` arrives, 0 for nothing.
-    int error_reported_for(uint8_t code, bool connected = true, uint16_t quoted_remote_port = 9000)
+    int error_reported_for(uint8_t code, bool connected = true, uint16_t quoted_remote_port = 9000,
+                           const IPv4Address& quoted_source = LOCAL_IP)
     {
         FakePacketChannel* channel = nullptr;
         auto stack = make_stack(channel);
@@ -3839,9 +3841,9 @@ namespace
         socket->set_error_callback([&reported](int error) { reported = error; });
         if (connected)
         {
-            socket->connect_peer(PEER_IP, 9000);
+            socket->connect_peer(PEER_IP, 9000, LOCAL_IP);
         }
-        channel->push_inbound(build_icmp_unreachable_for_our_udp(40000, quoted_remote_port, code));
+        channel->push_inbound(build_icmp_unreachable_for_our_udp(40000, quoted_remote_port, code, quoted_source));
         stack->poll();
         return reported;
     }
@@ -3892,7 +3894,7 @@ TEST(NetworkStackUdpErrors, AStrangersDatagramToAConnectedSocketDrawsPortUnreach
     FakePacketChannel* channel = nullptr;
     auto stack = make_stack(channel);
     UdpSocket* socket = stack->bind_udp(40000);
-    socket->connect_peer(IPv4Address("10.0.0.9"), 9000);
+    socket->connect_peer(IPv4Address("10.0.0.9"), 9000, LOCAL_IP);
     int delivered = 0;
     socket->set_datagram_received_callback([&delivered](const IpAddress&, uint16_t, const Bytes&) { delivered++; });
 
@@ -3916,4 +3918,14 @@ TEST(NetworkStackUdpErrors, SourceAddressComesFromTheRoute)
     std::optional<IpAddress> loopback = stack->source_address_for(IPv4Address("127.0.0.1"));
     ASSERT_TRUE(loopback && *loopback == IpAddress(IPv4Address("127.0.0.1")))
         << "a local destination is its own source";
+}
+
+// Linux looks the socket up by the full four-tuple, so an error quoting a
+// datagram that left from some other address of ours is not this socket's.
+TEST(NetworkStackUdpErrors, AnErrorQuotingAnotherLocalAddressIsIgnored)
+{
+    ASSERT_TRUE(error_reported_for(ICMP_CODE_PORT_UNREACHABLE, true, 9000, IPv4Address("10.0.0.99")) == 0)
+        << "same ports and peer, but the quoted source is not the address the socket sends from";
+    ASSERT_TRUE(error_reported_for(ICMP_CODE_PORT_UNREACHABLE, true, 9000, LOCAL_IP) == ECONNREFUSED)
+        << "the genuine quote still counts";
 }

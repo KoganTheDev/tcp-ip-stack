@@ -856,7 +856,7 @@ namespace ustack
         socket.peer_ip = ip;
         socket.peer_port = port;
         socket.udp_connected = true;
-        socket.udp->connect_peer(ip, port);
+        socket.udp->connect_peer(ip, port, socket.local_ip);
         return 0;
     }
 

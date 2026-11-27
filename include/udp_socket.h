@@ -57,18 +57,22 @@ public:
     // anything else is refused as if no socket were bound (on_datagram()
     // returns false, so the network layer answers Port Unreachable, as Linux
     // does) and counted - and only that peer's ICMP errors are reported.
-    void connect_peer(const IpAddress& peer_ip, uint16_t peer_port);
+    // local_ip is the address the socket now sends from (connect() on Linux
+    // fixes it, from the route if the socket was bound to the wildcard).
+    void connect_peer(const IpAddress& peer_ip, uint16_t peer_port, const IpAddress& local_ip);
     // Back to unconnected (connect() with AF_UNSPEC). The count is kept.
     void disconnect_peer() { _peer.reset(); }
     bool is_connected() const { return _peer.has_value(); }
     // Datagrams refused because they came from someone other than the peer.
     uint64_t datagrams_filtered() const { return _datagrams_filtered; }
 
-    // An ICMP error quoting a datagram this socket sent to dest_ip:dest_port.
+    // An ICMP error quoting a datagram sent from source_ip to dest_ip:dest_port.
     // Linux reports one only on a connected socket (IP_RECVERR is off), and
     // only when it is about the peer: an unconnected socket has no way to
-    // tell which of its destinations the error is about, so it is dropped.
-    void on_icmp_error(const IpAddress& dest_ip, uint16_t dest_port, int error);
+    // tell which of its destinations the error is about, so it is dropped. As
+    // in Linux, the whole four-tuple must match: the quoted source must be the
+    // address the socket sends from, or the error is about another socket.
+    void on_icmp_error(const IpAddress& source_ip, const IpAddress& dest_ip, uint16_t dest_port, int error);
 
     uint16_t get_local_port() const { return _local_port; }
 
@@ -82,6 +86,7 @@ private:
     {
         IpAddress ip;
         uint16_t port = 0;
+        IpAddress local_ip;
     };
     std::optional<Peer> _peer;
     uint64_t _datagrams_filtered = 0;
