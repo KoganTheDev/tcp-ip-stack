@@ -34,15 +34,34 @@
 // bug - it names some unrelated kernel file, or nothing. The one kernel fd on
 // offer is pollable_fd(), for nesting this epoll inside a kernel one.
 //
-// Non-blocking only. The stack is single-threaded and is driven by the same
-// thread that calls these functions, so a call that blocked waiting for the
-// network would wait forever: nothing else would read the frames it waits
-// for. socket() therefore REQUIRES SOCK_NONBLOCK and fails with EINVAL
-// without it, rather than quietly handing out a socket that behaves unlike
-// what was asked for; portable code passes SOCK_NONBLOCK on both stacks.
-// accept() returns a non-blocking socket too (it is the only kind there is),
-// so portable code calls accept4(..., SOCK_NONBLOCK). The only call that
-// waits is epoll_wait(), and it drives the stack while it does.
+// Blocking and non-blocking sockets, as on Linux. socket() without
+// SOCK_NONBLOCK makes a blocking socket (fcntl(fd, F_SETFL, O_NONBLOCK)
+// toggles it, F_GETFL reads it; accept() returns a blocking socket and
+// accept4() takes SOCK_NONBLOCK, as on Linux). A blocking call waits for its
+// condition - accept: a connection; connect: the handshake; recv: a byte, EOF
+// or an error; send: room for ALL the bytes - and MSG_DONTWAIT makes a single
+// call non-blocking. SO_RCVTIMEO bounds accept/recv, SO_SNDTIMEO bounds
+// connect/send (Linux's own pairing); expiry is -1/EAGAIN, or the count so
+// far for a send that queued some bytes, or EINPROGRESS for connect (what
+// Linux returns: the handshake carries on). 0 means forever.
+//
+// THE MODEL IS "PUMP INSIDE THE CALL". The stack has no thread of its own and
+// nothing else reads the frames a blocked caller is waiting for, so a
+// blocking call runs the stack's own event loop (the Driver, exactly what
+// run_once()/epoll_wait() do) until the socket is ready, the timeout expires
+// or an error arrives. It sleeps in the driver while it waits - the
+// RealDriver's kernel epoll and timerfd, no spinning - and time is the
+// driver's clock, so the simulator's driver runs a 30 s timeout in virtual
+// time. The socket is looked up again after every pump: whatever ran during it
+// may have closed the fd, and the call then fails with EBADF. A blocking call
+// on a driver that can never make progress (the simulator with no timer and no
+// frame pending, and no timeout) fails with EDEADLK rather than hang.
+//
+// It is still ONE thread per Stack: the thread that makes the call is the one
+// that drives the stack, so nothing else may call into the same Stack while a
+// call is blocked (a callback run by the pump excepted: it runs on that same
+// thread, and may use the Stack, including closing the fd being waited on).
+// sendto() on UDP never blocks: a datagram is queued or dropped at once.
 //
 // Errors are Linux's: ECONNREFUSED for a RST answering our SYN, ETIMEDOUT,
 // ECONNRESET, EPIPE for writing to a closed or shut-down socket (no SIGPIPE
@@ -59,9 +78,10 @@
 // so a V6ONLY listener and an AF_INET listener cannot share a port - a
 // dual-stack socket is the way to serve both.
 //
-// What is not here: blocking mode, MSG_PEEK and every other flag but
-// MSG_DONTWAIT/MSG_NOSIGNAL (accepted, and meaningless here), connect() on a
-// UDP socket, nesting one ustack epoll inside another, fcntl(), poll()/select().
+// What is not here: MSG_PEEK and every other flag but MSG_DONTWAIT/MSG_NOSIGNAL
+// (MSG_NOSIGNAL accepted, and meaningless here), connect() on a UDP socket,
+// nesting one ustack epoll inside another, poll()/select(), and every fcntl()
+// command but F_GETFL/F_SETFL (O_NONBLOCK only) and F_GETFD/F_SETFD.
 //
 // Not thread-safe: one thread owns a Stack and everything it drives.
 namespace ustack
@@ -103,6 +123,12 @@ namespace ustack
         // fd itself (poll(2)) what is ready, so the driver only has to wake
         // up. A driver with no kernel behind it cannot, hence the default.
         virtual int watch_fd(int /*fd*/, uint32_t /*events*/) { return ENOTSUP; }
+        // Whether wait(stack, -1) could ever return: false when nothing is
+        // pending that could make it - no frame, no timer. A blocking socket
+        // call with no timeout asks before it waits, and fails with EDEADLK
+        // instead of hanging. Only the simulator's driver can know this; a
+        // real one always has the outside world to wait for.
+        virtual bool can_progress(NetworkStack& /*stack*/) const { return true; }
     };
 
     // The production driver: a kernel epoll over the stack's channel fds and
@@ -156,8 +182,9 @@ namespace ustack
 
         // --- sockets ---
         // domain AF_INET or AF_INET6; type SOCK_STREAM or SOCK_DGRAM, OR'd with
-        // SOCK_NONBLOCK (required, see above) and optionally SOCK_CLOEXEC
-        // (accepted, meaningless); protocol 0 or the type's own.
+        // SOCK_NONBLOCK (else the socket blocks, see above) and optionally
+        // SOCK_CLOEXEC (stored for F_GETFD, meaningless); protocol 0 or the
+        // type's own.
         // NOT a kernel fd - see the top of this file.
         int socket(int domain, int type, int protocol);
         // sin_addr INADDR_ANY or the interface's address (sin6_addr ::, one of
@@ -171,11 +198,16 @@ namespace ustack
         // backlog is clamped to at least 1.
         int listen(int fd, int backlog);
         int accept(int fd, struct sockaddr* addr, socklen_t* addrlen);
-        // flags: SOCK_NONBLOCK and SOCK_CLOEXEC, both no-ops here.
+        // flags: SOCK_NONBLOCK makes the new socket non-blocking (else it
+        // blocks, as accept()'s does); SOCK_CLOEXEC is stored only. Blocks, if
+        // the listener does, until a connection is waiting (SO_RCVTIMEO).
         int accept4(int fd, struct sockaddr* addr, socklen_t* addrlen, int flags);
-        // TCP only. Starts the handshake and fails with EINPROGRESS; the
-        // socket becomes writable (EPOLLOUT) when it completes, or reports
-        // EPOLLERR|EPOLLHUP with SO_ERROR set when it does not.
+        // TCP only. Non-blocking: starts the handshake and fails with
+        // EINPROGRESS; the socket becomes writable (EPOLLOUT) when it
+        // completes, or reports EPOLLERR|EPOLLHUP with SO_ERROR set when it
+        // does not. Blocking: waits for the handshake and returns 0 or the
+        // error (ECONNREFUSED, ETIMEDOUT ...; EINTR never happens here), the
+        // error is returned by this call instead of through SO_ERROR.
         int connect(int fd, const struct sockaddr* addr, socklen_t addrlen);
         ssize_t send(int fd, const void* buf, size_t len, int flags);
         ssize_t recv(int fd, void* buf, size_t len, int flags);
@@ -197,7 +229,8 @@ namespace ustack
         // SOL_SOCKET: SO_KEEPALIVE, SO_LINGER (struct linger; {1, 0} means
         // abort on close, a nonzero l_linger is stored but close() never
         // waits), SO_REUSEADDR (accepted), SO_ERROR (get only, clears it),
-        // SO_TYPE (get only), SO_RCVBUF / SO_SNDBUF. IPPROTO_TCP: TCP_NODELAY, TCP_USER_TIMEOUT (ms;
+        // SO_TYPE (get only), SO_RCVTIMEO / SO_SNDTIMEO (struct timeval, 0 =
+        // forever; tv_usec outside [0, 1e6) is EDOM, as Linux), SO_RCVBUF / SO_SNDBUF. IPPROTO_TCP: TCP_NODELAY, TCP_USER_TIMEOUT (ms;
         // 0 means the default, TcpConnection::DEFAULT_USER_TIMEOUT_MS, as 0
         // means the system default on Linux), TCP_CONGESTION
         // ("reno" or "cubic"). Options set on a listening socket are
@@ -220,6 +253,12 @@ namespace ustack
         int getsockopt(int fd, int level, int optname, void* optval, socklen_t* optlen);
         int getsockname(int fd, struct sockaddr* addr, socklen_t* addrlen);
         int getpeername(int fd, struct sockaddr* addr, socklen_t* addrlen);
+        // F_GETFL / F_SETFL (O_NONBLOCK is the only flag that is kept; the
+        // access mode reads back as O_RDWR) and F_GETFD / F_SETFD
+        // (FD_CLOEXEC, stored and meaningless). Anything else is EINVAL. The
+        // third argument is an int, not a variadic, so ustack::KernelStack
+        // forwards it with no va_list handling.
+        int fcntl(int fd, int cmd, int arg = 0);
 
         // --- epoll ---
         // flags: 0 or EPOLL_CLOEXEC (a no-op).
@@ -301,6 +340,16 @@ namespace ustack
             // kernel's wait queue, which is who _wake() tells.
             std::vector<int> watchers;
 
+            // Unique per Socket object, never reused: a blocked call compares
+            // it after each pump, because the fd NUMBER may have been closed
+            // and handed to a different socket meanwhile.
+            uint64_t serial = 0;
+            bool nonblock = false; // O_NONBLOCK
+            bool cloexec = false;  // FD_CLOEXEC, stored only
+            // SO_RCVTIMEO / SO_SNDTIMEO in microseconds, 0 = forever.
+            int64_t rcvtimeo_us = 0;
+            int64_t sndtimeo_us = 0;
+
             uint16_t local_port = 0; // 0 while unbound
             // local_port was reserved by bind() (or an autobind) on this
             // Stack, rather than picked by NetworkStack::connect().
@@ -359,6 +408,23 @@ namespace ustack
         struct CallScope;
         void _init();
         Socket* _get(int fd);
+        // The calls as non-blocking, one attempt, -1/EAGAIN when they would
+        // wait. The public ones wrap these in _block_until() for a blocking socket.
+        int _accept4_once(int fd, struct sockaddr* addr, socklen_t* addrlen, int flags);
+        int _connect_once(int fd, const struct sockaddr* addr, socklen_t addrlen);
+        ssize_t _sendto_once(int fd, const void* buf, size_t len, int flags, const struct sockaddr* dest_addr,
+                             socklen_t addrlen);
+        ssize_t _recvfrom_once(int fd, void* buf, size_t len, int flags, struct sockaddr* src_addr, socklen_t* addrlen);
+        // Pumps the stack until _poll(fd) has one of `events`, deadline (the
+        // driver's now_ms()) passes, or something goes wrong. Returns 0 when
+        // ready, EAGAIN on timeout, EBADF if the fd was closed (or reused) while
+        // pumping, EDEADLK if the driver can never make progress. must_wait
+        // skips the first readiness check: the caller just saw the socket
+        // ready and its attempt still would block, so look again only after
+        // the stack has moved (never a busy loop).
+        int _block_until(int fd, uint32_t events, std::optional<uint64_t> deadline, bool must_wait = false);
+        // now + timeout_us on the driver's clock, or nullopt for "forever".
+        std::optional<uint64_t> _deadline(int64_t timeout_us);
         int _new_fd(std::unique_ptr<Socket> socket);
         // The live connection behind a TCP socket, or nullptr.
         TcpConnection* _connection(const Socket& socket) const;
@@ -420,6 +486,7 @@ namespace ustack
         std::unordered_set<uint16_t> _udp_ports;
         std::unordered_set<int> _epoll_fds;
         uint16_t _next_ephemeral = FIRST_EPHEMERAL_PORT;
+        uint64_t _next_serial = 1;
 
         int _signal_fd = -1;   // eventfd: set while some ready list has a ready item
         int _pollable_fd = -1; // kernel epoll over _signal_fd and the driver's wake fd

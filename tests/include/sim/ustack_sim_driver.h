@@ -33,6 +33,13 @@ public:
         }
     }
 
+    // False when no frame is in flight and no timer is pending anywhere in the
+    // network: a wait with no timeout would step virtual time for ever. The
+    // Stack turns that into EDEADLK for a blocking call (see Driver). A call
+    // with a timeout is fine - time passes to its deadline - and so is one
+    // that something pending will end.
+    bool can_progress(NetworkStack& /*stack*/) const override { return _network.has_pending_events(); }
+
 private:
     SimNetwork& _network;
 };

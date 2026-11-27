@@ -110,6 +110,10 @@ public:
     void deliver_due();
 
     bool links_idle() const;
+    // Whether any frame is in flight or any timer pending, in any stack: if
+    // not, no amount of stepping changes anything on its own. A tick hook that
+    // acts on the passing of time is not an event, so it does not count.
+    bool has_pending_events() const { return _ms_until_next_event().has_value(); }
 
     // Every frame as read by its receiver, at its delivery time - what a
     // capture on the receiving host would show.

@@ -32,6 +32,7 @@
 namespace
 {
     constexpr uint16_t PORT = 7000;
+    constexpr uint32_t LINK_DELAY_MS = 20;
 
     timeval timeval_ms(long ms)
     {
@@ -41,9 +42,19 @@ namespace
         return tv;
     }
 
+    // 20 ms each way, so a call that waits for the peer visibly takes virtual time.
+    LinkParams slow_link()
+    {
+        LinkParams params;
+        params.delay_ms = LINK_DELAY_MS;
+        return params;
+    }
+
     class UstackBlocking : public UstackFixture
     {
     protected:
+        UstackBlocking() : UstackFixture(slow_link()) {}
+
         static int blocking_socket(ustack::Stack& stack, int type = SOCK_STREAM)
         {
             int fd = stack.socket(AF_INET, type, 0);
@@ -57,9 +68,27 @@ namespace
             REQUIRE_TRUE(stack.setsockopt(fd, SOL_SOCKET, option, &tv, sizeof(tv)) == 0, std::strerror(errno));
         }
 
-        // Runs `action` on the n-th tick (counting from 1) of whatever pump
-        // is running.
+        // Counts the simulator steps taken so far, which a blocking call that
+        // returns at once leaves at 0: the proof that it really waited.
         int pumps = 0;
+        uint64_t started_ms = 0;
+        void count_pumps()
+        {
+            started_ms = net.now_ms();
+            net.add_tick_hook([this] { pumps++; });
+        }
+        // The call took at least one link crossing of virtual time.
+        void expect_it_waited() const
+        {
+            EXPECT_GE(pumps, 1) << "it must have pumped the stack";
+            EXPECT_GE(net.now_ms() - started_ms, LINK_DELAY_MS);
+        }
+
+        // Runs `action` on the n-th tick (counting from 1) of whatever pump
+        // is running. With a timeout, an idle simulator jumps straight to the
+        // deadline, so the hook runs there: good for "something happens during
+        // the call" checks, not for starting the traffic a call waits for -
+        // do that before the call, and the frames in flight are the events.
         void on_tick(int n, std::function<void()> action)
         {
             net.add_tick_hook(
@@ -151,10 +180,11 @@ TEST_F(UstackBlocking, Accept4FlagsAndInheritance)
 TEST_F(UstackBlocking, BlockingAcceptWaitsForAConnection)
 {
     listen_fd = blocking_listener();
-    on_tick(1, [&] { start_connect(PORT); });
+    start_connect(PORT); // the SYN is in flight, not yet delivered
+    count_pumps();
     int fd = server->accept(listen_fd, nullptr, nullptr);
     ASSERT_GE(fd, 0) << std::strerror(errno);
-    EXPECT_GE(pumps, 1) << "it must have pumped the stack";
+    expect_it_waited();
 }
 
 TEST_F(UstackBlocking, BlockingAcceptHonoursSoRcvtimeo)
@@ -203,17 +233,20 @@ TEST_F(UstackBlocking, BlockingConnectTimeoutFollowsLinuxAndReturnsEinprogress)
 TEST_F(UstackBlocking, BlockingRecvWaitsForData)
 {
     auto [c, s] = blocking_pair();
-    on_tick(1, [&] { send_string(*server, s, "hello"); });
+    ASSERT_EQ(send_string(*server, s, "hello"), 5); // in flight, not yet delivered
+    count_pumps();
     EXPECT_EQ(recv_string(*client, c), "hello");
-    EXPECT_GE(pumps, 1);
+    expect_it_waited();
 }
 
 TEST_F(UstackBlocking, BlockingRecvReturnsZeroAtEof)
 {
     auto [c, s] = blocking_pair();
-    on_tick(1, [&] { server->shutdown(s, SHUT_WR); });
+    ASSERT_EQ(server->shutdown(s, SHUT_WR), 0); // the FIN is in flight
+    count_pumps();
     char buffer[8];
     EXPECT_EQ(client->recv(c, buffer, sizeof(buffer), 0), 0);
+    expect_it_waited();
 }
 
 TEST_F(UstackBlocking, RecvTimeoutExpiresWithEagainAtTheRightVirtualTime)
@@ -264,17 +297,14 @@ TEST_F(UstackBlocking, MsgDontwaitMakesOneCallNonBlocking)
 TEST_F(UstackBlocking, PeerResetDuringBlockedRecvIsEconnreset)
 {
     auto [c, s] = blocking_pair();
-    set_timeout(*client, c, SO_RCVTIMEO, 5000);
-    on_tick(1,
-            [&]
-            {
-                linger abort_on_close{1, 0};
-                server->setsockopt(s, SOL_SOCKET, SO_LINGER, &abort_on_close, sizeof(abort_on_close));
-                server->close(s);
-            });
+    linger abort_on_close{1, 0};
+    ASSERT_EQ(server->setsockopt(s, SOL_SOCKET, SO_LINGER, &abort_on_close, sizeof(abort_on_close)), 0);
+    ASSERT_EQ(server->close(s), 0); // the RST is in flight
+    count_pumps();
     char buffer[8];
     EXPECT_EQ(client->recv(c, buffer, sizeof(buffer), 0), -1);
     EXPECT_EQ(errno, ECONNRESET);
+    expect_it_waited();
 }
 
 TEST_F(UstackBlocking, BlockingSendQueuesEveryByteWhileThePeerDrains)
@@ -332,16 +362,19 @@ TEST_F(UstackBlocking, UdpSendtoNeverBlocksAndRecvfromWaits)
     ASSERT_EQ(server->bind(rx, as_sockaddr(bind_to), sizeof(bind_to)), 0);
     int tx = blocking_socket(*client, SOCK_DGRAM);
     sockaddr_in to = address(server_ip, 9000);
-    on_tick(1, [&] { client->sendto(tx, "dgram", 5, 0, as_sockaddr(to), sizeof(to)); });
+    ASSERT_EQ(client->sendto(tx, "dgram", 5, 0, as_sockaddr(to), sizeof(to)), 5); // sendto() returned at once
+    count_pumps();
     char buffer[16];
     EXPECT_EQ(server->recvfrom(rx, buffer, sizeof(buffer), 0, nullptr, nullptr), 5);
     EXPECT_EQ(std::string(buffer, 5), "dgram");
+    expect_it_waited();
 }
 
 TEST_F(UstackBlocking, ClosingTheFdFromInsideThePumpIsEbadfNotAUseAfterFree)
 {
     auto [c, s] = blocking_pair();
     static_cast<void>(s);
+    set_timeout(*client, c, SO_RCVTIMEO, 5000);
     on_tick(1, [&] { client->close(c); });
     char buffer[8];
     EXPECT_EQ(client->recv(c, buffer, sizeof(buffer), 0), -1);

@@ -167,8 +167,9 @@ TEST_F(UstackSocket, UdpSendtoRecvfrom)
 
 TEST_F(UstackSocket, ErrorsMatchLinux)
 {
-    EXPECT_EQ(client->socket(AF_INET, SOCK_STREAM, 0), -1) << "blocking sockets are unsupported";
-    EXPECT_EQ(errno, EINVAL);
+    int blocking = client->socket(AF_INET, SOCK_STREAM, 0);
+    EXPECT_GE(blocking, 0) << "no SOCK_NONBLOCK makes a blocking socket (see test_ustack_blocking.cpp)";
+    EXPECT_EQ(client->close(blocking), 0);
     EXPECT_EQ(client->socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0), -1) << "AF_INET and AF_INET6 only";
     EXPECT_EQ(errno, EAFNOSUPPORT);
 
