@@ -235,7 +235,12 @@ hardware and is why promiscuous mode is never needed. See
 
 **UDP.** A connectionless `UdpSocket` with bind, `send_to`, and a receive callback.
 Sending to a peer whose MAC is not yet known queues the datagram and kicks off a
-bounded ARP resolution, the same way an active TCP open does.
+bounded ARP resolution, the same way an active TCP open does. A socket can also take a
+default peer (`connect_peer`): it then delivers only that peer's datagrams (others are
+refused, counted, and answered with Port Unreachable, as Linux does) and reports a hard
+ICMP error about the peer - port unreachable, fragmentation needed, administratively
+prohibited - to a callback. Net and host unreachable are soft and never reported, which
+matches Linux without `IP_RECVERR`.
 
 **ICMP.** Echo Request and Reply (so a real `ping` gets an answer), Destination
 Unreachable / Port Unreachable both generated and acted upon, and Time Exceeded for a
@@ -629,7 +634,16 @@ driver (a kernel epoll and a timerfd, no spinning), time is the driver's clock (
 in the simulator, so a 30 s timeout costs nothing), and it re-looks the socket up after
 every pump, failing with `EBADF` if something closed the fd meanwhile. A call that can
 never complete - the simulator with nothing pending and no timeout - fails with
-`EDEADLK` instead of hanging. The one-thread rule is unchanged: one thread owns a
+`EDEADLK` instead of hanging. `connect()` on a `SOCK_DGRAM` socket sets a default peer, as
+on Linux, for both families and v4-mapped peers: implicit bind with the route's source
+address, `send`/`write` to the peer (a `sendto` with an address still overrides it), only
+the peer's datagrams delivered, `getpeername`, and `connect(AF_UNSPEC)` to dissolve it
+(it gives back an automatically chosen port and keeps one `bind()` named). A hard ICMP
+error about the peer - Port Unreachable above all - is the socket's pending error: the
+next `send`/`recv` returns `ECONNREFUSED` once, `SO_ERROR` returns and clears it and
+`EPOLLERR`/`POLLERR` shows while it is pending; an unconnected socket hears nothing. Each
+of these was probed on the kernel first and is compared against it line by line in
+`tests/src/test_stack_differential_udp_connect.cpp`. The one-thread rule is unchanged: one thread owns a
 `Stack`, and it is the thread inside the blocking call; nothing else may call into that
 `Stack` meanwhile. `pollable_fd()` lets it nest inside an application's own kernel epoll. The other
 direction is `epoll_ctl_external()`: a kernel fd the application owns (an eventfd, say) is

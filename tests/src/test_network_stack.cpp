@@ -13,6 +13,7 @@
 #include "network_addresses.h"
 #include "syn_cookie.h"
 
+#include <cerrno>
 #include <map>
 #include <memory>
 #include <vector>
@@ -3805,4 +3806,126 @@ TEST(NetworkStackCounters, TheHalfOpenCapIsTheListenersBacklog)
     ASSERT_TRUE(stack->syn_cookies_sent() == 1) << "the fifth is past the cap";
     ASSERT_TRUE(NetworkStack::half_open_cap(1u << 20) == NetworkStack::MAX_LISTEN_BACKLOG) << "clamped like somaxconn";
     ASSERT_TRUE(NetworkStack::half_open_cap(0) == 1) << "and never zero";
+}
+
+// --- ICMP errors for UDP --------------------------------------------------
+
+namespace
+{
+    // An ICMP Destination Unreachable as the peer's stack would send it for a
+    // datagram we sent from local_port to PEER_IP:remote_port: the IP header
+    // plus the first 8 bytes of the UDP header, quoted back (RFC 792).
+    Bytes build_icmp_unreachable_for_our_udp(uint16_t local_port, uint16_t remote_port, uint8_t code,
+                                             const IPv4Address& quoted_source = LOCAL_IP)
+    {
+        Udp ours(local_port, remote_port, 9, 0, Bytes());
+        auto embedded_ip = std::make_unique<Ip>(4, 5, 0, 29, 0, 0, 0, 64, IpProtocol::UDP, 0,
+                                                quoted_source.get_address(), PEER_IP.get_address());
+        *embedded_ip /= std::make_unique<Raw>(ours.to_bytes());
+        embedded_ip->compute_checksum();
+        Bytes embedded = embedded_ip->to_bytes().slice(0, 28);
+
+        Icmp icmp(IcmpType::ICMP_DESTINATION_UNREACHABLE, code, 0, 0, embedded);
+        icmp.compute_checksum();
+        return wrap_ip(IpProtocol::ICMP, icmp.to_bytes());
+    }
+
+    // What a UDP socket is told when `code` arrives, 0 for nothing.
+    int error_reported_for(uint8_t code, bool connected = true, uint16_t quoted_remote_port = 9000,
+                           const IPv4Address& quoted_source = LOCAL_IP)
+    {
+        FakePacketChannel* channel = nullptr;
+        auto stack = make_stack(channel);
+        UdpSocket* socket = stack->bind_udp(40000);
+        int reported = 0;
+        socket->set_error_callback([&reported](int error) { reported = error; });
+        if (connected)
+        {
+            socket->connect_peer(PEER_IP, 9000, LOCAL_IP);
+        }
+        channel->push_inbound(build_icmp_unreachable_for_our_udp(40000, quoted_remote_port, code, quoted_source));
+        stack->poll();
+        return reported;
+    }
+}
+
+// What Linux does with each code on a connected UDP socket, found by injecting
+// them under `unshare -rn`: only hard errors surface, with icmp_err_convert's
+// errno. Net and host unreachable are transient, so nobody hears of them.
+TEST(NetworkStackUdpErrors, PortUnreachableIsConnectionRefused)
+{
+    ASSERT_TRUE(error_reported_for(ICMP_CODE_PORT_UNREACHABLE) == ECONNREFUSED) << "port unreachable -> ECONNREFUSED";
+}
+
+TEST(NetworkStackUdpErrors, HardCodesMapToLinuxsErrnos)
+{
+    ASSERT_TRUE(error_reported_for(2) == ENOPROTOOPT) << "protocol unreachable";
+    ASSERT_TRUE(error_reported_for(ICMP_CODE_FRAGMENTATION_NEEDED) == EMSGSIZE) << "fragmentation needed";
+    ASSERT_TRUE(error_reported_for(6) == ENETUNREACH) << "destination network unknown";
+    ASSERT_TRUE(error_reported_for(7) == EHOSTDOWN) << "destination host unknown";
+    ASSERT_TRUE(error_reported_for(9) == ENETUNREACH) << "network administratively prohibited";
+    ASSERT_TRUE(error_reported_for(10) == EHOSTUNREACH) << "host administratively prohibited";
+    ASSERT_TRUE(error_reported_for(13) == EHOSTUNREACH) << "communication administratively prohibited";
+}
+
+TEST(NetworkStackUdpErrors, NetAndHostUnreachableAreNotReportedByDefault)
+{
+    ASSERT_TRUE(error_reported_for(0) == 0) << "net unreachable is soft: Linux reports it only with IP_RECVERR";
+    ASSERT_TRUE(error_reported_for(1) == 0) << "host unreachable is soft too";
+    ASSERT_TRUE(error_reported_for(5) == 0) << "source route failed is soft";
+}
+
+TEST(NetworkStackUdpErrors, AnUnconnectedSocketIgnoresTheError)
+{
+    ASSERT_TRUE(error_reported_for(ICMP_CODE_PORT_UNREACHABLE, false) == 0)
+        << "an unconnected socket cannot tell which destination the error is about";
+}
+
+TEST(NetworkStackUdpErrors, AnErrorAboutAnotherPeerPortIsIgnored)
+{
+    ASSERT_TRUE(error_reported_for(ICMP_CODE_PORT_UNREACHABLE, true, 9001) == 0)
+        << "the quoted destination is not the connected peer";
+}
+
+// Linux answers a connected socket's third party with Port Unreachable, as if
+// nothing were bound: the stranger's own connected socket then learns of it.
+TEST(NetworkStackUdpErrors, AStrangersDatagramToAConnectedSocketDrawsPortUnreachable)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    UdpSocket* socket = stack->bind_udp(40000);
+    socket->connect_peer(IPv4Address("10.0.0.9"), 9000, LOCAL_IP);
+    int delivered = 0;
+    socket->set_datagram_received_callback([&delivered](const IpAddress&, uint16_t, const Bytes&) { delivered++; });
+
+    channel->push_inbound(build_arp_request());
+    channel->push_inbound(build_udp(5000, 40000, Bytes::from_hex("00"))); // from PEER_IP, not the peer
+    stack->poll();
+
+    ASSERT_TRUE(delivered == 0) << "the stranger's datagram is not delivered";
+    IcmpView reply = find_icmp(channel->outbound_frames());
+    ASSERT_TRUE(reply.is_icmp && reply.code == ICMP_CODE_PORT_UNREACHABLE) << "it is answered with Port Unreachable";
+    ASSERT_TRUE(socket->datagrams_filtered() == 1) << "and counted";
+}
+
+TEST(NetworkStackUdpErrors, SourceAddressComesFromTheRoute)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    std::optional<IpAddress> source = stack->source_address_for(PEER_IP);
+    ASSERT_TRUE(source && *source == IpAddress(LOCAL_IP))
+        << "a routed destination is reached from the interface address";
+    std::optional<IpAddress> loopback = stack->source_address_for(IPv4Address("127.0.0.1"));
+    ASSERT_TRUE(loopback && *loopback == IpAddress(IPv4Address("127.0.0.1")))
+        << "a local destination is its own source";
+}
+
+// Linux looks the socket up by the full four-tuple, so an error quoting a
+// datagram that left from some other address of ours is not this socket's.
+TEST(NetworkStackUdpErrors, AnErrorQuotingAnotherLocalAddressIsIgnored)
+{
+    ASSERT_TRUE(error_reported_for(ICMP_CODE_PORT_UNREACHABLE, true, 9000, IPv4Address("10.0.0.99")) == 0)
+        << "same ports and peer, but the quoted source is not the address the socket sends from";
+    ASSERT_TRUE(error_reported_for(ICMP_CODE_PORT_UNREACHABLE, true, 9000, LOCAL_IP) == ECONNREFUSED)
+        << "the genuine quote still counts";
 }

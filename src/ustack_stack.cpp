@@ -497,6 +497,25 @@ namespace ustack
                     receiver.received.push_back(Datagram{source, source_port, data});
                     stack->_wake(fd, READABLE);
                 });
+            // An ICMP error about the connected peer: kept as the pending
+            // error, as sk_err is, so the next call (or SO_ERROR) reports it.
+            socket.udp->set_error_callback(
+                [self, fd](int error)
+                {
+                    Stack* stack = *self;
+                    if (stack == nullptr)
+                    {
+                        return;
+                    }
+                    stack->_get(fd)->so_error = error;
+                    stack->_wake(fd, EPOLLERR);
+                });
+            // Binding again after a disconnect gave the port back: the
+            // address bind() named is still the socket's.
+            if (!_is_wildcard(socket.bound_ip))
+            {
+                socket.udp->set_bound_address(socket.bound_ip);
+            }
         }
         socket.local_port = port;
         socket.port_reserved = true;
@@ -583,6 +602,7 @@ namespace ustack
         {
             return fail(error);
         }
+        socket->port_from_bind = port != 0;
         socket->bound_ip = std::move(ip);
         if (socket->udp != nullptr && !_is_wildcard(socket->bound_ip))
         {
@@ -766,6 +786,80 @@ namespace ustack
         return fail(error);
     }
 
+    int Stack::_connect_udp(int fd, Socket& socket, const struct sockaddr* addr, socklen_t addrlen)
+    {
+        if (addr == nullptr)
+        {
+            return fail(EFAULT);
+        }
+        // inet_dgram_connect: the family is looked at before anything else, so
+        // AF_UNSPEC needs only the two bytes that hold it.
+        sa_family_t family = AF_UNSPEC;
+        if (addrlen < static_cast<socklen_t>(sizeof(family)))
+        {
+            return fail(EINVAL);
+        }
+        std::memcpy(&family, addr, sizeof(family));
+        if (family == AF_UNSPEC)
+        {
+            // udp_disconnect: back to unconnected. An automatically chosen
+            // port is released (a later send binds a fresh one), one named to
+            // bind() stays; the address the route supplied goes with the
+            // connection, one named to bind() stays. A pending error is not
+            // touched.
+            socket.udp_connected = false;
+            socket.peer_ip = IpAddress();
+            socket.peer_port = 0;
+            if (socket.udp != nullptr)
+            {
+                socket.udp->disconnect_peer();
+                if (!socket.port_from_bind)
+                {
+                    _stack.unbind_udp(socket.local_port);
+                    _udp_ports.erase(socket.local_port);
+                    socket.udp = nullptr;
+                    socket.local_port = 0;
+                    socket.port_reserved = false;
+                }
+            }
+            return 0;
+        }
+
+        IpAddress ip;
+        uint16_t port = 0;
+        if (int error = _parse_address(socket, addr, addrlen, ip, port); error != 0)
+        {
+            return fail(error);
+        }
+        if ((ip.is_v4() && socket.v6only) || (ip.is_v6() && !_stack.ipv6_enabled()))
+        {
+            return fail(ENETUNREACH);
+        }
+        // Connecting to "any" means this host, as for TCP.
+        if (_is_wildcard(ip))
+        {
+            ip = ip.is_v4() ? IpAddress(IPv4Address("127.0.0.1")) : IpAddress(IPv6Address("::1"));
+        }
+        std::optional<IpAddress> source = _stack.source_address_for(ip);
+        if (!source)
+        {
+            return fail(ENETUNREACH);
+        }
+        if (socket.udp == nullptr)
+        {
+            if (int error = _bind_port(fd, socket, 0); error != 0)
+            {
+                return fail(error);
+            }
+        }
+        socket.local_ip = _is_wildcard(socket.bound_ip) ? *source : socket.bound_ip;
+        socket.peer_ip = ip;
+        socket.peer_port = port;
+        socket.udp_connected = true;
+        socket.udp->connect_peer(ip, port, socket.local_ip);
+        return 0;
+    }
+
     int Stack::_connect_once(int fd, const struct sockaddr* addr, socklen_t addrlen)
     {
         CallScope scope(*this);
@@ -780,7 +874,7 @@ namespace ustack
         }
         if (socket->kind == Kind::UDP)
         {
-            return fail(EOPNOTSUPP); // a UDP default peer is not supported - see stack.h
+            return _connect_udp(fd, *socket, addr, addrlen);
         }
         IpAddress ip;
         uint16_t port = 0;
@@ -918,15 +1012,34 @@ namespace ustack
 
         if (socket->kind == Kind::UDP)
         {
-            if (dest_addr == nullptr)
+            // inet_sendmsg binds before anything else can fail, so even a send
+            // that ends in EDESTADDRREQ leaves the socket with a port.
+            if (socket->udp == nullptr)
             {
-                return fail(EDESTADDRREQ);
+                if (int error = _bind_port(fd, *socket, 0); error != 0)
+                {
+                    return fail(error);
+                }
             }
             IpAddress ip;
             uint16_t port = 0;
-            if (int error = _parse_address(*socket, dest_addr, addrlen, ip, port); error != 0)
+            if (dest_addr != nullptr)
             {
-                return fail(error);
+                // An address given to a connected socket is used for that
+                // datagram alone, as on Linux.
+                if (int error = _parse_address(*socket, dest_addr, addrlen, ip, port); error != 0)
+                {
+                    return fail(error);
+                }
+            }
+            else if (socket->udp_connected)
+            {
+                ip = socket->peer_ip;
+                port = socket->peer_port;
+            }
+            else
+            {
+                return fail(EDESTADDRREQ);
             }
             if ((ip.is_v4() && socket->v6only) || (ip.is_v6() && !_stack.ipv6_enabled()))
             {
@@ -938,13 +1051,12 @@ namespace ustack
             {
                 return fail(EMSGSIZE);
             }
-            if (socket->udp == nullptr)
+            // sock_alloc_send_skb: a pending error fails the send, and is
+            // consumed by it, so the datagram that would have drawn a second
+            // one is never sent.
+            if (socket->so_error != 0)
             {
-                // Autobind, as Linux does on a first send.
-                if (int error = _bind_port(fd, *socket, 0); error != 0)
-                {
-                    return fail(error);
-                }
+                return fail(_take_error(*socket));
             }
             Bytes payload(static_cast<unsigned int>(len));
             std::copy(bytes, bytes + len, payload.begin());
@@ -1159,6 +1271,12 @@ namespace ustack
 
         if (socket->kind == Kind::UDP)
         {
+            // __skb_try_recv_datagram looks at sk_err before the queue, so a
+            // pending error is reported first and taken even by MSG_PEEK.
+            if (socket->so_error != 0)
+            {
+                return fail(_take_error(*socket));
+            }
             if (socket->received.empty())
             {
                 return fail(EAGAIN);
@@ -1741,7 +1859,8 @@ namespace ustack
         {
             return fail(ENOTSOCK);
         }
-        const IpAddress& ip = socket->connection_id != 0 ? socket->local_ip : socket->bound_ip;
+        const bool has_local = socket->connection_id != 0 || socket->udp_connected;
+        const IpAddress& ip = has_local ? socket->local_ip : socket->bound_ip;
         if (int error = _fill_address(socket->family, ip, socket->local_port, addr, addrlen); error != 0)
         {
             return fail(error);
@@ -1761,10 +1880,20 @@ namespace ustack
         {
             return fail(ENOTSOCK);
         }
-        TcpConnection* connection = _connection(*socket);
-        if (connection == nullptr || handshaking(connection->get_state()))
+        if (socket->kind == Kind::UDP)
         {
-            return fail(ENOTCONN);
+            if (!socket->udp_connected)
+            {
+                return fail(ENOTCONN);
+            }
+        }
+        else
+        {
+            TcpConnection* connection = _connection(*socket);
+            if (connection == nullptr || handshaking(connection->get_state()))
+            {
+                return fail(ENOTCONN);
+            }
         }
         if (int error = _fill_address(socket->family, socket->peer_ip, socket->peer_port, addr, addrlen); error != 0)
         {
@@ -1934,7 +2063,9 @@ namespace ustack
         case Kind::TCP:
             return _poll_tcp(socket);
         case Kind::UDP:
-            return (socket.received.empty() ? 0 : READABLE) | WRITABLE;
+            // A pending ICMP error (sk_err) is EPOLLERR, as datagram_poll does.
+            return (socket.received.empty() ? 0 : READABLE) | WRITABLE
+                   | (socket.so_error != 0 ? static_cast<uint32_t>(EPOLLERR) : 0U);
         case Kind::EPOLL:
             return socket.epoll->ready.empty() ? 0 : READABLE;
         }

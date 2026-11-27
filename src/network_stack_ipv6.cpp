@@ -4,6 +4,7 @@
 // the v4 path below the transport layer - only TCP and UDP, which both paths
 // reach through the same family-neutral entry points.
 
+#include <cerrno>
 #include "network_stack.h"
 
 #include <algorithm>
@@ -757,12 +758,64 @@ void NetworkStack::_handle_router_advertisement(const Ipv6& ip, const Icmpv6& me
     }
 }
 
+void NetworkStack::_handle_icmpv6_udp_error(const Icmpv6& message, const Bytes& body)
+{
+    // What Linux makes of an ICMPv6 error for a UDP socket (icmpv6_err_convert),
+    // and, as for v4, only hard ones reach a connected socket: no route,
+    // beyond scope and address unreachable are transient and heard of by
+    // no one. Verified against a 7.x kernel by injecting each code.
+    int error = 0;
+    if (message.get_type() == ICMPV6_PACKET_TOO_BIG)
+    {
+        error = EMSGSIZE;
+    }
+    else
+    {
+        switch (message.get_code())
+        {
+        case 1: // administratively prohibited
+        case 5: // source address failed ingress/egress policy
+        case 6: // reject route
+            error = EACCES;
+            break;
+        case ICMPV6_CODE_PORT_UNREACHABLE:
+            error = ECONNREFUSED;
+            break;
+        default:
+            break;
+        }
+    }
+    if (error == 0)
+    {
+        LOG_DEBUG("NetworkStack: ignoring an ICMPv6 error (type " << static_cast<int>(message.get_type()) << ", code "
+                                                                  << static_cast<int>(message.get_code())
+                                                                  << ") for a UDP datagram - not a hard error");
+        return;
+    }
+    constexpr size_t QUOTE = 4;
+    const size_t transport = QUOTE + Ipv6::HEADER_SIZE;
+    IPv6Address original_source(body.slice(QUOTE + 8, IPv6Address::SIZE));
+    IPv6Address original_destination(body.slice(QUOTE + 24, IPv6Address::SIZE));
+    uint16_t local_port = body.slice_int<uint16_t>(transport);
+    uint16_t remote_port = body.slice_int<uint16_t>(transport + 2);
+    auto it = this->_udp_sockets.find(local_port);
+    if (it != this->_udp_sockets.end())
+    {
+        it->second->on_icmp_error(IpAddress(original_source), IpAddress(original_destination), remote_port, error);
+    }
+}
+
 void NetworkStack::_handle_icmpv6_error(const Icmpv6& message)
 {
     // Destination Unreachable and Packet Too Big share a shape: 4 bytes (unused,
     // or the MTU), then the invoking packet - our own, as it left.
     const Bytes& body = message.get_body();
     constexpr size_t QUOTE = 4;
+    if (body.size() >= QUOTE + Ipv6::HEADER_SIZE + 8 && body[QUOTE + 6] == IPV6_NEXT_UDP)
+    {
+        this->_handle_icmpv6_udp_error(message, body);
+        return;
+    }
     if (body.size() < QUOTE + Ipv6::HEADER_SIZE + 8 || body[QUOTE + 6] != IPV6_NEXT_TCP)
     {
         return; // too short to name a connection, or not about TCP

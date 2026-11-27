@@ -386,6 +386,10 @@ public:
     // an address configured on this stack. What the socket layer asks to accept
     // a bind() and to size a datagram by the loopback MTU.
     bool is_local_address(const IpAddress& address) const;
+    // The address a datagram to `destination` would leave from - what a
+    // connect() on a datagram socket reports as the socket's own address - or
+    // nullopt when there is no route to it (the caller's ENETUNREACH).
+    std::optional<IpAddress> source_address_for(const IpAddress& destination) const;
     uint64_t challenge_acks_sent() const { return _challenge_acks_sent; }
     uint64_t challenge_acks_suppressed() const { return _challenge_acks_suppressed; }
     // SYNs that ended a TIME_WAIT early to open a new connection on the same
@@ -817,6 +821,9 @@ private:
     // that sent it and fail it fast, instead of leaving it to grind through
     // the full retransmit-timeout budget before giving up.
     void _handle_icmp_error(const Icmp& icmp);
+    // The same message when it quotes a UDP datagram: finds the socket by the
+    // quoted source port and lets it decide (a connected one reports it).
+    void _handle_icmp_udp_error(const Icmp& icmp, const Bytes& quoted);
     // RFC 1191: a router could not forward a DF-set packet because the next
     // link's MTU is too small, and reported that MTU. Lowers the offending
     // connection's segment size instead of failing it.
@@ -1118,6 +1125,7 @@ private:
     void _handle_neighbour_advertisement(const Ipv6& ip, const Icmpv6& message);
     void _handle_router_advertisement(const Ipv6& ip, const Icmpv6& message);
     void _handle_icmpv6_error(const Icmpv6& message);
+    void _handle_icmpv6_udp_error(const Icmpv6& message, const Bytes& body);
     // A host's multicast memberships: all-nodes and the solicited-node group
     // of every address it has or is testing (RFC 4861 7.2.1, RFC 4862 5.4.2).
     bool _ipv6_group_joined(const IPv6Address& group) const;

@@ -1008,3 +1008,74 @@ TEST(Ipv6Stack, NeighbourCacheHoldsUnderAMixedSpoofedFlood)
     EXPECT_TRUE(sent[0].destination_mac == PEER_MAC);
     EXPECT_TRUE(sent[1].destination_mac == ROUTER_MAC);
 }
+
+// --- ICMPv6 errors for UDP ---------------------------------------------------
+
+namespace
+{
+    // What a UDP socket on LOCAL:40000 connected (or not) to PEER:9000 is told
+    // when an ICMPv6 error of this type and code arrives quoting its datagram;
+    // 0 for nothing.
+    int udp_error_reported_for(uint8_t type, uint8_t code, bool connected = true, uint16_t quoted_remote_port = 9000,
+                               const IPv6Address& quoted_source = LOCAL)
+    {
+        Host host;
+        host.stack->add_ipv6_address(LOCAL);
+        UdpSocket* socket = host.stack->bind_udp(40000);
+        int reported = 0;
+        socket->set_error_callback([&reported](int error) { reported = error; });
+        if (connected)
+        {
+            socket->connect_peer(PEER, 9000, LOCAL);
+        }
+        Bytes body;
+        body.append_int<uint32_t>(type == ICMPV6_PACKET_TOO_BIG ? 1400 : 0);
+        Bytes udp;
+        udp.append_int<uint16_t>(40000);
+        udp.append_int<uint16_t>(quoted_remote_port);
+        udp.append_int<uint16_t>(8);
+        udp.append_int<uint16_t>(0);
+        body |= ipv6_packet(quoted_source, PEER, IPV6_NEXT_UDP, udp);
+        host.deliver(icmpv6_packet(PEER, LOCAL, type, body, 64, code));
+        return reported;
+    }
+}
+
+// Found by injecting each code in a private network namespace: as for v4, only
+// hard errors reach a connected datagram socket.
+TEST(Ipv6UdpErrors, PortUnreachableIsConnectionRefused)
+{
+    EXPECT_EQ(udp_error_reported_for(ICMPV6_DESTINATION_UNREACHABLE, 4), ECONNREFUSED);
+}
+
+TEST(Ipv6UdpErrors, ProhibitedAndPolicyCodesAreAccessDenied)
+{
+    EXPECT_EQ(udp_error_reported_for(ICMPV6_DESTINATION_UNREACHABLE, 1), EACCES) << "administratively prohibited";
+    EXPECT_EQ(udp_error_reported_for(ICMPV6_DESTINATION_UNREACHABLE, 5), EACCES) << "source address policy";
+    EXPECT_EQ(udp_error_reported_for(ICMPV6_DESTINATION_UNREACHABLE, 6), EACCES) << "reject route";
+}
+
+TEST(Ipv6UdpErrors, PacketTooBigIsMessageTooLong)
+{
+    EXPECT_EQ(udp_error_reported_for(ICMPV6_PACKET_TOO_BIG, 0), EMSGSIZE);
+}
+
+TEST(Ipv6UdpErrors, NoRouteBeyondScopeAndAddressUnreachableAreNotReported)
+{
+    EXPECT_EQ(udp_error_reported_for(ICMPV6_DESTINATION_UNREACHABLE, 0), 0) << "no route";
+    EXPECT_EQ(udp_error_reported_for(ICMPV6_DESTINATION_UNREACHABLE, 2), 0) << "beyond scope";
+    EXPECT_EQ(udp_error_reported_for(ICMPV6_DESTINATION_UNREACHABLE, 3), 0) << "address unreachable";
+}
+
+TEST(Ipv6UdpErrors, AnUnconnectedSocketOrAnotherPeerPortHearsNothing)
+{
+    EXPECT_EQ(udp_error_reported_for(ICMPV6_DESTINATION_UNREACHABLE, 4, false), 0);
+    EXPECT_EQ(udp_error_reported_for(ICMPV6_DESTINATION_UNREACHABLE, 4, true, 9001), 0);
+}
+
+TEST(Ipv6UdpErrors, AnErrorQuotingAnotherLocalAddressIsIgnored)
+{
+    EXPECT_EQ(udp_error_reported_for(ICMPV6_DESTINATION_UNREACHABLE, 4, true, 9000, IPv6Address("2001:db8::99")), 0)
+        << "same ports and peer, but not the address the socket sends from";
+    EXPECT_EQ(udp_error_reported_for(ICMPV6_DESTINATION_UNREACHABLE, 4, true, 9000, LOCAL), ECONNREFUSED);
+}
