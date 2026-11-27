@@ -8,6 +8,7 @@
 
 namespace
 {
+    constexpr uint8_t FLAG_URG = 0x20;
     constexpr uint8_t FLAG_ACK = 0x10;
     constexpr uint8_t FLAG_RST = 0x04;
     constexpr uint8_t FLAG_SYN = 0x02;
@@ -281,7 +282,25 @@ void TcpConnection::_transmit(uint8_t flags, uint32_t seq, const Bytes& payload,
             static_cast<uint32_t>(std::min<uint64_t>((offered + (uint64_t{1} << our_shift) - 1) >> our_shift, 0xFFFFu));
     }
 
-    Tcp header(_local_port, _remote_port, seq, _recv_next, 5, flags, static_cast<uint16_t>(window_value), 0, 0);
+    // Urgent mode (Linux's tcp_transmit_skb): anything that starts before
+    // SND.UP is marked, whatever it is - a retransmission, a probe - and the
+    // pointer is how far SND.UP is from it, 65535 at most.
+    uint16_t urgent_ptr = 0;
+    if (_snd_up_set)
+    {
+        if (!seq_before(_in_flight.snd_una_or(_send_next), _snd_up))
+        {
+            _snd_up_set = false; // everything up to SND.UP is acknowledged: the urgent range is over
+        }
+        else if (!(flags & (FLAG_SYN | FLAG_RST)) && seq_before(seq, _snd_up))
+        {
+            flags |= FLAG_URG;
+            urgent_ptr = static_cast<uint16_t>(std::min<uint32_t>(_snd_up - seq, 0xFFFFu));
+        }
+    }
+
+    Tcp header(_local_port, _remote_port, seq, _recv_next, 5, flags, static_cast<uint16_t>(window_value), 0,
+               urgent_ptr);
     _add_options(header, flags, payload.size());
     _send_segment(header, payload, ecn);
     if (flags & FLAG_ACK)
@@ -3114,7 +3133,7 @@ TcpConnection::Info TcpConnection::info() const
     return out;
 }
 
-size_t TcpConnection::send(const Bytes& data)
+size_t TcpConnection::send(const Bytes& data, bool urgent)
 {
     EntryScope scope(*this);
     if ((_state != TcpState::ESTABLISHED && _state != TcpState::CLOSE_WAIT) || _fin_requested)
@@ -3132,6 +3151,15 @@ size_t TcpConnection::send(const Bytes& data)
     }
 
     _restart_after_idle();
+
+    if (urgent)
+    {
+        // Set before anything is transmitted: the segments this very call
+        // sends are the urgent ones. SND.UP is the end of what this write
+        // puts in the stream, behind whatever is already queued.
+        _snd_up = _send_next + static_cast<uint32_t>(_send_queued_bytes) + static_cast<uint32_t>(accepted);
+        _snd_up_set = true;
+    }
 
     // split anything larger than the negotiated effective MSS - the
     // application shouldn't have to know what that negotiated value is

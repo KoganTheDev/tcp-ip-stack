@@ -240,7 +240,14 @@ public:
     // no way to know it was doing so. A short return is the signal to stop and
     // wait for writable() - the send-side equivalent of the peer closing its
     // window on us.
-    size_t send(const Bytes& data);
+    //
+    // urgent = true is send(..., MSG_OOB): the bytes are written as usual and
+    // SND.UP is set to the byte after the last of them. Every segment that
+    // starts before SND.UP - retransmissions too - then carries URG and the
+    // pointer SND.UP - SEQ (capped at 65535), which is Linux's "one past the
+    // last urgent byte" reading of the pointer (RFC 6093 section 3.1 names it
+    // as the common one). A write that accepts nothing marks nothing.
+    size_t send(const Bytes& data, bool urgent = false);
 
     // Room left in the send queue. Zero means the next send() accepts nothing.
     size_t send_space_available() const;
@@ -1118,6 +1125,12 @@ private:
     // Bytes sitting in _send_queue, kept alongside it so send_space_available()
     // is a subtraction rather than a walk over every queued chunk.
     size_t _send_queued_bytes;
+    // SND.UP, the end of the last urgent write, and whether one is still
+    // outstanding. Linux keys "urgent mode" on snd_una != snd_up; the flag
+    // here is that test made safe against a stale value coming round again
+    // after the sequence space wraps. See _transmit().
+    uint32_t _snd_up = 0;
+    bool _snd_up_set = false;
     // close() called while data was still queued: the FIN goes out with the
     // last queued segment (see _send_chunk()).
     bool _fin_requested;
