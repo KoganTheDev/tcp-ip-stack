@@ -1919,6 +1919,12 @@ void TcpConnection::_handle_ack(const Tcp& segment)
     // one there is no telling which transmission the ack answers.
     SendScoreboard::AckContext rack_context = _rack_context(segment);
     SendScoreboard::Acked acked = _in_flight.acknowledge(ack, _sack_permitted ? &rack_context : nullptr);
+    {
+        const uint32_t una_now = _in_flight.snd_una_or(_send_next);
+        _acked_total = _acked_now(una_now);
+        _acked_mark = una_now;
+        _acked_started = true;
+    }
     // RFC 6937 DeliveredData: the change in SND.UNA plus the change in SACKed
     // bytes. Retired SACKed segments are in both, so they cancel.
     auto delivered = static_cast<uint32_t>(std::max<int64_t>(
@@ -3093,7 +3099,7 @@ TcpConnection::Info TcpConnection::info() const
     }
     // Linux counts the SYN acked by an active opener, not the SYN-ACK acked by
     // a passive one (its child socket starts counting after the handshake).
-    out.bytes_acked = static_cast<uint32_t>(una - _iss);
+    out.bytes_acked = _acked_now(una);
     if (!_active_open && out.bytes_acked > 0)
     {
         out.bytes_acked--;

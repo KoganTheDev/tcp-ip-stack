@@ -1288,6 +1288,17 @@ private:
     // RCV.NXT, unwrapped, as it was when the peer's SYN was taken in: what
     // bytes received are counted from (TCP_INFO's tcpi_bytes_received).
     uint64_t _recv_start_unwrapped = 0;
+    // SND.UNA - ISS as a 64-bit count (tcpi_bytes_acked): the 32-bit distance
+    // wraps at 4 GiB, so it is accumulated at each ack that moves SND.UNA.
+    // _acked_mark is the SND.UNA it was last brought up to; valid once
+    // _acked_started (it begins at the ISS).
+    uint64_t _acked_total = 0;
+    uint32_t _acked_mark = 0;
+    bool _acked_started = false;
+    uint64_t _acked_now(uint32_t snd_una) const
+    {
+        return _acked_total + static_cast<uint32_t>(snd_una - (_acked_started ? _acked_mark : _iss));
+    }
     // RCV.NXT + RCV.WND as last advertised, unwrapped like the above: the
     // right edge the window may never be pulled back from (RFC 1122
     // 4.2.2.16). See _advertised_window().
