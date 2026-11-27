@@ -449,6 +449,7 @@ namespace
             socket->set_families(true, !af_inet, af_inet);
             socket->set_bound_address(bound);
             socket->set_reuseport(reuseport);
+            stack->join_udp_group(socket);
             socket->set_datagram_received_callback(
                 [this, socket](const IpAddress&, uint16_t, const Bytes& data)
                 { received[socket].push_back(std::string(data.begin(), data.end())); });

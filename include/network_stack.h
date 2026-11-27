@@ -495,6 +495,12 @@ public:
     // four-tuple picks. Owned by NetworkStack until close_udp().
     UdpSocket* open_udp(uint16_t port);
     bool close_udp(UdpSocket* socket);
+    // Called once a socket from open_udp() is configured (families, bound
+    // address, SO_REUSEPORT): if it has SO_REUSEPORT, it joins the group of
+    // the latest socket on the port with the same binding and the option set
+    // now (creating that group if need be), as udp_reuseport_add_sock does
+    // at bind. Membership is never revisited afterwards.
+    void join_udp_group(UdpSocket* socket);
 
     // Binds a UdpSocket to a local port and returns it, owned by NetworkStack.
     // Calling this twice for the same port returns the same socket rather than

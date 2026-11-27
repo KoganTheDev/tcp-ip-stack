@@ -55,14 +55,20 @@ public:
         _takes_v6 = v6;
         _af_inet = af_inet;
     }
+    // SO_REUSEPORT as set now: read on the socket a datagram lands on, to
+    // decide whether to spread it over the group. Membership is separate
+    // (group(), fixed at bind by NetworkStack::join_udp_group()), as Linux's
+    // udp_lib_get_port fixes it: a socket bound without the option never
+    // joins however it sets it later, and one clearing it stays a member.
     void set_reuseport(bool reuseport) { _reuseport = reuseport; }
     bool reuseport() const { return _reuseport; }
-    // Members of one SO_REUSEPORT group: both set it, same families, same
-    // bound address.
-    bool same_group(const UdpSocket& other) const
+    uint64_t group() const { return _group; }
+    void set_group(uint64_t group) { _group = group; }
+    // Whether the two could share a group: same families, same bound address.
+    bool same_binding(const UdpSocket& other) const
     {
-        return _reuseport && other._reuseport && _takes_v4 == other._takes_v4 && _takes_v6 == other._takes_v6
-               && _af_inet == other._af_inet && _bound_address == other._bound_address;
+        return _takes_v4 == other._takes_v4 && _takes_v6 == other._takes_v6 && _af_inet == other._af_inet
+               && _bound_address == other._bound_address;
     }
     // How well a datagram from src_ip:src_port to dest_ip matches this socket,
     // or -1 if it does not take it at all - Linux's udp compute_score: base 2
@@ -123,4 +129,5 @@ private:
     bool _takes_v6 = true;
     bool _af_inet = false;
     bool _reuseport = false;
+    uint64_t _group = 0; // 0: in no SO_REUSEPORT group
 };

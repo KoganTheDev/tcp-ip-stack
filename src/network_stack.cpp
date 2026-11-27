@@ -1097,6 +1097,32 @@ UdpSocket* NetworkStack::open_udp(uint16_t port)
     return socket_ptr;
 }
 
+void NetworkStack::join_udp_group(UdpSocket* socket)
+{
+    if (socket == nullptr || !socket->reuseport() || socket->group() != 0)
+    {
+        return;
+    }
+    auto port_it = this->_udp_sockets.find(socket->get_local_port());
+    if (port_it != this->_udp_sockets.end())
+    {
+        for (auto it = port_it->second.rbegin(); it != port_it->second.rend(); ++it)
+        {
+            UdpSocket& other = **it;
+            if (&other != socket && other.reuseport() && other.same_binding(*socket))
+            {
+                if (other.group() == 0)
+                {
+                    other.set_group(this->_next_group_id++);
+                }
+                socket->set_group(other.group());
+                return;
+            }
+        }
+    }
+    socket->set_group(this->_next_group_id++);
+}
+
 bool NetworkStack::close_udp(UdpSocket* socket)
 {
     if (socket == nullptr)
@@ -2666,7 +2692,8 @@ UdpSocket* NetworkStack::_select_udp_socket(const IpAddress& source, const IpAdd
         }
         return nullptr;
     }
-    if (!best->reuseport() || best->is_connected())
+    // The landed-on socket's flag as set now; the group as joined at bind.
+    if (!best->reuseport() || best->group() == 0 || best->is_connected())
     {
         return best;
     }
@@ -2677,7 +2704,7 @@ UdpSocket* NetworkStack::_select_udp_socket(const IpAddress& source, const IpAdd
     std::vector<UdpSocket*> group;
     for (const std::unique_ptr<UdpSocket>& socket : sockets)
     {
-        if (!socket->is_connected() && socket->same_group(*best))
+        if (!socket->is_connected() && socket->group() == best->group())
         {
             group.push_back(socket.get());
         }

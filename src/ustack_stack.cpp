@@ -748,6 +748,7 @@ namespace ustack
             {
                 socket.udp->set_bound_address(ip);
             }
+            _stack.join_udp_group(socket.udp);
         }
         socket.local_port = port;
         socket.port_reserved = true;
@@ -1842,8 +1843,10 @@ namespace ustack
                     return fail(error);
                 }
                 // Read live, as Linux reads sk_reuse / sk_reuseport at each
-                // later bind() (probed: SO_REUSEPORT set on a listener after
-                // the fact still lets another SO_REUSEPORT socket join it).
+                // later bind() and on the socket a lookup lands on (probed:
+                // set on a listener after the fact, it still lets another
+                // SO_REUSEPORT socket join it). Group membership is not
+                // changed here: NetworkStack fixed it at listen() / bind().
                 (optname == SO_REUSEADDR ? socket->reuseaddr : socket->reuseport) = value != 0;
                 if (socket->udp != nullptr)
                 {
