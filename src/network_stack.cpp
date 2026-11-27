@@ -84,23 +84,38 @@ namespace
     {
         switch (code)
         {
-        case 0: return {ENETUNREACH, false};   // net unreachable
-        case 1: return {EHOSTUNREACH, false};  // host unreachable
-        case 2: return {ENOPROTOOPT, true};    // protocol unreachable
-        case 3: return {ECONNREFUSED, true};   // port unreachable
-        case 4: return {EMSGSIZE, true};       // fragmentation needed (default PMTU discovery)
-        case 5: return {EOPNOTSUPP, false};    // source route failed
-        case 6: return {ENETUNREACH, true};    // destination network unknown
-        case 7: return {EHOSTDOWN, true};      // destination host unknown
-        case 8: return {ENONET, true};         // source host isolated
-        case 9: return {ENETUNREACH, true};    // network administratively prohibited
-        case 10: return {EHOSTUNREACH, true};  // host administratively prohibited
-        case 11: return {ENETUNREACH, false};  // network unreachable for TOS
-        case 12: return {EHOSTUNREACH, false}; // host unreachable for TOS
-        case 13: return {EHOSTUNREACH, true};  // communication administratively prohibited
-        case 14: return {EHOSTUNREACH, true};  // host precedence violation
-        case 15: return {EHOSTUNREACH, true};  // precedence cutoff
-        default: return {0, false};
+        case 0:
+            return {ENETUNREACH, false};   // net unreachable
+        case 1:
+            return {EHOSTUNREACH, false};  // host unreachable
+        case 2:
+            return {ENOPROTOOPT, true};    // protocol unreachable
+        case 3:
+            return {ECONNREFUSED, true};   // port unreachable
+        case 4:
+            return {EMSGSIZE, true};       // fragmentation needed (default PMTU discovery)
+        case 5:
+            return {EOPNOTSUPP, false};    // source route failed
+        case 6:
+            return {ENETUNREACH, true};    // destination network unknown
+        case 7:
+            return {EHOSTDOWN, true};      // destination host unknown
+        case 8:
+            return {ENONET, true};         // source host isolated
+        case 9:
+            return {ENETUNREACH, true};    // network administratively prohibited
+        case 10:
+            return {EHOSTUNREACH, true};  // host administratively prohibited
+        case 11:
+            return {ENETUNREACH, false};  // network unreachable for TOS
+        case 12:
+            return {EHOSTUNREACH, false}; // host unreachable for TOS
+        case 13: // communication administratively prohibited
+        case 14: // host precedence violation
+        case 15: // precedence cutoff
+            return {EHOSTUNREACH, true};
+        default:
+            return {0, false};
         }
     }
 

@@ -788,8 +788,8 @@ void NetworkStack::_handle_icmpv6_udp_error(const Icmpv6& message, const Bytes& 
     if (error == 0)
     {
         LOG_DEBUG("NetworkStack: ignoring an ICMPv6 error (type " << static_cast<int>(message.get_type()) << ", code "
-                                                                 << static_cast<int>(message.get_code())
-                                                                 << ") for a UDP datagram - not a hard error");
+                                                                  << static_cast<int>(message.get_code())
+                                                                  << ") for a UDP datagram - not a hard error");
         return;
     }
     constexpr size_t QUOTE = 4;

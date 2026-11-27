@@ -81,7 +81,7 @@ private:
     struct Peer
     {
         IpAddress ip;
-        uint16_t port;
+        uint16_t port = 0;
     };
     std::optional<Peer> _peer;
     uint64_t _datagrams_filtered = 0;
