@@ -1050,7 +1050,10 @@ namespace ustack
             // A peek reads nothing off the queue, so each attempt peeks from
             // the start and the count is what is visible now.
             const size_t offset = peek ? 0 : total;
-            ssize_t n = _recvfrom_once(fd, out + offset, len - offset, once_flags, src_addr, addrlen);
+            // buf is null only for MSG_TRUNC, which copies nothing: never form
+            // null + offset.
+            byte_t* destination = out == nullptr ? nullptr : out + offset;
+            ssize_t n = _recvfrom_once(fd, destination, len - offset, once_flags, src_addr, addrlen);
             const int error = n < 0 ? errno : 0;
             Socket* socket = _get(fd);
             if (n < 0 && error != EAGAIN)
@@ -1141,7 +1144,10 @@ namespace ustack
         // here: MSG_PEEK (look, do not take), MSG_TRUNC, and MSG_OOB on TCP.
         const bool peek = (flags & MSG_PEEK) != 0;
         const bool truncate = (flags & MSG_TRUNC) != 0;
-        if (buf == nullptr && len > 0)
+        // A null buffer is the Linux idiom for discarding bytes, and is valid
+        // exactly when nothing is copied: TCP with MSG_TRUNC. UDP copies
+        // before it truncates, so a null buffer is EFAULT there.
+        if (buf == nullptr && len > 0 && !(socket->kind == Kind::TCP && truncate))
         {
             return fail(EFAULT);
         }

@@ -109,6 +109,14 @@ namespace
         return n == 0 ? "EOF" : "data:" + buffer.substr(0, static_cast<size_t>(n));
     }
 
+    // recv() with no buffer at all: the count, or the error.
+    template <class S>
+    std::string recv_null(S& s, int fd, size_t len, int flags)
+    {
+        ssize_t n = s.recv(fd, nullptr, len, flags);
+        return n < 0 ? failure() : "n=" + std::to_string(n);
+    }
+
     template <class S>
     void set_timeout_ms(S& s, int fd, int option, long ms)
     {
@@ -321,6 +329,17 @@ namespace
         note("MSG_OOB, no urgent data", recv_text(client, c, 20, MSG_OOB));
         note("peek nothing there", recv_text(client, c, 20, MSG_PEEK));
 
+        // --- a null buffer: valid on TCP exactly when MSG_TRUNC copies nothing ---
+        REQUIRE_TRUE(server.send(s, "0123456789", 10, MSG_NOSIGNAL) == 10, failure());
+        h.settle(400);
+        note("null buffer, no flag", recv_null(client, c, 4, MSG_DONTWAIT));
+        note("null buffer, peek", recv_null(client, c, 4, MSG_PEEK));
+        note("null buffer, trunc+peek", recv_null(client, c, 4, MSG_TRUNC | MSG_PEEK));
+        note("null buffer, trunc", recv_null(client, c, 4, MSG_TRUNC));
+        note("null buffer, trunc+peek+waitall", recv_null(client, c, 4, MSG_TRUNC | MSG_PEEK | MSG_WAITALL));
+        note("null buffer, trunc+waitall, 6 left of 20", recv_null(client, c, 20, MSG_TRUNC | MSG_WAITALL));
+        note("null buffer, trunc, nothing there", recv_null(client, c, 4, MSG_TRUNC));
+
         // --- TCP, blocking client with a short timeout, the other side of WAITALL ---
         int bc = open_stream(client, 0);
         set_timeout_ms(client, bc, SO_RCVTIMEO, 100);
@@ -383,6 +402,8 @@ namespace
         note("udp waitall + unknown flag", recv_text(server, u, 8, MSG_WAITALL | 0x40000000));
         note("udp MSG_OOB ignored", recv_text(server, u, 8, MSG_OOB));
         send_datagram("cd");
+        note("udp null buffer, peek", recv_null(server, u, 4, MSG_PEEK));
+        note("udp null buffer, peek+trunc", recv_null(server, u, 4, MSG_PEEK | MSG_TRUNC));
         {
             sockaddr_in from{};
             socklen_t from_length = sizeof(from);

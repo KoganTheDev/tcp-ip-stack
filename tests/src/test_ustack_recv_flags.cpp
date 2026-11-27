@@ -464,3 +464,49 @@ TEST_F(UstackRecvFlags, MsgDontwaitMakesABlockingRecvReturnAtOnce)
     EXPECT_EQ(errno, EAGAIN);
     EXPECT_EQ(net.now_ms(), before);
 }
+
+// Linux's idiom for throwing n bytes away without a buffer: a null buffer is
+// fine on TCP when MSG_TRUNC says nothing is copied. Without MSG_TRUNC (and on
+// UDP, which copies before it truncates) it is EFAULT.
+TEST_F(UstackRecvFlags, TcpTruncAllowsANullBufferAndOtherwiseItIsEfault)
+{
+    auto [c, s] = pair();
+    ASSERT_EQ(send_string(*server, s, "hello world"), 11);
+    net.step(2 * LINK_DELAY_MS);
+    EXPECT_EQ(client->recv(c, nullptr, 4, 0), -1);
+    EXPECT_EQ(errno, EFAULT);
+    EXPECT_EQ(client->recv(c, nullptr, 4, MSG_PEEK), -1);
+    EXPECT_EQ(errno, EFAULT);
+    EXPECT_EQ(client->recv(c, nullptr, 4, MSG_TRUNC | MSG_PEEK), 4) << std::strerror(errno);
+    EXPECT_EQ(client->recv(c, nullptr, 4, MSG_TRUNC), 4) << std::strerror(errno);
+    EXPECT_EQ(client->recv(c, nullptr, 4, MSG_TRUNC | MSG_PEEK | MSG_WAITALL), 4) << "7 left, 4 asked";
+    EXPECT_EQ(client->recv(c, nullptr, 20, MSG_TRUNC | MSG_WAITALL), 7) << "non-blocking: what is there";
+    EXPECT_EQ(client->recv(c, nullptr, 4, MSG_TRUNC), -1);
+    EXPECT_EQ(errno, EAGAIN);
+    EXPECT_EQ(client->recv(c, nullptr, 0, MSG_DONTWAIT), 0)
+        << "len 0 with nothing queued differs from Linux (EAGAIN): not compared";
+}
+
+TEST_F(UstackRecvFlags, BlockingWaitallTruncDiscardsIntoANullBuffer)
+{
+    auto [c, s] = blocking_pair();
+    ASSERT_EQ(send_string(*server, s, "abc"), 3);
+    int pumps = 0;
+    net.add_tick_hook(
+        [this, fd = s, &pumps]
+        {
+            if (++pumps == 4)
+            {
+                EXPECT_EQ(send_string(*server, fd, "defg"), 4);
+            }
+        });
+    EXPECT_EQ(client->recv(c, nullptr, 7, MSG_TRUNC | MSG_WAITALL), 7) << std::strerror(errno);
+}
+
+TEST_F(UstackRecvFlags, UdpNullBufferIsEfaultEvenWithTrunc)
+{
+    int u = udp_server();
+    udp_send("0123456789");
+    EXPECT_EQ(server->recv(u, nullptr, 4, MSG_PEEK | MSG_TRUNC), -1);
+    EXPECT_EQ(errno, EFAULT);
+}
