@@ -349,8 +349,8 @@ namespace ustack
         // read keeps waiting, SO_RCVTIMEO allowing, for min(mark, len) bytes,
         // then returns what it has; like Linux's it looks at the queue once
         // more at the deadline, since data below the mark does not wake it. A
-        // mark above the receive capacity counts as the capacity (Linux
-        // grows the buffer; there is nothing to grow here). UDP stores the
+        // mark above 7/8 of the receive capacity counts as that (Linux's
+        // memory-pressure rule: readable when the buffer is nearly full). UDP stores the
         // value and ignores it. Inherited by accepted sockets.
         //
         // SO_RCVBUF / SO_SNDBUF differ from Linux in one way. Linux doubles
@@ -584,8 +584,8 @@ namespace ustack
         ssize_t _recv_waitall(int fd, void* buf, size_t len, size_t target, int flags, struct sockaddr* src_addr,
                               socklen_t* addrlen);
         // SO_RCVLOWAT as it acts on a TCP socket: at least 1, and never more
-        // than the connection can ever queue (Linux grows the buffer for a
-        // big mark; here a mark above the capacity would never be reached).
+        // than 7/8 of the receive capacity - Linux does not grow the buffer
+        // for a big mark either, it reports readable under memory pressure.
         size_t _rcvlowat(const Socket& socket) const;
         // Pumps the stack until _poll(fd) has one of `events`, deadline (the
         // driver's now_ms()) passes, or something goes wrong. Returns 0 when

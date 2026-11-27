@@ -2292,7 +2292,13 @@ namespace ustack
         size_t mark = static_cast<size_t>(socket.rcvlowat);
         if (const TcpConnection* connection = _connection(socket))
         {
-            mark = std::min<size_t>(mark, connection->receive_capacity());
+            // Linux (probed): a mark at or above the buffer does not grow it,
+            // but poll still reports readable once the buffer is under
+            // memory pressure, tcp_rmem_pressure()'s 7/8 full. Capping the
+            // mark there keeps it reachable whatever the window rounding
+            // (the scaled window moves in steps of 256) leaves of the rest.
+            const size_t capacity = connection->receive_capacity();
+            mark = std::min<size_t>(mark, capacity - capacity / 8);
         }
         return std::max<size_t>(mark, 1);
     }

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
 #include <linux/sockios.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -350,6 +351,42 @@ namespace
         ASSERT_EQ(server->send(bs, "0123456789", 10, MSG_NOSIGNAL), 10);
         net.step(100);
         EXPECT_EQ(client->recv(bc, buffer, sizeof(buffer), 0), 12) << "2 left of xyz + 10";
+    }
+
+    // Linux (probed): with a mark at or above the receive buffer, poll still
+    // reports readable once the buffer is nearly full (tcp_rmem_pressure,
+    // 7/8), and the buffer is not grown. A capacity that is not a multiple of
+    // the window-scale step (256) must not make the mark unreachable.
+    TEST_F(UstackIoctlLowat, AMarkAtTheCapacityIsReadableOnceTheBufferIsFull)
+    {
+        listen_fd = listen_on(7000);
+        int bc = client->socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        sockaddr_in to = address(server_ip, 7000);
+        EXPECT_EQ(client->connect(bc, as_sockaddr(to), sizeof(to)), -1);
+        int bs = accept_within(listen_fd);
+        ASSERT_GE(bs, 0);
+        ASSERT_EQ(set_int(*client, bc, SOL_SOCKET, SO_RCVBUF, 100100), 0);
+        ASSERT_EQ(set_int(*client, bc, SOL_SOCKET, SO_RCVLOWAT, 100100), 0);
+        ASSERT_EQ(set_int(*server, bs, IPPROTO_TCP, TCP_NODELAY, 1), 0);
+        std::string data(300000, 'k');
+        size_t sent = 0;
+        for (int i = 0; i < 200 && sent < data.size(); i++)
+        {
+            ssize_t n = server->send(bs, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
+            sent += n > 0 ? static_cast<size_t>(n) : 0;
+            net.step(50);
+        }
+        net.step(1000);
+        pollfd entry{bc, POLLIN, 0};
+        EXPECT_EQ(client->poll(&entry, 1, 0), 1) << "the buffer is full, the mark is out of reach";
+        EXPECT_GT(query(*client, bc, FIONREAD), 80000);
+        char buffer[200000];
+        timeval timeout{5, 0};
+        ASSERT_EQ(client->setsockopt(bc, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), 0);
+        ASSERT_EQ(client->fcntl(bc, F_SETFL, 0), 0);
+        uint64_t before = net.now_ms();
+        EXPECT_GT(client->recv(bc, buffer, sizeof(buffer), 0), 80000);
+        EXPECT_LT(net.now_ms() - before, 1000u) << "no waiting for a timeout";
     }
 
     TEST_F(UstackIoctlLowat, UdpIgnoresTheMark)
