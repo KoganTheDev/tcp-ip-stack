@@ -187,11 +187,35 @@ namespace bind_matrix
         return fd;
     }
 
+    template <class S>
+    uint16_t bound_port(S& stack, int fd);
+
+    // A port nothing holds on any address of either family: the one the
+    // stack picks for a dual-stack wildcard bind. A row's first socket binds
+    // this rather than port 0, because on the kernel the port 0 picks for,
+    // say, ::1 may still be held on 127.0.0.1 by another test's TIME_WAIT -
+    // which would then refuse the row's second bind for a reason that is not
+    // the row's.
+    template <class S>
+    uint16_t free_port(S& stack, int type)
+    {
+        int probe = stack.socket(AF_INET6, type | SOCK_NONBLOCK, 0);
+        int dual = 0;
+        REQUIRE_TRUE(stack.setsockopt(probe, IPPROTO_IPV6, IPV6_V6ONLY, &dual, sizeof(dual)) == 0, "V6ONLY");
+        Address any = make_address(AF_INET6, "::", 0);
+        REQUIRE_TRUE(stack.bind(probe, any.get(), any.length) == 0, "free port probe");
+        uint16_t port = bound_port(stack, probe);
+        stack.close(probe);
+        return port;
+    }
+
     // Binds (and listens) one side; "ok", the bind's errno, or "listen:" and
-    // listen()'s.
+    // listen()'s. Port 0 means a free_port().
     template <class S>
     std::string bind_side(S& stack, int fd, int type, const Side& side, uint16_t port)
     {
+        if (port == 0)
+            port = free_port(stack, type);
         Address address = make_address(side.family, side.address, port);
         if (stack.bind(fd, address.get(), address.length) != 0)
             return result_text(errno);

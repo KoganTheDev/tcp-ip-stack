@@ -65,3 +65,39 @@ TEST(ConnectionKey, SameRemoteAndPortsToTwoLocalAddressesAreTwoConnections)
         ASSERT_EQ(static_cast<char>(got[0]), expected);
     }
 }
+
+// TIME_WAIT is held per four-tuple, local address included: it blocks (or is
+// reused by) a new SYN to the same local address only. A SYN from the same
+// peer port to another of this host's addresses is a different connection
+// and opens normally.
+TEST(ConnectionKey, TimeWaitOnOneLocalAddressLeavesTheOtherFree)
+{
+    TwoAddressServer s;
+    s.server->listen(80);
+    TcpConnection* first = s.client->connect(IPv6Address("fd00::2"), 80, 40000);
+    ASSERT_TRUE(s.net.run_until([&] { return s.server->has_pending_accept(80); }, 5000));
+    TcpConnection* server_side = s.server->accept(80);
+    ASSERT_NE(server_side, nullptr);
+    uint64_t server_id = server_side->get_id();
+    server_side->close(); // the server closes first, so its end waits in TIME_WAIT
+    s.net.step(50);
+    first->close();
+    ASSERT_TRUE(s.net.run_until(
+        [&]
+        {
+            TcpConnection* held = s.server->find_connection(server_id);
+            return held != nullptr && held->get_state() == TcpState::TIME_WAIT;
+        },
+        5000));
+
+    TcpConnection* other = s.client->connect(IPv6Address("fd00::3"), 80, 40000);
+    ASSERT_NE(other, nullptr);
+    ASSERT_TRUE(s.net.run_until([&] { return other->get_state() == TcpState::ESTABLISHED; }, 5000));
+    ASSERT_EQ(s.server->time_wait_reuses(), 0U) << "the other address's SYN never met the TIME_WAIT";
+    ASSERT_EQ(s.server->find_connection(server_id)->get_state(), TcpState::TIME_WAIT) << "and left it alone";
+
+    // The same tuple again does meet it, and ends it (RFC 6191).
+    ASSERT_TRUE(s.net.run_until(
+        [&] { return s.client->connect(IPv6Address("fd00::2"), 80, 40000) != nullptr; }, 5000));
+    ASSERT_TRUE(s.net.run_until([&] { return s.server->time_wait_reuses() == 1; }, 5000));
+}
