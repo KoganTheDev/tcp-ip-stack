@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <linux/sockios.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/eventfd.h>
@@ -144,6 +145,132 @@ namespace ustack
             std::memcpy(optval, &value, sizeof(int));
             *optlen = sizeof(int);
             return 0;
+        }
+
+        // TCP_INFO state numbers (the kernel's TCP_* values).
+        uint8_t linux_state(TcpState state)
+        {
+            switch (state)
+            {
+            case TcpState::ESTABLISHED:
+                return 1;
+            case TcpState::SYN_SENT:
+                return 2;
+            case TcpState::SYN_RECEIVED:
+                return 3;
+            case TcpState::FIN_WAIT_1:
+                return 4;
+            case TcpState::FIN_WAIT_2:
+                return 5;
+            case TcpState::CLOSE_WAIT:
+                return 8;
+            case TcpState::LAST_ACK:
+                return 9;
+            case TcpState::LISTEN:
+                return 10;
+            case TcpState::CLOSING:
+                return 11;
+            case TcpState::TIME_WAIT: // Linux moves the connection to a timewait sock; the socket reads CLOSE
+            case TcpState::CLOSED:
+                return 7;
+            }
+            return 7;
+        }
+
+        // What Linux reports for a socket with no connection: TCP_CLOSE, the
+        // initial RTO and window, no samples. (A listener differs a little:
+        // see fill_listener_info.)
+        tcp_info fresh_tcp_info()
+        {
+            tcp_info info;
+            std::memset(&info, 0, sizeof(info));
+            info.tcpi_state = 7;
+            info.tcpi_rto = static_cast<uint32_t>(RttEstimator::INITIAL_RTO_MS) * 1000;
+            info.tcpi_rttvar = info.tcpi_rto / 4;
+            info.tcpi_snd_ssthresh = 0x7fffffff; // TCP_INFINITE_SSTHRESH
+            info.tcpi_snd_cwnd = 10;
+            info.tcpi_snd_mss = 536; // TCP_MSS_DEFAULT
+            return info;
+        }
+
+        // Linux: a listener reads TCP_LISTEN with a cwnd of 10 and the rest zero.
+        tcp_info listener_tcp_info()
+        {
+            tcp_info info;
+            std::memset(&info, 0, sizeof(info));
+            info.tcpi_state = 10;
+            info.tcpi_snd_cwnd = 10;
+            return info;
+        }
+
+        // The connection's numbers in Linux's units: microseconds for the
+        // times, segments for cwnd and ssthresh (the stack keeps milliseconds
+        // and bytes), sequence-space byte counts as the kernel counts them.
+        // Fields the stack has no counterpart for stay zero.
+        tcp_info connection_tcp_info(const TcpConnection::Info& in)
+        {
+            tcp_info info;
+            std::memset(&info, 0, sizeof(info));
+            info.tcpi_state = linux_state(in.state);
+            info.tcpi_options =
+                static_cast<uint8_t>((in.timestamps ? TCPI_OPT_TIMESTAMPS : 0) | (in.sack ? TCPI_OPT_SACK : 0)
+                                     | (in.window_scaling ? TCPI_OPT_WSCALE : 0) | (in.ecn ? TCPI_OPT_ECN : 0));
+            info.tcpi_snd_wscale = in.snd_wscale & 0xF;
+            info.tcpi_rcv_wscale = in.rcv_wscale & 0xF;
+            info.tcpi_rto = in.rto_ms * 1000;
+            info.tcpi_rtt = in.has_rtt_sample ? std::max<uint32_t>(in.srtt_ms * 1000, 1) : 0;
+            info.tcpi_rttvar = in.has_rtt_sample ? in.rttvar_ms * 1000 : in.rto_ms * 250;
+            const uint32_t unit = std::max<uint32_t>(in.cwnd_unit_bytes, 1);
+            info.tcpi_snd_cwnd = std::max<uint32_t>(in.cwnd_bytes / unit, 1);
+            info.tcpi_snd_ssthresh =
+                in.ssthresh_bytes == UINT32_MAX ? 0x7fffffff : std::max<uint32_t>(in.ssthresh_bytes / unit, 2);
+            info.tcpi_snd_mss = in.send_mss;
+            info.tcpi_rcv_mss = in.send_mss; // no estimate of the peer's segment size: ours is the best guess
+            info.tcpi_advmss = in.cwnd_unit_bytes;
+            info.tcpi_retransmits = static_cast<uint8_t>(std::min<uint32_t>(in.consecutive_timeouts, 255));
+            info.tcpi_backoff = info.tcpi_retransmits;
+            info.tcpi_ca_state = in.in_rto_recovery ? 4 : in.in_recovery ? 3 : 0; // Loss, Recovery, Open
+            info.tcpi_unacked = in.unacked_segments;
+            info.tcpi_sacked = in.sacked_segments;
+            info.tcpi_lost = in.lost_segments;
+            info.tcpi_retrans = in.retransmitted_segments;
+            info.tcpi_total_retrans = static_cast<uint32_t>(in.total_retransmissions);
+            info.tcpi_rcv_space = in.receive_space;
+            info.tcpi_bytes_acked = in.bytes_acked;
+            info.tcpi_bytes_received = in.bytes_received;
+            info.tcpi_notsent_bytes = in.notsent_bytes;
+            info.tcpi_snd_wnd = in.peer_window;
+            info.tcpi_rcv_wnd = in.receive_window;
+            return info;
+        }
+
+        // The int-valued options Linux answers with min(optlen, sizeof(int))
+        // bytes - a short buffer gets a short copy, a negative length is
+        // EINVAL - and the copied length written back.
+        int write_int_option_short(void* optval, socklen_t* optlen, int value)
+        {
+            if (static_cast<int>(*optlen) < 0)
+            {
+                return EINVAL;
+            }
+            const socklen_t length = std::min<socklen_t>(*optlen, sizeof(int));
+            std::memcpy(optval, &value, length);
+            *optlen = length;
+            return 0;
+        }
+
+        // The most SO_RCVLOWAT stores: Linux's tcp_set_rcvlowat caps it at
+        // half of tcp_rmem's maximum, 16 MiB with the default 32 MiB; a
+        // negative value is read as a huge one, and 0 means 1.
+        constexpr int RCVLOWAT_MAX = 1 << 24;
+
+        int clamp_rcvlowat(int value)
+        {
+            if (value < 0 || value > RCVLOWAT_MAX)
+            {
+                return RCVLOWAT_MAX;
+            }
+            return value == 0 ? 1 : value;
         }
 
         const char* congestion_name(CongestionControlAlgorithm algorithm)
@@ -300,6 +427,10 @@ namespace ustack
     {
         connection.set_keepalive(socket.keepalive);
         connection.set_nodelay(socket.nodelay);
+        if (!socket.quickack)
+        {
+            connection.set_quickack(false); // the default state needs no call: ACKs are delayed anyway
+        }
         if (socket.receive_capacity_locked)
         {
             connection.set_receive_capacity(socket.receive_capacity);
@@ -729,6 +860,8 @@ namespace ustack
         socket->v6only = listener->v6only;
         socket->keepalive = listener->keepalive;
         socket->nodelay = listener->nodelay;
+        socket->quickack = listener->quickack;
+        socket->rcvlowat = listener->rcvlowat;
         socket->receive_capacity = listener->receive_capacity;
         socket->send_capacity = listener->send_capacity;
         socket->receive_capacity_locked = listener->receive_capacity_locked;
@@ -1110,9 +1243,16 @@ namespace ustack
     {
         // MSG_WAITALL is a TCP idea; on UDP Linux ignores it, and so does this.
         const Socket* first = _get(fd);
-        if (first != nullptr && first->kind == Kind::TCP && !first->listening && (flags & MSG_WAITALL) != 0)
+        // With len 0 WAITALL changes nothing (its target is raised to 1), so
+        // the plain path answers. A read collects up to its target: len for
+        // WAITALL, else min(SO_RCVLOWAT, len) - 1 unless a mark is set.
+        if (first != nullptr && first->kind == Kind::TCP && !first->listening && len > 0)
         {
-            return _recv_waitall(fd, buf, len, flags, src_addr, addrlen);
+            const size_t mark = std::min(_rcvlowat(*first), len);
+            if ((flags & MSG_WAITALL) != 0 || mark > 1)
+            {
+                return _recv_waitall(fd, buf, len, (flags & MSG_WAITALL) != 0 ? len : mark, flags, src_addr, addrlen);
+            }
         }
         ssize_t result = _recvfrom_once(fd, buf, len, flags, src_addr, addrlen);
         Socket* socket = result < 0 && errno == EAGAIN ? _get(fd) : nullptr;
@@ -1123,11 +1263,18 @@ namespace ustack
         // Linux: recv waits for at most SO_RCVTIMEO (sock_rcvtimeo()).
         std::optional<uint64_t> deadline = _deadline(socket->rcvtimeo_us);
         bool ready_again = false;
+        const bool tcp_zero_length = len == 0 && socket->kind == Kind::TCP; // socket may be gone after a wait
         for (;;)
         {
             if (int error = _block_until(fd, READABLE | EPOLLRDHUP | EPOLLERR | EPOLLHUP, deadline, ready_again);
                 error != 0)
             {
+                // tcp_recvmsg waits once for len == 0 and its "len > 0" loop
+                // condition then ends the call: a timeout is 0, not EAGAIN.
+                if (error == EAGAIN && tcp_zero_length)
+                {
+                    return 0;
+                }
                 return fail(error);
             }
             result = _recvfrom_once(fd, buf, len, flags, src_addr, addrlen);
@@ -1139,10 +1286,11 @@ namespace ustack
         }
     }
 
-    ssize_t Stack::_recv_waitall(int fd, void* buf, size_t len, int flags, struct sockaddr* src_addr,
+    ssize_t Stack::_recv_waitall(int fd, void* buf, size_t len, size_t target, int flags, struct sockaddr* src_addr,
                                  socklen_t* addrlen)
     {
-        // Linux's tcp_recvmsg with MSG_WAITALL: target = len, and the loop
+        // Linux's tcp_recvmsg with MSG_WAITALL (target = len) or an
+        // SO_RCVLOWAT above 1 (target = min(mark, len)): the loop
         // gives up early - returning the bytes copied so far - on EOF, an
         // error, an expired SO_RCVTIMEO (one timeout for the whole call), or
         // when the call may not wait (non-blocking socket or MSG_DONTWAIT).
@@ -1182,7 +1330,7 @@ namespace ustack
                 ready_again = false;
             }
             const size_t have = peek ? static_cast<size_t>(std::max<ssize_t>(n, 0)) : total;
-            if (have == len || (n == 0 && len > 0) || socket == nullptr)
+            if (have >= target || (n == 0 && len > 0) || socket == nullptr)
             {
                 return static_cast<ssize_t>(have); // got it all, or EOF
             }
@@ -1230,9 +1378,17 @@ namespace ustack
                 wait_error = _block_until(fd, READABLE | FINISHED, deadline, ready_again);
                 ready_again = true; // ready, yet the attempt found nothing new
             }
+            if (wait_error == EAGAIN)
+            {
+                // The timeout ran out. Linux's loop still looks at the queue
+                // once more before giving up (data below SO_RCVLOWAT does not
+                // wake a waiter, but a read at the deadline takes it).
+                may_wait = false;
+                continue;
+            }
             if (wait_error != 0)
             {
-                return wait_error == EAGAIN && have > 0 ? static_cast<ssize_t>(have) : fail(wait_error);
+                return fail(wait_error);
             }
         }
     }
@@ -1322,10 +1478,9 @@ namespace ustack
         {
             return 0; // closed: end of stream
         }
-        if (len == 0)
-        {
-            return 0;
-        }
+        // len == 0 is not special: Linux's tcp_recvmsg runs its loop once, so
+        // data queued gives 0 (nothing consumed) and an empty socket gives
+        // EAGAIN - an application reads a bare 0 as EOF.
         if (connection->bytes_available() > 0)
         {
             // MSG_TRUNC on TCP: the bytes are counted (and, unless peeking,
@@ -1527,6 +1682,15 @@ namespace ustack
                     connection->set_keepalive(socket->keepalive);
                 }
                 return 0;
+            case SO_RCVLOWAT:
+                if (int error = read_int_option(optval, optlen, value); error != 0)
+                {
+                    return fail(error);
+                }
+                socket->rcvlowat = clamp_rcvlowat(value);
+                // A lower mark can make queued bytes readable now.
+                _wake(fd, READABLE);
+                return 0;
             case SO_RCVBUF:
             case SO_SNDBUF:
             {
@@ -1604,6 +1768,17 @@ namespace ustack
             if (connection != nullptr)
             {
                 connection->set_nodelay(socket->nodelay);
+            }
+            return 0;
+        case TCP_QUICKACK:
+            if (int error = read_int_option(optval, optlen, value); error != 0)
+            {
+                return fail(error);
+            }
+            socket->quickack = value != 0;
+            if (connection != nullptr)
+            {
+                connection->set_quickack(socket->quickack);
             }
             return 0;
         case TCP_USER_TIMEOUT:
@@ -1719,6 +1894,12 @@ namespace ustack
                 error = write_int_option(optval, optlen, static_cast<int>(capacity * 2));
                 break;
             }
+            case SO_RCVLOWAT:
+                error = write_int_option_short(optval, optlen, socket->rcvlowat);
+                break;
+            case SO_SNDLOWAT:
+                error = write_int_option_short(optval, optlen, 1); // fixed at 1 on Linux, and not settable
+                break;
             case SO_REUSEADDR:
                 error = write_int_option(optval, optlen, socket->reuseaddr ? 1 : 0);
                 break;
@@ -1744,15 +1925,52 @@ namespace ustack
             error = write_int_option(optval, optlen, socket->v6only ? 1 : 0);
             return error != 0 ? fail(error) : 0;
         }
-        if (level != IPPROTO_TCP || socket->kind != Kind::TCP)
+        if (level == IPPROTO_TCP && socket->kind != Kind::TCP)
+        {
+            return fail(EOPNOTSUPP); // udp_lib_getsockopt hands anything but SOL_UDP to ip_getsockopt
+        }
+        if (level != IPPROTO_TCP)
         {
             return fail(ENOPROTOOPT);
         }
         switch (optname)
         {
+        case TCP_INFO:
+        {
+            // Linux: a negative length is EINVAL; otherwise min(len, sizeof)
+            // bytes are copied and that count written back.
+            if (static_cast<int>(*optlen) < 0)
+            {
+                return fail(EINVAL);
+            }
+            tcp_info info;
+            if (socket->listening)
+            {
+                info = listener_tcp_info();
+            }
+            else if (const TcpConnection* connection = _connection(*socket); connection != nullptr)
+            {
+                info = connection_tcp_info(connection->info());
+            }
+            else
+            {
+                info = fresh_tcp_info();
+            }
+            const socklen_t length = std::min<socklen_t>(*optlen, sizeof(info));
+            std::memcpy(optval, &info, length);
+            *optlen = length;
+            break;
+        }
         case TCP_NODELAY:
             error = write_int_option(optval, optlen, socket->nodelay ? 1 : 0);
             break;
+        case TCP_QUICKACK:
+        {
+            const TcpConnection* connection = _connection(*socket);
+            const bool on = connection != nullptr ? connection->quickack() : socket->quickack;
+            error = write_int_option_short(optval, optlen, on ? 1 : 0);
+            break;
+        }
         case TCP_USER_TIMEOUT:
             error = write_int_option(optval, optlen, static_cast<int>(socket->user_timeout_ms));
             break;
@@ -1902,6 +2120,67 @@ namespace ustack
         return 0;
     }
 
+    int Stack::ioctl(int fd, unsigned long request, int* arg)
+    {
+        CallScope scope(*this);
+        Socket* socket = _get(fd);
+        if (socket == nullptr)
+        {
+            return fail(EBADF);
+        }
+        const bool known = request == FIONREAD || request == SIOCOUTQ || request == SIOCOUTQNSD;
+        if (!known)
+        {
+            return fail(ENOTTY);
+        }
+        if (socket->kind == Kind::EPOLL)
+        {
+            return fail(EINVAL); // what Linux answers for a size query on an epoll fd
+        }
+        if (arg == nullptr)
+        {
+            return fail(EFAULT);
+        }
+        auto clamp = [](size_t bytes)
+        {
+            return static_cast<int>(std::min<size_t>(bytes, INT_MAX));
+        };
+        if (socket->kind == Kind::UDP)
+        {
+            // udp_ioctl: the next datagram's size, and nothing is ever queued to send.
+            if (request == SIOCOUTQNSD)
+            {
+                return fail(ENOTTY);
+            }
+            *arg =
+                request == FIONREAD && !socket->received.empty() ? clamp(socket->received.front().payload.size()) : 0;
+            return 0;
+        }
+        if (socket->listening)
+        {
+            return fail(EINVAL);
+        }
+        const TcpConnection* connection = _connection(*socket);
+        if (connection == nullptr)
+        {
+            *arg = 0; // no connection yet, or it is gone: nothing to read, nothing queued
+            return 0;
+        }
+        if (request == FIONREAD)
+        {
+            *arg = clamp(connection->bytes_available());
+        }
+        else if (handshaking(connection->get_state()))
+        {
+            *arg = 0; // tcp_ioctl: SYN_SENT / SYN_RECV have no send queue yet
+        }
+        else
+        {
+            *arg = clamp(request == SIOCOUTQ ? connection->bytes_unacked() : connection->bytes_unsent());
+        }
+        return 0;
+    }
+
     int Stack::fcntl(int fd, int cmd, int arg)
     {
         CallScope scope(*this);
@@ -2008,6 +2287,22 @@ namespace ustack
 
     // --- readiness ---
 
+    size_t Stack::_rcvlowat(const Socket& socket) const
+    {
+        size_t mark = static_cast<size_t>(socket.rcvlowat);
+        if (const TcpConnection* connection = _connection(socket))
+        {
+            // Linux (probed): a mark at or above the buffer does not grow it,
+            // but poll still reports readable once the buffer is under
+            // memory pressure, tcp_rmem_pressure()'s 7/8 full. Capping the
+            // mark there keeps it reachable whatever the window rounding
+            // (the scaled window moves in steps of 256) leaves of the rest.
+            const size_t capacity = connection->receive_capacity();
+            mark = std::min<size_t>(mark, capacity - capacity / 8);
+        }
+        return std::max<size_t>(mark, 1);
+    }
+
     uint32_t Stack::_poll_tcp(const Socket& socket) const
     {
         if (socket.listening)
@@ -2043,7 +2338,9 @@ namespace ustack
         {
             mask |= EPOLLHUP;
         }
-        if (connection->bytes_available() > 0)
+        // tcp_poll: readable once the queue holds SO_RCVLOWAT bytes; the end of
+        // the stream was handled above and always counts.
+        if (connection->bytes_available() >= _rcvlowat(socket))
         {
             mask |= READABLE;
         }
