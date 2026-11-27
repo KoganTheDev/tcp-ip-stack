@@ -1702,7 +1702,7 @@ namespace ustack
             // The call so far may have armed an earlier timer than the one the
             // driver is set to wake for (a SYN's retransmission, say).
             _driver->stack_changed(_stack);
-            _driver->wait(_stack, remaining);
+            _driver->wait_stack_only(_stack, remaining);
         }
     }
 

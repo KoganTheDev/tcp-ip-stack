@@ -122,6 +122,35 @@ namespace ustack
         run_pending(stack);
     }
 
+    void RealDriver::wait_stack_only(NetworkStack& stack, int timeout_ms)
+    {
+        // The epoll is level-triggered, so a ready application fd would end
+        // every wait at once. Take them out of the set for this wait and put
+        // them back after, rather than keep a second epoll: it is one
+        // syscall each, only while a blocking call is waiting.
+        for (const auto& watch : _watched)
+        {
+            ::epoll_ctl(_epoll_fd, EPOLL_CTL_DEL, watch.first, nullptr);
+        }
+        struct Restore
+        {
+            RealDriver& driver;
+            ~Restore()
+            {
+                for (const auto& watch : driver._watched)
+                {
+                    epoll_event event{};
+                    event.events = watch.second;
+                    event.data.fd = watch.first;
+                    // Fails if the application closed the fd meanwhile; it
+                    // will say so through watch_fd(fd, 0) as usual.
+                    ::epoll_ctl(driver._epoll_fd, EPOLL_CTL_ADD, watch.first, &event);
+                }
+            }
+        } restore{*this};
+        wait(stack, timeout_ms);
+    }
+
     int RealDriver::watch_fd(int fd, uint32_t events)
     {
         if (events == 0)
@@ -141,7 +170,7 @@ namespace ustack
         {
             return errno;
         }
-        _watched.insert(fd);
+        _watched[fd] = events;
         return 0;
     }
 

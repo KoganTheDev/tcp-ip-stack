@@ -109,6 +109,13 @@ namespace ustack
         // Waits at most timeout_ms (-1: no limit) for a frame or the next
         // timer, then does what run_pending() does. May return early.
         virtual void wait(NetworkStack& stack, int timeout_ms) = 0;
+        // Like wait(), but only the stack's own frames and timer end it, not
+        // the application's kernel fds added by watch_fd(): a blocking socket
+        // call uses this, so an external fd the application leaves readable
+        // cannot make it return at once, over and over (a busy loop). Those
+        // fds are reported by the next epoll_wait() as usual. The default is
+        // wait(), right for a driver that has no such fds.
+        virtual void wait_stack_only(NetworkStack& stack, int timeout_ms) { wait(stack, timeout_ms); }
         // Told after the application changed the stack (send, connect, close
         // ...), which may have armed an earlier timer than the one being
         // waited for.
@@ -148,6 +155,7 @@ namespace ustack
         uint64_t now_ms() override;
         void run_pending(NetworkStack& stack) override;
         void wait(NetworkStack& stack, int timeout_ms) override;
+        void wait_stack_only(NetworkStack& stack, int timeout_ms) override;
         void stack_changed(NetworkStack& stack) override;
         // The internal epoll fd, which is readable when any of its members is.
         int wake_fd() const override { return _epoll_fd; }
@@ -157,7 +165,8 @@ namespace ustack
         int _epoll_fd = -1;
         int _timer_fd = -1;
         // Application fds added by watch_fd(), so MOD or ADD is known.
-        std::unordered_set<int> _watched;
+        // Each with the event mask it is watched for.
+        std::unordered_map<int, uint32_t> _watched;
         // The monotonic time last reported to the stack.
         uint64_t _reported_ms = 0;
         // The stack-clock moment the timerfd is armed for, so an unchanged
