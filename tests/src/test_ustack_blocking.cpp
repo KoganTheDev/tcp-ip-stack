@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <climits>
 #include <chrono>
 #include <cstring>
 #include <functional>
@@ -473,5 +474,50 @@ TEST(UstackBlockingRealDriver, TimedRecvSleepsInsteadOfSpinning)
     EXPECT_GE(wall, 0.19);
     EXPECT_LT(wall, 1.0);
     EXPECT_LT(cpu, wall / 4) << "cpu " << cpu << " s over " << wall << " s of wall time: it spun";
+    ::close(fds[1]);
+}
+
+TEST(UstackBlockingRealDriver, ReadyExternalFdDoesNotMakeABlockedCallSpin)
+{
+    int fds[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_SEQPACKET, 0, fds), 0);
+    ustack::Stack stack(std::make_unique<NetworkStack>(std::make_unique<QuietChannel>(fds[0]),
+                                                       MacAddress("02:00:00:00:00:01"), IPv4Address("10.0.0.1")));
+    // A pipe that stays readable: the application never services it.
+    int pipefd[2];
+    ASSERT_EQ(::pipe(pipefd), 0);
+    ASSERT_EQ(::write(pipefd[1], "x", 1), 1);
+    int epfd = stack.epoll_create1(0);
+    epoll_event event{};
+    event.events = EPOLLIN;
+    event.data.u64 = 77;
+    ASSERT_EQ(stack.epoll_ctl_external(epfd, EPOLL_CTL_ADD, pipefd[0], &event), 0);
+
+    int fd = stack.socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in loopback{};
+    loopback.sin_family = AF_INET;
+    loopback.sin_port = htons(9000);
+    loopback.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(stack.bind(fd, reinterpret_cast<sockaddr*>(&loopback), sizeof(loopback)), 0);
+    timeval tv = timeval_ms(200);
+    ASSERT_EQ(stack.setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)), 0);
+
+    auto wall_start = std::chrono::steady_clock::now();
+    double cpu_start = cpu_seconds();
+    char byte = 0;
+    EXPECT_EQ(stack.recv(fd, &byte, 1, 0), -1);
+    EXPECT_EQ(errno, EAGAIN);
+    double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
+    double cpu = cpu_seconds() - cpu_start;
+    EXPECT_GE(wall, 0.19);
+    EXPECT_LT(cpu, wall / 4) << "cpu " << cpu << " s over " << wall << " s: the ready external fd made it spin";
+
+    // The external fd is still watched afterwards.
+    epoll_event out{};
+    EXPECT_EQ(stack.epoll_wait(epfd, &out, 1, 1000), 1);
+    EXPECT_EQ(out.data.u64, 77U);
+    EXPECT_EQ(stack.epoll_ctl_external(epfd, EPOLL_CTL_DEL, pipefd[0], nullptr), 0);
+    ::close(pipefd[0]);
+    ::close(pipefd[1]);
     ::close(fds[1]);
 }
