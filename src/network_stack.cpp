@@ -2448,7 +2448,8 @@ TcpConnection* NetworkStack::_connection_from_icmp_quote(const Icmp& icmp, uint3
         return nullptr;
     }
 
-    IPv4Address original_dest(embedded.slice(16, 4)); // the peer we were trying to reach
+    IPv4Address original_source(embedded.slice(12, 4)); // the local address the segment left from
+    IPv4Address original_dest(embedded.slice(16, 4));   // the peer we were trying to reach
     uint16_t local_port = embedded.slice_int<uint16_t>(ihl);       // our source port
     uint16_t remote_port = embedded.slice_int<uint16_t>(ihl + 2);  // the unreachable peer's port
 
@@ -2465,7 +2466,19 @@ TcpConnection* NetworkStack::_connection_from_icmp_quote(const Icmp& icmp, uint3
 
     ConnectionKey key{original_dest, remote_port, local_port};
     auto it = this->_connections.find(key);
-    return it != this->_connections.end() ? it->second.get() : nullptr;
+    if (it == this->_connections.end())
+    {
+        return nullptr;
+    }
+    // Linux's tcp_v4_err looks the socket up by the full four-tuple. Our
+    // connection table is keyed without the local address, so the quoted
+    // source is compared here: an error about a segment that left from some
+    // other address of ours is not this connection's.
+    if (it->second->get_local_ip() != IpAddress(original_source))
+    {
+        return nullptr;
+    }
+    return it->second.get();
 }
 
 void NetworkStack::_handle_icmp_fragmentation_needed(const Icmp& icmp)

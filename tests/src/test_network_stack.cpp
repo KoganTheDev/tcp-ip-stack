@@ -1234,11 +1234,11 @@ namespace
     // quoted_seq: the sequence number of the segment that was too big. A
     // genuine report quotes one this side has in flight (RFC 5927).
     Bytes build_icmp_fragmentation_needed(uint16_t local_port, uint16_t remote_port, uint16_t next_hop_mtu,
-                                          uint32_t quoted_seq = 0)
+                                          uint32_t quoted_seq = 0, const IPv4Address& quoted_source = LOCAL_IP)
     {
         Tcp our_segment(local_port, remote_port, quoted_seq, 0, 5, 0x10 /* ACK */, 65535, 0, 0);
-        auto embedded_ip = std::make_unique<Ip>(4, 5, 0, 40, 0, 0, 0, 64, IpProtocol::TCP, 0, LOCAL_IP.get_address(),
-                                                PEER_IP.get_address());
+        auto embedded_ip = std::make_unique<Ip>(4, 5, 0, 40, 0, 0, 0, 64, IpProtocol::TCP, 0,
+                                                quoted_source.get_address(), PEER_IP.get_address());
         *embedded_ip /= std::make_unique<Raw>(our_segment.to_bytes());
         embedded_ip->compute_checksum();
         Bytes embedded = embedded_ip->to_bytes().slice(0, 28);
@@ -3181,6 +3181,27 @@ TEST(NetworkStack, AFragmentationNeededQuotingNoSegmentInFlightIsIgnored)
     ASSERT_TRUE(connection->get_effective_mss() == 1460)
         << "a report quoting a sequence number never sent must be ignored, got MSS "
                + std::to_string(connection->get_effective_mss());
+}
+
+// Linux's tcp_v4_err looks the connection up by the full four-tuple, so an
+// error quoting a segment that left from another address of ours, with the
+// right ports, peer and an in-window sequence, is not this connection's.
+TEST(NetworkStack, AFragmentationNeededQuotingAnotherLocalAddressIsIgnored)
+{
+    FakePacketChannel* channel = nullptr;
+    auto stack = make_stack(channel);
+    TcpConnection* connection = accept_connection_with_peer_mss(*stack, *channel, 80, 40000);
+    ASSERT_TRUE(connection->get_effective_mss() == 1460) << "precondition: a full-sized MSS";
+    uint32_t seq = send_one_segment(*connection, *channel);
+
+    channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 1000, seq, IPv4Address("10.0.0.99")));
+    stack->poll();
+    ASSERT_TRUE(connection->get_effective_mss() == 1460)
+        << "same ports, peer and sequence, but another local source address: must have no effect";
+
+    channel->push_inbound(build_icmp_fragmentation_needed(80, 40000, 1000, seq));
+    stack->poll();
+    ASSERT_TRUE(connection->get_effective_mss() == 960) << "the genuine quote still lowers the MSS";
 }
 
 TEST(NetworkStack, AStaleHalfOpenConnectionIsEvictedToMakeRoomForANewSyn)

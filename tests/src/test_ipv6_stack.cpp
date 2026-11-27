@@ -554,14 +554,14 @@ namespace
         return syn.get_sequence_number();
     }
 
-    Bytes quote_of_syn(uint32_t seq)
+    Bytes quote_of_syn(uint32_t seq, const IPv6Address& source = LOCAL)
     {
         Bytes tcp;
         tcp.append_int<uint16_t>(49152); // local port: the first ephemeral
         tcp.append_int<uint16_t>(80);
         tcp.append_int<uint32_t>(seq);
         tcp.append_int<uint32_t>(0);
-        return ipv6_packet(LOCAL, PEER, IPV6_NEXT_TCP, tcp);
+        return ipv6_packet(source, PEER, IPV6_NEXT_TCP, tcp);
     }
 }
 
@@ -601,6 +601,32 @@ TEST(Ipv6Stack, PacketTooBigLowersTheMssForAQuoteInFlightOnly)
     EXPECT_EQ(connection->get_effective_mss(), 1340) << "1400 - 40 - 20";
     too_big(600, in_flight);
     EXPECT_EQ(connection->get_effective_mss(), 1220) << "clamped at 1280 - 60 (RFC 8201 4)";
+}
+
+// tcp_v6_err looks the connection up by the full four-tuple: a quote of a
+// segment sent from another local address is not this connection's, even with
+// the right ports, peer and an in-flight sequence.
+TEST(Ipv6Stack, AnIcmpv6ErrorQuotingAnotherLocalAddressIsIgnored)
+{
+    Host host;
+    TcpConnection* connection = nullptr;
+    uint32_t isn = open_to_peer(host, connection);
+    const IPv6Address other("2001:db8::99");
+
+    Bytes unreachable;
+    unreachable.append_int<uint32_t>(0);
+    unreachable |= quote_of_syn(isn, other);
+    host.deliver(icmpv6_packet(PEER, LOCAL, ICMPV6_DESTINATION_UNREACHABLE, unreachable, 64, 4));
+    uint64_t id = connection->get_id();
+    ASSERT_NE(host.stack->find_connection(id), nullptr) << "a foreign-source quote must not refuse the handshake";
+    ASSERT_EQ(connection->get_state(), TcpState::SYN_SENT);
+
+    unreachable = Bytes();
+    unreachable.append_int<uint32_t>(0);
+    unreachable |= quote_of_syn(isn);
+    host.deliver(icmpv6_packet(PEER, LOCAL, ICMPV6_DESTINATION_UNREACHABLE, unreachable, 64, 4));
+    EXPECT_EQ(host.stack->find_connection(id), nullptr)
+        << "the genuine quote still refuses it (and the connection is reaped)";
 }
 
 TEST(Ipv6Stack, PortUnreachableDuringTheHandshakeRefusesTheConnection)
