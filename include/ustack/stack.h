@@ -321,6 +321,15 @@ namespace ustack
         // third argument is an int, not a variadic, so ustack::KernelStack
         // forwards it with no va_list handling.
         int fcntl(int fd, int cmd, int arg = 0);
+        // The sockets' size queries, as Linux answers them: FIONREAD (= SIOCINQ)
+        // is the bytes a read would take on TCP and the size of the next
+        // datagram on UDP (0 when none, and for an empty datagram); SIOCOUTQ is
+        // the TCP bytes written but not yet acknowledged (queued plus in
+        // flight) and SIOCOUTQNSD only those not yet sent; UDP's SIOCOUTQ is 0.
+        // A listener is EINVAL for all of them, a socket with no connection
+        // yet reads 0. Anything else is ENOTTY, a null arg EFAULT, an epoll fd
+        // EINVAL. The argument is an int*, like every ioctl used here takes.
+        int ioctl(int fd, unsigned long request, int* arg);
 
         // --- poll and select ---
         // Readiness is _poll(fd), the same function epoll_wait() asks, so the

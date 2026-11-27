@@ -4,6 +4,7 @@
 #include <poll.h>
 #include <sys/select.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -72,6 +73,7 @@ namespace ustack
         // An int third argument, like ustack::Stack's, so this is a plain
         // forward; ::fcntl itself is variadic.
         int fcntl(int fd, int cmd, int arg = 0) { return ::fcntl(fd, cmd, arg); }
+        int ioctl(int fd, unsigned long request, int* arg) { return ::ioctl(fd, request, arg); }
 
         // --- poll and select ---
         int poll(struct pollfd* fds, nfds_t nfds, int timeout_ms) { return ::poll(fds, nfds, timeout_ms); }

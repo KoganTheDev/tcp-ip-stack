@@ -2037,6 +2037,14 @@ namespace ustack
         return 0;
     }
 
+    int Stack::ioctl(int fd, unsigned long request, int* arg)
+    {
+        static_cast<void>(fd);
+        static_cast<void>(request);
+        static_cast<void>(arg);
+        return fail(ENOTTY);
+    }
+
     int Stack::fcntl(int fd, int cmd, int arg)
     {
         CallScope scope(*this);
