@@ -224,6 +224,22 @@ namespace ustack
         // error is returned by this call instead of through SO_ERROR.
         int connect(int fd, const struct sockaddr* addr, socklen_t addrlen);
         ssize_t send(int fd, const void* buf, size_t len, int flags);
+        // recv() flags, with Linux's semantics: MSG_DONTWAIT (one call
+        // non-blocking), MSG_PEEK (TCP: copy without consuming, so repeated
+        // peeks see the same bytes and a peek is not a new edge for EPOLLET;
+        // UDP: the datagram stays queued), MSG_WAITALL (TCP: wait for len
+        // bytes, but return the partial count at EOF, on an error or when
+        // SO_RCVTIMEO expires, and on a non-blocking socket or with
+        // MSG_DONTWAIT take only what is there; UDP ignores it), MSG_TRUNC
+        // (UDP: return the datagram's real length even if it was cut short;
+        // TCP: consume - or with MSG_PEEK just count - bytes without copying
+        // them), MSG_NOSIGNAL (accepted, meaningless). Like Linux, any other
+        // flag is ignored, except that MSG_OOB on TCP is EINVAL: there is no
+        // urgent data. (send() is stricter: its flags other than MSG_DONTWAIT
+        // and MSG_NOSIGNAL are EOPNOTSUPP.) A deviation: after a partial
+        // MSG_WAITALL read cut short by an error, the error is kept for the
+        // next call, as Linux does, but the readiness bits (EPOLLERR) are not
+        // re-announced to an edge-triggered epoll.
         ssize_t recv(int fd, void* buf, size_t len, int flags);
         // UDP: one datagram each. A datagram larger than the interface MTU
         // allows fails with EMSGSIZE (no IP fragmentation on send); recvfrom()
@@ -456,6 +472,10 @@ namespace ustack
         ssize_t _sendto_once(int fd, const void* buf, size_t len, int flags, const struct sockaddr* dest_addr,
                              socklen_t addrlen);
         ssize_t _recvfrom_once(int fd, void* buf, size_t len, int flags, struct sockaddr* src_addr, socklen_t* addrlen);
+        // recv() with MSG_WAITALL on a TCP socket: keeps taking what is there
+        // until len bytes, EOF, an error, SO_RCVTIMEO or (if it may not wait)
+        // nothing more, as tcp_recvmsg does. Returns what recv() would.
+        ssize_t _recv_waitall(int fd, void* buf, size_t len, int flags, struct sockaddr* src_addr, socklen_t* addrlen);
         // Pumps the stack until _poll(fd) has one of `events`, deadline (the
         // driver's now_ms()) passes, or something goes wrong. Returns 0 when
         // ready, EAGAIN on timeout, EBADF if the fd was closed (or reused) while

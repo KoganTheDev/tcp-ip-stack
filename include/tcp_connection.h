@@ -439,6 +439,11 @@ public:
     // persist probe to discover the change.
     Bytes read(size_t max_bytes = static_cast<size_t>(-1));
 
+    // Copies up to max_bytes of what read() would return next, and takes
+    // nothing: the queue, the window and every counter stay as they were
+    // (MSG_PEEK). Calling it again returns the same bytes.
+    Bytes peek(size_t max_bytes = static_cast<size_t>(-1)) const;
+
     // Bytes waiting to be read. The application's share of the receive buffer.
     size_t bytes_available() const { return _receive_queued_bytes; }
     // Bytes held out of order, waiting for a gap before them to fill. They

@@ -4,6 +4,7 @@
 #include <poll.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <netinet/tcp.h>
 #include <sys/time.h>
 
 #include <cerrno>
@@ -49,11 +50,21 @@ namespace
     protected:
         UstackRecvFlags() : UstackFixture(slow_link()) {}
 
+        // The sender must not hold a small write back for the peer's ACK
+        // (Nagle), or "send a, send b" would arrive as two instalments.
+        void no_delay(int server_fd)
+        {
+            int on = 1;
+            REQUIRE_TRUE(server->setsockopt(server_fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)) == 0,
+                         std::strerror(errno));
+        }
+
         // {client, server} connected, both non-blocking, settled.
         std::pair<int, int> pair()
         {
             auto fds = connected_pair();
             REQUIRE_TRUE(fds.first >= 0 && fds.second >= 0, "no connection");
+            no_delay(fds.second);
             net.step(2 * LINK_DELAY_MS);
             return fds;
         }
@@ -67,6 +78,7 @@ namespace
             REQUIRE_TRUE(client->connect(c, as_sockaddr(to), sizeof(to)) == 0, std::strerror(errno));
             int s = accept_within(listen_fd);
             REQUIRE_TRUE(s >= 0, "no connection to accept");
+            no_delay(s);
             return {c, s};
         }
 
@@ -106,7 +118,7 @@ namespace
             REQUIRE_TRUE(client->sendto(udp_client, data.data(), data.size(), 0, as_sockaddr(to), sizeof(to))
                              == static_cast<ssize_t>(data.size()),
                          std::strerror(errno));
-            net.step(2 * LINK_DELAY_MS);
+            net.step(500); // room for ARP on the first datagram
         }
 
         int udp_client = -1;
@@ -304,11 +316,15 @@ TEST_F(UstackRecvFlags, WaitallOnANonBlockingSocketOrWithDontwaitWaitsForNothing
     EXPECT_EQ(recv_flags(*client, c, out, 10, MSG_WAITALL), -1);
     EXPECT_EQ(errno, EAGAIN);
     EXPECT_EQ(net.now_ms(), start) << "no time passes";
+}
 
+TEST_F(UstackRecvFlags, WaitallWithDontwaitOnABlockingSocketWaitsForNothing)
+{
     auto [bc, bs] = blocking_pair();
+    std::string out;
     ASSERT_EQ(send_string(*server, bs, "xy"), 2);
     net.step(2 * LINK_DELAY_MS);
-    start = net.now_ms();
+    uint64_t start = net.now_ms();
     ASSERT_EQ(recv_flags(*client, bc, out, 10, MSG_WAITALL | MSG_DONTWAIT), 2);
     EXPECT_EQ(recv_flags(*client, bc, out, 10, MSG_WAITALL | MSG_DONTWAIT), -1);
     EXPECT_EQ(errno, EAGAIN);

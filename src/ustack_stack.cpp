@@ -996,6 +996,12 @@ namespace ustack
 
     ssize_t Stack::recvfrom(int fd, void* buf, size_t len, int flags, struct sockaddr* src_addr, socklen_t* addrlen)
     {
+        // MSG_WAITALL is a TCP idea; on UDP Linux ignores it, and so does this.
+        const Socket* first = _get(fd);
+        if (first != nullptr && first->kind == Kind::TCP && !first->listening && (flags & MSG_WAITALL) != 0)
+        {
+            return _recv_waitall(fd, buf, len, flags, src_addr, addrlen);
+        }
         ssize_t result = _recvfrom_once(fd, buf, len, flags, src_addr, addrlen);
         Socket* socket = result < 0 && errno == EAGAIN ? _get(fd) : nullptr;
         if (socket == nullptr || socket->nonblock || (flags & MSG_DONTWAIT) != 0)
@@ -1021,6 +1027,101 @@ namespace ustack
         }
     }
 
+    ssize_t Stack::_recv_waitall(int fd, void* buf, size_t len, int flags, struct sockaddr* src_addr,
+                                 socklen_t* addrlen)
+    {
+        // Linux's tcp_recvmsg with MSG_WAITALL: target = len, and the loop
+        // gives up early - returning the bytes copied so far - on EOF, an
+        // error, an expired SO_RCVTIMEO (one timeout for the whole call), or
+        // when the call may not wait (non-blocking socket or MSG_DONTWAIT).
+        // With nothing copied those are 0, the error, EAGAIN and EAGAIN.
+        constexpr uint32_t FINISHED = EPOLLRDHUP | EPOLLHUP | EPOLLERR;
+        const bool peek = (flags & MSG_PEEK) != 0;
+        const int once_flags = flags & ~MSG_WAITALL;
+        auto* out = static_cast<byte_t*>(buf);
+        std::optional<uint64_t> deadline;
+        bool deadline_set = false;
+        bool may_wait = false;
+        uint64_t serial = 0;
+        size_t total = 0;
+        bool ready_again = false;
+        for (;;)
+        {
+            // A peek reads nothing off the queue, so each attempt peeks from
+            // the start and the count is what is visible now.
+            const size_t offset = peek ? 0 : total;
+            ssize_t n = _recvfrom_once(fd, out + offset, len - offset, once_flags, src_addr, addrlen);
+            const int error = n < 0 ? errno : 0;
+            Socket* socket = _get(fd);
+            if (n < 0 && error != EAGAIN)
+            {
+                if (total > 0 && socket != nullptr && socket->so_error == 0)
+                {
+                    socket->so_error = error; // Linux leaves sk_err for the next call
+                }
+                return total > 0 ? static_cast<ssize_t>(total) : fail(error);
+            }
+            if (!peek && n > 0)
+            {
+                total += static_cast<size_t>(n);
+                ready_again = false;
+            }
+            const size_t have = peek ? static_cast<size_t>(std::max<ssize_t>(n, 0)) : total;
+            if (have == len || (n == 0 && len > 0) || socket == nullptr)
+            {
+                return static_cast<ssize_t>(have); // got it all, or EOF
+            }
+            if (!deadline_set)
+            {
+                deadline = _deadline(socket->rcvtimeo_us);
+                deadline_set = true;
+                may_wait = !socket->nonblock && (flags & MSG_DONTWAIT) == 0;
+                serial = socket->serial;
+            }
+            if (peek && have > 0 && (_poll(fd) & FINISHED) != 0)
+            {
+                return static_cast<ssize_t>(have); // the stream will not grow
+            }
+            if (!may_wait)
+            {
+                return have > 0 ? static_cast<ssize_t>(have) : fail(EAGAIN);
+            }
+            int wait_error = 0;
+            if (peek)
+            {
+                // Something new: more bytes than the last look, or the end.
+                bool gone = false;
+                wait_error = _pump_until(
+                    [this, fd, serial, have, &gone]
+                    {
+                        const Socket* current = _get(fd);
+                        if (current == nullptr || current->serial != serial)
+                        {
+                            gone = true;
+                            return true;
+                        }
+                        const TcpConnection* connection = _connection(*current);
+                        return connection == nullptr || connection->bytes_available() > have
+                               || (_poll(fd) & FINISHED) != 0;
+                    },
+                    deadline, true);
+                if (gone)
+                {
+                    wait_error = EBADF;
+                }
+            }
+            else
+            {
+                wait_error = _block_until(fd, READABLE | FINISHED, deadline, ready_again);
+                ready_again = true; // ready, yet the attempt found nothing new
+            }
+            if (wait_error != 0)
+            {
+                return wait_error == EAGAIN && have > 0 ? static_cast<ssize_t>(have) : fail(wait_error);
+            }
+        }
+    }
+
     ssize_t Stack::_recvfrom_once(int fd, void* buf, size_t len, int flags, struct sockaddr* src_addr,
                                   socklen_t* addrlen)
     {
@@ -1034,10 +1135,12 @@ namespace ustack
         {
             return fail(ENOTSOCK);
         }
-        if ((flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL)) != 0)
-        {
-            return fail(EOPNOTSUPP);
-        }
+        // Flags this call does not know are ignored, as Linux ignores them
+        // (recv(2) lists what it acts on, not what it refuses); MSG_DONTWAIT
+        // and MSG_WAITALL were dealt with by the caller. What is acted on
+        // here: MSG_PEEK (look, do not take), MSG_TRUNC, and MSG_OOB on TCP.
+        const bool peek = (flags & MSG_PEEK) != 0;
+        const bool truncate = (flags & MSG_TRUNC) != 0;
         if (buf == nullptr && len > 0)
         {
             return fail(EFAULT);
@@ -1054,15 +1157,23 @@ namespace ustack
             {
                 return fail(EAGAIN);
             }
-            Datagram datagram = std::move(socket->received.front());
-            socket->received.pop_front();
-            size_t copied = std::min(len, datagram.payload.size());
+            // A datagram is delivered whole or not at all: what does not fit
+            // is dropped with it - unless this is a peek, which leaves it
+            // queued for the real read.
+            const Datagram& datagram = socket->received.front();
+            const size_t size = datagram.payload.size();
+            const size_t copied = std::min(len, size);
             std::copy(datagram.payload.begin(), datagram.payload.begin() + static_cast<std::ptrdiff_t>(copied), out);
             if (src_addr != nullptr)
             {
                 _fill_address(socket->family, datagram.source, datagram.source_port, src_addr, addrlen);
             }
-            return static_cast<ssize_t>(copied);
+            if (!peek)
+            {
+                socket->received.pop_front();
+            }
+            // MSG_TRUNC: the datagram's real length, not what fitted.
+            return static_cast<ssize_t>(truncate ? size : copied);
         }
 
         // TCP has no per-read source address: the length says "none".
@@ -1078,6 +1189,10 @@ namespace ustack
         {
             return fail(_take_error(*socket));
         }
+        if ((flags & MSG_OOB) != 0)
+        {
+            return fail(EINVAL); // urgent data is not supported: none is ever pending
+        }
         TcpConnection* connection = _connection(*socket);
         if (connection == nullptr)
         {
@@ -1089,8 +1204,23 @@ namespace ustack
         }
         if (connection->bytes_available() > 0)
         {
+            // MSG_TRUNC on TCP: the bytes are counted (and, unless peeking,
+            // consumed) but not copied, as in tcp_recvmsg.
+            if (peek)
+            {
+                if (truncate)
+                {
+                    return static_cast<ssize_t>(std::min(len, connection->bytes_available()));
+                }
+                Bytes data = connection->peek(len);
+                std::copy(data.begin(), data.end(), out);
+                return static_cast<ssize_t>(data.size());
+            }
             Bytes data = connection->read(len);
-            std::copy(data.begin(), data.end(), out);
+            if (!truncate)
+            {
+                std::copy(data.begin(), data.end(), out);
+            }
             return static_cast<ssize_t>(data.size());
         }
         TcpState state = connection->get_state();
