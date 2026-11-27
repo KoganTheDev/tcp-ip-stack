@@ -1692,10 +1692,11 @@ namespace ustack
             }
             else if (!_driver->can_progress(_stack))
             {
-                std::fprintf(stderr,
-                             "ustack: blocking call on fd %d can never complete: no timeout, and the driver has no "
-                             "frame or timer pending (returning EDEADLK)\n",
-                             fd);
+                static_cast<void>(
+                    std::fprintf(stderr,
+                                 "ustack: blocking call on fd %d can never complete: no timeout, and the driver has no "
+                                 "frame or timer pending (returning EDEADLK)\n",
+                                 fd));
                 return EDEADLK;
             }
             // The call so far may have armed an earlier timer than the one the
