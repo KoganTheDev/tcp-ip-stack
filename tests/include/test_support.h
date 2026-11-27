@@ -2,6 +2,11 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/resource.h>
+#include <sys/select.h>
+
+#include <algorithm>
+#include <climits>
 #include <stdexcept>
 #include <string>
 
@@ -40,6 +45,21 @@ namespace test_support
         using std::runtime_error::runtime_error;
     };
 
+    // A descriptor number that no open fd can have: at or above the soft
+    // RLIMIT_NOFILE the kernel never hands one out, so close()/ioctl() on it is
+    // EBADF whatever else the process has open. A hard-coded number (999) is
+    // only invalid until a leak, or a test that simply opens enough sockets,
+    // makes it valid.
+    inline int never_valid_fd()
+    {
+        rlimit limit{};
+        if (getrlimit(RLIMIT_NOFILE, &limit) != 0 || limit.rlim_cur == RLIM_INFINITY)
+        {
+            return INT_MAX - 1;
+        }
+        return static_cast<int>(std::min<rlim_t>(limit.rlim_cur, INT_MAX - 1));
+    }
+
     inline void require(bool condition, const std::string& message, const char* expression, const char* file, int line)
     {
         if (condition)
@@ -50,6 +70,12 @@ namespace test_support
         throw RequirementFailed(message);
     }
 }
+
+// Like REQUIRE_TRUE, for a descriptor about to go into an fd_set. FD_SET on an
+// fd >= FD_SETSIZE writes past the set (stack smashing), so a leak that pushes
+// fd numbers up must fail the test loudly instead.
+#define REQUIRE_FD_SETTABLE(fd) \
+    REQUIRE_TRUE((fd) >= 0 && (fd) < FD_SETSIZE, "fd " + std::to_string(fd) + " does not fit an fd_set (FD_SETSIZE)")
 
 #define REQUIRE_TRUE(condition, message) \
     ::test_support::require(static_cast<bool>(condition), (message), #condition, __FILE__, __LINE__)
