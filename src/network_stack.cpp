@@ -281,6 +281,8 @@ NetworkStack::SeededSecrets NetworkStack::SeededSecrets::from_seed(uint64_t seed
     secrets.challenge_ack_seed = next();
     secrets.ts_key_low = next();
     secrets.ts_key_high = next();
+    secrets.reuseport_key_low = next();
+    secrets.reuseport_key_high = next();
     return secrets;
 }
 
@@ -289,6 +291,7 @@ void NetworkStack::set_secret_seed(uint64_t seed)
     SeededSecrets secrets = SeededSecrets::from_seed(seed);
     this->_isn_generator = IsnGenerator(secrets.isn_key_low, secrets.isn_key_high);
     this->_ts_offset_generator = IsnGenerator(secrets.ts_key_low, secrets.ts_key_high);
+    this->_reuseport_hasher = IsnGenerator(secrets.reuseport_key_low, secrets.reuseport_key_high);
     this->_syn_cookies = SynCookies(secrets.cookie_key_low, secrets.cookie_key_high);
     this->_challenge_ack_rng.seed(static_cast<std::minstd_rand::result_type>(secrets.challenge_ack_seed));
     this->_isn_on_virtual_clock = true;
@@ -425,66 +428,128 @@ int NetworkStack::get_fd() const
 
 void NetworkStack::listen(uint16_t port, size_t backlog, ListenFamily family, const std::optional<IpAddress>& local)
 {
-    this->_listening_ports[port] = Listener{backlog, family, local};
+    auto port_it = this->_listeners_by_port.find(port);
+    if (port_it != this->_listeners_by_port.end() && !port_it->second.empty())
+    {
+        Listener& listener = this->_listeners.at(port_it->second.front());
+        listener.backlog = backlog;
+        listener.family = family;
+        listener.local = local;
+        return;
+    }
+    ListenOptions options;
+    options.backlog = backlog;
+    options.family = family;
+    options.local = local;
+    this->open_listener(port, options);
+}
+
+NetworkStack::ListenerId NetworkStack::open_listener(uint16_t port, const ListenOptions& options)
+{
+    ListenerId id = this->_next_listener_id++;
+    Listener listener;
+    listener.id = id;
+    listener.port = port;
+    listener.backlog = options.backlog;
+    listener.family = options.family;
+    listener.local = options.local;
+    listener.reuseport = options.reuseport;
+    listener.reuseaddr = options.reuseaddr;
+    this->_listeners.emplace(id, std::move(listener));
+    this->_listeners_by_port[port].push_back(id);
+    return id;
+}
+
+void NetworkStack::set_listener_backlog(ListenerId id, size_t backlog)
+{
+    auto it = this->_listeners.find(id);
+    if (it != this->_listeners.end())
+    {
+        it->second.backlog = backlog;
+    }
 }
 
 void NetworkStack::unlisten(uint16_t port)
 {
-    this->_listening_ports.erase(port);
+    auto port_it = this->_listeners_by_port.find(port);
+    if (port_it == this->_listeners_by_port.end())
+    {
+        return;
+    }
+    std::vector<ListenerId> ids = port_it->second; // close_listener edits the list
+    for (ListenerId id : ids)
+    {
+        this->close_listener(id);
+    }
+}
+
+void NetworkStack::close_listener(ListenerId id)
+{
+    auto it = this->_listeners.find(id);
+    if (it == this->_listeners.end())
+    {
+        return;
+    }
+    // Out of the tables first, so nothing below - a RST, a state change -
+    // can find it and queue onto it.
+    Listener listener = std::move(it->second);
+    this->_listeners.erase(it);
+    auto port_it = this->_listeners_by_port.find(listener.port);
+    if (port_it != this->_listeners_by_port.end())
+    {
+        std::vector<ListenerId>& ids = port_it->second;
+        ids.erase(std::remove(ids.begin(), ids.end(), id), ids.end());
+        if (ids.empty())
+        {
+            this->_listeners_by_port.erase(port_it);
+        }
+    }
 
     // What Linux does when a listener closes: connections that finished the
     // handshake were promised to an application that will now never take
     // them, so their peers are told with a RST; half-open ones are dropped
     // silently, and a client that answers late gets the ordinary RST for a
-    // segment matching no connection.
-    auto pending_it = this->_pending_accepts.find(port);
-    if (pending_it != this->_pending_accepts.end())
+    // segment matching no connection. A SO_REUSEPORT group's other members
+    // are not handed them: Linux migrates them only with
+    // net.ipv4.tcp_migrate_req=1, which is off by default (probed: closing one
+    // of two members resets its queued connections, the other keeps its own).
+    for (uint64_t pending_id : listener.pending)
     {
-        std::deque<uint64_t> pending = std::move(pending_it->second);
-        this->_pending_accepts.erase(pending_it);
-        for (uint64_t id : pending)
+        if (TcpConnection* connection = this->_queued_connection(pending_id))
         {
-            if (TcpConnection* connection = this->_queued_connection(id))
-            {
-                connection->abort();
-            }
+            connection->abort();
         }
     }
-    auto half_open_it = this->_half_open_per_port.find(port);
-    if (half_open_it != this->_half_open_per_port.end())
+    for (const auto& entry : listener.half_open)
     {
-        // Copied: each fail() leaves SYN_RECEIVED, whose callback edits the map.
-        std::vector<uint64_t> ids;
-        for (const auto& entry : half_open_it->second)
+        if (TcpConnection* connection = this->find_connection(entry.first))
         {
-            ids.push_back(entry.first);
-        }
-        for (uint64_t id : ids)
-        {
-            if (TcpConnection* connection = this->find_connection(id))
-            {
-                connection->fail(TcpCloseReason::ABORTED);
-            }
+            connection->fail(TcpCloseReason::ABORTED);
         }
     }
 }
 
 bool NetworkStack::has_pending_accept(uint16_t port) const
 {
-    auto pending_it = this->_pending_accepts.find(port);
-    if (pending_it == this->_pending_accepts.end())
+    auto port_it = this->_listeners_by_port.find(port);
+    if (port_it == this->_listeners_by_port.end())
     {
         return false;
     }
-    // Stale entries (see accept()) do not count: accept() would skip them.
-    for (uint64_t id : pending_it->second)
+    return std::any_of(port_it->second.begin(), port_it->second.end(),
+                       [this](ListenerId id) { return this->has_pending_accept_on(id); });
+}
+
+bool NetworkStack::has_pending_accept_on(ListenerId id) const
+{
+    auto it = this->_listeners.find(id);
+    if (it == this->_listeners.end())
     {
-        if (this->_queued_connection(id) != nullptr)
-        {
-            return true;
-        }
+        return false;
     }
-    return false;
+    // Stale entries (see accept_on()) do not count: accept would skip them.
+    return std::any_of(it->second.pending.begin(), it->second.pending.end(),
+                       [this](uint64_t connection_id) { return this->_queued_connection(connection_id) != nullptr; });
 }
 
 TcpConnection* NetworkStack::_queued_connection(uint64_t connection_id) const
@@ -501,15 +566,33 @@ TcpConnection* NetworkStack::_queued_connection(uint64_t connection_id) const
 
 TcpConnection* NetworkStack::accept(uint16_t port)
 {
-    auto pending_it = this->_pending_accepts.find(port);
-    if (pending_it == this->_pending_accepts.end() || pending_it->second.empty())
+    auto port_it = this->_listeners_by_port.find(port);
+    if (port_it == this->_listeners_by_port.end())
     {
         return nullptr;
     }
+    for (ListenerId id : port_it->second)
+    {
+        if (TcpConnection* connection = this->accept_on(id))
+        {
+            return connection;
+        }
+    }
+    return nullptr;
+}
+
+TcpConnection* NetworkStack::accept_on(ListenerId id)
+{
+    auto it = this->_listeners.find(id);
+    if (it == this->_listeners.end())
+    {
+        return nullptr;
+    }
+    std::deque<uint64_t>& pending = it->second.pending;
 
     // Keep popping until a live connection is found. A queued id can go stale:
     // _reap_closed_connections() erases from _connections but never from
-    // _pending_accepts, so a peer that RSTs immediately after handshaking leaves
+    // the accept queue, so a peer that RSTs immediately after handshaking leaves
     // an entry here pointing at nothing. (Ids rather than four-tuples are what
     // keep "nothing" from being some later connection on the same tuple.)
     //
@@ -517,17 +600,125 @@ TcpConnection* NetworkStack::accept(uint16_t port)
     // genuinely ready connection queued behind it, because a caller treating
     // nullptr as "nothing pending" moves on. One aborting peer was enough to
     // stall accepts for all the connections behind it.
-    while (!pending_it->second.empty())
+    while (!pending.empty())
     {
-        uint64_t id = pending_it->second.front();
-        pending_it->second.pop_front();
+        uint64_t connection_id = pending.front();
+        pending.pop_front();
 
-        if (TcpConnection* connection = this->_queued_connection(id))
+        if (TcpConnection* connection = this->_queued_connection(connection_id))
         {
             return connection;
         }
     }
     return nullptr;
+}
+
+const NetworkStack::Listener* NetworkStack::_select_listener(const IpAddress& source, uint16_t source_port,
+                                                             const IpAddress& destination, uint16_t port) const
+{
+    auto port_it = this->_listeners_by_port.find(port);
+    if (port_it == this->_listeners_by_port.end())
+    {
+        return nullptr;
+    }
+    const std::vector<ListenerId>& ids = port_it->second;
+    // Latest opened first, strictly better to replace: among equals the
+    // latest wins, as Linux's listening hash (added at the head) has it.
+    const Listener* best = nullptr;
+    int best_score = -1;
+    for (auto id_it = ids.rbegin(); id_it != ids.rend(); ++id_it)
+    {
+        const Listener& candidate = this->_listeners.at(*id_it);
+        if (!candidate.accepts(source, destination))
+        {
+            continue;
+        }
+        int score = candidate.score(source);
+        if (score > best_score)
+        {
+            best = &candidate;
+            best_score = score;
+        }
+    }
+    if (best == nullptr || !best->reuseport)
+    {
+        return best;
+    }
+    // A SO_REUSEPORT group: the members in the order they joined, and the
+    // one the keyed hash of this four-tuple picks (reciprocal_scale, as
+    // Linux's reuseport_select_sock). The same tuple always lands on the same
+    // member while the group is unchanged - a SYN's retransmission and its
+    // cookie ACK included - and nobody without the key can steer it.
+    std::vector<const Listener*> group;
+    for (ListenerId id : ids)
+    {
+        const Listener& member = this->_listeners.at(id);
+        if (member.same_group(*best))
+        {
+            group.push_back(&member);
+        }
+    }
+    uint32_t hash = this->reuseport_hash(destination, port, source, source_port);
+    size_t index = static_cast<size_t>((static_cast<uint64_t>(hash) * group.size()) >> 32);
+    return group[index];
+}
+
+NetworkStack::Listener* NetworkStack::_select_listener(const IpAddress& source, uint16_t source_port,
+                                                       const IpAddress& destination, uint16_t port)
+{
+    return const_cast<Listener*>(static_cast<const NetworkStack*>(this)->_select_listener(source, source_port,
+                                                                                          destination, port));
+}
+
+void NetworkStack::_queue_for_accept(Listener& listener, uint64_t connection_id)
+{
+    listener.pending.push_back(connection_id);
+    // Copied: a callback may close this very listener.
+    ListenerId id = listener.id;
+    uint16_t port = listener.port;
+    if (this->_on_listener_ready)
+    {
+        this->_on_listener_ready(id);
+    }
+    if (this->_on_accept_ready)
+    {
+        this->_on_accept_ready(port);
+    }
+}
+
+uint32_t NetworkStack::reuseport_hash(const IpAddress& local_ip, uint16_t local_port, const IpAddress& remote_ip,
+                                      uint16_t remote_port) const
+{
+    return this->_reuseport_hasher.offset_for(local_ip, local_port, remote_ip, remote_port);
+}
+
+void NetworkStack::set_connection_reuse(uint64_t connection_id, bool reuseaddr, bool reuseport)
+{
+    auto it = this->_connections_by_id.find(connection_id);
+    if (it != this->_connections_by_id.end())
+    {
+        it->second.reuseaddr = reuseaddr;
+        it->second.reuseport = reuseport;
+    }
+}
+
+void NetworkStack::for_each_connection_on_port(
+    uint16_t port, const std::function<void(const IpAddress& local, bool reuseaddr, bool reuseport)>& visit) const
+{
+    // A walk of every connection, but only for a port some connection uses:
+    // bind() is rare and this is never on the packet path.
+    if (this->_connections_per_port.count(port) == 0)
+    {
+        return;
+    }
+    for (const auto& entry : this->_connections_by_id)
+    {
+        const ConnectionRecord& record = entry.second;
+        if (record.key.local_port == port && record.connection->get_state() != TcpState::CLOSED)
+        {
+            visit(record.key.local_ip, record.reuseaddr, record.reuseport);
+        }
+    }
 }
 
 TcpConnection* NetworkStack::connect(const IpAddress& remote_ip, uint16_t remote_port, uint16_t local_port)
@@ -570,7 +761,7 @@ TcpConnection* NetworkStack::connect(const IpAddress& remote_ip, uint16_t remote
         // source and destination equal, which is what a listener sharing the
         // ephemeral range (a socket layer that binds port 0) would otherwise
         // meet on its first loopback connect.
-        found_free_port = found_free_port && this->_listening_ports.count(ephemeral_port) == 0;
+        found_free_port = found_free_port && this->_listeners_by_port.count(ephemeral_port) == 0;
         // Nor, to a local peer, its own destination port: with no listener
         // there the same collision arises (source == destination, equal
         // ports). Linux would allow that simultaneous self-connect; this stack
@@ -801,18 +992,47 @@ UdpSocket* NetworkStack::bind_udp(uint16_t port)
 UdpSocket* NetworkStack::_bind_udp_socket(uint16_t port)
 {
     auto existing_it = this->_udp_sockets.find(port);
-    if (existing_it != this->_udp_sockets.end())
+    if (existing_it != this->_udp_sockets.end() && !existing_it->second.empty())
     {
-        return existing_it->second.get();
+        return existing_it->second.front().get();
     }
+    return this->open_udp(port);
+}
 
+UdpSocket* NetworkStack::open_udp(uint16_t port)
+{
     auto socket =
         std::make_unique<UdpSocket>(port, [this](const IpAddress& dest_ip, const Udp& header, const Bytes& payload)
                                     { this->_send_or_queue_udp(dest_ip, header, payload); });
-
     UdpSocket* socket_ptr = socket.get();
-    this->_udp_sockets[port] = std::move(socket);
+    this->_udp_sockets[port].push_back(std::move(socket));
     return socket_ptr;
+}
+
+bool NetworkStack::close_udp(UdpSocket* socket)
+{
+    if (socket == nullptr)
+    {
+        return false;
+    }
+    auto port_it = this->_udp_sockets.find(socket->get_local_port());
+    if (port_it == this->_udp_sockets.end())
+    {
+        return false;
+    }
+    std::vector<std::unique_ptr<UdpSocket>>& sockets = port_it->second;
+    auto it = std::find_if(sockets.begin(), sockets.end(),
+                           [socket](const std::unique_ptr<UdpSocket>& held) { return held.get() == socket; });
+    if (it == sockets.end())
+    {
+        return false;
+    }
+    sockets.erase(it);
+    if (sockets.empty())
+    {
+        this->_udp_sockets.erase(port_it);
+    }
+    return true;
 }
 
 bool NetworkStack::unbind_udp(uint16_t port)
@@ -861,6 +1081,7 @@ void NetworkStack::_register_connection(const ConnectionKey& key, std::unique_pt
     this->_wire_connection(*connection_ptr);
     this->_connections_by_id[connection_id] = ConnectionRecord{key, connection_ptr, TcpConnection::NO_DEADLINE};
     this->_connections[key] = std::move(connection);
+    this->_connections_per_port[key.local_port] += 1;
     // It may have armed a timer before it was wired (the SYN-ACK
     // accept_incoming_syn() sent), when there was nobody to tell.
     this->_schedule_connection_timer(connection_id);
@@ -1384,6 +1605,11 @@ void NetworkStack::_reap_connection(uint64_t connection_id)
     reaped.connections += 1;
     reaped.retransmit_timeouts += id_it->second.connection->stats().retransmit_timeouts;
     reaped.retransmitted_segments += id_it->second.connection->stats().retransmitted_segments;
+    auto port_it = this->_connections_per_port.find(id_it->second.key.local_port);
+    if (port_it != this->_connections_per_port.end() && --port_it->second == 0)
+    {
+        this->_connections_per_port.erase(port_it);
+    }
     this->_connections.erase(id_it->second.key);
     this->_connections_by_id.erase(id_it);
 }
@@ -1860,8 +2086,9 @@ bool NetworkStack::_reuses_time_wait(const TcpConnection& existing, const IpAddr
     }
     // Only a listener can take the new connection. Without one the SYN goes to
     // the TIME_WAIT connection as before: a challenge ACK, rate limited.
-    auto listening_it = this->_listening_ports.find(tcp.get_dest_port());
-    if (listening_it == this->_listening_ports.end() || !listening_it->second.accepts(source, destination))
+    // The one _handle_tcp would hand the SYN to.
+    const Listener* selected = this->_select_listener(source, tcp.get_src_port(), destination, tcp.get_dest_port());
+    if (selected == nullptr)
     {
         return false;
     }
@@ -1871,19 +2098,16 @@ bool NetworkStack::_reuses_time_wait(const TcpConnection& existing, const IpAddr
     // the cookie, floor or no floor), ending TIME_WAIT would give up the
     // four-tuple's protection for nothing; the SYN goes to the TIME_WAIT
     // connection instead. Mirrors the admission checks in _handle_tcp.
-    const Listener& listener = listening_it->second;
-    auto pending_it = this->_pending_accepts.find(tcp.get_dest_port());
-    if (pending_it != this->_pending_accepts.end() && pending_it->second.size() >= listener.backlog)
+    const Listener& listener = *selected;
+    if (listener.pending.size() >= listener.backlog)
     {
         return false;
     }
-    auto half_open_it = this->_half_open_per_port.find(tcp.get_dest_port());
-    if (half_open_it != this->_half_open_per_port.end()
-        && half_open_it->second.size() >= half_open_cap(listener.backlog))
+    if (listener.half_open.size() >= half_open_cap(listener.backlog))
     {
         // Full: admitted only if the oldest is stale enough to be evicted.
-        uint64_t oldest_id = half_open_it->second.begin()->first;
-        uint64_t oldest_created = half_open_it->second.begin()->second;
+        uint64_t oldest_id = listener.half_open.begin()->first;
+        uint64_t oldest_created = listener.half_open.begin()->second;
         if (this->find_connection(oldest_id) == nullptr || this->_now_ms - oldest_created < HALF_OPEN_EVICT_AGE_MS)
         {
             return false;
@@ -1954,21 +2178,31 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
         // 3.10.7.4), so one carrying a FIN goes straight on to CLOSE_WAIT -
         // still a connection the application must be given, to read and close.
         TcpState state_after = connection_it->second->get_state();
+        //
+        // It joins the queue of the listener that took its SYN - the one
+        // recorded then, not one chosen again now - so a SO_REUSEPORT group
+        // changing meanwhile cannot move it to another socket. If that
+        // listener has closed, the connection was failed with it.
         if (state_before == TcpState::SYN_RECEIVED && state_after != TcpState::SYN_RECEIVED
             && state_after != TcpState::CLOSED && !connection_it->second->is_active_open())
         {
-            this->_pending_accepts[key.local_port].push_back(connection_it->second->get_id());
-            if (this->_on_accept_ready)
+            uint64_t connection_id = connection_it->second->get_id();
+            auto record_it = this->_connections_by_id.find(connection_id);
+            auto listener_it = record_it == this->_connections_by_id.end()
+                                   ? this->_listeners.end()
+                                   : this->_listeners.find(record_it->second.listener);
+            if (listener_it != this->_listeners.end())
             {
-                this->_on_accept_ready(key.local_port);
+                this->_queue_for_accept(listener_it->second, connection_id);
             }
         }
         return;
     }
 
-    auto listening_it = this->_listening_ports.find(tcp.get_dest_port());
-    bool is_new_connection_request = tcp.get_syn() && listening_it != this->_listening_ports.end()
-                                     && listening_it->second.accepts(source, destination);
+    Listener* listener = tcp.get_syn() ? this->_select_listener(source, tcp.get_src_port(), destination,
+                                                                tcp.get_dest_port())
+                                       : nullptr;
+    bool is_new_connection_request = listener != nullptr;
 
     if (is_new_connection_request)
     {
@@ -1976,13 +2210,12 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
         // retransmits its SYN, and if the application has accepted something by
         // then the retry succeeds. A RST here would tell it to give up on a
         // connection that was only ever refused because we were briefly behind.
-        auto pending_it = this->_pending_accepts.find(tcp.get_dest_port());
-        size_t queued = pending_it == this->_pending_accepts.end() ? 0 : pending_it->second.size();
-        if (queued >= listening_it->second.backlog)
+        size_t queued = listener->pending.size();
+        if (queued >= listener->backlog)
         {
             LOG_WARNING("NetworkStack: dropping a SYN for port "
                         << tcp.get_dest_port() << " - the accept queue is full (" << queued << "/"
-                        << listening_it->second.backlog
+                        << listener->backlog
                         << "). The application is not accepting fast enough, or this is a SYN flood.");
             this->_syns_dropped_accept_queue_full += 1;
             return;
@@ -1994,9 +2227,12 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
         // SYN built a connection that lived, retransmitting its SYN-ACK, until
         // it gave up. Dropped silently for the same reason as above.
         //
-        auto half_open_it = this->_half_open_per_port.find(key.local_port);
-        size_t half_open = half_open_it == this->_half_open_per_port.end() ? 0 : half_open_it->second.size();
-        if (half_open >= half_open_cap(listening_it->second.backlog))
+        // Per listener, as Linux's SYN queue is per listening socket: a
+        // SO_REUSEPORT group of N holds at most N caps' worth, each member
+        // evicts and falls back to cookies on its own, and a flood that the
+        // hash lands on one member cannot spend another's slots.
+        size_t half_open = listener->half_open.size();
+        if (half_open >= half_open_cap(listener->backlog))
         {
             // Full. If the oldest has waited far longer than a real client
             // takes to answer, it is almost certainly a flood's: evict it and
@@ -2004,8 +2240,8 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
             // SYN_RECEIVED, so _track_half_open's callback removes the record;
             // no RST goes out, and if that client does answer late it gets the
             // ordinary RST for a segment matching no connection.
-            uint64_t oldest_id = half_open_it->second.begin()->first;
-            uint64_t oldest_created = half_open_it->second.begin()->second;
+            uint64_t oldest_id = listener->half_open.begin()->first;
+            uint64_t oldest_created = listener->half_open.begin()->second;
             TcpConnection* oldest = this->find_connection(oldest_id);
             if (oldest != nullptr && this->_now_ms - oldest_created >= HALF_OPEN_EVICT_AGE_MS)
             {
@@ -2087,8 +2323,16 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
         return;
     }
 
-    this->_track_half_open(*connection, key.local_port);
+    ListenerId listener_id = listener->id;
+    bool reuseaddr = listener->reuseaddr;
+    bool reuseport = listener->reuseport;
+    this->_track_half_open(*connection, listener_id);
+    uint64_t connection_id = connection->get_id();
     this->_register_connection(key, std::move(connection));
+    ConnectionRecord& record = this->_connections_by_id.at(connection_id);
+    record.listener = listener_id;
+    record.reuseaddr = reuseaddr;
+    record.reuseport = reuseport;
 }
 
 void NetworkStack::_send_syn_cookie(const IpAddress& source, const IpAddress& destination, const Tcp& tcp)
@@ -2122,8 +2366,9 @@ NetworkStack::CookieAck NetworkStack::_try_complete_cookie_handshake(const IpAdd
         return CookieAck::NOT_A_COOKIE;
     }
     uint16_t local_port = tcp.get_dest_port();
-    auto listening_it = this->_listening_ports.find(local_port);
-    if (listening_it == this->_listening_ports.end() || !listening_it->second.accepts(source, destination))
+    // The listener the SYN went to: the same selection, the same tuple.
+    Listener* listener = this->_select_listener(source, tcp.get_src_port(), destination, local_port);
+    if (listener == nullptr)
     {
         return CookieAck::NOT_A_COOKIE;
     }
@@ -2187,9 +2432,7 @@ NetworkStack::CookieAck NetworkStack::_try_complete_cookie_handshake(const IpAdd
     // Genuine. The accept queue still bounds it, exactly as for a handshake
     // that completed the ordinary way; dropped silently like backlog
     // overflow, so the client's retransmission can succeed later.
-    auto pending_it = this->_pending_accepts.find(local_port);
-    size_t queued = pending_it == this->_pending_accepts.end() ? 0 : pending_it->second.size();
-    if (queued >= listening_it->second.backlog)
+    if (listener->pending.size() >= listener->backlog)
     {
         LOG_WARNING("NetworkStack: a valid SYN cookie for port " << local_port
                                                                  << " arrived with the accept queue full - dropped");
@@ -2208,13 +2451,13 @@ NetworkStack::CookieAck NetworkStack::_try_complete_cookie_handshake(const IpAdd
 
     TcpConnection* connection_ptr = connection.get();
     this->_register_connection(key, std::move(connection));
-    this->_connections_by_id.at(connection_ptr->get_id()).from_cookie = true;
+    ConnectionRecord& record = this->_connections_by_id.at(connection_ptr->get_id());
+    record.from_cookie = true;
+    record.listener = listener->id;
+    record.reuseaddr = listener->reuseaddr;
+    record.reuseport = listener->reuseport;
     this->_connections_from_cookie += 1;
-    this->_pending_accepts[local_port].push_back(connection_ptr->get_id());
-    if (this->_on_accept_ready)
-    {
-        this->_on_accept_ready(local_port);
-    }
+    this->_queue_for_accept(*listener, connection_ptr->get_id());
 
     // The completing ACK may carry data (or its window), so it is processed
     // like any segment of an established connection.
@@ -2222,10 +2465,10 @@ NetworkStack::CookieAck NetworkStack::_try_complete_cookie_handshake(const IpAdd
     return CookieAck::COMPLETED;
 }
 
-void NetworkStack::_track_half_open(TcpConnection& connection, uint16_t local_port)
+void NetworkStack::_track_half_open(TcpConnection& connection, ListenerId listener_id)
 {
     uint64_t id = connection.get_id();
-    this->_half_open_per_port[local_port][id] = this->_now_ms;
+    this->_listeners.at(listener_id).half_open[id] = this->_now_ms;
     // Erasing by id is idempotent, so later transitions (ESTABLISHED ->
     // CLOSE_WAIT -> ...) need no guard: only the first one out of
     // SYN_RECEIVED finds the record to remove. (A counter needed a once-only
@@ -2233,21 +2476,16 @@ void NetworkStack::_track_half_open(TcpConnection& connection, uint16_t local_po
     // _transition() invokes a copy of each subscriber.) The connection is
     // owned by this stack, so `this` outlives every call.
     connection.add_state_changed_callback(
-        [this, local_port, id](TcpState new_state)
+        [this, listener_id, id](TcpState new_state)
         {
             if (new_state == TcpState::SYN_RECEIVED)
             {
                 return;
             }
-            auto it = this->_half_open_per_port.find(local_port);
-            if (it == this->_half_open_per_port.end())
+            auto it = this->_listeners.find(listener_id);
+            if (it != this->_listeners.end())
             {
-                return;
-            }
-            it->second.erase(id);
-            if (it->second.empty())
-            {
-                this->_half_open_per_port.erase(it);
+                it->second.half_open.erase(id);
             }
         });
 }
@@ -2287,17 +2525,70 @@ void NetworkStack::_handle_udp(const Ip& ip, const Udp& udp, const Bytes& receiv
 
 bool NetworkStack::_deliver_udp(const IpAddress& source, const IpAddress& destination, const Udp& udp)
 {
-    auto socket_it = this->_udp_sockets.find(udp.get_dest_port());
-    if (socket_it == this->_udp_sockets.end())
+    // A socket bound to one address does not take datagrams sent to another,
+    // nor a connected one datagrams from anyone but its peer; to the sender
+    // that is the same as no socket at all.
+    UdpSocket* socket = this->_select_udp_socket(source, destination, udp);
+    if (socket == nullptr)
     {
         LOG_DEBUG("NetworkStack: dropping a UDP datagram to port "
-                  << udp.get_dest_port() << " - nothing is bound there, sending ICMP Port Unreachable");
+                  << udp.get_dest_port() << " - no socket there takes it, sending ICMP Port Unreachable");
         return false;
     }
+    socket->on_datagram(source, udp);
+    return true;
+}
 
-    // A socket bound to one address does not take datagrams sent to another;
-    // to the sender that is the same as no socket at all.
-    return socket_it->second->on_datagram(source, destination, udp);
+UdpSocket* NetworkStack::_select_udp_socket(const IpAddress& source, const IpAddress& destination,
+                                            const Udp& udp) const
+{
+    auto port_it = this->_udp_sockets.find(udp.get_dest_port());
+    if (port_it == this->_udp_sockets.end())
+    {
+        return nullptr;
+    }
+    const std::vector<std::unique_ptr<UdpSocket>>& sockets = port_it->second;
+    uint16_t source_port = udp.get_src_port();
+    // udp4_lib_lookup2: the best score wins, and among equals the latest bound
+    // (Linux adds to the head of the slot; probed: of two SO_REUSEADDR
+    // sockets on one address, the second gets every datagram).
+    UdpSocket* best = nullptr;
+    int best_score = -1;
+    for (auto it = sockets.rbegin(); it != sockets.rend(); ++it)
+    {
+        int score = (*it)->match_score(source, source_port, destination);
+        if (score > best_score)
+        {
+            best = it->get();
+            best_score = score;
+        }
+    }
+    if (best == nullptr)
+    {
+        for (const std::unique_ptr<UdpSocket>& socket : sockets)
+        {
+            socket->count_if_filtered(source, source_port, destination);
+        }
+        return nullptr;
+    }
+    if (!best->reuseport() || best->is_connected())
+    {
+        return best;
+    }
+    // A SO_REUSEPORT group: its unconnected members in bind order, and the
+    // one the keyed four-tuple hash picks - reuseport_select_sock_by_hash,
+    // which skips connected members. A connected member's own peer scored
+    // higher above and never reaches here.
+    std::vector<UdpSocket*> group;
+    for (const std::unique_ptr<UdpSocket>& socket : sockets)
+    {
+        if (!socket->is_connected() && socket->same_group(*best))
+        {
+            group.push_back(socket.get());
+        }
+    }
+    uint32_t hash = this->reuseport_hash(destination, udp.get_dest_port(), source, source_port);
+    return group[static_cast<size_t>((static_cast<uint64_t>(hash) * group.size()) >> 32)];
 }
 
 void NetworkStack::_handle_icmp(const Ip& ip, const Icmp& icmp)
@@ -2544,7 +2835,12 @@ void NetworkStack::_handle_icmp_udp_error(const Icmp& icmp, const Bytes& quoted)
     {
         return;
     }
-    it->second->on_icmp_error(IPv4Address(quoted.slice(12, 4)), original_dest, remote_port, mapped.error);
+    // Each socket checks the quote against its own connected four-tuple, so
+    // only the one that sent it takes the error.
+    for (const std::unique_ptr<UdpSocket>& socket : it->second)
+    {
+        socket->on_icmp_error(IPv4Address(quoted.slice(12, 4)), original_dest, remote_port, mapped.error);
+    }
 }
 
 void NetworkStack::_handle_icmp_error(const Icmp& icmp)

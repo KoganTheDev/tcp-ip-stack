@@ -801,7 +801,11 @@ void NetworkStack::_handle_icmpv6_udp_error(const Icmpv6& message, const Bytes& 
     auto it = this->_udp_sockets.find(local_port);
     if (it != this->_udp_sockets.end())
     {
-        it->second->on_icmp_error(IpAddress(original_source), IpAddress(original_destination), remote_port, error);
+        // Each socket checks the quote against its own connected four-tuple.
+        for (const std::unique_ptr<UdpSocket>& socket : it->second)
+        {
+            socket->on_icmp_error(IpAddress(original_source), IpAddress(original_destination), remote_port, error);
+        }
     }
 }
 

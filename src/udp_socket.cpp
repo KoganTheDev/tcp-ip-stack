@@ -48,6 +48,47 @@ bool UdpSocket::on_datagram(const IpAddress& src_ip, const IpAddress& dest_ip, c
     return true;
 }
 
+int UdpSocket::match_score(const IpAddress& src_ip, uint16_t src_port, const IpAddress& dest_ip) const
+{
+    if (src_ip.is_v4() ? !_takes_v4 : !_takes_v6)
+    {
+        return -1;
+    }
+    // Never a v4 peer in disguise: the network layer drops these, and a
+    // socket refuses them too.
+    if (src_ip.is_v6() && IpAddress::is_v4_mapped(src_ip.v6()))
+    {
+        return -1;
+    }
+    int score = src_ip.is_v4() && _af_inet ? 2 : 1;
+    if (_bound_address)
+    {
+        if (*_bound_address != dest_ip)
+        {
+            return -1;
+        }
+        score += 4;
+    }
+    if (_peer)
+    {
+        if (_peer->ip != src_ip || _peer->port != src_port)
+        {
+            return -1;
+        }
+        score += 8;
+    }
+    return score;
+}
+
+void UdpSocket::count_if_filtered(const IpAddress& src_ip, uint16_t src_port, const IpAddress& dest_ip)
+{
+    if (_peer && (_peer->ip != src_ip || _peer->port != src_port) && (!_bound_address || *_bound_address == dest_ip)
+        && (src_ip.is_v4() ? _takes_v4 : _takes_v6))
+    {
+        _datagrams_filtered++;
+    }
+}
+
 void UdpSocket::send_to(const IpAddress& dest_ip, uint16_t dest_port, const Bytes& data)
 {
     // checksum left at 0 here - like TcpConnection's _build_header(), the
