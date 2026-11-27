@@ -308,7 +308,9 @@ namespace ustack
         int poll(struct pollfd* fds, nfds_t nfds, int timeout_ms);
         // select(): EBADF for a set bit that is not an open fd (also if it is
         // closed during the wait), EINVAL for nfds outside [0, FD_SETSIZE] or
-        // a bad timeval (Linux clamps nfds to its fd table instead of failing).
+        // a bad timeval (Linux clamps nfds to its fd table instead of failing,
+        // so it silently ignores a bit for an fd number past the table's end
+        // where this reports EBADF).
         // Readable is POLLIN|POLLHUP|POLLERR and writable POLLOUT|POLLERR, as
         // in Linux. The exceptional set is Linux's too, EPOLLPRI alone, so it
         // is always empty: there is no urgent data (MSG_OOB) here. On return
