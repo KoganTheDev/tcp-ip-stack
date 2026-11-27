@@ -2,6 +2,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/eventfd.h>
+#include <sys/resource.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -12,11 +13,13 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "exceptions.h"
 #include "ustack/stack.h"
@@ -1684,18 +1687,32 @@ namespace ustack
             return EBADF;
         }
         const uint64_t serial = socket->serial;
+        int vanished = 0;
+        int result = _pump_until(
+            [this, fd, serial, events, &vanished]
+            {
+                // The pump may have run application callbacks, which may have
+                // closed this fd and even given its number to a new socket:
+                // look it up afresh and compare the serial, never hold the
+                // pointer.
+                Socket* current = _get(fd);
+                if (current == nullptr || current->serial != serial)
+                {
+                    vanished = EBADF;
+                    return true;
+                }
+                return (_poll(fd) & events) != 0;
+            },
+            deadline, must_wait);
+        return vanished != 0 ? vanished : result;
+    }
+
+    int Stack::_pump_until(const std::function<bool()>& done, std::optional<uint64_t> deadline, bool must_wait)
+    {
         _driver->run_pending(_stack);
         for (;;)
         {
-            // Everything below may run application callbacks (the pump), which
-            // may close this fd and even give its number to a new socket: look
-            // it up afresh and compare the serial, never hold the pointer.
-            socket = _get(fd);
-            if (socket == nullptr || socket->serial != serial)
-            {
-                return EBADF;
-            }
-            if (!must_wait && (_poll(fd) & events) != 0)
+            if (!must_wait && done())
             {
                 return 0;
             }
@@ -1713,10 +1730,8 @@ namespace ustack
             else if (!_driver->can_progress(_stack))
             {
                 static_cast<void>(
-                    std::fprintf(stderr,
-                                 "ustack: blocking call on fd %d can never complete: no timeout, and the driver has no "
-                                 "frame or timer pending (returning EDEADLK)\n",
-                                 fd));
+                    std::fprintf(stderr, "ustack: blocking call can never complete: no timeout, and the driver has no "
+                                         "frame or timer pending (returning EDEADLK)\n"));
                 return EDEADLK;
             }
             // The call so far may have armed an earlier timer than the one the
@@ -2169,14 +2184,224 @@ namespace ustack
         }
     }
 
-    int Stack::poll(struct pollfd*, nfds_t, int)
+    // poll() and select() ask _poll(fd) - the function epoll_wait()'s ready
+    // list checks too - so there is one definition of readiness. What they add
+    // is the shape of the answer (revents / fd_set bits) and the wait, which is
+    // _pump_until(): the F1 blocking helper, over several fds instead of one.
+    // An epoll's ready list is not consulted: it is an optimisation for
+    // epoll_wait() with many fds and few changes; here the caller names the
+    // fds, and asking each is the same work the list saves.
+    static_assert(POLLIN == EPOLLIN && POLLOUT == EPOLLOUT && POLLERR == EPOLLERR && POLLHUP == EPOLLHUP
+                      && POLLRDHUP == EPOLLRDHUP && POLLPRI == EPOLLPRI,
+                  "poll(2) and epoll share their event bits on Linux; poll() relies on it");
+
+    int Stack::poll(struct pollfd* fds, nfds_t nfds, int timeout_ms)
     {
-        return fail(ENOSYS);
+        CallScope scope(*this);
+        if (nfds > 0 && fds == nullptr)
+        {
+            return fail(EFAULT);
+        }
+        struct rlimit limit{};
+        if (::getrlimit(RLIMIT_NOFILE, &limit) == 0 && nfds > static_cast<nfds_t>(limit.rlim_cur))
+        {
+            return fail(EINVAL); // Linux: more entries than RLIMIT_NOFILE
+        }
+        // The socket each entry named when the call began. An fd with no
+        // socket, or one that is closed (or closed and reused) during the
+        // wait, is POLLNVAL - Linux would keep waiting on an fd closed under
+        // it, but with no other thread here the only closer is a callback run
+        // by the pump, and reporting it is the useful answer.
+        std::vector<uint64_t> serials(nfds, 0);
+        for (nfds_t i = 0; i < nfds; i++)
+        {
+            const Socket* socket = _get(fds[i].fd);
+            serials[i] = socket != nullptr ? socket->serial : 0;
+        }
+        auto scan = [this, fds, nfds, &serials]
+        {
+            int ready = 0;
+            for (nfds_t i = 0; i < nfds; i++)
+            {
+                fds[i].revents = 0;
+                if (fds[i].fd < 0)
+                {
+                    continue; // ignored, as POSIX says
+                }
+                const Socket* socket = _get(fds[i].fd);
+                if (socket == nullptr || socket->serial != serials[i])
+                {
+                    fds[i].revents = POLLNVAL;
+                }
+                else
+                {
+                    // ERR and HUP are reported whether asked for or not.
+                    uint32_t wanted = static_cast<uint16_t>(fds[i].events) | POLLERR | POLLHUP;
+                    fds[i].revents = static_cast<short>(_poll(fds[i].fd) & wanted);
+                }
+                ready += fds[i].revents != 0 ? 1 : 0;
+            }
+            return ready;
+        };
+        std::optional<uint64_t> deadline;
+        if (timeout_ms >= 0)
+        {
+            deadline = _driver->now_ms() + static_cast<uint64_t>(timeout_ms);
+        }
+        int error = _pump_until([&scan] { return scan() > 0; }, deadline);
+        if (error != 0 && error != EAGAIN)
+        {
+            return fail(error);
+        }
+        return scan(); // 0 after a timeout
     }
 
-    int Stack::select(int, fd_set*, fd_set*, fd_set*, struct timeval*)
+    int Stack::select(int nfds, fd_set* readfds, fd_set* writefds, fd_set* exceptfds, struct timeval* timeout)
     {
-        return fail(ENOSYS);
+        CallScope scope(*this);
+        // Linux clamps nfds to what the process has open instead; a fixed
+        // FD_SETSIZE bound is what glibc's fd_set can express, and an fd
+        // number past it cannot be in the sets anyway.
+        if (nfds < 0 || nfds > FD_SETSIZE)
+        {
+            return fail(EINVAL);
+        }
+        int64_t timeout_us = -1;
+        if (timeout != nullptr)
+        {
+            if (timeout->tv_sec < 0 || timeout->tv_usec < 0 || timeout->tv_usec >= 1000000)
+            {
+                return fail(EINVAL);
+            }
+            constexpr int64_t MAX_SECONDS = INT64_MAX / 1000000 - 1;
+            timeout_us = std::min<int64_t>(timeout->tv_sec, MAX_SECONDS) * 1000000 + timeout->tv_usec;
+        }
+        fd_set in_read;
+        fd_set in_write;
+        fd_set in_except;
+        FD_ZERO(&in_read);
+        FD_ZERO(&in_write);
+        FD_ZERO(&in_except);
+        if (readfds != nullptr)
+        {
+            in_read = *readfds;
+        }
+        if (writefds != nullptr)
+        {
+            in_write = *writefds;
+        }
+        if (exceptfds != nullptr)
+        {
+            in_except = *exceptfds;
+        }
+        auto wanted = [&](int fd)
+        {
+            return FD_ISSET(fd, &in_read) || FD_ISSET(fd, &in_write) || FD_ISSET(fd, &in_except);
+        };
+        std::vector<uint64_t> serials(static_cast<size_t>(nfds), 0);
+        for (int fd = 0; fd < nfds; fd++)
+        {
+            if (!wanted(fd))
+            {
+                continue;
+            }
+            const Socket* socket = _get(fd);
+            if (socket == nullptr)
+            {
+                return fail(EBADF);
+            }
+            serials[static_cast<size_t>(fd)] = socket->serial;
+        }
+
+        fd_set out_read;
+        fd_set out_write;
+        fd_set out_except;
+        bool vanished = false;
+        // The sets Linux's do_select() builds: readable is EPOLLIN | EPOLLHUP |
+        // EPOLLERR, writable is EPOLLOUT | EPOLLERR, exceptional is EPOLLPRI
+        // alone - urgent data, which this stack does not have (no MSG_OOB,
+        // no SO_OOBINLINE), so the exceptional set is always left empty.
+        // Notably an error does NOT put an fd in the exceptional set.
+        auto scan = [&]
+        {
+            FD_ZERO(&out_read);
+            FD_ZERO(&out_write);
+            FD_ZERO(&out_except);
+            int ready = 0;
+            for (int fd = 0; fd < nfds; fd++)
+            {
+                if (!wanted(fd))
+                {
+                    continue;
+                }
+                const Socket* socket = _get(fd);
+                if (socket == nullptr || socket->serial != serials[static_cast<size_t>(fd)])
+                {
+                    vanished = true;
+                    return ready;
+                }
+                const uint32_t events = _poll(fd);
+                if (FD_ISSET(fd, &in_read) && (events & (READABLE | EPOLLHUP | EPOLLERR)) != 0)
+                {
+                    FD_SET(fd, &out_read);
+                    ready++;
+                }
+                if (FD_ISSET(fd, &in_write) && (events & (WRITABLE | EPOLLERR)) != 0)
+                {
+                    FD_SET(fd, &out_write);
+                    ready++;
+                }
+                if (FD_ISSET(fd, &in_except) && (events & EPOLLPRI) != 0)
+                {
+                    FD_SET(fd, &out_except);
+                    ready++;
+                }
+            }
+            return ready;
+        };
+
+        const uint64_t start = _driver->now_ms();
+        std::optional<uint64_t> deadline;
+        if (timeout_us == 0)
+        {
+            deadline = start;
+        }
+        else if (timeout_us > 0)
+        {
+            deadline = _deadline(timeout_us);
+        }
+        int error = _pump_until([&] { return scan() > 0 || vanished; }, deadline);
+        if (!vanished && error != 0 && error != EAGAIN)
+        {
+            return fail(error);
+        }
+        int ready = scan();
+        if (vanished)
+        {
+            return fail(EBADF);
+        }
+        if (readfds != nullptr)
+        {
+            *readfds = out_read;
+        }
+        if (writefds != nullptr)
+        {
+            *writefds = out_write;
+        }
+        if (exceptfds != nullptr)
+        {
+            *exceptfds = out_except;
+        }
+        if (timeout != nullptr)
+        {
+            // Linux writes back the time not slept (select(2) NOTES), which a
+            // portable program must not rely on, but one written for Linux does.
+            const int64_t slept_us = static_cast<int64_t>(_driver->now_ms() - start) * 1000;
+            const int64_t left_us = std::max<int64_t>(timeout_us - slept_us, 0);
+            timeout->tv_sec = static_cast<time_t>(left_us / 1000000);
+            timeout->tv_usec = static_cast<suseconds_t>(left_us % 1000000);
+        }
+        return ready;
     }
 
     int Stack::run_once(int timeout_ms)

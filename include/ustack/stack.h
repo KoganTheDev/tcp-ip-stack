@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <list>
 #include <map>
 #include <memory>
@@ -80,9 +81,11 @@
 // so a V6ONLY listener and an AF_INET listener cannot share a port - a
 // dual-stack socket is the way to serve both.
 //
-// What is not here: MSG_PEEK and every other flag but MSG_DONTWAIT/MSG_NOSIGNAL
-// (MSG_NOSIGNAL accepted, and meaningless here), connect() on a UDP socket,
-// nesting one ustack epoll inside another, poll()/select(), and every fcntl()
+// What is not here: every send/recv flag but MSG_DONTWAIT/MSG_NOSIGNAL/
+// MSG_PEEK/MSG_WAITALL/MSG_TRUNC (MSG_NOSIGNAL accepted, and meaningless
+// here; see recvfrom()), urgent data (MSG_OOB, so select()'s exceptional set
+// is always empty), connect() on a UDP socket,
+// nesting one ustack epoll inside another, and every fcntl()
 // command but F_GETFL/F_SETFL (O_NONBLOCK only) and F_GETFD/F_SETFD.
 //
 // Not thread-safe: one thread owns a Stack and everything it drives.
@@ -272,8 +275,30 @@ namespace ustack
         int fcntl(int fd, int cmd, int arg = 0);
 
         // --- poll and select ---
-        // Placeholder: see the commit that implements them.
+        // Readiness is _poll(fd), the same function epoll_wait() asks, so the
+        // three calls cannot disagree. Both block as the F1 calls do: they
+        // pump the stack with the remaining time (the driver's clock, so a
+        // timeout is virtual time in the simulator, a real sleep on the
+        // RealDriver) and fail with EDEADLK if there is no timeout and nothing
+        // could ever happen.
+        //
+        // poll(): revents is what is ready among `events` plus POLLERR and
+        // POLLHUP, which are always reported (POLLIN, POLLOUT, POLLRDHUP,
+        // POLLERR, POLLHUP as epoll reports them). An fd that is not an open
+        // fd of this Stack gets POLLNVAL in revents (not an error) and counts
+        // as ready; so does one closed - or closed and reused - while the call
+        // waits. A negative fd is ignored (revents 0). timeout_ms -1 waits
+        // forever, 0 only looks. POLLPRI is accepted and never reported.
         int poll(struct pollfd* fds, nfds_t nfds, int timeout_ms);
+        // select(): EBADF for a set bit that is not an open fd (also if it is
+        // closed during the wait), EINVAL for nfds outside [0, FD_SETSIZE] or
+        // a bad timeval (Linux clamps nfds to its fd table instead of failing).
+        // Readable is POLLIN|POLLHUP|POLLERR and writable POLLOUT|POLLERR, as
+        // in Linux. The exceptional set is Linux's too, EPOLLPRI alone, so it
+        // is always empty: there is no urgent data (MSG_OOB) here. On return
+        // the sets hold only the ready fds (all cleared on timeout), the
+        // result is the number of bits set, and `timeout` is updated with the
+        // time not slept, as Linux does.
         int select(int nfds, fd_set* readfds, fd_set* writefds, fd_set* exceptfds, struct timeval* timeout);
 
         // --- epoll ---
@@ -439,6 +464,13 @@ namespace ustack
         // ready and its attempt still would block, so look again only after
         // the stack has moved (never a busy loop).
         int _block_until(int fd, uint32_t events, std::optional<uint64_t> deadline, bool must_wait = false);
+        // The pump loop under _block_until() and poll()/select(): runs the
+        // stack until done() is true (checked first, unless must_wait, and
+        // after every pump), the deadline passes (EAGAIN) or the driver can
+        // never make progress (EDEADLK). Returns 0 when done() was true.
+        // done() runs after application callbacks may have closed fds, so it
+        // must look everything up afresh.
+        int _pump_until(const std::function<bool()>& done, std::optional<uint64_t> deadline, bool must_wait = false);
         // now + timeout_us on the driver's clock, or nullopt for "forever".
         std::optional<uint64_t> _deadline(int64_t timeout_us);
         int _new_fd(std::unique_ptr<Socket> socket);
