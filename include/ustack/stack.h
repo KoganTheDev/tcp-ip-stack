@@ -76,10 +76,32 @@
 // An AF_INET6 socket is dual-stack, as on Linux with net.ipv6.bindv6only=0:
 // IPv4 peers appear as v4-mapped addresses (::ffff:a.b.c.d, RFC 3493 3.7),
 // and a v4-mapped address given to connect()/sendto() reaches the peer over
-// IPv4. IPPROTO_IPV6/IPV6_V6ONLY (set before bind) makes it IPv6 only. One
-// difference from Linux: a port is held by one socket whatever its family,
-// so a V6ONLY listener and an AF_INET listener cannot share a port - a
-// dual-stack socket is the way to serve both.
+// IPv4. IPPROTO_IPV6/IPV6_V6ONLY (set before bind) makes it IPv6 only.
+//
+// Ports are shared as Linux shares them (probed on Linux 7.3; the tables are
+// tests/include/bind_matrix.h). A binding covers addresses per family: a v4
+// address or 0.0.0.0, a v6 address or ::, and a dual-stack :: covers every v4
+// address as well (a v4-mapped bind is a v4 one). Two sockets conflict on a
+// port - bind() or listen() says EADDRINUSE - when their coverage overlaps,
+// unless both set SO_REUSEADDR and the one already there is not listening
+// (TCP; UDP has no such state), or both set SO_REUSEPORT. So a V6ONLY and an
+// AF_INET listener share a port, 127.0.0.1:80 and 127.0.0.2:80 coexist, and
+// a wildcard conflicts with either. A connection keeps its port held after
+// its socket closes - in TIME_WAIT, or still open after the listener that
+// accepted it closed - with the flags its socket had, so restarting a server
+// on its port needs SO_REUSEADDR on both, as on Linux. Of two SO_REUSEADDR
+// sockets bound to one port, the first to listen() wins.
+//
+// A SYN or a datagram goes to the most specific socket: an exact local
+// address over a wildcard, an AF_INET socket over a dual-stack one for IPv4,
+// for UDP a connected socket's own peer first and the latest bound among
+// equals. SO_REUSEPORT groups sockets with the same family and address; a
+// new connection or datagram goes to the member a SipHash of its four-tuple
+// (under a key of its own) picks, which a peer cannot steer. Each listener
+// keeps its own accept queue and half-open cap, as each Linux one does;
+// closing one resets the connections waiting in its queue (Linux's default,
+// tcp_migrate_req=0). A UDP group's connected members take only their peers'
+// datagrams. One Stack is one owner: Linux's same-uid rule always holds.
 //
 // What is not here: ioctl() requests other than FIONREAD / SIOCINQ,
 // SIOCOUTQ and SIOCOUTQNSD (ENOTTY; SIOCOUTQ does not count an unacked FIN),
@@ -237,13 +259,13 @@ namespace ustack
         int socket(int domain, int type, int protocol);
         // sin_addr INADDR_ANY or the interface's address (sin6_addr ::, one of
         // the interface's IPv6 addresses, or a v4-mapped one of those); sin_port 0 picks a
-        // free ephemeral port. EADDRINUSE if this Stack already has the port
-        // bound. SO_REUSEADDR is accepted but changes nothing: with no
-        // TIME_WAIT sockets holding ports here, there is nothing for it to
-        // relax.
+        // free ephemeral port. EADDRINUSE by the sharing rules at the top of
+        // this file (SO_REUSEADDR and SO_REUSEPORT as Linux has them).
         int bind(int fd, const struct sockaddr* addr, socklen_t addrlen);
         // An unbound socket is bound to an ephemeral port first, as on Linux.
-        // backlog is clamped to at least 1.
+        // backlog is clamped to at least 1. EADDRINUSE if another socket now
+        // holds the port in a way a listener cannot share (see the top of this
+        // file). Again on a listening socket: a new backlog.
         int listen(int fd, int backlog);
         int accept(int fd, struct sockaddr* addr, socklen_t* addrlen);
         // flags: SOCK_NONBLOCK makes the new socket non-blocking (else it
@@ -300,7 +322,8 @@ namespace ustack
         int close(int fd);
         // SOL_SOCKET: SO_KEEPALIVE, SO_LINGER (struct linger; {1, 0} means
         // abort on close, a nonzero l_linger is stored but close() never
-        // waits), SO_REUSEADDR (accepted), SO_ERROR (get only, clears it),
+        // waits), SO_REUSEADDR, SO_REUSEPORT (see the top of this file; read
+        // at each later bind(), so they matter set before bind()), SO_ERROR (get only, clears it),
         // SO_TYPE (get only), SO_RCVTIMEO / SO_SNDTIMEO (struct timeval, 0 =
         // forever; tv_usec outside [0, 1e6) is EDOM, as Linux), SO_RCVBUF / SO_SNDBUF, SO_RCVLOWAT (below), SO_SNDLOWAT (get only, always 1;
         // setting it is ENOPROTOOPT, as on Linux). IPPROTO_TCP: TCP_NODELAY, TCP_QUICKACK, TCP_INFO
