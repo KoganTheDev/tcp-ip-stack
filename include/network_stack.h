@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -226,8 +227,72 @@ public:
     // local, if given, is the one address the port answers on - a socket
     // bound to a specific address - and a SYN (or SYN-cookie ACK) sent to any
     // other of this host's addresses is treated as finding no listener.
+    //
+    // This is the one-listener-per-port form: calling it again for a port
+    // already listening replaces that listener's settings. open_listener()
+    // below is the general one.
     void listen(uint16_t port, size_t backlog = DEFAULT_LISTEN_BACKLOG, ListenFamily family = ListenFamily::ANY,
                 const std::optional<IpAddress>& local = std::nullopt);
+
+    // ---- Several listeners on one port ----------------------------------
+    //
+    // A port may have any number of listeners, as Linux's may: one per
+    // (family, local address), and several on the same one when they form a
+    // SO_REUSEPORT group. Whether two may coexist is the socket layer's
+    // decision (bind()'s conflict rules); this layer only routes between
+    // them. A SYN goes to the most specific listener that accepts it - an
+    // exact local address over a wildcard, and for a v4 peer an IPv4-only
+    // listener over a dual-stack one, as Linux's compute_score ranks them -
+    // and when that listener is in a reuseport group, to the member a keyed
+    // hash of the four-tuple picks (see _select_listener).
+    //
+    // Each listener has its own accept queue and its own half-open cap, as
+    // each Linux listening socket does: a group of N bounds a SYN flood at N
+    // times one listener's cap, and a socket's queue holds only connections
+    // it was chosen for.
+    using ListenerId = uint64_t;
+    struct ListenOptions
+    {
+        size_t backlog = DEFAULT_LISTEN_BACKLOG;
+        ListenFamily family = ListenFamily::ANY;
+        std::optional<IpAddress> local;
+        bool reuseport = false;
+        // Inherited by the connections it accepts, for bind()'s conflict
+        // rules (see for_each_connection_on_port).
+        bool reuseaddr = false;
+    };
+    ListenerId open_listener(uint16_t port, const ListenOptions& options);
+    // listen() again on a listening socket: a new backlog, nothing else.
+    void set_listener_backlog(ListenerId id, size_t backlog);
+    // SO_REUSEPORT set or cleared on a listening socket. Linux reads the flag
+    // live but fixes group membership when a listener opens (probed): set
+    // after listen(), it lets the next listener to open on the same binding
+    // join this one's group - the two then share by hash; cleared, the
+    // listener stays a member, and a SYN that lands on it (the latest opened
+    // among equals) is no longer spread.
+    void set_listener_reuseport(ListenerId id, bool reuseport);
+    // As unlisten(), for one listener: its queued connections are reset and
+    // its half-open ones dropped - also when it leaves a reuseport group, as
+    // Linux does with net.ipv4.tcp_migrate_req at its default of 0. The other
+    // members keep theirs.
+    void close_listener(ListenerId id);
+    TcpConnection* accept_on(ListenerId id);
+    bool has_pending_accept_on(ListenerId id) const;
+    // Told, with the listener, whenever a connection joins its accept queue.
+    // Fires alongside the per-port AcceptReadyFn below.
+    using ListenerReadyFn = std::function<void(ListenerId)>;
+    void set_listener_ready_callback(ListenerReadyFn callback) { _on_listener_ready = std::move(callback); }
+
+    // The SO_REUSEADDR / SO_REUSEPORT a connection's socket had, which
+    // bind()'s conflict rules consult for as long as the connection lives -
+    // in TIME_WAIT too, after its socket is gone. Accepted connections start
+    // with their listener's.
+    void set_connection_reuse(uint64_t connection_id, bool reuseaddr, bool reuseport);
+    // Every live (not CLOSED) connection on this local port, with its local
+    // address and reuse flags: what bind() checks a new socket against.
+    // Costs nothing for a port no connection uses.
+    void for_each_connection_on_port(
+        uint16_t port, const std::function<void(const IpAddress& local, bool reuseaddr, bool reuseport)>& visit) const;
 
     static constexpr size_t DEFAULT_LISTEN_BACKLOG = 128;
 
@@ -299,6 +364,8 @@ public:
         // Last, so adding them did not move the keys above for a given seed.
         uint64_t ts_key_low;
         uint64_t ts_key_high;
+        uint64_t reuseport_key_low;
+        uint64_t reuseport_key_high;
         static SeededSecrets from_seed(uint64_t seed);
     };
 
@@ -418,6 +485,23 @@ public:
     // holding the TcpConnection* itself across that gap risks it dangling.
     TcpConnection* find_connection(uint64_t id) const;
 
+    // A further UdpSocket on a port, whatever is bound there already: the
+    // socket layer's bind(), which has applied the conflict rules itself.
+    // Each datagram goes to the one socket that matches it best
+    // (UdpSocket::match_score - connected four-tuple, then exact local
+    // address, then wildcard; for a v4 datagram an AF_INET socket over a
+    // dual-stack one; the latest bound among equals), or, when that one is
+    // in a SO_REUSEPORT group, to the unconnected member a keyed hash of the
+    // four-tuple picks. Owned by NetworkStack until close_udp().
+    UdpSocket* open_udp(uint16_t port);
+    bool close_udp(UdpSocket* socket);
+    // Called once a socket from open_udp() is configured (families, bound
+    // address, SO_REUSEPORT): if it has SO_REUSEPORT, it joins the group of
+    // the latest socket on the port with the same binding and the option set
+    // now (creating that group if need be), as udp_reuseport_add_sock does
+    // at bind. Membership is never revisited afterwards.
+    void join_udp_group(UdpSocket* socket);
+
     // Binds a UdpSocket to a local port and returns it, owned by NetworkStack.
     // Calling this twice for the same port returns the same socket rather than
     // creating a second one bound to it. Throws if the port is in use by an
@@ -447,6 +531,14 @@ public:
     // bound. bind_udp() would hand that socket over rather than fail, so a
     // socket layer asks this first to report EADDRINUSE.
     bool udp_port_bound(uint16_t port) const { return _udp_sockets.count(port) != 0; }
+
+    // The keyed hash that spreads new connections and datagrams across a
+    // SO_REUSEPORT group: SipHash-2-4 of the four-tuple under a key of its
+    // own (drawn from std::random_device, or from set_secret_seed()), so a
+    // peer cannot choose which member it lands on - nor, by choosing, pile a
+    // flood onto one member - without the key. Exposed for tests.
+    uint32_t reuseport_hash(const IpAddress& local_ip, uint16_t local_port, const IpAddress& remote_ip,
+                            uint16_t remote_port) const;
 
     // Sends an ICMP Echo Request - a ping. identifier and sequence are echoed
     // back untouched by the peer, which is how a reply is matched to the
@@ -618,11 +710,33 @@ public:
     uint64_t connection_timer_runs() const { return _connection_timer_runs; }
 
 private:
+    // The full four-tuple. The local address is part of it: two connections
+    // from one peer ip:port to one local port, but to two of this host's
+    // addresses, are two connections (the peer keys them by its remote
+    // address), as Linux's established hash keys them.
+    //
+    // The addresses are held inline rather than as IpAddress, whose IPv4 form
+    // keeps its four bytes on the heap: every segment builds a key to look
+    // its connection up, and with two addresses in it that was two
+    // allocations per packet on the receive path.
+    struct PackedAddress
+    {
+        std::array<uint8_t, 16> bytes{};
+        bool v6 = false;
+        PackedAddress() = default;
+        // Implicit, so a key is written {peer, port, port, local} from any address type.
+        PackedAddress(const IpAddress& address);   // NOLINT(google-explicit-constructor)
+        PackedAddress(const IPv4Address& address); // NOLINT(google-explicit-constructor)
+        PackedAddress(const IPv6Address& address); // NOLINT(google-explicit-constructor)
+        IpAddress unpack() const;
+        bool operator==(const PackedAddress& other) const { return v6 == other.v6 && bytes == other.bytes; }
+    };
     struct ConnectionKey
     {
-        IpAddress remote_ip;
+        PackedAddress remote_ip;
         uint16_t remote_port{};
         uint16_t local_port{};
+        PackedAddress local_ip;
         bool operator==(const ConnectionKey& other) const;
     };
     struct ConnectionKeyHash
@@ -685,6 +799,9 @@ private:
     // Puts a connection in the tables and in the timer queue. Every
     // connection the stack creates comes through here.
     void _register_connection(const ConnectionKey& key, std::unique_ptr<TcpConnection> connection);
+    // The local address an active open to `remote` is made from, the one its
+    // key carries: what _open_connection and _open_ipv6_connection pick.
+    IpAddress _connect_source(const IpAddress& remote) const;
     // Makes the timer queue hold this connection's current deadline - called
     // whenever it may have moved (TcpConnection's timer-changed callback) and
     // after its timers have run.
@@ -714,7 +831,7 @@ private:
     // removes it on its first transition anywhere else - completion, RST,
     // give-up, eviction - which is every way out of the state, so the record
     // cannot leak.
-    void _track_half_open(TcpConnection& connection, uint16_t local_port);
+    void _track_half_open(TcpConnection& connection, ListenerId listener_id);
     // Answers a SYN with a stateless SYN-ACK whose ISN is a SYN cookie.
     void _send_syn_cookie(const IpAddress& source, const IpAddress& destination, const Tcp& tcp);
     // What _try_complete_cookie_handshake made of a segment matching no
@@ -993,6 +1110,14 @@ private:
     // ts_secret apart from the ISN secret: a TSval is visible to anyone the
     // connection talks to, and must not be a window onto the ISN hash.
     IsnGenerator _ts_offset_generator;
+    // SO_REUSEPORT's selection hash (reuseport_hash()): the same keyed
+    // four-tuple hash as the two above, under its own key, so knowing one
+    // reveals nothing about the others. Keyed on first use (from
+    // std::random_device, by IsnGenerator's default constructor) or by
+    // set_secret_seed(): drawing it in the constructor cost every stack a
+    // second entropy read and mt19937_64 seeding - 1% of a benchmark that
+    // builds stacks - for a key most stacks never use.
+    mutable std::optional<IsnGenerator> _reuseport_hasher;
     // Sets a new connection's TSval offset: this stack's clock plus the keyed
     // hash of the two addresses, so successive connections between the same
     // two hosts send ever-newer timestamps. Before accept_incoming_syn() or
@@ -1166,11 +1291,28 @@ private:
     void _fold_ipv6_timers(NextTimer& next) const;
 
     AcceptReadyFn _on_accept_ready;
+    ListenerReadyFn _on_listener_ready;
     struct Listener
     {
+        ListenerId id = 0;
+        uint16_t port = 0;
         size_t backlog = 0;
         ListenFamily family = ListenFamily::ANY;
         std::optional<IpAddress> local;
+        bool reuseport = false;
+        bool reuseaddr = false;
+        // The connections waiting for accept(), by id. Ids, not four-tuples:
+        // an entry can outlive its connection (reset and reaped before
+        // accept()), and a tuple left behind could name a different, later
+        // connection - an active open over the same tuple, which accept()
+        // would then hand out. An id names one connection, ever.
+        std::deque<uint64_t> pending;
+        // Connections in SYN_RECEIVED: connection id -> the stack clock when
+        // it was created. Ids only ever increase, so the map's order is
+        // creation order - begin() is the oldest, which is what eviction
+        // needs - and its size is the half-open count, so the cap check is
+        // O(1) rather than a walk of the whole connection table.
+        std::map<uint64_t, uint64_t> half_open;
         bool accepts(const IpAddress& peer, const IpAddress& destination) const
         {
             if (local && *local != destination)
@@ -1185,27 +1327,49 @@ private:
             }
             return family == ListenFamily::ANY || (family == ListenFamily::IPV4_ONLY) == peer.is_v4();
         }
+        // How specifically it matches a SYN it accepts, as Linux's listener
+        // compute_score: an exact local address beats a wildcard, and for a
+        // v4 peer an IPv4-only listener beats a dual-stack one.
+        int score(const IpAddress& peer) const
+        {
+            return (local ? 4 : 0) + (peer.is_v4() && family == ListenFamily::IPV4_ONLY ? 1 : 0);
+        }
+        // The SO_REUSEPORT group it joined when it opened, 0 for none. Fixed
+        // then, as Linux fixes membership when a socket is hashed: the
+        // option set or cleared later changes `reuseport` (read live, on the
+        // listener a SYN lands on) but not who is in the group.
+        uint64_t group = 0;
+        bool same_binding(const Listener& other) const { return family == other.family && local == other.local; }
     };
-    std::unordered_map<uint16_t, Listener> _listening_ports;
-    // Per listening port, the connections waiting for accept(), by id. Ids,
-    // not four-tuples: an entry can outlive its connection (reset and reaped
-    // before accept()), and a tuple left behind could name a different, later
-    // connection - an active open over the same tuple, which accept() would
-    // then hand out. An id names one connection, ever.
-    std::unordered_map<uint16_t, std::deque<uint64_t>> _pending_accepts;
+    uint64_t _next_group_id = 1;
+    std::unordered_map<ListenerId, Listener> _listeners;
+    // Per port, its listeners in the order they were opened - which is also
+    // the order of a reuseport group's members for the hash.
+    std::unordered_map<uint16_t, std::vector<ListenerId>> _listeners_by_port;
+    ListenerId _next_listener_id = 1;
+    // The listener a SYN (or a SYN-cookie ACK) from source:source_port to
+    // destination:port belongs to, or nullptr: the best score among those
+    // that accept it, the latest opened among equals, then, in a reuseport
+    // group, the member reuseport_hash() picks.
+    const Listener* _select_listener(const IpAddress& source, uint16_t source_port, const IpAddress& destination,
+                                     uint16_t port) const;
+    Listener* _select_listener(const IpAddress& source, uint16_t source_port, const IpAddress& destination,
+                               uint16_t port);
+    // Puts a connection that just completed its handshake on `listener`'s
+    // accept queue and tells whoever is waiting.
+    void _queue_for_accept(Listener& listener, uint64_t connection_id);
     // The connection a queued id names, if it is still live and still a
     // passive open; nullptr for an entry to skip.
     TcpConnection* _queued_connection(uint64_t connection_id) const;
-    // Connections in SYN_RECEIVED, per local port: connection id -> the stack
-    // clock when it was created. Ids only ever increase, so the map's order is
-    // creation order - begin() is the oldest, which is what eviction needs -
-    // and its size is the half-open count, so the cap check is O(1) rather
-    // than a walk of the whole connection table.
-    std::unordered_map<uint16_t, std::map<uint64_t, uint64_t>> _half_open_per_port;
     // Milliseconds of on_time_passed() so far - the stack's own clock, for
     // ageing half-open connections.
     uint64_t _now_ms = 0;
-    std::unordered_map<uint16_t, std::unique_ptr<UdpSocket>> _udp_sockets;
+    // Per port, its sockets in the order they were bound: bind_udp()'s one,
+    // or the socket layer's several (open_udp()).
+    std::unordered_map<uint16_t, std::vector<std::unique_ptr<UdpSocket>>> _udp_sockets;
+    // The socket a datagram to `udp`'s port is for (see open_udp()), or
+    // nullptr. Counts a datagram a connected socket alone refused.
+    UdpSocket* _select_udp_socket(const IpAddress& source, const IpAddress& destination, const Udp& udp) const;
     // Ports bound by the DNS resolver for its outstanding queries. bind_udp()
     // refuses them; the resolver binds through _bind_udp_socket() instead.
     std::unordered_set<uint16_t> _resolver_ports;
@@ -1224,7 +1388,15 @@ private:
         // the connection's real deadline - see _schedule_connection_timer().
         uint64_t queued_deadline = TcpConnection::NO_DEADLINE;
         bool from_cookie = false; // established by a SYN cookie, for tcp_totals()
+        // The listener whose accept queue it joins on completing the
+        // handshake; 0 for an active open.
+        ListenerId listener = 0;
+        bool reuseaddr = false; // see set_connection_reuse()
+        bool reuseport = false;
     };
+    // The connections on each local port, by id, so for_each_connection_on_port()
+    // visits only those - free for a port none uses.
+    std::unordered_map<uint16_t, std::vector<uint64_t>> _connections_by_port;
     // mutable only for queued_deadline, which ms_until_next_timer() maintains.
     mutable std::unordered_map<uint64_t, ConnectionRecord> _connections_by_id;
 

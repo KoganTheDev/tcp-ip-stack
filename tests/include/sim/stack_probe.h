@@ -67,26 +67,8 @@ namespace stack_probe
             return heap.size();
         }
     };
+    // UDP sockets across every port (a port may hold several).
     struct UdpSocketsTag
-    {
-        static inline size_t (*read)(const NetworkStack&) = nullptr;
-        template <class C>
-        static size_t measure(const C& table)
-        {
-            return table.size();
-        }
-    };
-    struct ResolverPortsTag
-    {
-        static inline size_t (*read)(const NetworkStack&) = nullptr;
-        template <class C>
-        static size_t measure(const C& ports)
-        {
-            return ports.size();
-        }
-    };
-    // Entries across every listening port's accept queue.
-    struct PendingAcceptsTag
     {
         static inline size_t (*read)(const NetworkStack&) = nullptr;
         template <class C>
@@ -100,17 +82,41 @@ namespace stack_probe
             return total;
         }
     };
-    // SYN_RECEIVED connections across every port.
+    struct ResolverPortsTag
+    {
+        static inline size_t (*read)(const NetworkStack&) = nullptr;
+        template <class C>
+        static size_t measure(const C& ports)
+        {
+            return ports.size();
+        }
+    };
+    // Entries across every listener's accept queue.
+    struct PendingAcceptsTag
+    {
+        static inline size_t (*read)(const NetworkStack&) = nullptr;
+        template <class C>
+        static size_t measure(const C& listeners)
+        {
+            size_t total = 0;
+            for (const auto& entry : listeners)
+            {
+                total += entry.second.pending.size();
+            }
+            return total;
+        }
+    };
+    // SYN_RECEIVED connections across every listener.
     struct HalfOpenTag
     {
         static inline size_t (*read)(const NetworkStack&) = nullptr;
         template <class C>
-        static size_t measure(const C& by_port)
+        static size_t measure(const C& listeners)
         {
             size_t total = 0;
-            for (const auto& entry : by_port)
+            for (const auto& entry : listeners)
             {
-                total += entry.second.size();
+                total += entry.second.half_open.size();
             }
             return total;
         }
@@ -204,8 +210,8 @@ namespace stack_probe
     template struct Opener<TimerQueueTag, &NetworkStack::_timer_queue>;
     template struct Opener<UdpSocketsTag, &NetworkStack::_udp_sockets>;
     template struct Opener<ResolverPortsTag, &NetworkStack::_resolver_ports>;
-    template struct Opener<PendingAcceptsTag, &NetworkStack::_pending_accepts>;
-    template struct Opener<HalfOpenTag, &NetworkStack::_half_open_per_port>;
+    template struct Opener<PendingAcceptsTag, &NetworkStack::_listeners>;
+    template struct Opener<HalfOpenTag, &NetworkStack::_listeners>;
     template struct Opener<CookieSlotsTag, &NetworkStack::_last_cookie_sent_ms>;
     template struct Opener<ArpEntriesTag, &NetworkStack::_interfaces>;
     template struct Opener<ArpPendingTag, &NetworkStack::_interfaces>;

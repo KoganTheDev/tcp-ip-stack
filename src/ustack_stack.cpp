@@ -342,16 +342,16 @@ namespace ustack
         }
 
         std::shared_ptr<Stack*> self = _self;
-        _stack.set_accept_ready_callback(
-            [self](uint16_t port)
+        _stack.set_listener_ready_callback(
+            [self](NetworkStack::ListenerId id)
             {
                 Stack* stack = *self;
                 if (stack == nullptr)
                 {
                     return;
                 }
-                auto listener = stack->_listener_by_port.find(port);
-                if (listener != stack->_listener_by_port.end())
+                auto listener = stack->_fd_by_listener.find(id);
+                if (listener != stack->_fd_by_listener.end())
                 {
                     stack->_wake(listener->second, READABLE);
                 }
@@ -364,12 +364,12 @@ namespace ustack
         // NetworkStack goes on running after this, and its connections may
         // still be finishing their close handshakes.
         *_self = nullptr;
-        _stack.set_accept_ready_callback(nullptr);
+        _stack.set_listener_ready_callback(nullptr);
         for (const auto& socket : _sockets)
         {
             if (socket && socket->kind == Kind::UDP && socket->udp != nullptr)
             {
-                _stack.unbind_udp(socket->local_port);
+                _stack.close_udp(socket->udp);
             }
         }
         ::close(_pollable_fd);
@@ -460,6 +460,7 @@ namespace ustack
         socket.local_ip = connection.get_local_ip();
         socket.peer_port = connection.get_remote_port();
         _fd_by_connection[id] = fd;
+        _stack.set_connection_reuse(id, socket.reuseaddr, socket.reuseport);
         _apply_options(socket, connection);
 
         // An accepted connection can already be gone - reset after its
@@ -549,19 +550,122 @@ namespace ustack
     {
         if (kind == Kind::TCP)
         {
-            return _tcp_ports.count(port) != 0;
+            return _tcp_binds.count(port) != 0;
         }
-        return _udp_ports.count(port) != 0 || _stack.udp_port_bound(port);
+        return _udp_binds.count(port) != 0 || _stack.udp_port_bound(port);
     }
 
-    uint16_t Stack::_ephemeral_port(Kind kind)
+    Stack::Coverage Stack::_coverage(int family, bool v6only, const IpAddress& ip)
+    {
+        Coverage coverage;
+        if (ip.is_v4())
+        {
+            // AF_INET, or a v4-mapped bind on an AF_INET6 socket.
+            coverage.v4 = _is_wildcard(ip) ? Coverage::Part::ANY : Coverage::Part::ONE;
+        }
+        else if (_is_wildcard(ip))
+        {
+            coverage.v6 = Coverage::Part::ANY;
+            coverage.v4 = family == AF_INET6 && !v6only ? Coverage::Part::ANY : Coverage::Part::NONE;
+        }
+        else
+        {
+            coverage.v6 = Coverage::Part::ONE;
+        }
+        coverage.address = ip;
+        return coverage;
+    }
+
+    bool Stack::_overlaps(const Coverage& a, const Coverage& b)
+    {
+        auto part = [](Coverage::Part x, Coverage::Part y, const IpAddress& ax, const IpAddress& by)
+        {
+            if (x == Coverage::Part::NONE || y == Coverage::Part::NONE)
+            {
+                return false;
+            }
+            if (x == Coverage::Part::ANY || y == Coverage::Part::ANY)
+            {
+                return true;
+            }
+            return ax == by;
+        };
+        return part(a.v4, b.v4, a.address, b.address) || part(a.v6, b.v6, a.address, b.address);
+    }
+
+    bool Stack::_bind_conflict(int fd, const Socket& socket, const IpAddress& ip, uint16_t port, bool listening) const
+    {
+        const Coverage mine = _coverage(socket.family, socket.v6only, ip);
+        // inet_bind_conflict, with `relax` and the same owner always true.
+        auto tolerated = [&socket](bool reuseaddr, bool reuseport, bool other_listening)
+        {
+            return (socket.reuseaddr && reuseaddr && !other_listening) || (socket.reuseport && reuseport);
+        };
+        static_cast<void>(listening); // a listener's own state only matters to the others' checks of it
+        const auto& binds = socket.kind == Kind::TCP ? _tcp_binds : _udp_binds;
+        auto binds_it = binds.find(port);
+        if (binds_it != binds.end())
+        {
+            for (int other_fd : binds_it->second)
+            {
+                const Socket* other = other_fd == fd ? nullptr : _sockets[static_cast<size_t>(other_fd)].get();
+                // A connected TCP socket is checked by its connection, below,
+                // whose local address is the one it actually holds.
+                if (other == nullptr || (other->connection_id != 0 && !other->dead))
+                {
+                    continue;
+                }
+                if (_overlaps(mine, _coverage(other->family, other->v6only, other->bound_ip))
+                    && !tolerated(other->reuseaddr, other->reuseport, other->listening))
+                {
+                    return true;
+                }
+            }
+        }
+        if (socket.kind == Kind::UDP)
+        {
+            // Something below this layer - DHCP, a DNS query - holds it.
+            return (binds_it == binds.end() || binds_it->second.empty()) && _stack.udp_port_bound(port);
+        }
+        bool conflict = false;
+        _stack.for_each_connection_on_port(
+            port,
+            [&](const IpAddress& local, bool reuseaddr, bool reuseport)
+            {
+                // A connection's own socket, when it is this one, is not
+                // in its way (a failed connect() rebinding).
+                if (!conflict && _overlaps(mine, _coverage(local.is_v4() ? AF_INET : AF_INET6, true, local))
+                    && !tolerated(reuseaddr, reuseport, false))
+                {
+                    conflict = true;
+                }
+            });
+        return conflict;
+    }
+
+    void Stack::_unbind(Kind kind, uint16_t port, int fd)
+    {
+        auto& binds = kind == Kind::TCP ? _tcp_binds : _udp_binds;
+        auto it = binds.find(port);
+        if (it == binds.end())
+        {
+            return;
+        }
+        it->second.erase(std::remove(it->second.begin(), it->second.end(), fd), it->second.end());
+        if (it->second.empty())
+        {
+            binds.erase(it);
+        }
+    }
+
+    uint16_t Stack::_ephemeral_port(int fd, const Socket& socket, const IpAddress& ip)
     {
         constexpr size_t EPHEMERAL_PORT_COUNT = 65536 - FIRST_EPHEMERAL_PORT;
         for (size_t attempt = 0; attempt < EPHEMERAL_PORT_COUNT; attempt++)
         {
             uint16_t port = _next_ephemeral;
             _next_ephemeral = _next_ephemeral == 65535 ? FIRST_EPHEMERAL_PORT : static_cast<uint16_t>(port + 1);
-            if (!_port_taken(kind, port))
+            if (!_port_taken(socket.kind, port) && !_bind_conflict(fd, socket, ip, port, false))
             {
                 return port;
             }
@@ -569,36 +673,35 @@ namespace ustack
         return 0;
     }
 
-    int Stack::_bind_port(int fd, Socket& socket, uint16_t port)
+    int Stack::_bind_port(int fd, Socket& socket, uint16_t port, const IpAddress& ip)
     {
         if (port == 0)
         {
-            port = _ephemeral_port(socket.kind);
+            port = _ephemeral_port(fd, socket, ip);
             if (port == 0)
             {
                 return EADDRINUSE;
             }
         }
-        else if (_port_taken(socket.kind, port))
+        else if (_bind_conflict(fd, socket, ip, port, false))
         {
             return EADDRINUSE;
         }
 
         if (socket.kind == Kind::TCP)
         {
-            _tcp_ports.insert(port);
+            _tcp_binds[port].push_back(fd);
         }
         else
         {
-            try
-            {
-                socket.udp = _stack.bind_udp(port);
-            }
-            catch (const std::exception&)
-            {
-                return EADDRINUSE; // the DNS resolver holds it for a query
-            }
-            _udp_ports.insert(port);
+            socket.udp = _stack.open_udp(port);
+            // What the socket takes, for the network layer's choice between
+            // the sockets on the port (UdpSocket::match_score).
+            bool v4 = socket.family == AF_INET || !socket.v6only || ip.is_v4();
+            bool v6 = socket.family == AF_INET6 && !ip.is_v4();
+            socket.udp->set_families(v4, v6, socket.family == AF_INET);
+            socket.udp->set_reuseport(socket.reuseport);
+            _udp_binds[port].push_back(fd);
             std::shared_ptr<Stack*> self = _self;
             socket.udp->set_datagram_received_callback(
                 [self, fd](const IpAddress& source, uint16_t source_port, const Bytes& data)
@@ -641,12 +744,11 @@ namespace ustack
                     stack->_get(fd)->so_error = error;
                     stack->_wake(fd, EPOLLERR);
                 });
-            // Binding again after a disconnect gave the port back: the
-            // address bind() named is still the socket's.
-            if (!_is_wildcard(socket.bound_ip))
+            if (!_is_wildcard(ip))
             {
-                socket.udp->set_bound_address(socket.bound_ip);
+                socket.udp->set_bound_address(ip);
             }
+            _stack.join_udp_group(socket.udp);
         }
         socket.local_port = port;
         socket.port_reserved = true;
@@ -729,16 +831,12 @@ namespace ustack
         {
             return fail(EINVAL); // already bound
         }
-        if (int error = _bind_port(fd, *socket, port); error != 0)
+        if (int error = _bind_port(fd, *socket, port, ip); error != 0)
         {
             return fail(error);
         }
         socket->port_from_bind = port != 0;
         socket->bound_ip = std::move(ip);
-        if (socket->udp != nullptr && !_is_wildcard(socket->bound_ip))
-        {
-            socket->udp->set_bound_address(socket->bound_ip);
-        }
         return 0;
     }
 
@@ -764,12 +862,25 @@ namespace ustack
         }
         if (socket->local_port == 0)
         {
-            if (int error = _bind_port(fd, *socket, 0); error != 0)
+            if (int error = _bind_port(fd, *socket, 0, socket->bound_ip); error != 0)
             {
                 return fail(error);
             }
         }
         backlog = std::clamp(backlog, 1, MAX_BACKLOG);
+        if (socket->listening)
+        {
+            // listen() again: a new backlog, as Linux takes one.
+            _stack.set_listener_backlog(socket->listener_id, static_cast<size_t>(backlog));
+            return 0;
+        }
+        // inet_csk_listen_start checks the port again, now as a listener: of
+        // two SO_REUSEADDR sockets bound to one port, the first to listen
+        // wins and the other's listen() is refused (probed).
+        if (_bind_conflict(fd, *socket, socket->bound_ip, socket->local_port, true))
+        {
+            return fail(EADDRINUSE);
+        }
         NetworkStack::ListenFamily family = NetworkStack::ListenFamily::IPV4_ONLY;
         if (socket->family == AF_INET6)
         {
@@ -782,9 +893,15 @@ namespace ustack
             local = socket->bound_ip;
             family = local->is_v4() ? NetworkStack::ListenFamily::IPV4_ONLY : NetworkStack::ListenFamily::IPV6_ONLY;
         }
-        _stack.listen(socket->local_port, static_cast<size_t>(backlog), family, local);
+        NetworkStack::ListenOptions options;
+        options.backlog = static_cast<size_t>(backlog);
+        options.family = family;
+        options.local = std::move(local);
+        options.reuseport = socket->reuseport;
+        options.reuseaddr = socket->reuseaddr;
+        socket->listener_id = _stack.open_listener(socket->local_port, options);
         socket->listening = true;
-        _listener_by_port[socket->local_port] = fd;
+        _fd_by_listener[socket->listener_id] = fd;
         return 0;
     }
 
@@ -844,7 +961,7 @@ namespace ustack
         {
             return fail(EFAULT);
         }
-        TcpConnection* connection = _stack.accept(listener->local_port);
+        TcpConnection* connection = _stack.accept_on(listener->listener_id);
         if (connection == nullptr)
         {
             return fail(EAGAIN);
@@ -867,6 +984,7 @@ namespace ustack
         socket->receive_capacity_locked = listener->receive_capacity_locked;
         socket->send_capacity_set = listener->send_capacity_set;
         socket->reuseaddr = listener->reuseaddr;
+        socket->reuseport = listener->reuseport;
         socket->linger = listener->linger;
         socket->user_timeout_ms = listener->user_timeout_ms;
         socket->congestion = listener->congestion;
@@ -948,8 +1066,8 @@ namespace ustack
                 socket.udp->disconnect_peer();
                 if (!socket.port_from_bind)
                 {
-                    _stack.unbind_udp(socket.local_port);
-                    _udp_ports.erase(socket.local_port);
+                    _stack.close_udp(socket.udp);
+                    _unbind(Kind::UDP, socket.local_port, fd);
                     socket.udp = nullptr;
                     socket.local_port = 0;
                     socket.port_reserved = false;
@@ -980,7 +1098,7 @@ namespace ustack
         }
         if (socket.udp == nullptr)
         {
-            if (int error = _bind_port(fd, socket, 0); error != 0)
+            if (int error = _bind_port(fd, socket, 0, socket.bound_ip); error != 0)
             {
                 return fail(error);
             }
@@ -1149,7 +1267,7 @@ namespace ustack
             // that ends in EDESTADDRREQ leaves the socket with a port.
             if (socket->udp == nullptr)
             {
-                if (int error = _bind_port(fd, *socket, 0); error != 0)
+                if (int error = _bind_port(fd, *socket, 0, socket->bound_ip); error != 0)
                 {
                     return fail(error);
                 }
@@ -1592,18 +1710,18 @@ namespace ustack
         case Kind::UDP:
             if (socket->udp != nullptr)
             {
-                _stack.unbind_udp(socket->local_port);
+                _stack.close_udp(socket->udp);
             }
             if (socket->port_reserved)
             {
-                _udp_ports.erase(socket->local_port);
+                _unbind(Kind::UDP, socket->local_port, fd);
             }
             break;
         case Kind::TCP:
             if (socket->listening)
             {
-                _stack.unlisten(socket->local_port);
-                _listener_by_port.erase(socket->local_port);
+                _stack.close_listener(socket->listener_id);
+                _fd_by_listener.erase(socket->listener_id);
             }
             if (TcpConnection* connection = _connection(*socket))
             {
@@ -1629,7 +1747,7 @@ namespace ustack
             }
             if (socket->port_reserved)
             {
-                _tcp_ports.erase(socket->local_port);
+                _unbind(Kind::TCP, socket->local_port, fd);
             }
             break;
         }
@@ -1719,11 +1837,29 @@ namespace ustack
                 return 0;
             }
             case SO_REUSEADDR:
+            case SO_REUSEPORT:
                 if (int error = read_int_option(optval, optlen, value); error != 0)
                 {
                     return fail(error);
                 }
-                socket->reuseaddr = value != 0;
+                // Read live, as Linux reads sk_reuse / sk_reuseport at each
+                // later bind() and on the socket a lookup lands on (probed:
+                // set on a listener after the fact, it still lets another
+                // SO_REUSEPORT socket join it). Group membership is not
+                // changed here: NetworkStack fixed it at listen() / bind().
+                (optname == SO_REUSEADDR ? socket->reuseaddr : socket->reuseport) = value != 0;
+                if (socket->udp != nullptr)
+                {
+                    socket->udp->set_reuseport(socket->reuseport);
+                }
+                if (socket->listening)
+                {
+                    _stack.set_listener_reuseport(socket->listener_id, socket->reuseport);
+                }
+                if (connection != nullptr)
+                {
+                    _stack.set_connection_reuse(connection->get_id(), socket->reuseaddr, socket->reuseport);
+                }
                 return 0;
             case SO_LINGER:
                 if (optlen < static_cast<socklen_t>(sizeof(struct linger)))
@@ -1902,6 +2038,9 @@ namespace ustack
                 break;
             case SO_REUSEADDR:
                 error = write_int_option(optval, optlen, socket->reuseaddr ? 1 : 0);
+                break;
+            case SO_REUSEPORT:
+                error = write_int_option(optval, optlen, socket->reuseport ? 1 : 0);
                 break;
             case SO_LINGER:
                 if (*optlen < static_cast<socklen_t>(sizeof(struct linger)))
@@ -2307,7 +2446,7 @@ namespace ustack
     {
         if (socket.listening)
         {
-            return _stack.has_pending_accept(socket.local_port) ? READABLE : 0;
+            return _stack.has_pending_accept_on(socket.listener_id) ? READABLE : 0;
         }
         if (socket.connection_id == 0)
         {

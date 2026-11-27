@@ -136,7 +136,7 @@ std::unordered_set<IPv6Address> NetworkStack::_ipv6_neighbours_in_use() const
     }
     for (const auto& entry : this->_connections_by_id)
     {
-        const IpAddress& peer = entry.second.key.remote_ip;
+        const IpAddress& peer = entry.second.connection->get_remote_ip();
         TcpState state = entry.second.connection->get_state();
         if (!peer.is_v6() || state == TcpState::SYN_RECEIVED || state == TcpState::CLOSED)
         {
@@ -345,9 +345,9 @@ bool NetworkStack::_ipv6_route_for(const IPv6Address& destination, IPv6Address& 
 TcpConnection* NetworkStack::_open_ipv6_connection(const IPv6Address& remote_ip, uint16_t remote_port,
                                                    uint16_t local_port)
 {
-    ConnectionKey key{remote_ip, remote_port, local_port};
     std::optional<IPv6Address> local = this->_ipv6_source_for(remote_ip);
     IpAddress local_ip = local ? IpAddress(*local) : IpAddress(IPv6Address());
+    ConnectionKey key{remote_ip, remote_port, local_port, local_ip};
 
     auto connection = std::make_unique<TcpConnection>(
         local_port, remote_ip, remote_port, this->_next_isn(local_ip, local_port, remote_ip, remote_port),
@@ -801,7 +801,11 @@ void NetworkStack::_handle_icmpv6_udp_error(const Icmpv6& message, const Bytes& 
     auto it = this->_udp_sockets.find(local_port);
     if (it != this->_udp_sockets.end())
     {
-        it->second->on_icmp_error(IpAddress(original_source), IpAddress(original_destination), remote_port, error);
+        // Each socket checks the quote against its own connected four-tuple.
+        for (const std::unique_ptr<UdpSocket>& socket : it->second)
+        {
+            socket->on_icmp_error(IpAddress(original_source), IpAddress(original_destination), remote_port, error);
+        }
     }
 }
 
@@ -827,18 +831,15 @@ void NetworkStack::_handle_icmpv6_error(const Icmpv6& message)
     uint16_t remote_port = body.slice_int<uint16_t>(transport + 2);
     uint32_t quoted_seq = body.slice_int<uint32_t>(transport + 4);
 
-    auto it = this->_connections.find(ConnectionKey{original_destination, remote_port, local_port});
+    // tcp_v6_err looks the socket up by the full four-tuple, local address
+    // included, and so does this.
+    auto it = this->_connections.find(
+        ConnectionKey{original_destination, remote_port, local_port, IpAddress(original_source)});
     if (it == this->_connections.end())
     {
         return;
     }
     TcpConnection& connection = *it->second;
-    // tcp_v6_err looks the socket up by the full four-tuple; the table here is
-    // keyed without the local address, so compare the quoted source.
-    if (connection.get_local_ip() != IpAddress(original_source))
-    {
-        return;
-    }
     // RFC 5927 5.1: only an error quoting a sequence number this connection
     // has in flight is believed - anything else is a blind attacker guessing.
     if (!connection.has_sent_unacknowledged(quoted_seq))

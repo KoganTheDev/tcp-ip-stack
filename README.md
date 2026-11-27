@@ -387,6 +387,22 @@ DAD, router solicitation, SLAAC from RAs with RFC 4862 lifetimes and the two-hou
   as Linux with `bindv6only=0`: IPv4 peers appear as `::ffff:a.b.c.d`. `IPV6_V6ONLY`
   (before bind) makes one IPv6-only. A socket bound to a specific address only accepts
   SYNs and datagrams sent to it.
+- **Ports are shared as Linux shares them.** `bind()` and `listen()` follow
+  `inet_csk_bind_conflict`: per family and per local address (a `V6ONLY` and an AF_INET
+  listener share a port, `127.0.0.1:80` and `127.0.0.2:80` coexist, a wildcard conflicts
+  with both, a dual-stack `::` covers IPv4 too), `SO_REUSEADDR` on both sides unless the
+  existing one listens, and connections - `TIME_WAIT` included - holding their port with
+  their socket's flags after it closes. The whole matrix is probed against the kernel
+  (`test_bind_rules.cpp`). A SYN or datagram goes to the most specific socket: exact
+  address over wildcard, AF_INET over dual-stack for IPv4, a connected UDP socket's peer
+  first.
+- **`SO_REUSEPORT`** (TCP listeners and UDP): every member must set it; new connections
+  and datagrams spread over the group by a SipHash of the four-tuple under its own secret
+  key, so a peer cannot pick its member. Each listener keeps its own accept queue and
+  half-open cap, as Linux's do - a group of N bounds a SYN flood at N caps, and a flood
+  aimed at one member cannot spend another's slots. A member leaving resets the
+  connections in its own queue (Linux's default `tcp_migrate_req=0`); established
+  connections are found by their four-tuple first, so no member can take another's.
 
 **Routing.** A subnet mask, a default gateway, and a route table with longest-prefix
 match, each route naming the interface to send by. Every send decides whether the destination is on-link, and so resolves the
@@ -503,9 +519,6 @@ These are documented decisions, not gaps that were missed:
   `IpReassembler` solves.
 - **No MLD, DHCPv6 or ICMPv6 Redirect.** Group membership is local filtering only, the M
   flag is ignored, and Redirects are dropped unread.
-- **One socket per port, whatever the family.** ustack cannot have an `IPV6_V6ONLY`
-  listener and an AF_INET listener on the same port as Linux can; a dual-stack socket
-  serves both.
 - **No RFC 4941 temporary addresses.** SLAAC derives the interface identifier from the MAC,
   so a host is trackable across networks by the bottom 64 bits of its address. Privacy
   addresses are the fix and are not implemented.
