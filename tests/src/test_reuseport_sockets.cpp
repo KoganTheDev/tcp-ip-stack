@@ -71,6 +71,58 @@ namespace
             REQUIRE_TRUE(stack.sendto(from, "x", 1, 0, target.get(), target.length) == 1, "sendto");
         }
 
+        void set_reuseport(int fd, int value)
+        {
+            REQUIRE_TRUE(stack.setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &value, sizeof(value)) == 0, "SO_REUSEPORT");
+        }
+
+        // How `counts` (of `total`) split: "fair" when each got at least a
+        // sixth of an even share, else each as 0, "all" or "some" -
+        // deterministic either way, whatever the key.
+        static std::string shares(const std::vector<int>& counts, int total)
+        {
+            bool fair = true;
+            std::string out;
+            for (int count : counts)
+            {
+                fair = fair && count * 6 * static_cast<int>(counts.size()) >= total;
+                out += std::string(out.empty() ? "" : " ") + (count == 0 ? "0" : count == total ? "all" : "some");
+            }
+            return fair ? "fair" : out;
+        }
+
+        std::string shares_tcp(uint16_t port, const std::vector<int>& listeners, int connections)
+        {
+            for (int fd : listeners)
+                REQUIRE_TRUE(stack.listen(fd, 128) == 0, "listen");
+            std::vector<int> clients;
+            for (int i = 0; i < connections; i++)
+                clients.push_back(connect_to(AF_INET, "127.0.0.1", port));
+            settle(50);
+            std::vector<int> counts;
+            for (int fd : listeners)
+                counts.push_back(drain_accepts(fd));
+            for (int fd : clients)
+                stack.close(fd);
+            settle(50);
+            return shares(counts, connections);
+        }
+
+        std::string shares_udp(uint16_t port, const std::vector<int>& sockets, int datagrams)
+        {
+            for (int i = 0; i < datagrams; i++)
+            {
+                int sender = stack.socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+                send_datagram(sender, "127.0.0.1", port);
+                stack.close(sender);
+            }
+            settle(50);
+            std::vector<int> counts;
+            for (int fd : sockets)
+                counts.push_back(drain_datagrams(fd));
+            return shares(counts, datagrams);
+        }
+
         void run()
         {
             // TCP: an exact address beats the wildcard.
@@ -213,6 +265,66 @@ namespace
                     stack.close(fd);
                 settle(50);
             }
+            // SO_REUSEPORT set after the fact. Linux decides group membership
+            // when a socket joins (listen() for TCP, bind() for UDP) and reads
+            // live the flag of the socket a lookup lands on (probed):
+            //  - A listening without it, then setting it, is grouped with the
+            //    B that joins next, and the two share by hash;
+            //  - a member turning it off takes everything when it is the one
+            //    lookups land on (the latest), and stays a member otherwise;
+            //  - a UDP socket bound without it is not a member however it sets
+            //    it later.
+            {
+                int a = bound(SOCK_STREAM, Side{AF_INET, "127.0.0.1", LISTEN}, 0);
+                uint16_t port = bound_port(stack, a);
+                set_reuseport(a, 1);
+                int b = bound(SOCK_STREAM, Side{AF_INET, "127.0.0.1", RP | LISTEN}, port);
+                note("tcp late RP then a member joins", shares_tcp(port, {a, b}, 60));
+                stack.close(a);
+                stack.close(b);
+                settle(50);
+            }
+            {
+                int a = bound(SOCK_STREAM, Side{AF_INET, "127.0.0.1", RP | LISTEN}, 0);
+                uint16_t port = bound_port(stack, a);
+                int b = bound(SOCK_STREAM, Side{AF_INET, "127.0.0.1", RP | LISTEN}, port);
+                set_reuseport(b, 0);
+                note("tcp latest member turns RP off", shares_tcp(port, {a, b}, 60));
+                stack.close(a);
+                stack.close(b);
+                settle(50);
+            }
+            {
+                int a = bound(SOCK_DGRAM, Side{AF_INET, "127.0.0.1", RA}, 0);
+                uint16_t port = bound_port(stack, a);
+                int b = bound(SOCK_DGRAM, Side{AF_INET, "127.0.0.1", RA | RP}, port);
+                set_reuseport(a, 1);
+                int c = bound(SOCK_DGRAM, Side{AF_INET, "127.0.0.1", RA | RP}, port);
+                note("udp RA socket sets RP late, then a member joins", shares_udp(port, {a, b, c}, 90));
+                for (int fd : {a, b, c})
+                    stack.close(fd);
+            }
+            {
+                int a = bound(SOCK_DGRAM, Side{AF_INET, "127.0.0.1", RA}, 0);
+                uint16_t port = bound_port(stack, a);
+                int b = bound(SOCK_DGRAM, Side{AF_INET, "127.0.0.1", RA | RP}, port);
+                set_reuseport(a, 1);
+                note("udp RA socket sets RP late", shares_udp(port, {a, b}, 60));
+                stack.close(a);
+                stack.close(b);
+            }
+            for (size_t off : {size_t{2}, size_t{0}})
+            {
+                std::vector<int> group;
+                group.push_back(bound(SOCK_DGRAM, Side{AF_INET, "127.0.0.1", RP}, 0));
+                uint16_t port = bound_port(stack, group[0]);
+                group.push_back(bound(SOCK_DGRAM, Side{AF_INET, "127.0.0.1", RP}, port));
+                group.push_back(bound(SOCK_DGRAM, Side{AF_INET, "127.0.0.1", RP}, port));
+                set_reuseport(group[off], 0);
+                note("udp member " + std::to_string(off) + " of 3 turns RP off", shares_udp(port, group, 90));
+                for (int fd : group)
+                    stack.close(fd);
+            }
             // TCP: SO_REUSEPORT spreads 200 connections over 4 members.
             {
                 std::vector<int> group;
@@ -261,6 +373,12 @@ namespace
             "udp v4/dual, v4 first no: 1/0",
             "udp group, unconnected/connected: 10/5",
             "tcp leaving member: reset + survivor's = 20, both shared: yes",
+            "tcp late RP then a member joins: fair",
+            "tcp latest member turns RP off: 0 all",
+            "udp RA socket sets RP late, then a member joins: 0 some some",
+            "udp RA socket sets RP late: 0 all",
+            "udp member 2 of 3 turns RP off: 0 0 all",
+            "udp member 0 of 3 turns RP off: fair",
             "tcp spread: total 200, members with a fair share 4",
         };
     }
