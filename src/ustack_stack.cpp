@@ -13,6 +13,7 @@
 #include <cstring>
 #include <exception>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -111,7 +112,23 @@ namespace ustack
             {
                 return EDOM;
             }
-            microseconds = tv.tv_sec < 0 ? 0 : static_cast<int64_t>(tv.tv_sec) * 1000000 + tv.tv_usec;
+            // Clamped before multiplying: tv_sec * 1000000 overflows (signed,
+            // so undefined) for a large tv_sec, and wrapping could turn
+            // "forever" into an instant timeout. Linux likewise turns a value
+            // too big for a jiffy count into MAX_SCHEDULE_TIMEOUT.
+            constexpr int64_t MAX_SECONDS = std::numeric_limits<int64_t>::max() / 1000000 - 1;
+            if (tv.tv_sec < 0)
+            {
+                microseconds = 0;
+            }
+            else if (static_cast<int64_t>(tv.tv_sec) > MAX_SECONDS)
+            {
+                microseconds = MAX_SECONDS * 1000000;
+            }
+            else
+            {
+                microseconds = static_cast<int64_t>(tv.tv_sec) * 1000000 + tv.tv_usec;
+            }
             return 0;
         }
 
@@ -1648,7 +1665,10 @@ namespace ustack
 
     std::optional<uint64_t> Stack::_deadline(int64_t timeout_us)
     {
-        if (timeout_us <= 0)
+        // Over a year is "forever": it keeps the deadline arithmetic far from
+        // overflow, and no caller can tell the difference.
+        constexpr int64_t FOREVER_US = 366LL * 24 * 3600 * 1000000;
+        if (timeout_us <= 0 || timeout_us >= FOREVER_US)
         {
             return std::nullopt;
         }
