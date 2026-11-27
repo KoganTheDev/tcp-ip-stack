@@ -33,7 +33,7 @@ runs:
         echo "CCACHE_MAXSIZE=300M" >> "$GITHUB_ENV"
 
     - name: Restore the compiler cache
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: .ccache
         key: ccache-${{ inputs.cache-name }}-${{ github.sha }}
