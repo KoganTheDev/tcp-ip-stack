@@ -221,7 +221,9 @@ protected:
 
 TEST_F(UstackTcpInfoLossy, RetransmissionsAreCounted)
 {
-    auto [c, s] = connected_pair();
+    auto pair = connected_pair();
+    const int c = pair.first;
+    const int s = pair.second;
     std::string data(200000, 'z');
     size_t sent = 0;
     size_t received = 0;

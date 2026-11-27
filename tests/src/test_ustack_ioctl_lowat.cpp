@@ -199,7 +199,9 @@ namespace
     // own TCP_INFO: the receiver's ACK shows up there.
     TEST_F(UstackIoctlLowat, QuickackAcksAtOnceInsteadOfAfterTheDelayedAckTimer)
     {
-        auto [c, s] = connected_pair();
+        auto pair = connected_pair();
+        const int c = pair.first;
+        const int s = pair.second;
         auto unacked = [&]
         {
             tcp_info info{};
