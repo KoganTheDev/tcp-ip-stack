@@ -521,3 +521,39 @@ TEST(UstackBlockingRealDriver, ReadyExternalFdDoesNotMakeABlockedCallSpin)
     ::close(pipefd[1]);
     ::close(fds[1]);
 }
+
+TEST_F(UstackBlocking, HugeAndInvalidTimevalsAreHandledWithoutOverflow)
+{
+    int fd = blocking_socket(*client);
+    timeval huge{};
+    huge.tv_sec = LONG_MAX;
+    huge.tv_usec = 999999;
+    ASSERT_EQ(client->setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &huge, sizeof(huge)), 0);
+    timeval back{};
+    socklen_t length = sizeof(back);
+    ASSERT_EQ(client->getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &back, &length), 0);
+    EXPECT_GT(back.tv_sec, 1000000000L) << "still effectively forever, not wrapped to 0 or negative";
+
+    // Forever, so on an idle simulator the call reports EDEADLK instead of
+    // timing out at once, which a wrapped value would have caused.
+    int udp = blocking_socket(*client, SOCK_DGRAM);
+    sockaddr_in any = address(IPv4Address(), 9000);
+    ASSERT_EQ(client->bind(udp, as_sockaddr(any), sizeof(any)), 0);
+    ASSERT_EQ(client->setsockopt(udp, SOL_SOCKET, SO_RCVTIMEO, &huge, sizeof(huge)), 0);
+    net.step(120000);
+    char byte = 0;
+    EXPECT_EQ(client->recv(udp, &byte, 1, 0), -1);
+    EXPECT_EQ(errno, EDEADLK);
+
+    timeval negative{-5, 0};
+    ASSERT_EQ(client->setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &negative, sizeof(negative)), 0);
+    length = sizeof(back);
+    ASSERT_EQ(client->getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &back, &length), 0);
+    EXPECT_EQ(back.tv_sec, 0) << "a negative tv_sec means no timeout";
+    for (suseconds_t bad : {static_cast<suseconds_t>(-1), static_cast<suseconds_t>(1000000)})
+    {
+        timeval invalid{1, bad};
+        EXPECT_EQ(client->setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &invalid, sizeof(invalid)), -1);
+        EXPECT_EQ(errno, EDOM);
+    }
+}
