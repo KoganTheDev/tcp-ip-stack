@@ -666,8 +666,8 @@ const NetworkStack::Listener* NetworkStack::_select_listener(const IpAddress& so
 NetworkStack::Listener* NetworkStack::_select_listener(const IpAddress& source, uint16_t source_port,
                                                        const IpAddress& destination, uint16_t port)
 {
-    return const_cast<Listener*>(static_cast<const NetworkStack*>(this)->_select_listener(source, source_port,
-                                                                                          destination, port));
+    return const_cast<Listener*>(
+        static_cast<const NetworkStack*>(this)->_select_listener(source, source_port, destination, port));
 }
 
 void NetworkStack::_queue_for_accept(Listener& listener, uint64_t connection_id)
@@ -733,7 +733,8 @@ TcpConnection* NetworkStack::connect(const IpAddress& remote_ip, uint16_t remote
         // given, or refused if that exact four-tuple is taken - including by a
         // connection still waiting in an accept queue, which is in
         // _connections until it is accepted and closed.
-        if (this->_connections.count(ConnectionKey{remote_ip, remote_port, local_port, this->_connect_source(remote_ip)})
+        if (this->_connections.count(
+                ConnectionKey{remote_ip, remote_port, local_port, this->_connect_source(remote_ip)})
             != 0)
         {
             return nullptr;
@@ -2208,9 +2209,8 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
         return;
     }
 
-    Listener* listener = tcp.get_syn() ? this->_select_listener(source, tcp.get_src_port(), destination,
-                                                                tcp.get_dest_port())
-                                       : nullptr;
+    Listener* listener =
+        tcp.get_syn() ? this->_select_listener(source, tcp.get_src_port(), destination, tcp.get_dest_port()) : nullptr;
     bool is_new_connection_request = listener != nullptr;
 
     if (is_new_connection_request)
@@ -2223,8 +2223,7 @@ void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destina
         if (queued >= listener->backlog)
         {
             LOG_WARNING("NetworkStack: dropping a SYN for port "
-                        << tcp.get_dest_port() << " - the accept queue is full (" << queued << "/"
-                        << listener->backlog
+                        << tcp.get_dest_port() << " - the accept queue is full (" << queued << "/" << listener->backlog
                         << "). The application is not accepting fast enough, or this is a SYN flood.");
             this->_syns_dropped_accept_queue_full += 1;
             return;
@@ -2548,8 +2547,7 @@ bool NetworkStack::_deliver_udp(const IpAddress& source, const IpAddress& destin
     return true;
 }
 
-UdpSocket* NetworkStack::_select_udp_socket(const IpAddress& source, const IpAddress& destination,
-                                            const Udp& udp) const
+UdpSocket* NetworkStack::_select_udp_socket(const IpAddress& source, const IpAddress& destination, const Udp& udp) const
 {
     auto port_it = this->_udp_sockets.find(udp.get_dest_port());
     if (port_it == this->_udp_sockets.end())

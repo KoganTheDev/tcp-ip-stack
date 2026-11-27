@@ -628,19 +628,18 @@ namespace ustack
             return (binds_it == binds.end() || binds_it->second.empty()) && _stack.udp_port_bound(port);
         }
         bool conflict = false;
-        _stack.for_each_connection_on_port(port,
-                                           [&](const IpAddress& local, bool reuseaddr, bool reuseport)
-                                           {
-                                               // A connection's own socket, when it is this one, is not
-                                               // in its way (a failed connect() rebinding).
-                                               if (!conflict
-                                                   && _overlaps(mine, _coverage(local.is_v4() ? AF_INET : AF_INET6,
-                                                                                true, local))
-                                                   && !tolerated(reuseaddr, reuseport, false))
-                                               {
-                                                   conflict = true;
-                                               }
-                                           });
+        _stack.for_each_connection_on_port(
+            port,
+            [&](const IpAddress& local, bool reuseaddr, bool reuseport)
+            {
+                // A connection's own socket, when it is this one, is not
+                // in its way (a failed connect() rebinding).
+                if (!conflict && _overlaps(mine, _coverage(local.is_v4() ? AF_INET : AF_INET6, true, local))
+                    && !tolerated(reuseaddr, reuseport, false))
+                {
+                    conflict = true;
+                }
+            });
         return conflict;
     }
 
@@ -896,7 +895,7 @@ namespace ustack
         NetworkStack::ListenOptions options;
         options.backlog = static_cast<size_t>(backlog);
         options.family = family;
-        options.local = local;
+        options.local = std::move(local);
         options.reuseport = socket->reuseport;
         options.reuseaddr = socket->reuseaddr;
         socket->listener_id = _stack.open_listener(socket->local_port, options);

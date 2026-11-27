@@ -97,7 +97,6 @@ TEST(ConnectionKey, TimeWaitOnOneLocalAddressLeavesTheOtherFree)
     ASSERT_EQ(s.server->find_connection(server_id)->get_state(), TcpState::TIME_WAIT) << "and left it alone";
 
     // The same tuple again does meet it, and ends it (RFC 6191).
-    ASSERT_TRUE(s.net.run_until(
-        [&] { return s.client->connect(IPv6Address("fd00::2"), 80, 40000) != nullptr; }, 5000));
+    ASSERT_TRUE(s.net.run_until([&] { return s.client->connect(IPv6Address("fd00::2"), 80, 40000) != nullptr; }, 5000));
     ASSERT_TRUE(s.net.run_until([&] { return s.server->time_wait_reuses() == 1; }, 5000));
 }
