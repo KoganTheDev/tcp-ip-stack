@@ -618,11 +618,16 @@ public:
     uint64_t connection_timer_runs() const { return _connection_timer_runs; }
 
 private:
+    // The full four-tuple. The local address is part of it: two connections
+    // from one peer ip:port to one local port, but to two of this host's
+    // addresses, are two connections (the peer keys them by its remote
+    // address), as Linux's established hash keys them.
     struct ConnectionKey
     {
         IpAddress remote_ip;
         uint16_t remote_port{};
         uint16_t local_port{};
+        IpAddress local_ip;
         bool operator==(const ConnectionKey& other) const;
     };
     struct ConnectionKeyHash
@@ -685,6 +690,9 @@ private:
     // Puts a connection in the tables and in the timer queue. Every
     // connection the stack creates comes through here.
     void _register_connection(const ConnectionKey& key, std::unique_ptr<TcpConnection> connection);
+    // The local address an active open to `remote` is made from, the one its
+    // key carries: what _open_connection and _open_ipv6_connection pick.
+    IpAddress _connect_source(const IpAddress& remote) const;
     // Makes the timer queue hold this connection's current deadline - called
     // whenever it may have moved (TcpConnection's timer-changed callback) and
     // after its timers have run.

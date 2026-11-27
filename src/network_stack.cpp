@@ -182,8 +182,8 @@ namespace
 
 bool NetworkStack::ConnectionKey::operator==(const ConnectionKey& other) const
 {
-    return this->remote_ip == other.remote_ip && this->remote_port == other.remote_port
-           && this->local_port == other.local_port;
+    return this->remote_port == other.remote_port && this->local_port == other.local_port
+           && this->remote_ip == other.remote_ip && this->local_ip == other.local_ip;
 }
 
 size_t NetworkStack::ConnectionKeyHash::operator()(const ConnectionKey& key) const
@@ -191,7 +191,8 @@ size_t NetworkStack::ConnectionKeyHash::operator()(const ConnectionKey& key) con
     size_t h1 = std::hash<IpAddress>{}(key.remote_ip);
     size_t h2 = std::hash<uint16_t>{}(key.remote_port);
     size_t h3 = std::hash<uint16_t>{}(key.local_port);
-    return h1 ^ (h2 << 1) ^ (h3 << 2);
+    size_t h4 = std::hash<IpAddress>{}(key.local_ip);
+    return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3);
 }
 
 namespace
@@ -542,7 +543,8 @@ TcpConnection* NetworkStack::connect(const IpAddress& remote_ip, uint16_t remote
         // given, or refused if that exact four-tuple is taken - including by a
         // connection still waiting in an accept queue, which is in
         // _connections until it is accepted and closed.
-        if (this->_connections.count(ConnectionKey{remote_ip, remote_port, local_port}) != 0)
+        if (this->_connections.count(ConnectionKey{remote_ip, remote_port, local_port, this->_connect_source(remote_ip)})
+            != 0)
         {
             return nullptr;
         }
@@ -556,12 +558,13 @@ TcpConnection* NetworkStack::connect(const IpAddress& remote_ip, uint16_t remote
     // application's pointer to it dangling and its id finding this one.
     constexpr size_t EPHEMERAL_PORT_COUNT = 65536 - FIRST_EPHEMERAL_PORT;
     const bool local_destination = this->is_local_address(remote_ip);
+    const IpAddress source = this->_connect_source(remote_ip);
     uint16_t ephemeral_port = 0;
     bool found_free_port = false;
     for (size_t attempt = 0; attempt < EPHEMERAL_PORT_COUNT && !found_free_port; attempt++)
     {
         ephemeral_port = this->_allocate_ephemeral_port();
-        found_free_port = this->_connections.count(ConnectionKey{remote_ip, remote_port, ephemeral_port}) == 0;
+        found_free_port = this->_connections.count(ConnectionKey{remote_ip, remote_port, ephemeral_port, source}) == 0;
         // Never a port this stack listens on, as Linux's allocator. Harmless
         // between two hosts; to a local peer it is a connection to itself,
         // source and destination equal, which is what a listener sharing the
@@ -583,6 +586,20 @@ TcpConnection* NetworkStack::connect(const IpAddress& remote_ip, uint16_t remote
     return this->_open_connection(remote_ip, remote_port, ephemeral_port);
 }
 
+IpAddress NetworkStack::_connect_source(const IpAddress& remote) const
+{
+    if (remote.is_v6())
+    {
+        std::optional<IPv6Address> local = this->_ipv6_source_for(remote.v6());
+        return local ? IpAddress(*local) : IpAddress(IPv6Address());
+    }
+    // A local peer is reached from the address it was named by (127.0.0.1 to
+    // 127.0.0.1, an own address to itself): the same rule that picks a
+    // datagram's source, so the connection's idea of its address and the one
+    // on its segments cannot disagree.
+    return this->_is_local_ipv4(remote.v4()) ? remote : IpAddress(this->_primary().config.ip);
+}
+
 TcpConnection* NetworkStack::_open_connection(const IpAddress& remote_address, uint16_t remote_port,
                                               uint16_t local_port)
 {
@@ -591,14 +608,9 @@ TcpConnection* NetworkStack::_open_connection(const IpAddress& remote_address, u
         return this->_open_ipv6_connection(remote_address.v6(), remote_port, local_port);
     }
     const IPv4Address& remote_ip = remote_address.v4();
-    ConnectionKey key{remote_ip, remote_port, local_port};
-
-    // A local peer is reached from the address it was named by (127.0.0.1 to
-    // 127.0.0.1, an own address to itself): the same rule that picks a
-    // datagram's source, so the connection's idea of its address and the one
-    // on its segments cannot disagree.
     const bool local_peer = this->_is_local_ipv4(remote_ip);
-    const IPv4Address local_ip = local_peer ? remote_ip : this->_primary().config.ip;
+    const IPv4Address local_ip = this->_connect_source(remote_ip).v4();
+    ConnectionKey key{remote_ip, remote_port, local_port, local_ip};
     auto connection = std::make_unique<TcpConnection>(
         local_port, remote_ip, remote_port, this->_next_isn(local_ip, local_port, remote_ip, remote_port),
         this->_segment_sender(remote_ip, local_ip), this->_local_mss_for(remote_ip));
@@ -1887,7 +1899,7 @@ bool NetworkStack::_reuses_time_wait(const TcpConnection& existing, const IpAddr
 
 void NetworkStack::_handle_tcp(const IpAddress& source, const IpAddress& destination, const Tcp& tcp, Ecn ecn)
 {
-    ConnectionKey key{source, tcp.get_src_port(), tcp.get_dest_port()};
+    ConnectionKey key{source, tcp.get_src_port(), tcp.get_dest_port(), destination};
 
     auto connection_it = this->_connections.find(key);
 
@@ -2185,7 +2197,7 @@ NetworkStack::CookieAck NetworkStack::_try_complete_cookie_handshake(const IpAdd
         return CookieAck::DROPPED;
     }
 
-    ConnectionKey key{remote_ip, tcp.get_src_port(), local_port};
+    ConnectionKey key{remote_ip, tcp.get_src_port(), local_port, local_ip};
     LOG_DEBUG("NetworkStack: completing a connection from " << remote_ip.to_string() << ":" << key.remote_port
                                                             << " by SYN cookie (MSS " << mss << ")");
     auto connection =
@@ -2464,17 +2476,11 @@ TcpConnection* NetworkStack::_connection_from_icmp_quote(const Icmp& icmp, uint3
         *out_quoted_seq = embedded.slice_int<uint32_t>(ihl + 4);
     }
 
-    ConnectionKey key{original_dest, remote_port, local_port};
-    auto it = this->_connections.find(key);
+    // Linux's tcp_v4_err looks the socket up by the full four-tuple, and so
+    // does this: an error about a segment that left from some other address
+    // of ours is not this connection's.
+    auto it = this->_connections.find(ConnectionKey{original_dest, remote_port, local_port, original_source});
     if (it == this->_connections.end())
-    {
-        return nullptr;
-    }
-    // Linux's tcp_v4_err looks the socket up by the full four-tuple. Our
-    // connection table is keyed without the local address, so the quoted
-    // source is compared here: an error about a segment that left from some
-    // other address of ours is not this connection's.
-    if (it->second->get_local_ip() != IpAddress(original_source))
     {
         return nullptr;
     }
@@ -3141,7 +3147,8 @@ void NetworkStack::_send_tcp_segment(const IpAddress& destination, const Tcp& he
         // a RST for a closed port, the SYN-ACK sent before the connection is
         // registered) answers an unverified peer.
         NeighbourOrigin origin = NeighbourOrigin::REPLY;
-        auto owner = this->_connections.find(ConnectionKey{destination, header.get_dest_port(), header.get_src_port()});
+        auto owner = this->_connections.find(
+            ConnectionKey{destination, header.get_dest_port(), header.get_src_port(), IpAddress(*source)});
         if (!header.get_rst() && owner != this->_connections.end() && owner->second->sending_to_verified_peer())
         {
             origin = NeighbourOrigin::HOST;
