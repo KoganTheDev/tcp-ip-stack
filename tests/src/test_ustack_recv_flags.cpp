@@ -248,13 +248,13 @@ TEST_F(UstackRecvFlags, WaitallBlocksUntilLenBytesHaveArrived)
     int pumps = 0;
     bool sent_rest = false;
     net.add_tick_hook(
-        [this, s, &pumps, &sent_rest]
+        [this, fd = s, &pumps, &sent_rest]
         {
             // The rest goes out after the first bytes have been delivered.
             if (++pumps == 4 && !sent_rest)
             {
                 sent_rest = true;
-                EXPECT_EQ(send_string(*server, s, "defg"), 4);
+                EXPECT_EQ(send_string(*server, fd, "defg"), 4);
             }
         });
     std::string out;
@@ -339,12 +339,12 @@ TEST_F(UstackRecvFlags, WaitallLargerThanTheReceiveBufferDrainsAsDataComes)
     constexpr size_t TOTAL = 30000;
     size_t sent = 0;
     net.add_tick_hook(
-        [this, s, &sent]
+        [this, fd = s, &sent]
         {
             if (sent < TOTAL)
             {
                 std::string chunk(std::min<size_t>(1000, TOTAL - sent), 'z');
-                ssize_t n = server->send(s, chunk.data(), chunk.size(), MSG_DONTWAIT);
+                ssize_t n = server->send(fd, chunk.data(), chunk.size(), MSG_DONTWAIT);
                 if (n > 0)
                 {
                     sent += static_cast<size_t>(n);
@@ -362,11 +362,11 @@ TEST_F(UstackRecvFlags, WaitallWithPeekWaitsUntilLenBytesCanBeSeenAndConsumesNot
     ASSERT_EQ(send_string(*server, s, "abc"), 3);
     int pumps = 0;
     net.add_tick_hook(
-        [this, s, &pumps]
+        [this, fd = s, &pumps]
         {
             if (++pumps == 4)
             {
-                EXPECT_EQ(send_string(*server, s, "def"), 3);
+                EXPECT_EQ(send_string(*server, fd, "def"), 3);
             }
         });
     std::string out;

@@ -234,11 +234,11 @@ TEST_F(UstackPoll, FdClosedDuringTheWaitIsPollnval)
     static_cast<void>(s);
     int pumps = 0;
     net.add_tick_hook(
-        [this, c, &pumps]
+        [this, fd = c, &pumps]
         {
             if (++pumps == 1)
             {
-                EXPECT_EQ(client->close(c), 0);
+                EXPECT_EQ(client->close(fd), 0);
             }
         });
     pollfd entry{c, POLLIN, 0};
@@ -253,11 +253,11 @@ TEST_F(UstackPoll, FdNumberReusedDuringTheWaitIsStillPollnval)
     int pumps = 0;
     int reused = -1;
     net.add_tick_hook(
-        [this, c, &pumps, &reused]
+        [this, fd = c, &pumps, &reused]
         {
             if (++pumps == 1)
             {
-                EXPECT_EQ(client->close(c), 0);
+                EXPECT_EQ(client->close(fd), 0);
                 reused = client->socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
             }
         });
@@ -383,11 +383,11 @@ TEST_F(UstackPoll, SelectOnFdClosedDuringTheWaitIsEbadf)
     static_cast<void>(s);
     int pumps = 0;
     net.add_tick_hook(
-        [this, c, &pumps]
+        [this, fd = c, &pumps]
         {
             if (++pumps == 1)
             {
-                EXPECT_EQ(client->close(c), 0);
+                EXPECT_EQ(client->close(fd), 0);
             }
         });
     Sets sets;
