@@ -7,6 +7,7 @@
 
 #include <cstring>
 #include <memory>
+#include <set>
 
 #include "guard_channel.h"
 #include "sim/sim_network.h"
@@ -21,6 +22,56 @@
 // simulator, real on the kernel.
 namespace stack_harness
 {
+    // A KernelStack that closes the fds it handed out and the scenario did not
+    // close. KernelStack is stateless by design (the fds belong to the
+    // process), and the scenarios close their sockets by hand, which a
+    // REQUIRE_TRUE throw, an early return or a forgotten close skips - and the
+    // leaked kernel sockets then pile up for the rest of the run (see
+    // fd_leak_guard.cpp). Same method names and signatures, so a template
+    // taking StackT cannot tell it from KernelStack.
+    //
+    // close() forgets the fd before the kernel can hand the number out again,
+    // so a number reused by a later socket() is tracked afresh and the
+    // destructor never closes an fd the scenario already closed.
+    class OwnedKernelStack : public ustack::KernelStack
+    {
+    public:
+        OwnedKernelStack() = default;
+        OwnedKernelStack(const OwnedKernelStack&) = delete;
+        OwnedKernelStack& operator=(const OwnedKernelStack&) = delete;
+        ~OwnedKernelStack()
+        {
+            for (int fd : _open)
+            {
+                ::close(fd);
+            }
+        }
+
+        int socket(int domain, int type, int protocol) { return track(KernelStack::socket(domain, type, protocol)); }
+        int accept(int fd, sockaddr* addr, socklen_t* addrlen) { return track(KernelStack::accept(fd, addr, addrlen)); }
+        int accept4(int fd, sockaddr* addr, socklen_t* addrlen, int flags)
+        {
+            return track(KernelStack::accept4(fd, addr, addrlen, flags));
+        }
+        int epoll_create1(int flags) { return track(KernelStack::epoll_create1(flags)); }
+        int close(int fd)
+        {
+            _open.erase(fd);
+            return KernelStack::close(fd);
+        }
+
+    private:
+        int track(int fd)
+        {
+            if (fd >= 0)
+            {
+                _open.insert(fd);
+            }
+            return fd;
+        }
+        std::set<int> _open;
+    };
+
     // Server and client stacks, and a way to name the server's address.
     class SimHarness
     {
@@ -99,7 +150,7 @@ namespace stack_harness
     class KernelHarness
     {
     public:
-        using StackT = ustack::KernelStack;
+        using StackT = OwnedKernelStack;
         static constexpr const char* NAME = "KernelStack over loopback";
 
         StackT& server_stack() { return _stack; }

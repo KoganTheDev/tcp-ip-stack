@@ -213,7 +213,7 @@ namespace
         // Errors.
         {
             int value = 0;
-            int rc = client.ioctl(999, FIONREAD, &value);
+            int rc = client.ioctl(test_support::never_valid_fd(), FIONREAD, &value);
             note("ioctl bad fd", rc == 0 ? "ok" : failure());
             rc = server.ioctl(s, FIONREAD, nullptr);
             note("ioctl null arg", rc == 0 ? "ok" : failure());

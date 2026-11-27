@@ -71,6 +71,7 @@ namespace
         FD_ZERO(&r);
         FD_ZERO(&w);
         FD_ZERO(&e);
+        REQUIRE_FD_SETTABLE(fd);
         FD_SET(fd, &r);
         FD_SET(fd, &w);
         FD_SET(fd, &e);
@@ -221,12 +222,14 @@ namespace
         note("poll timeout 30 ms, idle", std::to_string(server.poll(&idle, 1, 30)) + " " + poll_text(idle.revents));
         fd_set r;
         FD_ZERO(&r);
+        REQUIRE_FD_SETTABLE(sfd);
         FD_SET(sfd, &r);
         timeval tv{0, 30000};
         int sel = server.select(sfd + 1, &r, nullptr, nullptr, &tv);
         note("select timeout 30 ms, idle", std::to_string(sel) + " r" + std::to_string(FD_ISSET(sfd, &r) ? 1 : 0)
                                                + " left " + std::to_string(tv.tv_sec * 1000000 + tv.tv_usec));
         FD_ZERO(&r);
+        REQUIRE_FD_SETTABLE(sfd);
         FD_SET(sfd, &r);
         REQUIRE_TRUE(client.send(cfd, "x", 1, MSG_NOSIGNAL) == 1, failure());
         h.settle(50);

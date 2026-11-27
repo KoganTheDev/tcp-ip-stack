@@ -15,6 +15,7 @@
 #include "guard_channel.h"
 #include "sim/sim_network.h"
 #include "sim/ustack_sim_driver.h"
+#include "stack_harness.h"
 #include "test_support.h"
 #include "ustack/kernel_stack.h"
 #include "ustack/stack.h"
@@ -84,7 +85,7 @@ namespace
     class KernelHarness6
     {
     public:
-        using StackT = ustack::KernelStack;
+        using StackT = stack_harness::OwnedKernelStack;
         StackT& server_stack() { return _stack; }
         StackT& client_stack() { return _stack; }
         static const char* server_text() { return "::1"; }
