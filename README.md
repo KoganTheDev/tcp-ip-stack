@@ -206,8 +206,10 @@ simultaneous close rather than folding it into `FIN_WAIT_2`. On top of that:
   which is a half close - `shutdown(SHUT_WR)`, not POSIX `close()`. After a ustack `close()`
   (`abandon_receive()`), new data from the peer is answered with a RST (RFC 9293 3.10.7.4),
   as is data left unread at close time; after `shutdown(SHUT_WR)` it is still delivered
-- Data is sized so that payload plus options fits the MSS (RFC 6691); urgent data is
-  delivered inline and URG is never sent (RFC 6093)
+- Data is sized so that payload plus options fits the MSS (RFC 6691); urgent data
+  through the socket API follows Linux (MSG_OOB sets URG; one out-of-band byte,
+  SO_OOBINLINE keeps it in the stream as RFC 6093 advises); a bare TcpConnection
+  ignores URG and delivers it inline (RFC 6093)
 - A frame the device drops for a passing reason (`ENOBUFS`, `EAGAIN`, a link that is
   down) is counted as loss and recovered by retransmission rather than thrown at the
   application; only a device that is gone surfaces, as `FatalChannelError`

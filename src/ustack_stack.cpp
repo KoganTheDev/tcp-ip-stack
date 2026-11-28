@@ -427,6 +427,10 @@ namespace ustack
     {
         connection.set_keepalive(socket.keepalive);
         connection.set_nodelay(socket.nodelay);
+        // MSG_OOB and SO_OOBINLINE: urgent data is Linux's here, not RFC 6093's
+        // "ignore URG" (see TcpConnection::set_urgent_tracking).
+        connection.set_urgent_tracking(true);
+        connection.set_oob_inline(socket.oob_inline);
         if (!socket.quickack)
         {
             connection.set_quickack(false); // the default state needs no call: ACKs are delayed anyway
@@ -496,7 +500,11 @@ namespace ustack
             {
                 if (Stack* stack = *self)
                 {
-                    stack->_wake_connection(id, READABLE);
+                    // An urgent byte arriving is data ready, and EPOLLPRI for
+                    // a watcher that asked only for that.
+                    const TcpConnection* current = stack->_stack.find_connection(id);
+                    const uint32_t urgent = current != nullptr && current->urgent_pending() ? EPOLLPRI : 0U;
+                    stack->_wake_connection(id, READABLE | urgent);
                 }
             });
     }
@@ -977,6 +985,7 @@ namespace ustack
         socket->v6only = listener->v6only;
         socket->keepalive = listener->keepalive;
         socket->nodelay = listener->nodelay;
+        socket->oob_inline = listener->oob_inline;
         socket->quickack = listener->quickack;
         socket->rcvlowat = listener->rcvlowat;
         socket->receive_capacity = listener->receive_capacity;
@@ -1251,7 +1260,9 @@ namespace ustack
         {
             return fail(ENOTSOCK);
         }
-        if ((flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL)) != 0)
+        // MSG_OOB is TCP's: UDP refuses it, as udp_sendmsg does.
+        const int accepted_flags = MSG_DONTWAIT | MSG_NOSIGNAL | (socket->kind == Kind::TCP ? MSG_OOB : 0);
+        if ((flags & ~accepted_flags) != 0)
         {
             return fail(EOPNOTSUPP);
         }
@@ -1349,7 +1360,7 @@ namespace ustack
         }
         Bytes payload(static_cast<unsigned int>(room));
         std::copy(bytes, bytes + room, payload.begin());
-        size_t accepted = connection->send(payload);
+        size_t accepted = connection->send(payload, (flags & MSG_OOB) != 0);
         if (accepted == 0)
         {
             return fail(EAGAIN);
@@ -1361,6 +1372,12 @@ namespace ustack
     {
         // MSG_WAITALL is a TCP idea; on UDP Linux ignores it, and so does this.
         const Socket* first = _get(fd);
+        // recv(MSG_OOB) never waits: tcp_recv_urg answers at once, and
+        // MSG_WAITALL means nothing to it.
+        if (first != nullptr && first->kind == Kind::TCP && (flags & MSG_OOB) != 0)
+        {
+            return _recvfrom_once(fd, buf, len, flags, src_addr, addrlen);
+        }
         // With len 0 WAITALL changes nothing (its target is raised to 1), so
         // the plain path answers. A read collects up to its target: len for
         // WAITALL, else min(SO_RCVLOWAT, len) - 1 unless a mark is set.
@@ -1579,17 +1596,23 @@ namespace ustack
         {
             *addrlen = 0;
         }
-        if (socket->listening || socket->connection_id == 0)
+        if (socket->listening)
+        {
+            return fail(ENOTCONN);
+        }
+        // tcp_recvmsg answers MSG_OOB before it looks at the queue or sk_err,
+        // so a socket that never connected is EINVAL here, not ENOTCONN.
+        if ((flags & MSG_OOB) != 0)
+        {
+            return _recv_urgent(*socket, buf, len, flags);
+        }
+        if (socket->connection_id == 0)
         {
             return fail(ENOTCONN);
         }
         if (socket->so_error != 0)
         {
             return fail(_take_error(*socket));
-        }
-        if ((flags & MSG_OOB) != 0)
-        {
-            return fail(EINVAL); // urgent data is not supported: none is ever pending
         }
         TcpConnection* connection = _connection(*socket);
         if (connection == nullptr)
@@ -1603,22 +1626,42 @@ namespace ustack
         {
             // MSG_TRUNC on TCP: the bytes are counted (and, unless peeking,
             // consumed) but not copied, as in tcp_recvmsg.
+            // Bytes in the queue are not always bytes to read: a lone urgent
+            // byte (out of band) is stepped over, and then there is nothing -
+            // the answer is the one for an empty queue below, as on Linux.
+            // len == 0 reads 0 either way.
             if (peek)
             {
                 if (truncate)
                 {
-                    return static_cast<ssize_t>(std::min(len, connection->bytes_available()));
+                    const size_t counted = connection->readable_size(len);
+                    if (counted > 0 || len == 0)
+                    {
+                        return static_cast<ssize_t>(counted);
+                    }
                 }
-                Bytes data = connection->peek(len);
-                std::copy(data.begin(), data.end(), out);
-                return static_cast<ssize_t>(data.size());
+                else
+                {
+                    Bytes data = connection->peek(len);
+                    if (!data.empty() || len == 0)
+                    {
+                        std::copy(data.begin(), data.end(), out);
+                        return static_cast<ssize_t>(data.size());
+                    }
+                }
             }
-            Bytes data = connection->read(len);
-            if (!truncate)
+            else
             {
-                std::copy(data.begin(), data.end(), out);
+                Bytes data = connection->read(len);
+                if (!data.empty() || len == 0)
+                {
+                    if (!truncate)
+                    {
+                        std::copy(data.begin(), data.end(), out);
+                    }
+                    return static_cast<ssize_t>(data.size());
+                }
             }
-            return static_cast<ssize_t>(data.size());
         }
         TcpState state = connection->get_state();
         if (handshaking(state))
@@ -1630,6 +1673,39 @@ namespace ustack
             return 0;
         }
         return fail(EAGAIN);
+    }
+
+    ssize_t Stack::_recv_urgent(const Socket& socket, void* buf, size_t len, int flags)
+    {
+        // tcp_recv_urg: the byte once, EINVAL when there is none (never sent,
+        // read already, passed by a normal read, or SO_OOBINLINE), EAGAIN when
+        // the pointer is here and the byte is not - or 0 if the stream has
+        // ended. len 0 reads the byte without copying it, MSG_TRUNC likewise;
+        // MSG_PEEK leaves it to be read.
+        TcpConnection* connection = _connection(socket);
+        if (connection == nullptr)
+        {
+            return fail(EINVAL);
+        }
+        uint8_t byte = 0;
+        switch (connection->read_urgent(byte, (flags & MSG_PEEK) != 0))
+        {
+        case TcpConnection::UrgentRead::BYTE:
+            if (len > 0 && (flags & MSG_TRUNC) == 0)
+            {
+                *static_cast<byte_t*>(buf) = byte;
+            }
+            return len > 0 ? 1 : 0;
+        case TcpConnection::UrgentRead::NOT_YET:
+            if (socket.shut_rd || peer_finished(connection->get_state()))
+            {
+                return 0;
+            }
+            return fail(EAGAIN);
+        case TcpConnection::UrgentRead::NONE:
+            break;
+        }
+        return fail(EINVAL);
     }
 
     int Stack::shutdown(int fd, int how)
@@ -1789,6 +1865,17 @@ namespace ustack
                 (optname == SO_RCVTIMEO ? socket->rcvtimeo_us : socket->sndtimeo_us) = microseconds;
                 return 0;
             }
+            case SO_OOBINLINE:
+                if (int error = read_int_option(optval, optlen, value); error != 0)
+                {
+                    return fail(error);
+                }
+                socket->oob_inline = value != 0;
+                if (connection != nullptr)
+                {
+                    connection->set_oob_inline(socket->oob_inline);
+                }
+                return 0;
             case SO_KEEPALIVE:
                 if (int error = read_int_option(optval, optlen, value); error != 0)
                 {
@@ -2014,6 +2101,9 @@ namespace ustack
             }
             case SO_KEEPALIVE:
                 error = write_int_option(optval, optlen, socket->keepalive ? 1 : 0);
+                break;
+            case SO_OOBINLINE:
+                error = write_int_option(optval, optlen, socket->oob_inline ? 1 : 0);
                 break;
             case SO_RCVBUF:
             case SO_SNDBUF:
@@ -2267,14 +2357,15 @@ namespace ustack
         {
             return fail(EBADF);
         }
-        const bool known = request == FIONREAD || request == SIOCOUTQ || request == SIOCOUTQNSD;
+        const bool known =
+            request == FIONREAD || request == SIOCOUTQ || request == SIOCOUTQNSD || request == SIOCATMARK;
         if (!known)
         {
             return fail(ENOTTY);
         }
         if (socket->kind == Kind::EPOLL)
         {
-            return fail(EINVAL); // what Linux answers for a size query on an epoll fd
+            return fail(EINVAL); // what Linux answers for a size query on an epoll fd, SIOCATMARK too
         }
         if (arg == nullptr)
         {
@@ -2287,12 +2378,20 @@ namespace ustack
         if (socket->kind == Kind::UDP)
         {
             // udp_ioctl: the next datagram's size, and nothing is ever queued to send.
-            if (request == SIOCOUTQNSD)
+            if (request == SIOCOUTQNSD || request == SIOCATMARK)
             {
                 return fail(ENOTTY);
             }
             *arg =
                 request == FIONREAD && !socket->received.empty() ? clamp(socket->received.front().payload.size()) : 0;
+            return 0;
+        }
+        // tcp_ioctl answers SIOCATMARK before it looks at the state, so a
+        // listener, like any socket with no urgent data, is "not at the mark".
+        if (request == SIOCATMARK)
+        {
+            const TcpConnection* marked = socket->listening ? nullptr : _connection(*socket);
+            *arg = marked != nullptr && marked->at_urgent_mark() ? 1 : 0;
             return 0;
         }
         if (socket->listening)
@@ -2307,7 +2406,8 @@ namespace ustack
         }
         if (request == FIONREAD)
         {
-            *arg = clamp(connection->bytes_available());
+            // Up to an urgent byte held out of band, as tcp_ioctl counts.
+            *arg = clamp(connection->bytes_before_urgent_mark());
         }
         else if (handshaking(connection->get_state()))
         {
@@ -2479,9 +2579,18 @@ namespace ustack
         }
         // tcp_poll: readable once the queue holds SO_RCVLOWAT bytes; the end of
         // the stream was handled above and always counts.
-        if (connection->bytes_available() >= _rcvlowat(socket))
+        // tcp_poll raises the target by one when the reader is at an urgent
+        // byte it will step over: that byte is not something to read.
+        const size_t target = _rcvlowat(socket) + (!socket.oob_inline && connection->at_urgent_mark() ? 1 : 0);
+        if (connection->bytes_available() >= target)
         {
             mask |= READABLE;
+        }
+        // An urgent byte has arrived and is unread (tcp_poll's EPOLLPRI):
+        // also with SO_OOBINLINE, until the reader is past it.
+        if (connection->urgent_pending())
+        {
+            mask |= EPOLLPRI;
         }
         // Shut for writing counts as writable: a write returns at once (EPIPE).
         if (socket.shut_wr || connection->send_space_available() > 0)
@@ -3022,8 +3131,7 @@ namespace ustack
         bool vanished = false;
         // The sets Linux's do_select() builds: readable is EPOLLIN | EPOLLHUP |
         // EPOLLERR, writable is EPOLLOUT | EPOLLERR, exceptional is EPOLLPRI
-        // alone - urgent data, which this stack does not have (no MSG_OOB,
-        // no SO_OOBINLINE), so the exceptional set is always left empty.
+        // alone - urgent data that has arrived and not been read.
         // Notably an error does NOT put an fd in the exceptional set.
         auto scan = [&]
         {

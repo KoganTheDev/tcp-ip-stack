@@ -466,7 +466,7 @@ public:
 
     // Bytes waiting to be read. The application's share of the receive buffer.
     // An urgent byte held out of band is in this count until it is passed,
-    // as Linux's is (poll says readable for a lone one).
+    // as Linux's is (the socket layer discounts it for readiness).
     size_t bytes_available() const { return _receive_queued_bytes; }
 
     // --- Urgent data (MSG_OOB), with Linux's semantics ---
@@ -493,6 +493,10 @@ public:
     // FIONREAD: with an urgent byte held out of band, what lies before it;
     // otherwise everything queued.
     size_t bytes_before_urgent_mark() const;
+    // How many bytes a read (or MSG_PEEK) of up to `max` would give right now:
+    // fewer than are queued when the mark is ahead, and not counting an urgent
+    // byte it would step over.
+    size_t readable_size(size_t max) const;
     // recv(MSG_OOB). BYTE: *byte is the urgent byte (and, unless `peek`, it
     // is now read - once only). NONE: none, already read, or inline (EINVAL).
     // NOT_YET: the pointer has arrived and the byte has not (EAGAIN).
@@ -1383,7 +1387,10 @@ private:
     uint8_t _urg_byte = 0;
     // The unwrapped position of the next byte the application reads
     // (Linux's copied_seq).
-    uint64_t _copied_unwrapped() const { return _recv_next_unwrapped - _receive_queued_bytes; }
+    // RCV.NXT counts the peer's FIN, which is no byte of the stream.
+    uint64_t _recv_fin_counted = 0;
+    uint64_t _data_end_unwrapped() const { return _recv_next_unwrapped - _recv_fin_counted; }
+    uint64_t _copied_unwrapped() const { return _data_end_unwrapped() - _receive_queued_bytes; }
     // What a read of up to `max` bytes does about the urgent byte: skip it
     // first (it is at the head, out of band), and take at most `limit`.
     void _urgent_plan(size_t max, size_t& skip, size_t& limit) const;

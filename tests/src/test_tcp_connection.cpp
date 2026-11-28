@@ -2487,8 +2487,9 @@ TEST(TcpConnection, DataPlusOptionsNeverExceedsTheMss)
 // middleboxes clear it, so it cannot be relied on. This stack follows the
 // RFC's advice for implementations that do not use it: the URG bit and the
 // pointer are ignored for delivery, and "urgent" bytes arrive inline, in
-// sequence order, like any others (the SO_OOBINLINE behaviour). It never sets
-// URG on what it sends.
+// sequence order, like any others (the SO_OOBINLINE behaviour). It only sets
+// URG on what it sends when asked (send(data, true); see test_tcp_urgent.cpp),
+// and only tracks urgent data when asked (set_urgent_tracking()).
 TEST(TcpConnection, UrgentDataIsDeliveredInlineAndUrgIsNeverSent)
 {
     struct Sent

@@ -698,6 +698,14 @@ void TcpConnection::_urgent_after_read()
     }
 }
 
+size_t TcpConnection::readable_size(size_t max) const
+{
+    size_t skip = 0;
+    size_t limit = max;
+    _urgent_plan(max, skip, limit);
+    return std::min(limit, _receive_queued_bytes - std::min(skip, _receive_queued_bytes));
+}
+
 bool TcpConnection::at_urgent_mark() const
 {
     return _urgent_tracking && _urg_state != UrgState::NONE && _urg_seq == _copied_unwrapped();
@@ -708,7 +716,7 @@ size_t TcpConnection::bytes_before_urgent_mark() const
     // tcp_ioctl(SIOCINQ): only a byte held out of band, and still ahead of
     // RCV.NXT, shortens the answer.
     if (!_urgent_tracking || _oob_inline || _urg_state == UrgState::NONE || _urg_seq < _copied_unwrapped()
-        || _urg_seq >= _recv_next_unwrapped)
+        || _urg_seq >= _data_end_unwrapped())
     {
         return _receive_queued_bytes;
     }
@@ -2300,6 +2308,7 @@ void TcpConnection::_handle_fin(uint32_t fin_seq)
     }
 
     _advance_recv_next(1); // the FIN itself consumes one sequence number
+    _recv_fin_counted = 1;
 
     if (_state == TcpState::ESTABLISHED)
     {

@@ -345,6 +345,19 @@ TEST(TcpUrgentReceive, ALoneUrgentByteIsSkippedByANormalReadAndLost)
     ASSERT_TRUE(wire.connection->read_urgent(byte, false) == TcpConnection::UrgentRead::NONE);
 }
 
+// RCV.NXT counts the peer's FIN, which is not a byte of the stream: the
+// reader's position must not move by it, or the urgent byte is missed.
+TEST(TcpUrgentReceive, AFinAfterTheUrgentByteDoesNotShiftTheReadersPosition)
+{
+    UrgentWire wire;
+    wire.data(501, "x", 1);
+    wire.connection->on_segment(*Wire::peer_segment(502, 1001, FLAG_ACK | 0x01, Bytes(), 0));
+    ASSERT_TRUE(wire.connection->at_urgent_mark());
+    ASSERT_TRUE(wire.connection->bytes_before_urgent_mark() == 0);
+    ASSERT_TRUE(wire.read().empty()) << "the urgent byte is stepped over, EOF follows";
+    ASSERT_TRUE(!wire.connection->urgent_pending());
+}
+
 TEST(TcpUrgentReceive, AZeroLengthReadTakesNothingAndSkipsNothing)
 {
     UrgentWire wire;
