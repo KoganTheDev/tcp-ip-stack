@@ -12,6 +12,7 @@
 
 #include "stack_harness.h"
 #include "test_support.h"
+#include "ustack/tcp_info_abi.h"
 
 // getsockopt(TCP_INFO) on ustack::Stack and on the kernel (KernelStack), as one
 // scenario each. Values that depend on timing, the congestion state or the
@@ -48,7 +49,7 @@ namespace
     template <class S>
     std::string info_shape(S& s, int fd, bool sent_data = false)
     {
-        tcp_info info;
+        ustack::KernelTcpInfo info;
         std::memset(&info, 0, sizeof(info));
         socklen_t length = sizeof(info);
         if (s.getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &length) != 0)
@@ -167,7 +168,7 @@ namespace
         note("optlen 100", optlen_case(client, pair.client, 100));
         note("optlen 1024", optlen_case(client, pair.client, 1024));
         {
-            tcp_info info;
+            ustack::KernelTcpInfo info;
             socklen_t length = static_cast<socklen_t>(-1);
             int rc = client.getsockopt(pair.client, IPPROTO_TCP, TCP_INFO, &info, &length);
             note("optlen -1", rc == 0 ? "ok" : failure());

@@ -1,6 +1,7 @@
 #include "test_support.h"
 #include "tcp_connection.h"
 #include "raw.h"
+#include "ustack/tcp_info_abi.h"
 
 #include <gtest/gtest.h>
 

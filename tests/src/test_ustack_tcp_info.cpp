@@ -10,6 +10,7 @@
 
 #include "test_support.h"
 #include "ustack_fixture.h"
+#include "ustack/tcp_info_abi.h"
 
 // getsockopt(IPPROTO_TCP, TCP_INFO) on ustack::Stack. The layout and the units
 // are Linux's, read off the kernel with a probe program (and compared again in
@@ -37,9 +38,9 @@ namespace
     protected:
         UstackTcpInfo() : UstackFixture(delayed_link()) {}
 
-        static tcp_info info_of(ustack::Stack& stack, int fd)
+        static ustack::KernelTcpInfo info_of(ustack::Stack& stack, int fd)
         {
-            tcp_info info;
+            ustack::KernelTcpInfo info;
             std::memset(&info, 0xAA, sizeof(info));
             socklen_t length = sizeof(info);
             int rc = stack.getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &length);
@@ -75,7 +76,7 @@ namespace
 TEST_F(UstackTcpInfo, AFreshSocketIsClosedWithLinuxsInitialValues)
 {
     int fd = client->socket(AF_INET, SOCK_STREAM, 0);
-    tcp_info info = info_of(*client, fd);
+    ustack::KernelTcpInfo info = info_of(*client, fd);
     EXPECT_EQ(info.tcpi_state, 7) << "TCP_CLOSE";
     EXPECT_EQ(info.tcpi_rto, 1000000u) << "1 s initial RTO, in microseconds";
     EXPECT_EQ(info.tcpi_snd_cwnd, 10u) << "RFC 6928 initial window, in segments";
@@ -96,7 +97,7 @@ TEST_F(UstackTcpInfo, AListenerIsInListenState)
 TEST_F(UstackTcpInfo, EstablishedConnectionShowsNegotiatedOptionsAndUnits)
 {
     auto [c, s] = connected_pair();
-    tcp_info info = info_of(*client, c);
+    ustack::KernelTcpInfo info = info_of(*client, c);
     EXPECT_EQ(info.tcpi_state, 1) << "TCP_ESTABLISHED";
     EXPECT_EQ(info.tcpi_options, TCPI_OPT_TIMESTAMPS | TCPI_OPT_SACK | TCPI_OPT_WSCALE);
     EXPECT_GT(info.tcpi_snd_wscale, 0);
@@ -117,7 +118,7 @@ TEST_F(UstackTcpInfo, RoundTripTimeIsInMicroseconds)
 {
     auto [c, s] = connected_pair();
     transfer(c, s, 20000);
-    tcp_info info = info_of(*client, c);
+    ustack::KernelTcpInfo info = info_of(*client, c);
     // 2 x 20 ms on the wire (more if a delayed ACK was timed): in microseconds
     // that is at least 40000; read as milliseconds it would be under 300.
     EXPECT_GE(info.tcpi_rtt, 40000u);
@@ -142,7 +143,7 @@ TEST_F(UstackTcpInfo, DataInFlightShowsAsUnackedSegments)
     auto [c, s] = connected_pair();
     std::string data(4000, 'y');
     ASSERT_EQ(client->send(c, data.data(), data.size(), MSG_NOSIGNAL), 4000);
-    tcp_info info = info_of(*client, c);
+    ustack::KernelTcpInfo info = info_of(*client, c);
     EXPECT_EQ(info.tcpi_unacked, 3u) << "4000 bytes at 1448 per segment, nothing acked yet";
     EXPECT_EQ(info.tcpi_sacked, 0u);
     EXPECT_EQ(info.tcpi_lost, 0u);
@@ -155,7 +156,7 @@ TEST_F(UstackTcpInfo, OptlenIsHonouredLikeLinux)
 {
     auto [c, s] = connected_pair();
     (void)s;
-    tcp_info info;
+    ustack::KernelTcpInfo info;
     socklen_t length = 0;
     EXPECT_EQ(client->getsockopt(c, IPPROTO_TCP, TCP_INFO, &info, &length), 0) << std::strerror(errno);
     EXPECT_EQ(length, 0u);
@@ -170,7 +171,7 @@ TEST_F(UstackTcpInfo, OptlenIsHonouredLikeLinux)
     char big[1024];
     length = sizeof(big);
     EXPECT_EQ(client->getsockopt(c, IPPROTO_TCP, TCP_INFO, big, &length), 0) << std::strerror(errno);
-    EXPECT_EQ(length, sizeof(tcp_info)) << "capped at the structure's size";
+    EXPECT_EQ(length, sizeof(ustack::KernelTcpInfo)) << "capped at the structure's size";
 
     length = static_cast<socklen_t>(-1);
     EXPECT_EQ(client->getsockopt(c, IPPROTO_TCP, TCP_INFO, &info, &length), -1);
@@ -184,7 +185,7 @@ TEST_F(UstackTcpInfo, OptlenIsHonouredLikeLinux)
 TEST_F(UstackTcpInfo, CannotBeSetAndIsNotForDatagrams)
 {
     int fd = client->socket(AF_INET, SOCK_STREAM, 0);
-    tcp_info info{};
+    ustack::KernelTcpInfo info{};
     EXPECT_EQ(client->setsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, sizeof(info)), -1);
     EXPECT_EQ(errno, ENOPROTOOPT);
 
@@ -240,7 +241,7 @@ TEST_F(UstackTcpInfoLossy, RetransmissionsAreCounted)
         },
         600000);
     ASSERT_EQ(received, data.size());
-    tcp_info info{};
+    ustack::KernelTcpInfo info{};
     socklen_t length = sizeof(info);
     ASSERT_EQ(client->getsockopt(c, IPPROTO_TCP, TCP_INFO, &info, &length), 0);
     EXPECT_GT(info.tcpi_total_retrans, 0u) << "3% loss over 200 kB";
