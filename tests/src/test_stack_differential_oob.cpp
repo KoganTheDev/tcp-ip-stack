@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
 #include <linux/sockios.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -103,6 +104,23 @@ namespace
     {
         std::string buffer(len, '\0');
         ssize_t n = s.recv(fd, buffer.data(), len, flags | MSG_DONTWAIT);
+        if (n < 0)
+        {
+            return failure();
+        }
+        buffer.resize(static_cast<size_t>(n));
+        return "n=" + std::to_string(n) + " \"" + buffer + "\"";
+    }
+
+    // As recv_text, but a call that may wait: only then does the WAITALL /
+    // SO_RCVLOWAT loop go round again past the mark. Data is always queued, so
+    // no blocking happens when the stack stops at the mark.
+    template <class S>
+    std::string recv_text_blocking(S& s, int fd, size_t len, int flags)
+    {
+        REQUIRE_TRUE(s.fcntl(fd, F_SETFL, 0) == 0, failure()); // the sockets are made O_NONBLOCK
+        std::string buffer(len, '\0');
+        ssize_t n = s.recv(fd, buffer.data(), len, flags);
         if (n < 0)
         {
             return failure();
@@ -399,6 +417,42 @@ namespace
                 total += static_cast<size_t>(n);
             }
             note("stream bytes read", std::to_string(total));
+        }
+        {
+            // A read that wants more than the bytes before the mark must stop
+            // at the mark (tcp_recvmsg: "if (copied) break" at urgent_data),
+            // so the reader can see SIOCATMARK and read the byte out of band.
+            struct Case
+            {
+                const char* name;
+                int lowat;
+                int flags;
+            };
+            const Case cases[] = {{"mark waitall", 0, MSG_WAITALL},
+                                  {"mark rcvlowat", 6, 0},
+                                  {"mark peek waitall", 0, MSG_PEEK | MSG_WAITALL},
+                                  {"mark peek rcvlowat", 6, MSG_PEEK}};
+            for (const Case& c : cases)
+            {
+                Pair p = fresh(c.name);
+                if (c.lowat != 0)
+                {
+                    int value = c.lowat;
+                    REQUIRE_TRUE(server.setsockopt(p.server, SOL_SOCKET, SO_RCVLOWAT, &value, sizeof(value)) == 0,
+                                 failure());
+                }
+                send_to(p.client, "abc", 0);
+                send_to(p.client, "X", MSG_OOB);
+                send_to(p.client, "def", 0);
+                note("first read", recv_text_blocking(server, p.server, 10, c.flags));
+                if ((c.flags & MSG_PEEK) != 0)
+                {
+                    note("consume", recv_text(server, p.server, 3, 0));
+                }
+                note("state", state(server, p.server));
+                note("recv OOB", recv_text(server, p.server, 1, MSG_OOB));
+                note("rest", recv_text(server, p.server, 10, 0));
+            }
         }
         {
             Pair p = fresh("epoll");

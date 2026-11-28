@@ -8,6 +8,8 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 
+#include <fcntl.h>
+
 #include <cerrno>
 #include <cstring>
 #include <string>
@@ -66,6 +68,22 @@ namespace
         {
             std::string out(len, '\0');
             ssize_t n = client->recv(fd, out.data(), len, flags | MSG_DONTWAIT);
+            if (n < 0)
+            {
+                return std::string("-") + std::strerror(errno);
+            }
+            out.resize(static_cast<size_t>(n));
+            return "=" + out;
+        }
+
+        // Without MSG_DONTWAIT: the WAITALL / SO_RCVLOWAT loop only goes round
+        // again, and so can step over the mark, on a call that may wait. Every
+        // read here has its data queued, so a correct stack never blocks.
+        std::string recv_blocking(int fd, size_t len, int flags)
+        {
+            REQUIRE_TRUE(client->fcntl(fd, F_SETFL, 0) == 0, std::strerror(errno)); // the fixture's sockets are O_NONBLOCK
+            std::string out(len, '\0');
+            ssize_t n = client->recv(fd, out.data(), len, flags);
             if (n < 0)
             {
                 return std::string("-") + std::strerror(errno);
@@ -139,6 +157,48 @@ TEST_F(UstackOob, ANormalReadStopsAtTheMarkThenStepsOverTheByte)
     EXPECT_EQ(at_mark(c), 0);
     EXPECT_EQ(poll_events(c) & POLLPRI, 0);
     EXPECT_EQ(recv_flags(c, 1, MSG_OOB), "-Invalid argument") << "passed without being read: gone";
+}
+
+// tcp_recvmsg breaks out of its copy loop at the urgent mark once it has
+// copied something, even when MSG_WAITALL / SO_RCVLOWAT want more: the reader
+// gets the short count and can see the mark (SIOCATMARK, recv(MSG_OOB)).
+TEST_F(UstackOob, WaitallStopsAtTheMarkSoTheByteCanBeReadOutOfBand)
+{
+    auto [c, s] = pair();
+    send_plain(s, "abc");
+    send_oob(s, "X");
+    send_plain(s, "def");
+    EXPECT_EQ(recv_blocking(c, 10, MSG_WAITALL), "=abc") << "short read at the mark";
+    EXPECT_EQ(at_mark(c), 1);
+    EXPECT_EQ(recv_flags(c, 1, MSG_OOB), "=X") << "the byte was not skipped";
+    EXPECT_EQ(recv_flags(c, 10, 0), "=def");
+}
+
+TEST_F(UstackOob, RcvlowatAboveOneStopsAtTheMarkToo)
+{
+    auto [c, s] = pair();
+    int lowat = 6;
+    ASSERT_EQ(client->setsockopt(c, SOL_SOCKET, SO_RCVLOWAT, &lowat, sizeof(lowat)), 0) << std::strerror(errno);
+    send_plain(s, "abc");
+    send_oob(s, "X");
+    send_plain(s, "def");
+    EXPECT_EQ(recv_blocking(c, 10, 0), "=abc");
+    EXPECT_EQ(at_mark(c), 1);
+    EXPECT_EQ(recv_flags(c, 1, MSG_OOB), "=X");
+    EXPECT_EQ(recv_flags(c, 10, 0), "=def");
+}
+
+TEST_F(UstackOob, PeekWaitallIsBoundedByTheMark)
+{
+    auto [c, s] = pair();
+    send_plain(s, "abc");
+    send_oob(s, "X");
+    send_plain(s, "def");
+    EXPECT_EQ(recv_blocking(c, 10, MSG_PEEK | MSG_WAITALL), "=abc");
+    EXPECT_EQ(recv_flags(c, 3, 0), "=abc");
+    EXPECT_EQ(at_mark(c), 1);
+    EXPECT_EQ(recv_flags(c, 1, MSG_OOB), "=X");
+    EXPECT_EQ(recv_flags(c, 10, 0), "=def");
 }
 
 TEST_F(UstackOob, ReadingTheByteFirstLeavesTheMarkInPlace)
