@@ -9,6 +9,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -197,6 +198,47 @@ TEST_F(UstackSigurgReal, SoOobinlineNotifiesToo)
     EXPECT_EQ(sigurg.wait(SIGNAL_WAIT_MS), 1) << "Linux raises it with SO_OOBINLINE as well";
     send_oob(s, "j");
     EXPECT_EQ(sigurg.wait(SIGNAL_WAIT_MS), 1);
+}
+
+// An owner group of 1 is process group 1, as Linux has it - not kill(-1),
+// POSIX's broadcast to every process the caller may signal, which a remote
+// peer could trigger by sending urgent data. A bystander in a group of its
+// own, blocking SIGURG, must therefore see nothing.
+TEST_F(UstackSigurgReal, OwnerGroupOneIsNotABroadcast)
+{
+    auto [c, s] = pair();
+    int ready[2] = {-1, -1};
+    ASSERT_EQ(::pipe(ready), 0) << std::strerror(errno);
+    pid_t child = ::fork();
+    if (child < 0)
+    {
+        ::close(ready[0]);
+        ::close(ready[1]);
+    }
+    ASSERT_GE(child, 0) << std::strerror(errno);
+    if (child == 0)
+    {
+        ::setsid();
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGURG);
+        pthread_sigmask(SIG_BLOCK, &set, nullptr);
+        char go = 'r';
+        static_cast<void>(::write(ready[1], &go, 1));
+        timespec timeout{1, 0};
+        ::_exit(sigtimedwait(&set, nullptr, &timeout) == SIGURG ? 1 : 0);
+    }
+    char go = 0;
+    ssize_t got = ::read(ready[0], &go, 1);
+    ::close(ready[0]);
+    ::close(ready[1]);
+    ASSERT_EQ(got, 1);
+    EXPECT_EQ(client->fcntl(c, F_SETOWN, -1), 0) << "Linux accepts group 1";
+    send_oob(s, "b");
+    int status = 0;
+    ASSERT_EQ(::waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0) << "a process outside group 1 was signalled: kill(-1) broadcast";
 }
 
 // The real driver, end to end: a SOCK_SEQPACKET socketpair is the wire, the

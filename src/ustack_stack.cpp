@@ -428,10 +428,19 @@ namespace ustack
     {
         auto it = _fd_by_connection.find(connection_id);
         const Socket* socket = it == _fd_by_connection.end() ? nullptr : _get(it->second);
-        if (socket != nullptr && socket->owner_id != 0)
+        if (socket == nullptr || socket->owner_id <= 0)
         {
-            _pending_signals.push_back({socket->owner_type, socket->owner_id});
+            return;
         }
+        // One signal per owner per step: standard signals coalesce anyway.
+        for (const PendingSignal& queued : _pending_signals)
+        {
+            if (queued.owner_type == socket->owner_type && queued.owner_id == socket->owner_id)
+            {
+                return;
+            }
+        }
+        _pending_signals.push_back({socket->owner_type, socket->owner_id});
     }
 
     void Stack::_deliver_signals()
@@ -455,6 +464,15 @@ namespace ustack
             batch.swap(_pending_signals);
             for (const PendingSignal& pending : batch)
             {
+                // Never kill(0) (our group) or kill(-1) (everyone): ids are
+                // positive when queued, and groups go through killpg().
+                // glibc's killpg(1, ...) IS kill(-1, ...), the broadcast (Linux
+                // itself signals group 1 from the kernel), so group 1 is
+                // stored and reported but never signalled from here.
+                if (pending.owner_id <= 0)
+                {
+                    continue;
+                }
                 if (_signal_sender)
                 {
                     static_cast<void>(_signal_sender(pending.owner_type, pending.owner_id, SIGURG));
@@ -466,7 +484,10 @@ namespace ustack
                     static_cast<void>(::kill(pending.owner_id, SIGURG));
                     break;
                 case F_OWNER_PGRP:
-                    static_cast<void>(::kill(-pending.owner_id, SIGURG));
+                    if (pending.owner_id != 1)
+                    {
+                        static_cast<void>(::killpg(pending.owner_id, SIGURG));
+                    }
                     break;
                 default:
                     static_cast<void>(::syscall(SYS_tgkill, ::getpid(), pending.owner_id, SIGURG));
@@ -2599,7 +2620,10 @@ namespace ustack
                 probe = ::kill(id, 0);
                 break;
             case F_OWNER_PGRP:
-                probe = ::kill(-id, 0);
+                // killpg, never kill(-id): id is positive here, but a
+                // negative kill() argument is the POSIX spelling of a group
+                // and kill(-1) is a broadcast. Group 1 is group 1.
+                probe = id == 1 ? 0 : ::killpg(id, 0); // group 1: see _deliver_signals()
                 break;
             default:
                 probe = static_cast<int>(::syscall(SYS_tgkill, ::getpid(), id, 0));

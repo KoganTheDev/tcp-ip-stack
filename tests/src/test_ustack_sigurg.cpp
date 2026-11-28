@@ -313,3 +313,74 @@ TEST_F(UstackSigurg, ABlockedEpollWaitDeliversAfterItsPumpStep)
     EXPECT_EQ(events.size(), 1U);
     EXPECT_EQ(sent.size(), 1U) << "delivered inside the wait, not left for a later call";
 }
+
+TEST_F(UstackSigurg, GroupOwnersAreNeverNegativeOrZeroKillTargets)
+{
+    auto [c, s] = pair();
+    ASSERT_EQ(client->fcntl(c, F_SETOWN, -1), 0) << "Linux accepts process group 1";
+    send_flags(s, "a", MSG_OOB);
+    ASSERT_EQ(sent.size(), 1U);
+    EXPECT_EQ(sent[0], (Sent{F_OWNER_PGRP, 1, SIGURG})) << "group 1, with a positive id";
+    EXPECT_EQ(client->fcntl(c, F_SETOWN, -4000000), -1);
+    EXPECT_EQ(errno, ESRCH) << "a group that does not exist";
+    EXPECT_EQ(owner_ex(c, F_OWNER_PGRP, 4000000), -1);
+    EXPECT_EQ(errno, ESRCH);
+}
+
+TEST_F(UstackSigurg, NotificationsForTheSameOwnerInOneStepAreOne)
+{
+    auto [c, s] = pair();
+    ASSERT_EQ(client->fcntl(c, F_SETOWN, getpid()), 0);
+    ASSERT_EQ(server->send(s, "a", 1, MSG_OOB), 1);
+    ASSERT_EQ(server->send(s, "b", 1, MSG_OOB), 1);
+    settle();
+    EXPECT_EQ(sent.size(), 1U) << "standard signals coalesce anyway";
+}
+
+// A frame delivered twice carries the same urgent pointer again (what a
+// retransmission does): tcp_check_urg ignores a pointer that is not newer.
+TEST(UstackSigurgDuplicate, ARepeatedUrgentSegmentNotifiesOnce)
+{
+    LinkParams params;
+    params.duplicate = 1.0;
+    SimNetwork net{7};
+    NetemChannel& link = net.add_link(params, params);
+    NetworkStack& a_net =
+        net.add_stack(link.take_endpoint(NetemChannel::A), MacAddress("02:00:00:00:00:11"), IPv4Address("10.1.0.1"));
+    NetworkStack& b_net =
+        net.add_stack(link.take_endpoint(NetemChannel::B), MacAddress("02:00:00:00:00:12"), IPv4Address("10.1.0.2"));
+    ustack::Stack a(a_net, std::make_unique<UstackSimDriver>(net));
+    ustack::Stack b(b_net, std::make_unique<UstackSimDriver>(net));
+    int received = 0;
+    b.set_signal_sender(
+        [&received](int, int, int)
+        {
+            received++;
+            return 0;
+        });
+    sockaddr_in in{};
+    in.sin_family = AF_INET;
+    in.sin_port = htons(7100);
+    const IPv4Address server_ip("10.1.0.2");
+    std::memcpy(&in.sin_addr.s_addr, server_ip.get_address().data(), 4);
+    const sockaddr* to = reinterpret_cast<const sockaddr*>(&in);
+    int listener = b.socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    ASSERT_EQ(b.bind(listener, to, sizeof(in)), 0);
+    ASSERT_EQ(b.listen(listener, 4), 0);
+    int sender = a.socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    ASSERT_EQ(a.connect(sender, to, sizeof(in)), -1);
+    int accepted = -1;
+    net.run_until(
+        [&]
+        {
+            accepted = b.accept4(listener, nullptr, nullptr, SOCK_NONBLOCK);
+            return accepted >= 0;
+        },
+        2000);
+    ASSERT_GE(accepted, 0);
+    ASSERT_EQ(b.fcntl(accepted, F_SETOWN, getpid()), 0);
+    ASSERT_EQ(a.send(sender, "u", 1, MSG_OOB), 1);
+    net.step(50);
+    b.run_once(0);
+    EXPECT_EQ(received, 1) << "the duplicate repeats a pointer already seen";
+}

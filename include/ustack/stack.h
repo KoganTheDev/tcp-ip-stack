@@ -434,6 +434,8 @@ namespace ustack
         //    reader has already passed.
         // Here the signal is sent by this process (the Stack lives in the
         // application): kill(pid), kill(-pgid) or tgkill(getpid(), tid).
+        // Process group 1 is accepted (as Linux does) but never signalled:
+        // glibc's killpg(1) is kill(-1), a broadcast to every process.
         // An F_OWNER_TID owner must therefore be a thread of this process
         // (Linux also takes a thread of another one). O_ASYNC / SIGIO is not
         // implemented (the flag is ignored, as the F_SETFL comment says).
