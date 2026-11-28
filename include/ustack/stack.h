@@ -413,7 +413,48 @@ namespace ustack
         // (FD_CLOEXEC, stored and meaningless). Anything else is EINVAL. The
         // third argument is an int, not a variadic, so ustack::KernelStack
         // forwards it with no va_list handling.
+        //
+        // Ownership of urgent-data signals, as Linux's f_owner: F_SETOWN
+        // (arg > 0 a process, < 0 a process group, 0 none; INT_MIN is
+        // EINVAL) and F_SETOWN_EX (struct f_owner_ex: F_OWNER_TID,
+        // F_OWNER_PID or F_OWNER_PGRP; the second overload below), with
+        // F_GETOWN / F_GETOWN_EX to read it back. Probed on loopback:
+        //  - F_GETOWN is the pid, the tid for an F_OWNER_TID owner, and
+        //    -pgid for a group (a negative that is not an error); no owner
+        //    is 0, and F_GETOWN_EX then says {F_OWNER_TID, 0};
+        //  - an owner that does not exist is ESRCH, an unknown type EINVAL,
+        //    a null pointer EFAULT; a refused call changes nothing;
+        //  - any socket takes an owner (listener, UDP, epoll fd, a TCP
+        //    socket with no connection yet); an accepted socket does NOT
+        //    inherit its listener's;
+        //  - when a segment brings a NEW urgent pointer to a TCP socket
+        //    (tcp_check_urg -> sk_send_sigurg), SIGURG goes to the owner,
+        //    also under SO_OOBINLINE; no owner, no signal. Not for ordinary
+        //    data, not for an old or repeated pointer, not for one the
+        //    reader has already passed.
+        // Here the signal is sent by this process (the Stack lives in the
+        // application): kill(pid), kill(-pgid) or tgkill(getpid(), tid).
+        // Process group 1 is accepted (as Linux does) but never signalled:
+        // glibc's killpg(1) is kill(-1), a broadcast to every process.
+        // An F_OWNER_TID owner must therefore be a thread of this process
+        // (Linux also takes a thread of another one). O_ASYNC / SIGIO is not
+        // implemented (the flag is ignored, as the F_SETFL comment says).
+        //
+        // The signal is not raised where the segment is processed. The
+        // notification is queued then, and sent by this thread after the
+        // current pump step (and at the end of the public call), outside any
+        // iteration of the stack's own tables, so a signal handler that calls
+        // back into the Stack never re-enters it mid-update. A handler's own
+        // calls may queue more; they go out before the outer call returns.
+        // The owner is read when the pointer arrives, as Linux does.
         int fcntl(int fd, int cmd, int arg = 0);
+        int fcntl(int fd, int cmd, struct f_owner_ex* owner);
+        // Where the notifications go: (owner type F_OWNER_*, id, signal),
+        // returning what kill() would. The default sends the real signal.
+        // A test seam too: it sees each notification without a process
+        // signal. nullptr restores the default.
+        using SignalSender = std::function<int(int owner_type, int id, int signo)>;
+        void set_signal_sender(SignalSender sender);
         // The sockets' size queries, as Linux answers them: FIONREAD (= SIOCINQ)
         // is the bytes a read would take on TCP and the size of the next
         // datagram on UDP (0 when none, and for an empty datagram); SIOCOUTQ is
@@ -558,6 +599,10 @@ namespace ustack
             bool keepalive = false;
             bool nodelay = false;
             bool oob_inline = false; // SO_OOBINLINE: an urgent byte stays in the stream
+            // F_SETOWN / F_SETOWN_EX: who gets SIGURG. owner_id 0 = nobody;
+            // owner_type is an F_OWNER_* value. Not inherited by accept().
+            int owner_type = 0;
+            int owner_id = 0;
             bool quickack = true;  // TCP_QUICKACK as set; a live connection answers for itself
             int rcvlowat = 1;      // SO_RCVLOWAT, already clamped (TCP only acts on it)
             // SO_RCVBUF / SO_SNDBUF: the payload capacity the application
@@ -676,6 +721,16 @@ namespace ustack
         // the pollable fd's signal.
         void _after_call();
         void _update_signal();
+        // fcntl()'s ownership commands: the common part of F_SETOWN and F_SETOWN_EX.
+        int _set_owner(Socket& socket, int type, int id);
+        // The urgent pointer of the connection's socket is new: queue SIGURG
+        // for its owner (read now), if it has one.
+        void _on_urgent(uint64_t connection_id);
+        // Sends what is queued. Called by the thread that drives the stack
+        // after every pump step and at the end of each public call - never
+        // from inside segment processing. Re-entrant calls (from a handler)
+        // return at once; the outer loop picks up what they queued.
+        void _deliver_signals();
         // A free port for bind(0), listen()'s or sendto()'s automatic bind:
         // one nothing of this Stack is bound to and, as Linux's
         // inet_csk_find_open_port, that no connection holds in a way
@@ -753,5 +808,15 @@ namespace ustack
         int _signal_fd = -1;   // eventfd: set while some ready list has a ready item
         int _pollable_fd = -1; // kernel epoll over _signal_fd and the driver's wake fd
         bool _signalled = false;
+        SignalSender _signal_sender; // empty: the real signals
+        // Urgent-pointer notifications recorded during segment processing,
+        // sent by _deliver_signals() at the next step boundary.
+        struct PendingSignal
+        {
+            int owner_type;
+            int owner_id;
+        };
+        std::vector<PendingSignal> _pending_signals;
+        bool _delivering = false; // a sender is running: a nested call only queues
     };
 }

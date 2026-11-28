@@ -4,6 +4,7 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -11,6 +12,7 @@
 #include <array>
 #include <cerrno>
 #include <climits>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -418,7 +420,81 @@ namespace ustack
         int saved_errno = errno;
         _driver->stack_changed(_stack);
         _update_signal();
+        _deliver_signals();
         errno = saved_errno;
+    }
+
+    void Stack::_on_urgent(uint64_t connection_id)
+    {
+        auto it = _fd_by_connection.find(connection_id);
+        const Socket* socket = it == _fd_by_connection.end() ? nullptr : _get(it->second);
+        if (socket == nullptr || socket->owner_id <= 0)
+        {
+            return;
+        }
+        // One signal per owner per step: standard signals coalesce anyway.
+        for (const PendingSignal& queued : _pending_signals)
+        {
+            if (queued.owner_type == socket->owner_type && queued.owner_id == socket->owner_id)
+            {
+                return;
+            }
+        }
+        _pending_signals.push_back({socket->owner_type, socket->owner_id});
+    }
+
+    void Stack::_deliver_signals()
+    {
+        if (_delivering || _pending_signals.empty())
+        {
+            return;
+        }
+        // Cleared however the sender leaves (it is the application's code).
+        struct Guard
+        {
+            bool& flag;
+            explicit Guard(bool& flag) : flag(flag) { flag = true; }
+            ~Guard() { flag = false; }
+            Guard(const Guard&) = delete;
+            Guard& operator=(const Guard&) = delete;
+        } guard(_delivering);
+        while (!_pending_signals.empty())
+        {
+            std::vector<PendingSignal> batch;
+            batch.swap(_pending_signals);
+            for (const PendingSignal& pending : batch)
+            {
+                // Never kill(0) (our group) or kill(-1) (everyone): ids are
+                // positive when queued, and groups go through killpg().
+                // glibc's killpg(1, ...) IS kill(-1, ...), the broadcast (Linux
+                // itself signals group 1 from the kernel), so group 1 is
+                // stored and reported but never signalled from here.
+                if (pending.owner_id <= 0)
+                {
+                    continue;
+                }
+                if (_signal_sender)
+                {
+                    static_cast<void>(_signal_sender(pending.owner_type, pending.owner_id, SIGURG));
+                    continue;
+                }
+                switch (pending.owner_type)
+                {
+                case F_OWNER_PID:
+                    static_cast<void>(::kill(pending.owner_id, SIGURG));
+                    break;
+                case F_OWNER_PGRP:
+                    if (pending.owner_id != 1)
+                    {
+                        static_cast<void>(::killpg(pending.owner_id, SIGURG));
+                    }
+                    break;
+                default:
+                    static_cast<void>(::syscall(SYS_tgkill, ::getpid(), pending.owner_id, SIGURG));
+                    break;
+                }
+            }
+        }
     }
 
     // --- connections ---
@@ -486,6 +562,14 @@ namespace ustack
                     stack->_on_connection_state(id, state);
                 }
             });
+        connection.set_urgent_callback(
+            [self, id]()
+            {
+                if (Stack* stack = *self)
+                {
+                    stack->_on_urgent(id);
+                }
+            });
         connection.set_send_space_callback(
             [self, id]()
             {
@@ -512,6 +596,7 @@ namespace ustack
     void Stack::_detach(TcpConnection& connection)
     {
         connection.set_data_ready_callback(nullptr);
+        connection.set_urgent_callback(nullptr);
         connection.set_send_space_callback(nullptr);
         // The state callback cannot be removed; it finds no fd from now on.
         _fd_by_connection.erase(connection.get_id());
@@ -2459,9 +2544,104 @@ namespace ustack
         case F_SETFD:
             socket->cloexec = (arg & FD_CLOEXEC) != 0;
             return 0;
+        case F_SETOWN:
+        {
+            // The sign picks the kind, as in fcntl(2); INT_MIN has no negation.
+            if (arg == INT_MIN)
+            {
+                return fail(EINVAL);
+            }
+            return _set_owner(*socket, arg < 0 ? F_OWNER_PGRP : F_OWNER_PID, arg < 0 ? -arg : arg);
+        }
+        case F_GETOWN:
+            // Linux: the pid or tid as is, a group as its negation.
+            return socket->owner_type == F_OWNER_PGRP ? -socket->owner_id : socket->owner_id;
         default:
             return fail(EINVAL);
         }
+    }
+
+    int Stack::fcntl(int fd, int cmd, struct f_owner_ex* owner)
+    {
+        CallScope scope(*this);
+        Socket* socket = _get(fd);
+        if (socket == nullptr)
+        {
+            return fail(EBADF);
+        }
+        switch (cmd)
+        {
+        case F_SETOWN_EX:
+            if (owner == nullptr)
+            {
+                return fail(EFAULT);
+            }
+            {
+                // The type is an enum in the header but whatever int the caller
+                // wrote (99 is EINVAL, not undefined behaviour): read its bytes.
+                static_assert(sizeof(owner->type) == sizeof(int), "f_owner_ex::type is an int-sized enum");
+                int type = 0;
+                std::memcpy(&type, &owner->type, sizeof(type));
+                return _set_owner(*socket, type, owner->pid);
+            }
+        case F_GETOWN_EX:
+            if (owner == nullptr)
+            {
+                return fail(EFAULT);
+            }
+            // An unset owner is {F_OWNER_TID (0), 0}, which is what the
+            // fields hold until the first set.
+            owner->type = static_cast<__pid_type>(socket->owner_type);
+            owner->pid = socket->owner_id;
+            return 0;
+        default:
+            return fail(EINVAL);
+        }
+    }
+
+    int Stack::_set_owner(Socket& socket, int type, int id)
+    {
+        if (type != F_OWNER_TID && type != F_OWNER_PID && type != F_OWNER_PGRP)
+        {
+            return fail(EINVAL);
+        }
+        if (id < 0)
+        {
+            return fail(ESRCH); // find_vpid() of a negative number finds nothing
+        }
+        if (id != 0)
+        {
+            // The kernel looks the pid up and gives ESRCH when there is none.
+            // A signal-0 probe is the same question; EPERM means it exists.
+            int probe = 0;
+            switch (type)
+            {
+            case F_OWNER_PID:
+                probe = ::kill(id, 0);
+                break;
+            case F_OWNER_PGRP:
+                // killpg, never kill(-id): id is positive here, but a
+                // negative kill() argument is the POSIX spelling of a group
+                // and kill(-1) is a broadcast. Group 1 is group 1.
+                probe = id == 1 ? 0 : ::killpg(id, 0); // group 1: see _deliver_signals()
+                break;
+            default:
+                probe = static_cast<int>(::syscall(SYS_tgkill, ::getpid(), id, 0));
+                break;
+            }
+            if (probe != 0 && errno != EPERM)
+            {
+                return fail(ESRCH);
+            }
+        }
+        socket.owner_type = type; // kept even when cleared: F_SETOWN 0 then reads {F_OWNER_PID, 0}
+        socket.owner_id = id;
+        return 0;
+    }
+
+    void Stack::set_signal_sender(SignalSender sender)
+    {
+        _signal_sender = std::move(sender);
     }
 
     // --- blocking ---
@@ -2510,6 +2690,7 @@ namespace ustack
     int Stack::_pump_until(const std::function<bool()>& done, std::optional<uint64_t> deadline, bool must_wait)
     {
         _driver->run_pending(_stack);
+        _deliver_signals();
         for (;;)
         {
             if (!must_wait && done())
@@ -2538,6 +2719,7 @@ namespace ustack
             // driver is set to wake for (a SYN's retransmission, say).
             _driver->stack_changed(_stack);
             _driver->wait_stack_only(_stack, remaining);
+            _deliver_signals();
         }
     }
 
@@ -2990,9 +3172,16 @@ namespace ustack
             return fail(EFAULT);
         }
         _driver->run_pending(_stack);
+        _deliver_signals();
         uint64_t start = _driver->now_ms();
         for (;;)
         {
+            // A handler may have closed the epoll fd: look it up afresh.
+            owner = _get(epfd);
+            if (owner == nullptr || owner->kind != Kind::EPOLL)
+            {
+                return fail(EBADF);
+            }
             int count = _collect(*owner->epoll, events, maxevents);
             count += _collect_external(*owner->epoll, events + count, maxevents - count);
             if (count > 0 || timeout == 0)
@@ -3010,6 +3199,7 @@ namespace ustack
                 remaining = timeout - static_cast<int>(elapsed);
             }
             _driver->wait(_stack, remaining);
+            _deliver_signals();
         }
     }
 
@@ -3236,9 +3426,11 @@ namespace ustack
     {
         CallScope scope(*this);
         _driver->run_pending(_stack);
+        _deliver_signals();
         if (timeout_ms != 0 && !_any_ready())
         {
             _driver->wait(_stack, timeout_ms);
+            _deliver_signals();
         }
         return 0;
     }

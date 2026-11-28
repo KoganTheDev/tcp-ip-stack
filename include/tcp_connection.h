@@ -486,6 +486,13 @@ public:
     // SO_OOBINLINE: the byte is read in the stream, and read_urgent() has
     // nothing to give.
     void set_oob_inline(bool on) { _oob_inline = on; }
+    // Called when a segment brings an urgent pointer that is new: Linux's
+    // tcp_check_urg reaching sk_send_sigurg. Not for a pointer already seen
+    // (a retransmission, an older one) or one the reader is past, and before
+    // the urgent byte itself has necessarily arrived. It runs inside segment
+    // processing, so the callee must only record it (ustack::Stack queues a
+    // SIGURG), never call back into the stack.
+    void set_urgent_callback(DataReadyFn callback) { _on_urgent = std::move(callback); }
     // POLLPRI: an urgent byte has arrived and has not been read out of band.
     bool urgent_pending() const { return _urgent_tracking && _urg_state == UrgState::VALID; }
     // SIOCATMARK: the next byte to read is where the urgent pointer is.
@@ -1473,6 +1480,7 @@ private:
 
     SendSegmentEcnFn _send_segment;
     DataReadyFn _on_data_ready;
+    DataReadyFn _on_urgent;
     std::vector<StateChangedFn> _on_state_changed;
     // In-order data that has been acknowledged to the peer but not yet read by
     // the application. This is what the advertised window is a window onto: it

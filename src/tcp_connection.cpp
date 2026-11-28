@@ -770,6 +770,10 @@ void TcpConnection::_track_urgent(const Tcp& segment, const Bytes* payload)
             }
             _urg_state = UrgState::NOT_YET;
             _urg_seq = static_cast<uint64_t>(target);
+            if (_on_urgent)
+            {
+                _on_urgent(); // sk_send_sigurg, whether or not SO_OOBINLINE
+            }
         }
     }
     // tcp_urg: a byte waiting for its segment is taken from the one that has

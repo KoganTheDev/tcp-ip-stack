@@ -73,6 +73,8 @@ namespace ustack
         // An int third argument, like ustack::Stack's, so this is a plain
         // forward; ::fcntl itself is variadic.
         int fcntl(int fd, int cmd, int arg = 0) { return ::fcntl(fd, cmd, arg); }
+        // F_SETOWN_EX / F_GETOWN_EX take a struct f_owner_ex*.
+        int fcntl(int fd, int cmd, struct f_owner_ex* owner) { return ::fcntl(fd, cmd, owner); }
         int ioctl(int fd, unsigned long request, int* arg) { return ::ioctl(fd, request, arg); }
 
         // --- poll and select ---
