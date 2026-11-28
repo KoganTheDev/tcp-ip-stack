@@ -146,6 +146,14 @@ jobs:
               echo "No score was produced - see the job log."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+          # mull-runner exits 0 even when its warm-up run fails, so without
+          # this check the job stayed green while producing no score at all -
+          # it did, unnoticed, for several nightlies (warm-up timed out at
+          # mull-runner's 3 s default once the suite outgrew it).
+          if ! grep -q "Mutation score" build/mutation/mull-report/mull.log 2>/dev/null; then
+            echo "::error::Mull produced no mutation score (see 'Original test failed' in the log above)"
+            exit 1
+          fi
 
       - name: Upload the report
         if: always()
