@@ -348,7 +348,7 @@ namespace ustack
         // ("reno" or "cubic"). Options set on a listening socket are
         // inherited by the sockets accept() returns.
         //
-        // TCP_INFO fills the system's struct tcp_info (<netinet/tcp.h>) as
+        // TCP_INFO fills ustack::KernelTcpInfo (ustack/tcp_info_abi.h, the kernel UAPI struct tcp_info) as
         // Linux does: min(optlen, sizeof) bytes are copied and that length
         // written back; a negative length is EINVAL; on a UDP socket the get is
         // EOPNOTSUPP, as for every IPPROTO_TCP option there. Units are Linux's,

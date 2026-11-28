@@ -63,6 +63,39 @@ jobs:
           path: build/debug/test-results/
           if-no-files-found: ignore
 
+  # The same build on the oldest supported distro. ubuntu-latest tracks a newer
+  # glibc, which hid a break once: the nightly Mull job runs on ubuntu-24.04,
+  # whose <netinet/tcp.h> struct tcp_info lacks the newer fields. This job is
+  # advisory (not a required check): it is here so such a break shows on the
+  # pull request instead of the next morning's nightly run.
+  test-old-glibc:
+    name: test (g++, ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-deps
+        with:
+          cache-name: debug-g++-ubuntu-24.04
+
+      - name: Configure
+        run: cmake --preset debug -DCMAKE_CXX_COMPILER=g++
+
+      - name: Build
+        run: cmake --build --preset debug
+
+      - name: Run the unit tests
+        run: ctest --preset debug -L unit --parallel "$(nproc)"
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-debug-ubuntu-24.04
+          path: build/debug/test-results/
+          if-no-files-found: ignore
+
   # The network simulator's seeded property tests (ctest label `sim`), which the
   # unit runs above leave out. The default 200 seeds take a few seconds; the
   # nightly workflow runs 100000. A failing seed leaves a pcap of the run, which

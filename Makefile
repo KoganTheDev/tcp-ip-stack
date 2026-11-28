@@ -116,23 +116,45 @@ soak: all
 # Needs clang++-$(MULL_VERSION) and Mull's matching package (mull-$(MULL_VERSION)
 # from the Mull apt repository; its plugin must be built for exactly that LLVM).
 # Always a from-scratch build, for the same reason as the sanitizers: objects
-# compiled without the plugin have no mutants in them. The simulator's property
-# tests are left out (each mutant would pay for 200 seeds) and the report
-# lands in build/mutation/mull-report. MULL_RUNNER_ARGS adds mull-runner flags.
+# compiled without the plugin have no mutants in them. The report lands in
+# build/mutation/mull-report. MULL_RUNNER_ARGS adds mull-runner flags.
 MULL_VERSION ?= 19
 MULL_PLUGIN ?= /usr/lib/mull-ir-frontend-$(MULL_VERSION)
 MULL_RUNNER ?= $(shell command -v mull-runner-$(MULL_VERSION) || echo mull-runner)
 MULL_WORKERS ?= $(shell nproc 2>/dev/null || echo 1)
-MULL_RUNNER_ARGS ?=
+# Every mutant reruns the whole filtered suite, so its length is multiplied by
+# the mutant count (771 at last count). Left out: the simulator's property
+# tests (each mutant would pay for 200 seeds), the soaks, and every suite whose
+# time is spent waiting on the real clock - the kernel differentials, the
+# RealDriver tests, the load tests and the watchdog's own test. Those took the
+# suite from ~9 s to ~55 s and pushed the nightly past its 150-minute limit,
+# while the ustack code they reach is covered by the unit and simulator tests.
+# Suites are named exactly: a bare *Real* also matches unit tests about real
+# losses, which are the ones that kill tcp_connection mutants.
+MULL_TEST_EXCLUDE ?= *SimTransfer*:Soak.*:SoakSmoke.*:StackDifferential*:*SocketsDifferential.*:BindRulesDifferential.*:EchoLoad.*:EchoRealLoad.*:WatchdogTest.*:UstackRealDriver.*:UstackRealDriverLoopback.*:UstackBlockingRealDriver.*:UstackPollRealDriver.*:UstackSigurgReal.*:UstackSigurgRealDriver.*
+# mull-runner's default 3 s timeout also covers the warm-up run, which executes
+# the whole filtered suite in one process (~15 s on a CI runner with the
+# plugin's instrumentation); at 3 s that run timed out and no score was ever
+# produced. 60 s leaves room for it and bounds what a hanging mutant costs.
+MULL_TIMEOUT_MS ?= 60000
+MULL_RUNNER_ARGS ?= --timeout $(MULL_TIMEOUT_MS)
 
 mutation:
 	rm -rf build/mutation
 	$(CMAKE) --preset mutation -DCMAKE_CXX_COMPILER=clang++-$(MULL_VERSION) -DTCPIP_MULL_PLUGIN=$(MULL_PLUGIN)
 	$(CMAKE) --build --preset mutation --target run_tests
 	mkdir -p build/mutation/mull-report
+	@# One plain run first: mull-runner hides gtest's output, and this run's
+	@# slowest tests are where each of the ~771 mutant runs spends its time.
+	./build/mutation/run_tests --gtest_filter='-$(MULL_TEST_EXCLUDE)' > build/mutation/mull-report/plain-run.log 2>&1 || \
+	    { tail -40 build/mutation/mull-report/plain-run.log; exit 1; }
+	@echo "slowest tests in the mutation build (ms):"
+	@grep -E '^\[       OK \]' build/mutation/mull-report/plain-run.log | \
+	    sed -E 's/.*\] ([^ ]+) \(([0-9]+) ms\)/\2 \1/' | sort -rn | head -25
+	@grep -E '^\[==========\].*ran' build/mutation/mull-report/plain-run.log
 	$(MULL_RUNNER) ./build/mutation/run_tests --reporters IDE --reporters Elements \
 	    --report-dir build/mutation/mull-report --workers $(MULL_WORKERS) --allow-surviving \
-	    $(MULL_RUNNER_ARGS) --gtest_filter='-*SimTransfer*:Soak.*' | tee build/mutation/mull-report/mull.log
+	    $(MULL_RUNNER_ARGS) --gtest_filter='-$(MULL_TEST_EXCLUDE)' | tee build/mutation/mull-report/mull.log
 
 # Configure a preset the first time it is used, and again whenever the presets
 # file changes (re-running `cmake --preset` re-applies its cache variables).

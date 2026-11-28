@@ -17,6 +17,7 @@
 
 #include "stack_harness.h"
 #include "test_support.h"
+#include "ustack/tcp_info_abi.h"
 
 // ioctl(FIONREAD / SIOCOUTQ ...), TCP_QUICKACK and SO_RCVLOWAT / SO_SNDLOWAT
 // on ustack::Stack and on the kernel (KernelStack), as one scenario each and
@@ -104,7 +105,7 @@ namespace
     template <class S>
     unsigned unacked_of(S& s, int fd)
     {
-        tcp_info info{};
+        ustack::KernelTcpInfo info{};
         socklen_t length = sizeof(info);
         REQUIRE_TRUE(s.getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &length) == 0, failure());
         return info.tcpi_unacked;

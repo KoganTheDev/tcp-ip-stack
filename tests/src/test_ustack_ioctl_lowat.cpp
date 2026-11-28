@@ -16,6 +16,7 @@
 
 #include "test_support.h"
 #include "ustack_fixture.h"
+#include "ustack/tcp_info_abi.h"
 
 // ioctl(FIONREAD / SIOCINQ / SIOCOUTQ / SIOCOUTQNSD), TCP_QUICKACK and
 // SO_RCVLOWAT / SO_SNDLOWAT on ustack::Stack. The expected answers are the
@@ -205,7 +206,7 @@ namespace
         const int s = pair.second;
         auto unacked = [&]
         {
-            tcp_info info{};
+            ustack::KernelTcpInfo info{};
             socklen_t length = sizeof(info);
             REQUIRE_TRUE(client->getsockopt(c, IPPROTO_TCP, TCP_INFO, &info, &length) == 0, std::strerror(errno));
             return info.tcpi_unacked;

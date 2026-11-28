@@ -3,6 +3,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -26,6 +27,7 @@
 
 #include "exceptions.h"
 #include "ustack/stack.h"
+#include "ustack/tcp_info_abi.h"
 
 namespace ustack
 {
@@ -182,9 +184,9 @@ namespace ustack
         // What Linux reports for a socket with no connection: TCP_CLOSE, the
         // initial RTO and window, no samples. (A listener differs a little:
         // see fill_listener_info.)
-        tcp_info fresh_tcp_info()
+        KernelTcpInfo fresh_tcp_info()
         {
-            tcp_info info;
+            KernelTcpInfo info;
             std::memset(&info, 0, sizeof(info));
             info.tcpi_state = 7;
             info.tcpi_rto = static_cast<uint32_t>(RttEstimator::INITIAL_RTO_MS) * 1000;
@@ -196,9 +198,9 @@ namespace ustack
         }
 
         // Linux: a listener reads TCP_LISTEN with a cwnd of 10 and the rest zero.
-        tcp_info listener_tcp_info()
+        KernelTcpInfo listener_tcp_info()
         {
-            tcp_info info;
+            KernelTcpInfo info;
             std::memset(&info, 0, sizeof(info));
             info.tcpi_state = 10;
             info.tcpi_snd_cwnd = 10;
@@ -209,9 +211,9 @@ namespace ustack
         // times, segments for cwnd and ssthresh (the stack keeps milliseconds
         // and bytes), sequence-space byte counts as the kernel counts them.
         // Fields the stack has no counterpart for stay zero.
-        tcp_info connection_tcp_info(const TcpConnection::Info& in)
+        KernelTcpInfo connection_tcp_info(const TcpConnection::Info& in)
         {
-            tcp_info info;
+            KernelTcpInfo info;
             std::memset(&info, 0, sizeof(info));
             info.tcpi_state = linux_state(in.state);
             info.tcpi_options =
@@ -2274,7 +2276,7 @@ namespace ustack
             {
                 return fail(EINVAL);
             }
-            tcp_info info;
+            KernelTcpInfo info;
             if (socket->listening)
             {
                 info = listener_tcp_info();
