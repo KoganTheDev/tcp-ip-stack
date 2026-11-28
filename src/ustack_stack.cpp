@@ -1469,6 +1469,23 @@ namespace ustack
             {
                 return static_cast<ssize_t>(have); // got it all, or EOF
             }
+            // tcp_recvmsg stops at the urgent mark once it has copied
+            // something, however much WAITALL / SO_RCVLOWAT still want: the
+            // short read lets the application see the mark (SIOCATMARK,
+            // recv(MSG_OOB)). Going round again would step over the byte
+            // and lose it. A peek is at the mark when it saw everything
+            // before it and more is queued behind. Inline, the byte is data
+            // and the read goes on.
+            if (have > 0 && !socket->oob_inline)
+            {
+                const TcpConnection* connection = _connection(*socket);
+                if (connection != nullptr
+                    && (peek ? have == connection->bytes_before_urgent_mark() && have < connection->bytes_available()
+                             : connection->at_urgent_mark()))
+                {
+                    return static_cast<ssize_t>(have);
+                }
+            }
             if (!deadline_set)
             {
                 deadline = _deadline(socket->rcvtimeo_us);

@@ -81,7 +81,8 @@ namespace
         // read here has its data queued, so a correct stack never blocks.
         std::string recv_blocking(int fd, size_t len, int flags)
         {
-            REQUIRE_TRUE(client->fcntl(fd, F_SETFL, 0) == 0, std::strerror(errno)); // the fixture's sockets are O_NONBLOCK
+            REQUIRE_TRUE(client->fcntl(fd, F_SETFL, 0) == 0,
+                         std::strerror(errno)); // the fixture's sockets are O_NONBLOCK
             std::string out(len, '\0');
             ssize_t n = client->recv(fd, out.data(), len, flags);
             if (n < 0)
