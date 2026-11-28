@@ -704,6 +704,11 @@ ARP ageing, IPv6 addressing and headers, the NDP neighbour cache, DAD and SLAAC,
 ICMP, the thread pool and completion queue, and the logger, plus a fuzz suite asserting
 no codec crashes on malformed input.
 
+A per-test watchdog (`tests/src/test_watchdog.cpp`) turns a hung test into a named failure: a
+test running longer than `TEST_WATCHDOG_S` seconds (default 120, five times that under ASan/TSan,
+an hour for the opt-in `SOAK` and `ECHO_REAL_STRESS` runs, `0` disables) is reported, every
+thread's backtrace is printed through gdb, and the run aborts.
+
 Two seams make the untestable parts testable without any OS involvement: `PacketChannel`
 injects a fake frame transport into `NetworkStack`, and `LoopbackChannel` wires two
 complete stacks back to back through a real ARP exchange, handshake, data transfer, and
