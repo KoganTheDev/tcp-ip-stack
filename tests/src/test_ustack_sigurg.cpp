@@ -125,6 +125,9 @@ TEST_F(UstackSigurg, SetOwnShowsInGetOwnAndGetOwnEx)
 
     ASSERT_EQ(client->fcntl(c, F_SETOWN, 0), 0);
     EXPECT_EQ(client->fcntl(c, F_GETOWN), 0) << "0 clears the owner";
+    ASSERT_EQ(client->fcntl(c, F_GETOWN_EX, &owner), 0);
+    EXPECT_EQ(owner.type, F_OWNER_PID) << "probed: the type stays as F_SETOWN set it";
+    EXPECT_EQ(owner.pid, 0);
     (void)s;
 }
 

@@ -2603,7 +2603,7 @@ namespace ustack
                 return fail(ESRCH);
             }
         }
-        socket.owner_type = id == 0 ? F_OWNER_TID : type;
+        socket.owner_type = type; // kept even when cleared: F_SETOWN 0 then reads {F_OWNER_PID, 0}
         socket.owner_id = id;
         return 0;
     }
