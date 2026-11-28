@@ -144,6 +144,14 @@ mutation:
 	$(CMAKE) --preset mutation -DCMAKE_CXX_COMPILER=clang++-$(MULL_VERSION) -DTCPIP_MULL_PLUGIN=$(MULL_PLUGIN)
 	$(CMAKE) --build --preset mutation --target run_tests
 	mkdir -p build/mutation/mull-report
+	@# One plain run first: mull-runner hides gtest's output, and this run's
+	@# slowest tests are where each of the ~771 mutant runs spends its time.
+	./build/mutation/run_tests --gtest_filter='-$(MULL_TEST_EXCLUDE)' > build/mutation/mull-report/plain-run.log 2>&1 || \
+	    { tail -40 build/mutation/mull-report/plain-run.log; exit 1; }
+	@echo "slowest tests in the mutation build (ms):"
+	@grep -E '^\[       OK \]' build/mutation/mull-report/plain-run.log | \
+	    sed -E 's/.*\] ([^ ]+) \(([0-9]+) ms\)/\2 \1/' | sort -rn | head -25
+	@grep -E '^\[==========\].*ran' build/mutation/mull-report/plain-run.log
 	$(MULL_RUNNER) ./build/mutation/run_tests --reporters IDE --reporters Elements \
 	    --report-dir build/mutation/mull-report --workers $(MULL_WORKERS) --allow-surviving \
 	    $(MULL_RUNNER_ARGS) --gtest_filter='-$(MULL_TEST_EXCLUDE)' | tee build/mutation/mull-report/mull.log
