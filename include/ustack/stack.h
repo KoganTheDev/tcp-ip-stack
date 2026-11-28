@@ -103,14 +103,28 @@
 // tcp_migrate_req=0). A UDP group's connected members take only their peers'
 // datagrams. One Stack is one owner: Linux's same-uid rule always holds.
 //
+// Urgent data has Linux's semantics (probed on loopback, and compared with the
+// kernel in test_stack_differential_oob.cpp), not RFC 6093's "ignore URG":
+// send(MSG_OOB) sets URG with the pointer one past the last byte written;
+// the receiver keeps ONE out-of-band byte (the last urgent one, a later one
+// replaces it). Without SO_OOBINLINE a normal recv() stops at the mark and then
+// steps over that byte, recv(MSG_OOB) returns it once (EINVAL when there is
+// none, it was read, or SO_OOBINLINE is set; EAGAIN if the pointer is here
+// and the byte is not), SIOCATMARK says whether the next byte is at the mark,
+// FIONREAD stops at the mark, and POLLPRI / EPOLLPRI / select()'s exceptional
+// set report the byte from its arrival until it is read or passed. With
+// SO_OOBINLINE (an int option, inherited by accepted sockets) the byte stays
+// in the stream, so peers' "urgent" bytes are delivered inline as RFC 6093
+// advises - reads still stop at the mark. Urgent data is legacy: do not build
+// protocols on it. Not done: SIGURG / F_SETOWN.
+//
 // What is not here: ioctl() requests other than FIONREAD / SIOCINQ,
-// SIOCOUTQ and SIOCOUTQNSD (ENOTTY; SIOCOUTQ does not count an unacked FIN),
+// SIOCOUTQ, SIOCOUTQNSD and SIOCATMARK (ENOTTY; SIOCOUTQ does not count an unacked FIN),
 // the rest of struct tcp_info (see TCP_INFO below), a tcpi_rcv_mss that
 // tracks the peer's segment sizes, quick-ack mode at the start of a
 // connection, every send/recv flag but MSG_DONTWAIT/MSG_NOSIGNAL/
 // MSG_PEEK/MSG_WAITALL/MSG_TRUNC (MSG_NOSIGNAL accepted, and meaningless
-// here; see recvfrom()), urgent data (MSG_OOB, so select()'s exceptional set
-// is always empty), IP_RECVERR (so a connected UDP socket hears only the hard
+// here; see recvfrom()), SIGURG on urgent data, IP_RECVERR (so a connected UDP socket hears only the hard
 // ICMP errors, as Linux does by default), nesting one ustack epoll inside another, and every fcntl()
 // command but F_GETFL/F_SETFL (O_NONBLOCK only) and F_GETFD/F_SETFD.
 //
@@ -292,9 +306,10 @@ namespace ustack
         // (UDP: return the datagram's real length even if it was cut short;
         // TCP: consume - or with MSG_PEEK just count - bytes without copying
         // them), MSG_NOSIGNAL (accepted, meaningless). Like Linux, any other
-        // flag is ignored, except that MSG_OOB on TCP is EINVAL: there is no
-        // urgent data. (send() is stricter: its flags other than MSG_DONTWAIT
-        // and MSG_NOSIGNAL are EOPNOTSUPP.) A deviation: after a partial
+        // flag is ignored. MSG_OOB on TCP reads the out-of-band byte and never
+        // waits (see the urgent-data notes at the top). (send() is stricter:
+        // its flags other than MSG_DONTWAIT and MSG_NOSIGNAL - and MSG_OOB on
+        // TCP - are EOPNOTSUPP.) A deviation: after a partial
         // MSG_WAITALL read cut short by an error, the error is kept for the
         // next call, as Linux does, but the readiness bits (EPOLLERR) are not
         // re-announced to an edge-triggered epoll.
@@ -423,7 +438,7 @@ namespace ustack
         // fd of this Stack gets POLLNVAL in revents (not an error) and counts
         // as ready; so does one closed - or closed and reused - while the call
         // waits. A negative fd is ignored (revents 0). timeout_ms -1 waits
-        // forever, 0 only looks. POLLPRI is accepted and never reported.
+        // forever, 0 only looks. POLLPRI reports unread urgent data on TCP.
         int poll(struct pollfd* fds, nfds_t nfds, int timeout_ms);
         // select(): EBADF for a set bit that is not an open fd (also if it is
         // closed during the wait), EINVAL for nfds outside [0, FD_SETSIZE] or
@@ -431,8 +446,8 @@ namespace ustack
         // so it silently ignores a bit for an fd number past the table's end
         // where this reports EBADF).
         // Readable is POLLIN|POLLHUP|POLLERR and writable POLLOUT|POLLERR, as
-        // in Linux. The exceptional set is Linux's too, EPOLLPRI alone, so it
-        // is always empty: there is no urgent data (MSG_OOB) here. On return
+        // in Linux. The exceptional set is Linux's too, EPOLLPRI alone: unread urgent
+        // data (MSG_OOB). On return
         // the sets hold only the ready fds (all cleared on timeout), the
         // result is the number of bits set, and `timeout` is updated with the
         // time not slept, as Linux does.
@@ -542,6 +557,7 @@ namespace ustack
             // before a connection exists and inherited across accept().
             bool keepalive = false;
             bool nodelay = false;
+            bool oob_inline = false; // SO_OOBINLINE: an urgent byte stays in the stream
             bool quickack = true;  // TCP_QUICKACK as set; a live connection answers for itself
             int rcvlowat = 1;      // SO_RCVLOWAT, already clamped (TCP only acts on it)
             // SO_RCVBUF / SO_SNDBUF: the payload capacity the application
@@ -603,6 +619,8 @@ namespace ustack
         ssize_t _sendto_once(int fd, const void* buf, size_t len, int flags, const struct sockaddr* dest_addr,
                              socklen_t addrlen);
         ssize_t _recvfrom_once(int fd, void* buf, size_t len, int flags, struct sockaddr* src_addr, socklen_t* addrlen);
+        // recv(MSG_OOB) on a connected TCP socket: tcp_recv_urg().
+        ssize_t _recv_urgent(const Socket& socket, void* buf, size_t len, int flags);
         // recv() with MSG_WAITALL on a TCP socket: keeps taking what is there
         // until len bytes, EOF, an error, SO_RCVTIMEO or (if it may not wait)
         // nothing more, as tcp_recvmsg does. Returns what recv() would.

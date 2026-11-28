@@ -240,7 +240,14 @@ public:
     // no way to know it was doing so. A short return is the signal to stop and
     // wait for writable() - the send-side equivalent of the peer closing its
     // window on us.
-    size_t send(const Bytes& data);
+    //
+    // urgent = true is send(..., MSG_OOB): the bytes are written as usual and
+    // SND.UP is set to the byte after the last of them. Every segment that
+    // starts before SND.UP - retransmissions too - then carries URG and the
+    // pointer SND.UP - SEQ (capped at 65535), which is Linux's "one past the
+    // last urgent byte" reading of the pointer (RFC 6093 section 3.1 names it
+    // as the common one). A write that accepts nothing marks nothing.
+    size_t send(const Bytes& data, bool urgent = false);
 
     // Room left in the send queue. Zero means the next send() accepts nothing.
     size_t send_space_available() const;
@@ -458,7 +465,48 @@ public:
     Bytes peek(size_t max_bytes = static_cast<size_t>(-1)) const;
 
     // Bytes waiting to be read. The application's share of the receive buffer.
+    // An urgent byte held out of band is in this count until it is passed,
+    // as Linux's is (the socket layer discounts it for readiness).
     size_t bytes_available() const { return _receive_queued_bytes; }
+
+    // --- Urgent data (MSG_OOB), with Linux's semantics ---
+    //
+    // Off by default: URG is then ignored and "urgent" bytes are plain stream
+    // data (RFC 6093, what every other user of this class gets). A socket
+    // layer that offers MSG_OOB turns it on. Then, as in tcp_check_urg() /
+    // tcp_urg(), one out-of-band byte is tracked per connection: the byte at
+    // the urgent pointer minus one (Linux reads the pointer as one past it).
+    // It stays in the receive queue, in sequence order, and is copied aside
+    // when its segment arrives. A later pointer replaces it; the old byte is
+    // dropped if it was at the head of the queue and is ordinary data if not.
+    //
+    // read() and peek() stop at the mark - with the byte inline or not - and
+    // when they start at it, skip it unless it is inline.
+    void set_urgent_tracking(bool on) { _urgent_tracking = on; }
+    // SO_OOBINLINE: the byte is read in the stream, and read_urgent() has
+    // nothing to give.
+    void set_oob_inline(bool on) { _oob_inline = on; }
+    // POLLPRI: an urgent byte has arrived and has not been read out of band.
+    bool urgent_pending() const { return _urgent_tracking && _urg_state == UrgState::VALID; }
+    // SIOCATMARK: the next byte to read is where the urgent pointer is.
+    bool at_urgent_mark() const;
+    // FIONREAD: with an urgent byte held out of band, what lies before it;
+    // otherwise everything queued.
+    size_t bytes_before_urgent_mark() const;
+    // How many bytes a read (or MSG_PEEK) of up to `max` would give right now:
+    // fewer than are queued when the mark is ahead, and not counting an urgent
+    // byte it would step over.
+    size_t readable_size(size_t max) const;
+    // recv(MSG_OOB). BYTE: *byte is the urgent byte (and, unless `peek`, it
+    // is now read - once only). NONE: none, already read, or inline (EINVAL).
+    // NOT_YET: the pointer has arrived and the byte has not (EAGAIN).
+    enum class UrgentRead
+    {
+        BYTE,
+        NONE,
+        NOT_YET
+    };
+    UrgentRead read_urgent(uint8_t& byte, bool peek);
     // Bytes held out of order, waiting for a gap before them to fill. They
     // occupy the receive buffer but no longer shrink the advertised window
     // (see _advertised_window()), so this is the way to see them.
@@ -1118,6 +1166,12 @@ private:
     // Bytes sitting in _send_queue, kept alongside it so send_space_available()
     // is a subtraction rather than a walk over every queued chunk.
     size_t _send_queued_bytes;
+    // SND.UP, the end of the last urgent write, and whether one is still
+    // outstanding. Linux keys "urgent mode" on snd_una != snd_up; the flag
+    // here is that test made safe against a stale value coming round again
+    // after the sequence space wraps. See _transmit().
+    uint32_t _snd_up = 0;
+    bool _snd_up_set = false;
     // close() called while data was still queued: the FIN goes out with the
     // last queued segment (see _send_chunk()).
     bool _fin_requested;
@@ -1315,6 +1369,35 @@ private:
         _recv_next += count;
         _recv_next_unwrapped += count;
     }
+    // Urgent data, receive side (see set_urgent_tracking()). The state is
+    // Linux's urg_data: NONE, NOT_YET (pointer seen, its byte not), VALID
+    // (byte saved, unread), READ (taken by read_urgent()). _urg_seq is the
+    // unwrapped position of the urgent byte.
+    enum class UrgState
+    {
+        NONE,
+        NOT_YET,
+        VALID,
+        READ
+    };
+    bool _urgent_tracking = false;
+    bool _oob_inline = false;
+    UrgState _urg_state = UrgState::NONE;
+    uint64_t _urg_seq = 0;
+    uint8_t _urg_byte = 0;
+    // The unwrapped position of the next byte the application reads
+    // (Linux's copied_seq).
+    // RCV.NXT counts the peer's FIN, which is no byte of the stream.
+    uint64_t _recv_fin_counted = 0;
+    uint64_t _data_end_unwrapped() const { return _recv_next_unwrapped - _recv_fin_counted; }
+    uint64_t _copied_unwrapped() const { return _data_end_unwrapped() - _receive_queued_bytes; }
+    // What a read of up to `max` bytes does about the urgent byte: skip it
+    // first (it is at the head, out of band), and take at most `limit`.
+    void _urgent_plan(size_t max, size_t& skip, size_t& limit) const;
+    void _discard_front(size_t count);
+    void _track_urgent(const Tcp& segment, const Bytes* payload);
+    // Linux clears urg_data once the reader is past the byte.
+    void _urgent_after_read();
     // Stores whatever part of an out-of-order segment is not already held.
     void _buffer_out_of_order(uint32_t seq, const Bytes& payload);
     uint32_t _user_timeout_ms = DEFAULT_USER_TIMEOUT_MS;
