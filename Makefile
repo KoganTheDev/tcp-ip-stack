@@ -123,7 +123,11 @@ MULL_VERSION ?= 19
 MULL_PLUGIN ?= /usr/lib/mull-ir-frontend-$(MULL_VERSION)
 MULL_RUNNER ?= $(shell command -v mull-runner-$(MULL_VERSION) || echo mull-runner)
 MULL_WORKERS ?= $(shell nproc 2>/dev/null || echo 1)
-MULL_RUNNER_ARGS ?=
+# mull-runner's default 3 s timeout also covers the warm-up run, which executes
+# the whole suite in one process (about a minute); that run timed out as soon
+# as the plugin built, so no score was ever produced.
+MULL_TIMEOUT_MS ?= 180000
+MULL_RUNNER_ARGS ?= --timeout $(MULL_TIMEOUT_MS)
 
 mutation:
 	rm -rf build/mutation
