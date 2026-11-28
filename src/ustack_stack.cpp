@@ -2555,7 +2555,14 @@ namespace ustack
             {
                 return fail(EFAULT);
             }
-            return _set_owner(*socket, owner->type, owner->pid);
+            {
+                // The type is an enum in the header but whatever int the caller
+                // wrote (99 is EINVAL, not undefined behaviour): read its bytes.
+                static_assert(sizeof(owner->type) == sizeof(int), "f_owner_ex::type is an int-sized enum");
+                int type = 0;
+                std::memcpy(&type, &owner->type, sizeof(type));
+                return _set_owner(*socket, type, owner->pid);
+            }
         case F_GETOWN_EX:
             if (owner == nullptr)
             {

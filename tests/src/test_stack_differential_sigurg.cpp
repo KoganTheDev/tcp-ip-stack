@@ -180,7 +180,7 @@ namespace
     std::string set_own_ex(S& s, int fd, int type, int id)
     {
         f_owner_ex ex{};
-        ex.type = static_cast<__pid_type>(type);
+        std::memcpy(&ex.type, &type, sizeof(type)); // may be a value the enum has not (99)
         ex.pid = id;
         return s.fcntl(fd, F_SETOWN_EX, &ex) == 0 ? "ok" : failure();
     }

@@ -85,7 +85,7 @@ namespace
         int owner_ex(int fd, int type, int id)
         {
             f_owner_ex owner{};
-            owner.type = static_cast<__pid_type>(type);
+            std::memcpy(&owner.type, &type, sizeof(type)); // may be a value the enum has not (99)
             owner.pid = id;
             return client->fcntl(fd, F_SETOWN_EX, &owner);
         }
@@ -278,11 +278,12 @@ TEST_F(UstackSigurg, TheNotificationIsDeliveredOutsideSegmentProcessing)
     ASSERT_EQ(client->fcntl(c, F_SETOWN, getpid()), 0);
     std::string seen;
     int reentrant_calls_ok = 0;
+    const int receiver = c; // a structured binding cannot be captured in C++17
     client->set_signal_sender(
         [&](int, int, int)
         {
             char byte = 0;
-            if (client->recv(c, &byte, 1, MSG_OOB) == 1)
+            if (client->recv(receiver, &byte, 1, MSG_OOB) == 1)
             {
                 seen.push_back(byte);
             }
