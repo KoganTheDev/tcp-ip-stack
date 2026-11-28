@@ -4,6 +4,7 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -11,6 +12,7 @@
 #include <array>
 #include <cerrno>
 #include <climits>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -2459,9 +2461,94 @@ namespace ustack
         case F_SETFD:
             socket->cloexec = (arg & FD_CLOEXEC) != 0;
             return 0;
+        case F_SETOWN:
+        {
+            // The sign picks the kind, as in fcntl(2); INT_MIN has no negation.
+            if (arg == INT_MIN)
+            {
+                return fail(EINVAL);
+            }
+            return _set_owner(*socket, arg < 0 ? F_OWNER_PGRP : F_OWNER_PID, arg < 0 ? -arg : arg);
+        }
+        case F_GETOWN:
+            // Linux: the pid or tid as is, a group as its negation.
+            return socket->owner_type == F_OWNER_PGRP ? -socket->owner_id : socket->owner_id;
         default:
             return fail(EINVAL);
         }
+    }
+
+    int Stack::fcntl(int fd, int cmd, struct f_owner_ex* owner)
+    {
+        CallScope scope(*this);
+        Socket* socket = _get(fd);
+        if (socket == nullptr)
+        {
+            return fail(EBADF);
+        }
+        switch (cmd)
+        {
+        case F_SETOWN_EX:
+            if (owner == nullptr)
+            {
+                return fail(EFAULT);
+            }
+            return _set_owner(*socket, owner->type, owner->pid);
+        case F_GETOWN_EX:
+            if (owner == nullptr)
+            {
+                return fail(EFAULT);
+            }
+            // An unset owner is {F_OWNER_TID (0), 0}, which is what the
+            // fields hold until the first set.
+            owner->type = static_cast<__pid_type>(socket->owner_type);
+            owner->pid = socket->owner_id;
+            return 0;
+        default:
+            return fail(EINVAL);
+        }
+    }
+
+    int Stack::_set_owner(Socket& socket, int type, int id)
+    {
+        if (type != F_OWNER_TID && type != F_OWNER_PID && type != F_OWNER_PGRP)
+        {
+            return fail(EINVAL);
+        }
+        if (id < 0)
+        {
+            return fail(ESRCH); // find_vpid() of a negative number finds nothing
+        }
+        if (id != 0)
+        {
+            // The kernel looks the pid up and gives ESRCH when there is none.
+            // A signal-0 probe is the same question; EPERM means it exists.
+            int probe = 0;
+            switch (type)
+            {
+            case F_OWNER_PID:
+                probe = ::kill(id, 0);
+                break;
+            case F_OWNER_PGRP:
+                probe = ::kill(-id, 0);
+                break;
+            default:
+                probe = static_cast<int>(::syscall(SYS_tgkill, ::getpid(), id, 0));
+                break;
+            }
+            if (probe != 0 && errno != EPERM)
+            {
+                return fail(ESRCH);
+            }
+        }
+        socket.owner_type = id == 0 ? F_OWNER_TID : type;
+        socket.owner_id = id;
+        return 0;
+    }
+
+    void Stack::set_signal_sender(SignalSender sender)
+    {
+        _signal_sender = std::move(sender);
     }
 
     // --- blocking ---
