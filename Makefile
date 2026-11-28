@@ -117,9 +117,7 @@ soak: all
 # from the Mull apt repository; its plugin must be built for exactly that LLVM).
 # Always a from-scratch build, for the same reason as the sanitizers: objects
 # compiled without the plugin have no mutants in them. The simulator's property
-# tests and the multi-second EchoLoad suites are left out (each mutant would
-# pay for 200 seeds; under the plugin the load tests overrun mull-runner's
-# default 3 s per-test timeout in the warm-up run) and the report
+# tests are left out (each mutant would pay for 200 seeds) and the report
 # lands in build/mutation/mull-report. MULL_RUNNER_ARGS adds mull-runner flags.
 MULL_VERSION ?= 19
 MULL_PLUGIN ?= /usr/lib/mull-ir-frontend-$(MULL_VERSION)
@@ -134,7 +132,7 @@ mutation:
 	mkdir -p build/mutation/mull-report
 	$(MULL_RUNNER) ./build/mutation/run_tests --reporters IDE --reporters Elements \
 	    --report-dir build/mutation/mull-report --workers $(MULL_WORKERS) --allow-surviving \
-	    $(MULL_RUNNER_ARGS) --gtest_filter='-*SimTransfer*:Soak.*:EchoLoad.*:EchoRealLoad.*' | tee build/mutation/mull-report/mull.log
+	    $(MULL_RUNNER_ARGS) --gtest_filter='-*SimTransfer*:Soak.*' | tee build/mutation/mull-report/mull.log
 
 # Configure a preset the first time it is used, and again whenever the presets
 # file changes (re-running `cmake --preset` re-applies its cache variables).
