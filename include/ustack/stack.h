@@ -721,6 +721,14 @@ namespace ustack
         void _update_signal();
         // fcntl()'s ownership commands: the common part of F_SETOWN and F_SETOWN_EX.
         int _set_owner(Socket& socket, int type, int id);
+        // The urgent pointer of the connection's socket is new: queue SIGURG
+        // for its owner (read now), if it has one.
+        void _on_urgent(uint64_t connection_id);
+        // Sends what is queued. Called by the thread that drives the stack
+        // after every pump step and at the end of each public call - never
+        // from inside segment processing. Re-entrant calls (from a handler)
+        // return at once; the outer loop picks up what they queued.
+        void _deliver_signals();
         // A free port for bind(0), listen()'s or sendto()'s automatic bind:
         // one nothing of this Stack is bound to and, as Linux's
         // inet_csk_find_open_port, that no connection holds in a way
@@ -799,5 +807,14 @@ namespace ustack
         int _pollable_fd = -1; // kernel epoll over _signal_fd and the driver's wake fd
         bool _signalled = false;
         SignalSender _signal_sender; // empty: the real signals
+        // Urgent-pointer notifications recorded during segment processing,
+        // sent by _deliver_signals() at the next step boundary.
+        struct PendingSignal
+        {
+            int owner_type;
+            int owner_id;
+        };
+        std::vector<PendingSignal> _pending_signals;
+        bool _delivering = false; // a sender is running: a nested call only queues
     };
 }

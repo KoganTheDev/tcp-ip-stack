@@ -420,7 +420,60 @@ namespace ustack
         int saved_errno = errno;
         _driver->stack_changed(_stack);
         _update_signal();
+        _deliver_signals();
         errno = saved_errno;
+    }
+
+    void Stack::_on_urgent(uint64_t connection_id)
+    {
+        auto it = _fd_by_connection.find(connection_id);
+        const Socket* socket = it == _fd_by_connection.end() ? nullptr : _get(it->second);
+        if (socket != nullptr && socket->owner_id != 0)
+        {
+            _pending_signals.push_back({socket->owner_type, socket->owner_id});
+        }
+    }
+
+    void Stack::_deliver_signals()
+    {
+        if (_delivering || _pending_signals.empty())
+        {
+            return;
+        }
+        // Cleared however the sender leaves (it is the application's code).
+        struct Guard
+        {
+            bool& flag;
+            explicit Guard(bool& flag) : flag(flag) { flag = true; }
+            ~Guard() { flag = false; }
+            Guard(const Guard&) = delete;
+            Guard& operator=(const Guard&) = delete;
+        } guard(_delivering);
+        while (!_pending_signals.empty())
+        {
+            std::vector<PendingSignal> batch;
+            batch.swap(_pending_signals);
+            for (const PendingSignal& pending : batch)
+            {
+                if (_signal_sender)
+                {
+                    static_cast<void>(_signal_sender(pending.owner_type, pending.owner_id, SIGURG));
+                    continue;
+                }
+                switch (pending.owner_type)
+                {
+                case F_OWNER_PID:
+                    static_cast<void>(::kill(pending.owner_id, SIGURG));
+                    break;
+                case F_OWNER_PGRP:
+                    static_cast<void>(::kill(-pending.owner_id, SIGURG));
+                    break;
+                default:
+                    static_cast<void>(::syscall(SYS_tgkill, ::getpid(), pending.owner_id, SIGURG));
+                    break;
+                }
+            }
+        }
     }
 
     // --- connections ---
@@ -488,6 +541,14 @@ namespace ustack
                     stack->_on_connection_state(id, state);
                 }
             });
+        connection.set_urgent_callback(
+            [self, id]()
+            {
+                if (Stack* stack = *self)
+                {
+                    stack->_on_urgent(id);
+                }
+            });
         connection.set_send_space_callback(
             [self, id]()
             {
@@ -514,6 +575,7 @@ namespace ustack
     void Stack::_detach(TcpConnection& connection)
     {
         connection.set_data_ready_callback(nullptr);
+        connection.set_urgent_callback(nullptr);
         connection.set_send_space_callback(nullptr);
         // The state callback cannot be removed; it finds no fd from now on.
         _fd_by_connection.erase(connection.get_id());
@@ -2597,6 +2659,7 @@ namespace ustack
     int Stack::_pump_until(const std::function<bool()>& done, std::optional<uint64_t> deadline, bool must_wait)
     {
         _driver->run_pending(_stack);
+        _deliver_signals();
         for (;;)
         {
             if (!must_wait && done())
@@ -2625,6 +2688,7 @@ namespace ustack
             // driver is set to wake for (a SYN's retransmission, say).
             _driver->stack_changed(_stack);
             _driver->wait_stack_only(_stack, remaining);
+            _deliver_signals();
         }
     }
 
@@ -3077,9 +3141,16 @@ namespace ustack
             return fail(EFAULT);
         }
         _driver->run_pending(_stack);
+        _deliver_signals();
         uint64_t start = _driver->now_ms();
         for (;;)
         {
+            // A handler may have closed the epoll fd: look it up afresh.
+            owner = _get(epfd);
+            if (owner == nullptr || owner->kind != Kind::EPOLL)
+            {
+                return fail(EBADF);
+            }
             int count = _collect(*owner->epoll, events, maxevents);
             count += _collect_external(*owner->epoll, events + count, maxevents - count);
             if (count > 0 || timeout == 0)
@@ -3097,6 +3168,7 @@ namespace ustack
                 remaining = timeout - static_cast<int>(elapsed);
             }
             _driver->wait(_stack, remaining);
+            _deliver_signals();
         }
     }
 
@@ -3323,9 +3395,11 @@ namespace ustack
     {
         CallScope scope(*this);
         _driver->run_pending(_stack);
+        _deliver_signals();
         if (timeout_ms != 0 && !_any_ready())
         {
             _driver->wait(_stack, timeout_ms);
+            _deliver_signals();
         }
         return 0;
     }

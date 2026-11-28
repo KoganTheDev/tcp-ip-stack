@@ -403,3 +403,38 @@ TEST(TcpUrgentReceive, AnUrgentPointerBehindTheReaderIsIgnored)
     wire.data(501, "hello", 3); // a retransmission pointing at byte 503
     ASSERT_TRUE(!wire.connection->urgent_pending());
 }
+
+// Linux's tcp_check_urg sends SIGURG when a segment brings a pointer that is
+// new: not for plain data, not for a repeat of the pointer (a retransmission),
+// not for an older one, not for one behind the reader - and before the urgent
+// byte itself need have arrived.
+TEST(TcpUrgentReceive, TheUrgentCallbackFiresOncePerNewPointer)
+{
+    UrgentWire wire;
+    int fired = 0;
+    wire.connection->set_urgent_callback([&fired] { fired++; });
+    wire.data(501, "ab");
+    ASSERT_TRUE(fired == 0) << "plain data";
+    wire.data(503, "c!", 2); // urgent byte at 504
+    ASSERT_TRUE(fired == 1);
+    wire.data(503, "c!", 2); // a retransmission: the same pointer
+    ASSERT_TRUE(fired == 1) << "a repeated pointer is not new";
+    wire.data(505, "x", 1); // byte 505 is newer
+    ASSERT_TRUE(fired == 2);
+    wire.data(501, "ab", 1); // byte 501, older than 505
+    ASSERT_TRUE(fired == 2) << "an older pointer is ignored";
+    wire.read();
+    wire.data(501, "ab", 1); // behind the reader now
+    ASSERT_TRUE(fired == 2) << "stale";
+}
+
+TEST(TcpUrgentReceive, ThePointerNotifiesBeforeItsByteArrivesAndAlsoWhenInline)
+{
+    UrgentWire wire(true);
+    int fired = 0;
+    wire.connection->set_urgent_callback([&fired] { fired++; });
+    wire.data(501, "ab", 5); // urgent byte is at 505, not here yet
+    ASSERT_TRUE(fired == 1) << "sk_send_sigurg does not wait for the byte";
+    wire.data(503, "cde");
+    ASSERT_TRUE(fired == 1);
+}

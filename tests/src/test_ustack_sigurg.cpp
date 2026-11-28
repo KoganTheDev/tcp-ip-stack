@@ -68,7 +68,18 @@ namespace
         {
             REQUIRE_TRUE(server->send(sender, text.data(), text.size(), flags) == static_cast<ssize_t>(text.size()),
                          std::strerror(errno));
+            settle();
+        }
+
+        // The simulator moves frames outside any Stack call; the receiver
+        // sees them, and sends what they queued, at its next call - which a
+        // real driver makes by itself, since there frames only move inside
+        // run_pending() / wait(). run_once(0) is that call here.
+        void settle()
+        {
             net.step(20);
+            client->run_once(0);
+            server->run_once(0);
         }
 
         int owner_ex(int fd, int type, int id)
@@ -175,4 +186,126 @@ TEST_F(UstackSigurg, AnyKindOfSocketTakesAnOwnerAndAcceptedSocketsDoNotInheritIt
     ASSERT_EQ(client->fcntl(epfd, F_SETOWN, getpid()), 0);
     EXPECT_EQ(client->fcntl(epfd, F_GETOWN), getpid());
     (void)cfd;
+}
+
+TEST_F(UstackSigurg, NoOwnerMeansNoNotification)
+{
+    auto [c, s] = pair();
+    send_flags(s, "a", MSG_OOB);
+    EXPECT_TRUE(sent.empty());
+    (void)c;
+}
+
+TEST_F(UstackSigurg, OneNotificationPerNewUrgentPointer)
+{
+    auto [c, s] = pair();
+    ASSERT_EQ(client->fcntl(c, F_SETOWN, getpid()), 0);
+    send_flags(s, "abc", 0);
+    EXPECT_TRUE(sent.empty()) << "ordinary data is no urgent notice";
+
+    send_flags(s, "x", MSG_OOB);
+    ASSERT_EQ(sent.size(), 1U);
+    EXPECT_EQ(sent[0], (Sent{F_OWNER_PID, getpid(), SIGURG}));
+
+    send_flags(s, "y", MSG_OOB);
+    EXPECT_EQ(sent.size(), 2U) << "a second urgent byte is a new pointer, read or not";
+
+    send_flags(s, "zzz", MSG_OOB);
+    EXPECT_EQ(sent.size(), 3U) << "one segment, one pointer, one notification whatever its length";
+    send_flags(s, "plain", 0);
+    EXPECT_EQ(sent.size(), 3U);
+}
+
+TEST_F(UstackSigurg, TheKindOfOwnerPicksWhatIsSent)
+{
+    auto [c, s] = pair();
+    ASSERT_EQ(client->fcntl(c, F_SETOWN, -getpgrp()), 0);
+    send_flags(s, "a", MSG_OOB);
+    const int tid = static_cast<int>(syscall(SYS_gettid));
+    ASSERT_EQ(owner_ex(c, F_OWNER_TID, tid), 0);
+    send_flags(s, "b", MSG_OOB);
+    ASSERT_EQ(client->fcntl(c, F_SETOWN, 0), 0);
+    send_flags(s, "c", MSG_OOB);
+    ASSERT_EQ(sent.size(), 2U) << "cleared: nobody";
+    EXPECT_EQ(sent[0], (Sent{F_OWNER_PGRP, getpgrp(), SIGURG}));
+    EXPECT_EQ(sent[1], (Sent{F_OWNER_TID, tid, SIGURG}));
+}
+
+TEST_F(UstackSigurg, SoOobinlineStillNotifies)
+{
+    auto [c, s] = pair();
+    int on = 1;
+    ASSERT_EQ(client->setsockopt(c, SOL_SOCKET, SO_OOBINLINE, &on, sizeof(on)), 0);
+    ASSERT_EQ(client->fcntl(c, F_SETOWN, getpid()), 0);
+    send_flags(s, "a", MSG_OOB);
+    EXPECT_EQ(sent.size(), 1U);
+}
+
+TEST_F(UstackSigurg, AnAcceptedSocketNeedsItsOwnOwner)
+{
+    auto [c, s] = pair();
+    ASSERT_EQ(server->fcntl(listen_fd, F_SETOWN, getpid()), 0);
+    // The data goes the other way here: client -> server, signalled on the
+    // server, whose listener has an owner and whose accepted socket s has not.
+    int on = 1;
+    ASSERT_EQ(client->setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)), 0);
+    int count = 0;
+    server->set_signal_sender(
+        [&count](int, int, int)
+        {
+            count++;
+            return 0;
+        });
+    ASSERT_EQ(client->send(c, "a", 1, MSG_OOB), 1);
+    settle();
+    EXPECT_EQ(count, 0) << "not inherited";
+    ASSERT_EQ(server->fcntl(s, F_SETOWN, getpid()), 0);
+    ASSERT_EQ(client->send(c, "b", 1, MSG_OOB), 1);
+    settle();
+    EXPECT_EQ(count, 1);
+}
+
+// A handler that calls back into the Stack must not find it mid-update: the
+// notification is delivered after the step, not from inside the segment
+// handler. Here the "handler" reads the urgent byte, which needs the byte to
+// be in place already, and makes calls that touch the socket table.
+TEST_F(UstackSigurg, TheNotificationIsDeliveredOutsideSegmentProcessing)
+{
+    auto [c, s] = pair();
+    ASSERT_EQ(client->fcntl(c, F_SETOWN, getpid()), 0);
+    std::string seen;
+    int reentrant_calls_ok = 0;
+    client->set_signal_sender(
+        [&](int, int, int)
+        {
+            char byte = 0;
+            if (client->recv(c, &byte, 1, MSG_OOB) == 1)
+            {
+                seen.push_back(byte);
+            }
+            int extra = client->socket(AF_INET, SOCK_DGRAM, 0);
+            if (extra >= 0 && client->close(extra) == 0)
+            {
+                reentrant_calls_ok++;
+            }
+            return 0;
+        });
+    send_flags(s, "q", MSG_OOB);
+    EXPECT_EQ(seen, "q");
+    EXPECT_EQ(reentrant_calls_ok, 1);
+}
+
+// The notification is sent by the thread that drives the stack, from inside a
+// blocking call too: epoll_wait() with a timeout pumps, and the sender (a
+// handler's stand-in) runs before it returns.
+TEST_F(UstackSigurg, ABlockedEpollWaitDeliversAfterItsPumpStep)
+{
+    auto [c, s] = pair();
+    ASSERT_EQ(client->fcntl(c, F_SETOWN, getpid()), 0);
+    int epfd = client->epoll_create1(0);
+    ASSERT_EQ(add(*client, epfd, c, EPOLLPRI), 0);
+    ASSERT_EQ(server->send(s, "!", 1, MSG_OOB), 1);
+    auto events = wait_events(*client, epfd, 1000);
+    EXPECT_EQ(events.size(), 1U);
+    EXPECT_EQ(sent.size(), 1U) << "delivered inside the wait, not left for a later call";
 }
